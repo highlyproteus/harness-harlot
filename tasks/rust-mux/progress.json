@@ -1,15 +1,15 @@
 {
   "task_dir": "tasks/rust-mux",
-  "complete": 38,
-  "total": 53,
-  "percent": 72,
+  "complete": 40,
+  "total": 62,
+  "percent": 65,
   "tasks": [
     {
       "file": "tasks/rust-mux/00-vision.md",
       "title": "Rust Mux Vision",
-      "goal": "Define a reliability-first native local and SSH terminal workspace whose sessions outlive its desktop UI.",
-      "complete": 7,
-      "total": 7,
+      "goal": "Define a lightweight, reliability-first native local and SSH terminal workspace whose sessions outlive its desktop UI without becoming an agent harness or runtime.",
+      "complete": 9,
+      "total": 9,
       "percent": 100,
       "checks": [
         {
@@ -34,6 +34,16 @@
         },
         {
           "text": "Defer browser, mobile, generic remote-control UI, worktree/diff, AI integrations, and optional remote-rmuxd reattachment.",
+          "done": true,
+          "section": "Requirements"
+        },
+        {
+          "text": "Treat terminals and agents as ordinary shell workloads; Rust Mux must stay out of their way rather than own or supervise an agent runtime.",
+          "done": true,
+          "section": "Requirements"
+        },
+        {
+          "text": "Make bounded history, change-only updates, off-UI-thread work, and content-safe performance diagnostics part of the product contract.",
           "done": true,
           "section": "Requirements"
         },
@@ -109,8 +119,8 @@
       "title": "Persistent PTY Sessions",
       "goal": "Make the session service own real local and system-SSH shell processes and terminal byte streams.",
       "complete": 7,
-      "total": 10,
-      "percent": 70,
+      "total": 12,
+      "percent": 58,
       "checks": [
         {
           "text": "Add `portable-pty` behind a narrow service-owned Unix PTY abstraction on macOS and Linux.",
@@ -124,6 +134,11 @@
         },
         {
           "text": "Stream ordered output with bounded queues and reconnect-safe sequence numbers.",
+          "done": false,
+          "section": "Requirements"
+        },
+        {
+          "text": "Keep every PTY draining into bounded daemon-owned history even when its desktop subscription is idle or disconnected.",
           "done": false,
           "section": "Requirements"
         },
@@ -161,6 +176,11 @@
           "text": "Backpressure behavior is documented and tested.",
           "done": false,
           "section": "Acceptance Criteria"
+        },
+        {
+          "text": "A pane left unattended beyond the idle threshold cannot block its local or SSH child and can resume from a fresh snapshot without lost output.",
+          "done": false,
+          "section": "Acceptance Criteria"
         }
       ]
     },
@@ -169,8 +189,8 @@
       "title": "Terminal Rendering and Input",
       "goal": "Render interactive terminal panes in the native desktop without duplicating terminal-emulation logic.",
       "complete": 8,
-      "total": 9,
-      "percent": 89,
+      "total": 12,
+      "percent": 67,
       "checks": [
         {
           "text": "Expand the `alacritty_terminal` adapter around parsing, resize, and visible-grid snapshots.",
@@ -203,6 +223,16 @@
           "section": "Requirements"
         },
         {
+          "text": "Move protocol decoding, terminal update preparation, and other non-paint work off the UI thread.",
+          "done": false,
+          "section": "Requirements"
+        },
+        {
+          "text": "Render revision-aware deltas only for changed, actively subscribed panes and resync stale panes from one fresh snapshot on focus.",
+          "done": false,
+          "section": "Requirements"
+        },
+        {
           "text": "Interactive local shells render and accept input.",
           "done": true,
           "section": "Acceptance Criteria"
@@ -215,6 +245,11 @@
         {
           "text": "Desktop restart reconnects to the current rendered state.",
           "done": true,
+          "section": "Acceptance Criteria"
+        },
+        {
+          "text": "Size and activity matrix measurements cover update volume, UI-thread work, resume latency, CPU, and memory for focused, recent, and stale panes.",
+          "done": false,
           "section": "Acceptance Criteria"
         }
       ]
@@ -279,8 +314,8 @@
       "title": "macOS Reliability Hardening",
       "goal": "Validate the reliability claim under desktop, display, daemon, and SSH lifecycle stress on macOS and Linux.",
       "complete": 2,
-      "total": 9,
-      "percent": 22,
+      "total": 11,
+      "percent": 18,
       "checks": [
         {
           "text": "Add structured service logs and opt-in diagnostics without recording terminal contents.",
@@ -289,6 +324,11 @@
         },
         {
           "text": "Add crash/reconnect, slow-client, high-output, and service-upgrade scenarios.",
+          "done": false,
+          "section": "Requirements"
+        },
+        {
+          "text": "Define and measure idle-pane CPU, memory, serialized-byte, UI-thread, and focus-resume targets with diagnostics that never record terminal contents.",
           "done": false,
           "section": "Requirements"
         },
@@ -324,6 +364,11 @@
         },
         {
           "text": "Release packaging preserves the independent service lifecycle.",
+          "done": false,
+          "section": "Acceptance Criteria"
+        },
+        {
+          "text": "Focused/recent panes remain responsive, stale panes stop generating live desktop traffic, and refocus performs one bounded fresh-snapshot resync before live deltas resume.",
           "done": false,
           "section": "Acceptance Criteria"
         }

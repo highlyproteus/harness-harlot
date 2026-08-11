@@ -136,7 +136,7 @@
   "goal_id": "rust-mux-mvp",
   "goal_file": "../PDR.html",
   "title": "Build the Tokio service and local IPC foundation",
-  "description": "Turn the scaffold into an asynchronous Tokio service using a thin length-delimited request/response and event protocol over a per-user Unix-domain socket. Add a versioned capability handshake, frame limits, request IDs, stable entity IDs, monotonic revisions, bounded subscriptions, and snapshot/reconnect semantics. Keep transport DTOs separate from service commands so a later opt-in Axum HTTP/WebSocket adapter or remote rmuxd can reuse the command layer.",
+  "description": "Turn the scaffold into an asynchronous Tokio service using a thin length-delimited request/response and event protocol over a per-user Unix-domain socket. Add a versioned capability handshake, frame limits, request IDs, stable entity IDs, monotonic revisions, revision-aware delta events, bounded attention-aware subscriptions, and snapshot/reconnect semantics. Focused and recent panes receive responsive deltas. After about 60 seconds without attention, stop serializing and pushing their live screens while the daemon continues draining and parsing every PTY into bounded history; focus requests one fresh snapshot before rendering and then resumes deltas. Keep transport DTOs separate from service commands so a later opt-in Axum HTTP/WebSocket adapter or remote rmuxd can reuse the command layer.",
   "why": "UI restart isolation is Rust Mux's defining guarantee. A thin framed protocol directly models ordered terminal events and backpressure without opening a TCP port or assuming a cloud backend.",
   "acceptance_criteria": [
     { "text": "Protocol and state-model crates compile without OS-specific APIs", "met": true },
@@ -144,13 +144,15 @@
     { "text": "Local IPC endpoints are restricted to the current user and reject incompatible protocol versions", "met": true },
     { "text": "Closing a client leaves the service and canonical seeded session state alive", "met": true },
     { "text": "All request handling is bounded and no UI call can synchronously block PTY draining", "met": true },
+    { "text": "Focused and recent panes receive revision-aware deltas while panes idle for about 60 seconds stop generating serialized live-screen traffic without pausing PTY drain or losing bounded history", "met": false },
+    { "text": "Selecting a stale pane yields one immediate current snapshot before rendering, then resumes live deltas without penalizing normal frequent tab switching", "met": false },
     { "text": "No unauthenticated TCP port is bound by default; later Axum or rmuxd listeners are explicit and policy-gated", "met": true }
   ],
   "depends_on": ["task-01"],
   "status": "in_progress",
   "block_reason": null,
-  "notes": [{ "timestamp": "2026-08-11T18:01:19Z", "text": "The protocol-v2 checkpoint now has a bounded handshake/request path over an owner-only Unix socket, no TCP listener, independent PTY reader threads, and live client reconnect proof. Request IDs, subscriptions/sequence resync, and Linux CI execution remain before this task is complete." }, { "timestamp": "2026-08-11T21:22:24Z", "text": "The four parallel tracks now share one coherent protocol v5: commands retain the desktop key-forwarding boundary, terminal interaction adds structured requests and responses, and ConnectSsh uses the same handshake without a second incompatible version. The local owner-only Unix socket remains the sole default endpoint. Request IDs, subscription resync, and Linux CI remain." }],
-  "last_updated": "2026-08-11T21:22:24Z"
+  "notes": [{ "timestamp": "2026-08-11T18:01:19Z", "text": "The protocol-v2 checkpoint now has a bounded handshake/request path over an owner-only Unix socket, no TCP listener, independent PTY reader threads, and live client reconnect proof. Request IDs, subscriptions/sequence resync, and Linux CI execution remain before this task is complete." }, { "timestamp": "2026-08-11T21:22:24Z", "text": "The four parallel tracks now share one coherent protocol v5: commands retain the desktop key-forwarding boundary, terminal interaction adds structured requests and responses, and ConnectSsh uses the same handshake without a second incompatible version. The local owner-only Unix socket remains the sole default endpoint. Request IDs, subscription resync, and Linux CI remain." }, { "timestamp": "2026-08-11T22:22:58Z", "text": "Recorded the approved idle-pane contract for the next streaming slice: revision-aware deltas for focused/recent panes, live-screen suppression after about 60 seconds without attention, uninterrupted PTY drain into bounded history, and an immediate fresh-snapshot resync on selection. This is roadmap-only; the current full-snapshot transport is unchanged." }],
+  "last_updated": "2026-08-11T22:22:58Z"
 }
 </script>
 
