@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Task</title>
+<style>
+  :root {
+    --paper: #F7F5F0;
+    --card: #FFFFFF;
+    --ink: #1C1B19;
+    --ink-soft: #57534A;
+    --line: #DEDACF;
+    --accent: #3D5A73;
+    --done: #4B6A4E;
+    --done-bg: #E7EDE4;
+    --progress-c: #A6752C;
+    --progress-bg: #F3E8D6;
+    --blocked: #9C4A3C;
+    --blocked-bg: #F5E4DF;
+    --idle: #8C8577;
+    --idle-bg: #EDEBE4;
+    --serif: Georgia, 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', serif;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    --mono: 'SF Mono', 'IBM Plex Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    background: rgba(247, 245, 240, 0.92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line);
+    z-index: 10;
+  }
+  .topbar-inner {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+  .back-link { font-family: var(--mono); font-size: 13px; color: var(--accent); text-decoration: none; margin-right: auto; }
+  .back-link:hover { text-decoration: underline; }
+
+  .pill {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 100px;
+  }
+  .pill.status-done { background: var(--done-bg); color: var(--done); }
+  .pill.status-in_progress { background: var(--progress-bg); color: var(--progress-c); }
+  .pill.status-blocked { background: var(--blocked-bg); color: var(--blocked); }
+  .pill.status-not_started { background: var(--idle-bg); color: var(--idle); }
+
+  main { max-width: 760px; margin: 0 auto; padding: 0 24px 80px; }
+
+  .hero { padding: 48px 0 32px; }
+  .eyebrow { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); margin: 0 0 8px; }
+  h1 { font-family: var(--serif); font-size: 32px; line-height: 1.2; margin: 0; font-weight: 600; }
+
+  section { padding: 28px 0; border-top: 1px solid var(--line); }
+  .hero + section { border-top: none; }
+  h2 {
+    font-family: var(--sans);
+    font-size: 13px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0 0 14px;
+    font-weight: 600;
+  }
+  p.body-text { margin: 0; font-size: 15px; }
+
+  #depends-list { list-style: none; margin: 0; padding: 0; }
+  #depends-list li {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 13px;
+    background: var(--idle-bg);
+    color: var(--ink-soft);
+    padding: 3px 10px;
+    border-radius: 100px;
+    margin: 0 6px 6px 0;
+  }
+  #depends-list li.muted { background: none; padding: 0; font-family: var(--sans); font-style: italic; }
+
+  .criteria-list { list-style: none; margin: 0; padding: 0; }
+  .criteria-list li { padding: 7px 0; font-size: 15px; }
+  .criteria-list li.met { color: var(--ink-soft); text-decoration: line-through; text-decoration-color: var(--line); }
+  .check { font-family: var(--mono); margin-right: 8px; }
+
+  .callout { padding: 14px 16px; border-radius: 8px; font-size: 14px; }
+  .callout.blocked { background: var(--blocked-bg); color: var(--blocked); }
+
+  .notes-list { list-style: none; margin: 0; padding: 0; }
+  .notes-list li { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .notes-list li:last-child { border-bottom: none; }
+  .timestamp { font-family: var(--mono); color: var(--ink-soft); margin-right: 8px; }
+  .muted { color: var(--ink-soft); font-style: italic; }
+
+  footer {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 20px 24px 60px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+
+  @media (max-width: 600px) {
+    h1 { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+
+<script type="application/json" id="pdr-state">
+{
+  "id": "task-05",
+  "goal_id": "rust-mux-mvp",
+  "goal_file": "../PDR.html",
+  "title": "Implement secure SSH remote workspaces",
+  "description": "Add a host picker for concrete aliases from the user's standard SSH configuration and launch the system OpenSSH client inside a daemon-owned PTY. Use structured argv, let OpenSSH resolve Host and Include rules, agent and IdentityFile behavior, known-host policy, ProxyJump or ProxyCommand, Match rules, and multiplexing, and forward terminal resize naturally through the PTY. Store non-secret SSH session metadata in the daemon and present remote shells or agent commands as ordinary movable panes beside local ones. Design a future rmuxd-backed session kind without requiring remote bootstrap now.",
+  "why": "Remote development is a core workflow. Reusing system OpenSSH maximizes compatibility and keeps authentication, host-key verification, and proxy behavior in the user's audited toolchain instead of creating a new security surface.",
+  "acceptance_criteria": [
+    { "text": "Host discovery shows concrete SSH aliases while ssh -G remains the source of truth for resolved configuration", "met": false },
+    { "text": "OpenSSH is spawned with structured argv and rejects control-character or option-injection host aliases", "met": false },
+    { "text": "Existing SSH agent, key, Include, wildcard, Match, ProxyJump or ProxyCommand, and multiplexing behavior is honored without reading private keys", "met": false },
+    { "text": "Unknown and changed host keys retain normal OpenSSH prompts or failures and are never bypassed", "met": false },
+    { "text": "Remote stty size follows pane resize and moving a pane never changes its SSH process or session ID", "met": false },
+    { "text": "Desktop disconnect and restart preserve the daemon-owned SSH PID and replay missed output", "met": false },
+    { "text": "Terminal contents, prompts, keys, and secret-bearing config values are excluded from default logs and crash reports", "met": false },
+    { "text": "Session metadata can later distinguish an optional rmuxd-backed remote PTY without making rmuxd an MVP dependency", "met": false }
+  ],
+  "depends_on": ["task-03", "task-04"],
+  "status": "not_started",
+  "block_reason": null,
+  "notes": [
+    { "timestamp": "2026-08-11T16:46:38Z", "text": "Security boundary: system OpenSSH owns protocol, authentication, host-key verification, and jump-host behavior; Rust Mux owns only the local PTY, process lifecycle, metadata, and UI projection." }
+  ],
+  "last_updated": "2026-08-11T16:46:38Z"
+}
+</script>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="back-link" id="back-link" href="../PDR.html">&larr; Back to goal</a>
+    <span id="status-pill" class="pill"></span>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <p class="eyebrow" id="task-id"></p>
+    <h1 id="task-title"></h1>
+  </section>
+
+  <section>
+    <h2>What needs to happen</h2>
+    <p class="body-text" id="task-description"></p>
+  </section>
+
+  <section>
+    <h2>Why it matters</h2>
+    <p class="body-text" id="task-why"></p>
+  </section>
+
+  <section>
+    <h2>Depends on</h2>
+    <ul id="depends-list"></ul>
+  </section>
+
+  <section>
+    <h2>Definition of done</h2>
+    <ul id="criteria-list" class="criteria-list"></ul>
+  </section>
+
+  <section id="block-section" style="display:none">
+    <h2>Blocked</h2>
+    <div class="callout blocked" id="block-callout"></div>
+  </section>
+
+  <section>
+    <h2>Notes</h2>
+    <ul id="notes-list" class="notes-list"></ul>
+  </section>
+</main>
+
+<footer>
+  <p>Last updated <span id="last-updated"></span></p>
+</footer>
+
+<script>
+(function () {
+  var stateEl = document.getElementById('pdr-state');
+  var state = JSON.parse(stateEl.textContent);
+
+  var STATUS_LABEL = { done: 'Done', in_progress: 'In progress', blocked: 'Blocked', not_started: 'Not started' };
+
+  document.title = (state.id || 'Task') + ' \u00B7 ' + (state.title || '');
+  document.getElementById('back-link').setAttribute('href', state.goal_file || '../PDR.html');
+  document.getElementById('task-id').textContent = state.id || '';
+  document.getElementById('task-title').textContent = state.title || 'Untitled task';
+  document.getElementById('task-description').textContent = state.description || '\u2014';
+  document.getElementById('task-why').textContent = state.why || '\u2014';
+
+  var depEl = document.getElementById('depends-list');
+  var deps = state.depends_on || [];
+  if (deps.length === 0) {
+    var noneLi = document.createElement('li');
+    noneLi.className = 'muted';
+    noneLi.textContent = 'Nothing \u2014 this can start any time.';
+    depEl.appendChild(noneLi);
+  } else {
+    deps.forEach(function (d) {
+      var li = document.createElement('li');
+      li.textContent = d;
+      depEl.appendChild(li);
+    });
+  }
+
+  var critList = document.getElementById('criteria-list');
+  (state.acceptance_criteria || []).forEach(function (c) {
+    var text = (typeof c === 'string') ? c : (c.text || '');
+    var met = (typeof c === 'object') && !!c.met;
+    var li = document.createElement('li');
+    li.className = met ? 'met' : 'unmet';
+    var check = document.createElement('span');
+    check.className = 'check';
+    check.setAttribute('aria-hidden', 'true');
+    check.textContent = met ? '\u2611' : '\u2610';
+    li.appendChild(check);
+    li.appendChild(document.createTextNode(text));
+    critList.appendChild(li);
+  });
+
+  var pill = document.getElementById('status-pill');
+  var status = state.status || 'not_started';
+  pill.textContent = STATUS_LABEL[status] || STATUS_LABEL.not_started;
+  pill.className = 'pill status-' + status;
+
+  if (status === 'blocked') {
+    document.getElementById('block-section').style.display = '';
+    document.getElementById('block-callout').textContent = state.block_reason || 'No reason given.';
+  }
+
+  var notesList = document.getElementById('notes-list');
+  var notes = state.notes || [];
+  if (notes.length === 0) {
+    var emptyLi = document.createElement('li');
+    emptyLi.className = 'muted';
+    emptyLi.textContent = 'No notes yet.';
+    notesList.appendChild(emptyLi);
+  } else {
+    notes.forEach(function (n) {
+      var li = document.createElement('li');
+      var ts = document.createElement('span');
+      ts.className = 'timestamp';
+      ts.textContent = n.timestamp || '';
+      li.appendChild(ts);
+      li.appendChild(document.createTextNode(n.text || ''));
+      notesList.appendChild(li);
+    });
+  }
+
+  document.getElementById('last-updated').textContent = state.last_updated || '\u2014';
+})();
+</script>
+
+</body>
+</html>

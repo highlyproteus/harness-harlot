@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDR</title>
+<style>
+  :root {
+    --paper: #F7F5F0;
+    --card: #FFFFFF;
+    --ink: #1C1B19;
+    --ink-soft: #57534A;
+    --line: #DEDACF;
+    --accent: #3D5A73;
+    --done: #4B6A4E;
+    --done-bg: #E7EDE4;
+    --progress-c: #A6752C;
+    --progress-bg: #F3E8D6;
+    --blocked: #9C4A3C;
+    --blocked-bg: #F5E4DF;
+    --idle: #8C8577;
+    --idle-bg: #EDEBE4;
+    --serif: Georgia, 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', serif;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    --mono: 'SF Mono', 'IBM Plex Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  a:focus-visible, .dot:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    background: rgba(247, 245, 240, 0.92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line);
+    z-index: 10;
+  }
+  .topbar-inner {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+  .mark { font-family: var(--mono); font-size: 12px; letter-spacing: 0.12em; color: var(--ink-soft); }
+  .topnav { display: flex; gap: 18px; margin-right: auto; }
+  .topnav a { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); text-decoration: none; }
+  .topnav a:hover { color: var(--accent); }
+
+  .pill {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 100px;
+  }
+  .pill.status-done { background: var(--done-bg); color: var(--done); }
+  .pill.status-in_progress { background: var(--progress-bg); color: var(--progress-c); }
+  .pill.status-blocked { background: var(--blocked-bg); color: var(--blocked); }
+  .pill.status-not_started { background: var(--idle-bg); color: var(--idle); }
+
+  main { max-width: 760px; margin: 0 auto; padding: 0 24px 80px; }
+
+  .hero { padding: 48px 0 32px; }
+  .eyebrow { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); margin: 0 0 8px; }
+  h1 { font-family: var(--serif); font-size: 34px; line-height: 1.2; margin: 0 0 10px; font-weight: 600; }
+  .meta { font-size: 14px; color: var(--ink-soft); margin: 0; }
+
+  section { padding: 32px 0; border-top: 1px solid var(--line); }
+  .hero + section { border-top: none; }
+  h2 {
+    font-family: var(--sans);
+    font-size: 13px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0 0 18px;
+    font-weight: 600;
+  }
+
+  .context {
+    font-size: 15px;
+    color: var(--ink-soft);
+    border-left: 2px solid var(--line);
+    padding-left: 16px;
+    margin: 0 0 20px;
+  }
+  #objectives-list { margin: 0; padding-left: 20px; }
+  #objectives-list li { margin-bottom: 8px; }
+
+  .task-list { list-style: none; margin: 0; padding: 0; }
+  .task-row { border-bottom: 1px solid var(--line); padding: 4px 0; }
+  .task-row:last-child { border-bottom: none; }
+  .task-link {
+    display: grid;
+    grid-template-columns: 20px 60px 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 8px;
+    border-radius: 8px;
+    text-decoration: none;
+    color: var(--ink);
+  }
+  .task-link:hover { background: var(--card); }
+  .glyph { font-size: 15px; }
+  .status-done .glyph { color: var(--done); }
+  .status-in_progress .glyph { color: var(--progress-c); }
+  .status-blocked .glyph { color: var(--blocked); }
+  .status-not_started .glyph { color: var(--idle); }
+  .task-id { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
+  .task-title { font-size: 15px; }
+  .task-status { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-soft); }
+  .block-reason { margin: 0 0 8px 52px; font-size: 13px; color: var(--blocked); }
+
+  .ledger { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  .dot {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    text-decoration: none;
+    font-size: 14px;
+  }
+  .dot.status-done { background: var(--done-bg); color: var(--done); }
+  .dot.status-in_progress { background: var(--progress-bg); color: var(--progress-c); }
+  .dot.status-blocked { background: var(--blocked-bg); color: var(--blocked); }
+  .dot.status-not_started { background: var(--idle-bg); color: var(--idle); }
+
+  .progress-summary { font-family: var(--mono); font-size: 14px; color: var(--ink-soft); margin: 0 0 20px; }
+
+  .callout { padding: 14px 16px; border-radius: 8px; font-size: 14px; margin-bottom: 10px; }
+  .callout.blocked { background: var(--blocked-bg); color: var(--blocked); }
+
+  footer {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 20px 24px 60px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+
+  @media (max-width: 600px) {
+    h1 { font-size: 26px; }
+    .task-link { grid-template-columns: 18px 1fr auto; }
+    .task-id { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<script type="application/json" id="pdr-state">
+{
+  "goal_id": "rust-mux-mvp",
+  "goal": "Deliver a reliability-first local and SSH terminal workspace for macOS and Linux whose live sessions survive desktop-client restarts",
+  "created": "2026-08-11",
+  "last_updated": "2026-08-11T19:17:10Z",
+  "context": "Rust Mux is a compact terminal workspace: a dense workspace list on the left and real local shell panes on the right. Users create and switch workspaces, add as many panes as needed, split, resize, focus, and rearrange them. The first usable checkpoint is explicitly local-only and must run the user's configured shell in daemon-owned PTYs with real keyboard input, output, terminal parsing, and resize; fake terminal cards, activity dashboards, health badges, agent status, and browser surfaces are not acceptable. SSH remains the next core milestone after this local end-to-end flow. Behavior and layout may be informed by public cmux material, but Rust Mux will use no cmux source, branding, icons, assets, or documentation prose. The desktop remains Rust-authored, GPU-rendered, WebView-free, and restartable independently of sessions on macOS and Linux. The terminal stack is a hard all-Rust boundary: Alacritty owns VT/grid semantics and GPUI/Rust owns rendering; Ghostty, libghostty, GhosttyKit, and other non-Rust terminal engines are excluded unless a future approved PDR revision reverses that decision.",
+  "objectives": [
+    "Keep PTYs, processes, terminal state, and canonical layouts alive in a separate Rust service when the desktop exits or restarts",
+    "Ship the same focused workspace, tab, split-pane, drag-rearrange, and keyboard-navigation experience on macOS and Linux",
+    "Make configured SSH hosts first-class workspaces while preserving OpenSSH config, agents, host-key verification, jump hosts, and terminal resize",
+    "Use established PTY and terminal-engine libraries instead of reimplementing Unix PTYs, SSH authentication, or VT parsing",
+    "Keep the terminal engine and renderer all Rust, using Alacritty grid state plus GPUI text/GPU facilities rather than libghostty or another non-Rust engine",
+    "Make the first runnable product proof a real configured-shell command flow across two daemon-owned local panes, not synthetic terminal content",
+    "Select a WebView-free native GPU UI through a measured GPUI-first spike before locking the frontend framework",
+    "Prove reliability with bounded streaming, deterministic state mutations, local and SSH reconnect tests, and platform-specific lifecycle tests"
+  ],
+  "tasks": [
+    { "id": "task-01", "title": "Lock the source-informed architecture contract", "file": "tasks/task-01-source-informed-architecture.html", "status": "done", "block_reason": null, "depends_on": [] },
+    { "id": "task-02", "title": "Run the native GPU UI spike", "file": "tasks/task-02-cross-platform-ui-spike.html", "status": "done", "block_reason": null, "depends_on": ["task-01"] },
+    { "id": "task-03", "title": "Build the Tokio service and local IPC foundation", "file": "tasks/task-03-service-and-ipc-foundation.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-01"] },
+    { "id": "task-04", "title": "Implement persistent local Unix PTY sessions", "file": "tasks/task-04-persistent-pty-sessions.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-03"] },
+    { "id": "task-05", "title": "Implement secure SSH remote workspaces", "file": "tasks/task-05-remote-workspaces.html", "status": "not_started", "block_reason": null, "depends_on": ["task-03", "task-04"] },
+    { "id": "task-06", "title": "Integrate terminal streaming and rendering", "file": "tasks/task-06-terminal-streaming-and-rendering.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-02", "task-04"] },
+    { "id": "task-07", "title": "Build the workspace and pane experience", "file": "tasks/task-07-workspace-pane-experience.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-02", "task-03", "task-04", "task-06"] },
+    { "id": "task-08", "title": "Harden reliability and package macOS and Linux", "file": "tasks/task-08-reliability-and-packaging.html", "status": "not_started", "block_reason": null, "depends_on": ["task-04", "task-05", "task-06", "task-07"] }
+  ]
+}
+</script>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <span class="mark">PDR</span>
+    <nav class="topnav">
+      <a href="#objectives">Objectives</a>
+      <a href="#plan">Plan</a>
+      <a href="#progress">Progress</a>
+    </nav>
+    <span id="status-pill" class="pill"></span>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <p class="eyebrow" id="goal-id"></p>
+    <h1 id="goal-title"></h1>
+    <p class="meta" id="goal-meta"></p>
+  </section>
+
+  <section id="objectives">
+    <h2>Objectives</h2>
+    <p id="context" class="context"></p>
+    <ul id="objectives-list"></ul>
+  </section>
+
+  <section id="plan">
+    <h2>Plan</h2>
+    <ol id="task-list" class="task-list"></ol>
+  </section>
+
+  <section id="progress">
+    <h2>Progress</h2>
+    <div id="ledger" class="ledger"></div>
+    <p id="progress-summary" class="progress-summary"></p>
+    <div id="blocked-callouts"></div>
+  </section>
+</main>
+
+<footer>
+  <p>Last updated <span id="last-updated"></span> · generated by the pdr skill</p>
+</footer>
+
+<script>
+(function () {
+  var stateEl = document.getElementById('pdr-state');
+  var state = JSON.parse(stateEl.textContent);
+
+  var STATUS_GLYPH = { done: '\u25CF', in_progress: '\u25D0', blocked: '\u2298', not_started: '\u25CB' };
+  var STATUS_LABEL = { done: 'Done', in_progress: 'In progress', blocked: 'Blocked', not_started: 'Not started' };
+
+  document.title = (state.goal || 'PDR');
+  document.getElementById('goal-id').textContent = state.goal_id || '';
+  document.getElementById('goal-title').textContent = state.goal || 'Untitled goal';
+
+  var tasks = state.tasks || [];
+  document.getElementById('goal-meta').textContent =
+    'Created ' + (state.created || '\u2014') + '  \u00B7  ' + tasks.length + (tasks.length === 1 ? ' task' : ' tasks');
+
+  var contextEl = document.getElementById('context');
+  if (state.context) {
+    contextEl.textContent = state.context;
+  } else {
+    contextEl.style.display = 'none';
+  }
+
+  var objList = document.getElementById('objectives-list');
+  (state.objectives || []).forEach(function (o) {
+    var li = document.createElement('li');
+    li.textContent = o;
+    objList.appendChild(li);
+  });
+
+  var taskListEl = document.getElementById('task-list');
+  tasks.forEach(function (t) {
+    var li = document.createElement('li');
+    li.className = 'task-row status-' + (t.status || 'not_started');
+
+    var a = document.createElement('a');
+    a.href = t.file || '#';
+    a.className = 'task-link';
+
+    var glyph = document.createElement('span');
+    glyph.className = 'glyph';
+    glyph.setAttribute('aria-hidden', 'true');
+    glyph.textContent = STATUS_GLYPH[t.status] || STATUS_GLYPH.not_started;
+
+    var idSpan = document.createElement('span');
+    idSpan.className = 'task-id';
+    idSpan.textContent = t.id || '';
+
+    var titleSpan = document.createElement('span');
+    titleSpan.className = 'task-title';
+    titleSpan.textContent = t.title || 'Untitled task';
+
+    var statusSpan = document.createElement('span');
+    statusSpan.className = 'task-status';
+    statusSpan.textContent = STATUS_LABEL[t.status] || STATUS_LABEL.not_started;
+
+    a.appendChild(glyph);
+    a.appendChild(idSpan);
+    a.appendChild(titleSpan);
+    a.appendChild(statusSpan);
+    li.appendChild(a);
+
+    if (t.status === 'blocked' && t.block_reason) {
+      var reason = document.createElement('p');
+      reason.className = 'block-reason';
+      reason.textContent = 'Blocked: ' + t.block_reason;
+      li.appendChild(reason);
+    }
+
+    taskListEl.appendChild(li);
+  });
+
+  var ledger = document.getElementById('ledger');
+  tasks.forEach(function (t) {
+    var dot = document.createElement('a');
+    dot.href = t.file || '#';
+    dot.className = 'dot status-' + (t.status || 'not_started');
+    dot.title = (t.id || '') + ': ' + (STATUS_LABEL[t.status] || STATUS_LABEL.not_started);
+    dot.setAttribute('aria-label', (t.id || '') + ' ' + (STATUS_LABEL[t.status] || STATUS_LABEL.not_started));
+    dot.textContent = STATUS_GLYPH[t.status] || STATUS_GLYPH.not_started;
+    ledger.appendChild(dot);
+  });
+
+  var done = tasks.filter(function (t) { return t.status === 'done'; }).length;
+  var blocked = tasks.filter(function (t) { return t.status === 'blocked'; });
+
+  document.getElementById('progress-summary').textContent =
+    done + ' / ' + tasks.length + ' tasks complete' + (blocked.length ? '  \u00B7  ' + blocked.length + ' blocked' : '');
+
+  var calloutsEl = document.getElementById('blocked-callouts');
+  blocked.forEach(function (t) {
+    var div = document.createElement('div');
+    div.className = 'callout blocked';
+    var strong = document.createElement('strong');
+    strong.textContent = (t.id || '') + ' \u2014 ' + (t.title || '');
+    div.appendChild(strong);
+    div.appendChild(document.createElement('br'));
+    div.appendChild(document.createTextNode(t.block_reason || 'No reason given'));
+    calloutsEl.appendChild(div);
+  });
+
+  var pillText, pillClass;
+  if (tasks.length === 0) {
+    pillText = STATUS_LABEL.not_started; pillClass = 'status-not_started';
+  } else if (done === tasks.length) {
+    pillText = STATUS_LABEL.done; pillClass = 'status-done';
+  } else if (blocked.length === tasks.length) {
+    pillText = STATUS_LABEL.blocked; pillClass = 'status-blocked';
+  } else {
+    pillText = STATUS_LABEL.in_progress; pillClass = 'status-in_progress';
+  }
+  var pill = document.getElementById('status-pill');
+  pill.textContent = pillText;
+  pill.className = 'pill ' + pillClass;
+
+  document.getElementById('last-updated').textContent = state.last_updated || state.created || '\u2014';
+})();
+</script>
+
+</body>
+</html>

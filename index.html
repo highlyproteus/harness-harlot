@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rust Mux Project Plan</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #101418; color: #e7edf3; }
+    body { max-width: 1080px; margin: 0 auto; padding: 48px 24px 80px; line-height: 1.55; }
+    h1 { font-size: clamp(2.4rem, 7vw, 5rem); margin: 0; letter-spacing: -.05em; }
+    h2 { margin-top: 42px; color: #7dd3fc; }
+    h3 { color: #c4b5fd; }
+    .lede { max-width: 760px; font-size: 1.2rem; color: #bdc8d2; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+    .card { border: 1px solid #2b3640; border-radius: 12px; padding: 18px; background: #151b21; }
+    code { color: #a7f3d0; }
+    a { color: #7dd3fc; }
+    .deferred { border-left: 3px solid #fbbf24; padding-left: 18px; }
+  </style>
+</head>
+<body>
+  <h1>Rust Mux</h1>
+  <p class="lede">A reliability-first native terminal workspace whose PTYs and processes live in a persistent Rust service, independently of the restartable desktop UI.</p>
+
+  <h2>Locked decisions</h2>
+  <div class="grid">
+    <div class="card"><strong>Session authority</strong><br>The service owns PTYs, processes, session state, and layouts.</div>
+    <div class="card"><strong>Desktop role</strong><br>A native reconnectable client with workspaces, tabs, splits, and pane drag/drop.</div>
+    <div class="card"><strong>Terminal engine</strong><br>Alacritty's Rust terminal engine; no terminal emulator built from scratch.</div>
+    <div class="card"><strong>First platforms</strong><br>macOS and Linux; Windows is a documented later path.</div>
+  </div>
+
+  <h2>System model</h2>
+  <div class="card"><code>native GPU desktop</code> → versioned local Unix-socket protocol → <code>Tokio session service</code> → local/SSH PTYs + canonical layout state. The desktop may disappear and reconnect without changing session ownership. GPUI is the first spike, not yet a framework lock.</div>
+
+  <h2>Phases</h2>
+  <ol>
+    <li><strong>Foundation:</strong> source-informed architecture, process boundary, terminal-engine adapter, native GPU spike.</li>
+    <li><strong>Session core:</strong> Tokio daemon, framed local IPC, local PTYs, ordered streaming, reconnect semantics.</li>
+    <li><strong>Remote core:</strong> system OpenSSH in managed PTYs, standard SSH config, host-key and agent safety.</li>
+    <li><strong>Terminal:</strong> GPU-backed cells, input, Unicode, selection, scrollback, search.</li>
+    <li><strong>Workspace UX:</strong> tabs, split tree, pane drag/drop, atomic persistence.</li>
+    <li><strong>Reliability:</strong> local/SSH crash recovery plus macOS Spaces and Linux compositor soak testing.</li>
+  </ol>
+
+  <h2>Risks</h2>
+  <div class="grid">
+    <div class="card"><strong>Output pressure</strong><br>A stalled client must never stall PTY reads or grow memory without bounds.</div>
+    <div class="card"><strong>State races</strong><br>Layout commands need revisions and deterministic conflict handling.</div>
+    <div class="card"><strong>UI stalls</strong><br>Terminal updates and display changes must stay off blocking IPC paths.</div>
+    <div class="card"><strong>Recovery</strong><br>Service crash recovery differs from desktop reconnect and must be stated honestly.</div>
+  </div>
+
+  <h2>Deferred</h2>
+  <p class="deferred">No embedded browser, mobile app, generic remote-control UI, worktree or diff review, or AI-specific integrations. SSH terminal workspaces are early; optional remote rmuxd reattachment is later.</p>
+
+  <h2>Execution dashboard</h2>
+  <!-- PROJECT_PLANNER_TASKS_START -->
+<section id="task-dashboard" class="project-planner-dashboard">
+  <style>
+    .project-planner-dashboard { padding: 64px 0; border-bottom: 1px solid #d9ded9; background: #fbfbf8; }
+    .project-planner-wrap { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
+    .project-planner-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px; align-items: end; margin-bottom: 24px; }
+    .project-planner-head h2 { margin: 0; font-size: clamp(30px, 4vw, 46px); line-height: 1.08; letter-spacing: 0; }
+    .project-planner-head p { margin: 10px 0 0; color: #5f6867; font-size: 17px; }
+    .project-planner-progress { min-width: 190px; padding: 18px; border: 1px solid #d9ded9; border-radius: 8px; background: #fff; }
+    .project-planner-progress strong { display: block; font-size: 34px; line-height: 1; }
+    .project-planner-bar { height: 9px; margin-top: 12px; overflow: hidden; border-radius: 999px; background: #e9eeec; }
+    .project-planner-bar span { display: block; height: 100%; background: linear-gradient(90deg, #087f7b, #d85d4f); }
+    .project-planner-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .project-planner-task { padding: 18px; border: 1px solid #d9ded9; border-radius: 8px; background: #fff; box-shadow: 0 10px 26px rgba(22, 30, 28, 0.04); }
+    .project-planner-task h3 { margin: 0 0 8px; font-size: 20px; line-height: 1.15; }
+    .project-planner-task h3 a { color: #151718; text-decoration-color: rgba(8, 127, 123, 0.3); text-underline-offset: 3px; }
+    .project-planner-task p { margin: 0 0 12px; color: #5f6867; }
+    .project-planner-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; color: #5f6867; font-size: 14px; }
+    .project-planner-checks { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+    .project-planner-checks li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: start; color: #5f6867; }
+    .project-planner-box { display: grid; place-items: center; width: 18px; height: 18px; margin-top: 2px; border: 1px solid #aab6b3; border-radius: 4px; color: #fff; font-size: 13px; font-weight: 800; }
+    .project-planner-box.done { border-color: #087f7b; background: #087f7b; }
+    .project-planner-empty { color: #5f6867; }
+    @media (max-width: 820px) { .project-planner-head, .project-planner-grid { grid-template-columns: 1fr; } .project-planner-progress { min-width: 0; } }
+  </style>
+  <div class="project-planner-wrap">
+    <div class="project-planner-head">
+      <div>
+        <p class="eyebrow">Execution Source Of Truth</p>
+        <h2>Rust Mux task dashboard</h2>
+        <p>Generated from Markdown task files. Refresh this page after Codex updates checkboxes and re-renders the dashboard.</p>
+      </div>
+      <div class="project-planner-progress">
+        <strong>49%</strong>
+        <span>26 of 53 checklist items complete</span>
+        <div class="project-planner-bar" aria-label="Overall task progress">
+          <span style="width: 49%"></span>
+        </div>
+      </div>
+    </div>
+    <div class="project-planner-grid">
+      <article class="project-planner-task">
+        <h3><a href="tasks/rust-mux/00-vision.md">Rust Mux Vision</a></h3>
+        <p>Define a reliability-first native local and SSH terminal workspace whose sessions outlive its desktop UI.</p>
+        <div class="project-planner-meta">
+          <span>7 / 7 complete</span>
+          <span>100%</span>
+        </div>
+        <div class="project-planner-bar" aria-label="Task progress">
+          <span style="width: 100%"></span>
+        </div>
+        <ul class="project-planner-checks">
+          <li><span class="project-planner-box done">x</span><span>Keep PTYs, child processes, session state, and layouts in a separate Rust service.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Make the native desktop UI a reconnectable client.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Preserve workspaces, sidebar, tabs, split panes, drag-to-rearrange panes, and configured-host SSH workspaces in the product direction.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Reuse an established terminal engine rather than implementing VT behavior.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Defer browser, mobile, generic remote-control UI, worktree/diff, AI integrations, and optional remote-rmuxd reattachment.</span></li>
+          <li><span class="project-planner-box done">x</span><span>The architecture and scope boundary are documented in the repository.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Future tasks preserve the service/UI ownership boundary.</span></li>
+        </ul>
+      </article>
+      <article class="project-planner-task">
+        <h3><a href="tasks/rust-mux/01-foundation.md">Repository and Process-Boundary Foundation</a></h3>
+        <p>Create a locally validated open-source Rust workspace that proves the desktop/service boundary.</p>
+        <div class="project-planner-meta">
+          <span>9 / 9 complete</span>
+          <span>100%</span>
+        </div>
+        <div class="project-planner-bar" aria-label="Task progress">
+          <span style="width: 100%"></span>
+        </div>
+        <ul class="project-planner-checks">
+          <li><span class="project-planner-box done">x</span><span>Create workspace crates for protocol, service, terminal model, and desktop.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add a versioned handshake and snapshot request over a Unix socket.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add a seeded workspace/tab/pane state owned by the service.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add a native desktop shell that reconnects and renders the snapshot structure.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add license, contributing guidance, ignore rules, pinned toolchain, and CI.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Formatting passes.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Clippy passes with warnings denied.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Workspace tests pass.</span></li>
+          <li><span class="project-planner-box done">x</span><span>A live service handshake and snapshot fetch are verified.</span></li>
+        </ul>
+      </article>
+      <article class="project-planner-task">
+        <h3><a href="tasks/rust-mux/02-pty-sessions.md">Persistent PTY Sessions</a></h3>
+        <p>Make the session service own real local and system-SSH shell processes and terminal byte streams.</p>
+        <div class="project-planner-meta">
+          <span>2 / 10 complete</span>
+          <span>20%</span>
+        </div>
+        <div class="project-planner-bar" aria-label="Task progress">
+          <span style="width: 20%"></span>
+        </div>
+        <ul class="project-planner-checks">
+          <li><span class="project-planner-box checked"></span><span>Add `portable-pty` behind a narrow service-owned Unix PTY abstraction on macOS and Linux.</span></li>
+          <li><span class="project-planner-box"></span><span>Create, resize, write to, and terminate panes through explicit protocol commands.</span></li>
+          <li><span class="project-planner-box"></span><span>Stream ordered output with bounded queues and reconnect-safe sequence numbers.</span></li>
+          <li><span class="project-planner-box"></span><span>Define graceful exit, forced termination, and service-shutdown semantics.</span></li>
+          <li><span class="project-planner-box checked"></span><span>Prove that closing and reopening a client preserves the shell and its output.</span></li>
+          <li><span class="project-planner-box"></span><span>Launch configured-host remote shells through system OpenSSH without bypassing SSH config, agents, host-key checks, or jump hosts.</span></li>
+          <li><span class="project-planner-box"></span><span>Prove that desktop reconnect and pane movement preserve the OpenSSH PID and remote session identity.</span></li>
+          <li><span class="project-planner-box"></span><span>Integration tests cover create/input/output/resize/exit.</span></li>
+          <li><span class="project-planner-box"></span><span>A reconnect test proves the PTY survives desktop-client teardown.</span></li>
+          <li><span class="project-planner-box"></span><span>Backpressure behavior is documented and tested.</span></li>
+        </ul>
+      </article>
+      <article class="project-planner-task">
+        <h3><a href="tasks/rust-mux/03-terminal-rendering.md">Terminal Rendering and Input</a></h3>
+        <p>Render interactive terminal panes in the native desktop without duplicating terminal-emulation logic.</p>
+        <div class="project-planner-meta">
+          <span>6 / 9 complete</span>
+          <span>67%</span>
+        </div>
+        <div class="project-planner-bar" aria-label="Task progress">
+          <span style="width: 67%"></span>
+        </div>
+        <ul class="project-planner-checks">
+          <li><span class="project-planner-box checked"></span><span>Expand the `alacritty_terminal` adapter around parsing, resize, and visible-grid snapshots.</span></li>
+          <li><span class="project-planner-box checked"></span><span>Add a GPUI terminal surface with monospaced text and HiDPI-aware PTY sizing.</span></li>
+          <li><span class="project-planner-box checked"></span><span>Translate core keyboard and focus events into PTY input.</span></li>
+          <li><span class="project-planner-box"></span><span>Add styled cells, cursor rendering, Unicode-width handling, IME, mouse reporting, and paste/clipboard integration.</span></li>
+          <li><span class="project-planner-box"></span><span>Add scrollback, selection, copy, and search.</span></li>
+          <li><span class="project-planner-box checked"></span><span>Keep terminal-model APIs independent of GPUI.</span></li>
+          <li><span class="project-planner-box checked"></span><span>Interactive local shells render and accept input.</span></li>
+          <li><span class="project-planner-box"></span><span>Unicode, colors, cursor modes, resize, and scrollback have regression coverage.</span></li>
+          <li><span class="project-planner-box checked"></span><span>Desktop restart reconnects to the current rendered state.</span></li>
+        </ul>
+      </article>
+      <article class="project-planner-task">
+        <h3><a href="tasks/rust-mux/04-layout-interactions.md">Workspace and Pane Interactions</a></h3>
+        <p>Deliver the workspace, tab, split, and freely rearrangeable pane workflow.</p>
+        <div class="project-planner-meta">
+          <span>2 / 9 complete</span>
+          <span>22%</span>
+        </div>
+        <div class="project-planner-bar" aria-label="Task progress">
+          <span style="width: 22%"></span>
+        </div>
+        <ul class="project-planner-checks">
+          <li><span class="project-planner-box"></span><span>Implement create/rename/reorder/delete for workspaces and tabs.</span></li>
+          <li><span class="project-planner-box checked"></span><span>Implement horizontal and vertical split-tree mutations.</span></li>
+          <li><span class="project-planner-box checked"></span><span>Implement pane drag/drop with visible targets and cancel-safe behavior.</span></li>
+          <li><span class="project-planner-box"></span><span>Persist layout changes atomically in the session service.</span></li>
+          <li><span class="project-planner-box"></span><span>Restore focus and layout consistently after desktop restart.</span></li>
+          <li><span class="project-planner-box"></span><span>Display and move local and SSH panes uniformly while retaining explicit connection state.</span></li>
+          <li><span class="project-planner-box"></span><span>Every layout mutation has deterministic model tests.</span></li>
+          <li><span class="project-planner-box"></span><span>Drag/drop works across splits and tabs without losing a local or SSH session.</span></li>
+          <li><span class="project-planner-box"></span><span>Persisted layouts survive service and desktop restarts.</span></li>
+        </ul>
+      </article>
+      <article class="project-planner-task">
+        <h3><a href="tasks/rust-mux/05-reliability-hardening.md">macOS Reliability Hardening</a></h3>
+        <p>Validate the reliability claim under desktop, display, daemon, and SSH lifecycle stress on macOS and Linux.</p>
+        <div class="project-planner-meta">
+          <span>0 / 9 complete</span>
+          <span>0%</span>
+        </div>
+        <div class="project-planner-bar" aria-label="Task progress">
+          <span style="width: 0%"></span>
+        </div>
+        <ul class="project-planner-checks">
+          <li><span class="project-planner-box"></span><span>Add structured service logs and opt-in diagnostics without recording terminal contents.</span></li>
+          <li><span class="project-planner-box"></span><span>Add crash/reconnect, slow-client, high-output, and service-upgrade scenarios.</span></li>
+          <li><span class="project-planner-box"></span><span>Test repeated Space switches, display attach/detach, sleep/wake, and fullscreen transitions.</span></li>
+          <li><span class="project-planner-box"></span><span>Test Linux compositor/display-session changes and SSH network loss, host-key failure, jump-host, and desktop-reconnect behavior.</span></li>
+          <li><span class="project-planner-box"></span><span>Add atomic state persistence and corruption recovery.</span></li>
+          <li><span class="project-planner-box"></span><span>Package the service and desktop with clear start/stop/uninstall behavior.</span></li>
+          <li><span class="project-planner-box"></span><span>Repeatable macOS and Linux soak tests run without UI freezes or lost local/SSH sessions.</span></li>
+          <li><span class="project-planner-box"></span><span>Recovery behavior is documented for desktop crash, service crash, and corrupt state.</span></li>
+          <li><span class="project-planner-box"></span><span>Release packaging preserves the independent service lifecycle.</span></li>
+        </ul>
+      </article>
+    </div>
+  </div>
+</section>
+<!-- PROJECT_PLANNER_TASKS_END -->
+</body>
+</html>
