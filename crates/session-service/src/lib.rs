@@ -1,7 +1,10 @@
 #![allow(clippy::missing_errors_doc)]
 
+mod persistence;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -17,9 +20,12 @@ use rust_mux_protocol::{
 use rust_mux_terminal_model::TerminalModel;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use uuid::Uuid;
+
+use crate::persistence::{SnapshotStore, default_snapshot_path};
 
 const INITIAL_COLUMNS: u16 = 100;
 const INITIAL_ROWS: u16 = 30;
@@ -43,8 +49,20 @@ impl std::fmt::Debug for PtySession {
     }
 }
 
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        let Ok(child) = self.child.get_mut() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
 impl PtySession {
-    fn spawn(pane_id: Uuid) -> Result<Arc<Self>> {
+    fn spawn(pane_id: Uuid, cwd: &Path) -> Result<Arc<Self>> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: INITIAL_ROWS,
@@ -59,9 +77,7 @@ impl PtySession {
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.env("RUST_MUX_PANE_ID", pane_id.to_string());
-        if let Some(home) = std::env::var_os("HOME") {
-            command.cwd(home);
-        }
+        command.cwd(cwd);
 
         let child = pair
             .slave
@@ -253,12 +269,29 @@ impl PtySession {
         Ok(())
     }
 
-    fn terminate(&self) -> Result<()> {
+    fn terminate_and_wait(&self) -> Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("PTY child lock was poisoned"))?;
+        if child
+            .try_wait()
+            .context("observe PTY child before close")?
+            .is_none()
+        {
+            child.kill().context("terminate PTY child")?;
+        }
+        child.wait().context("observe PTY child exit after close")?;
+        Ok(())
+    }
+
+    fn exit_status(&self) -> Result<Option<String>> {
         self.child
             .lock()
             .map_err(|_| anyhow!("PTY child lock was poisoned"))?
-            .kill()
-            .context("terminate PTY child")
+            .try_wait()
+            .map(|status| status.map(|status| status.to_string()))
+            .context("observe PTY child exit")
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -267,10 +300,19 @@ impl PtySession {
 }
 
 #[derive(Debug)]
+struct RuntimePane {
+    session: Arc<PtySession>,
+    last_valid_cwd: PathBuf,
+    recovered: bool,
+    exit_status: Option<String>,
+}
+
+#[derive(Debug)]
 struct RegistryState {
     snapshot: SessionSnapshot,
-    panes: HashMap<Uuid, Arc<PtySession>>,
+    panes: HashMap<Uuid, RuntimePane>,
     next_terminal_number: u32,
+    store: Option<SnapshotStore>,
 }
 
 impl RegistryState {
@@ -292,45 +334,133 @@ pub struct SessionRegistry {
 
 impl SessionRegistry {
     pub fn new() -> Result<Self> {
+        Self::seeded(None)
+    }
+
+    pub fn load_default() -> Result<Self> {
+        Self::persistent(default_snapshot_path()?)
+    }
+
+    pub fn persistent(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if !path.is_absolute() {
+            bail!("recovery snapshot path must be absolute");
+        }
+        let store = SnapshotStore::new(path);
+        let Some(mut recovered) = store.load_or_quarantine()? else {
+            let registry = Self::seeded(Some(store))?;
+            registry.persist()?;
+            return Ok(registry);
+        };
+
+        let fallback = fallback_cwd()?;
+        let pane_ids = pane_ids_in_snapshot(&recovered.snapshot);
+        let mut panes = HashMap::new();
+        for pane_id in pane_ids {
+            let cwd = recovered
+                .cwd_by_pane
+                .remove(&pane_id)
+                .filter(|cwd| valid_local_cwd(cwd))
+                .unwrap_or_else(|| fallback.clone());
+            match PtySession::spawn(pane_id, &cwd) {
+                Ok(session) => {
+                    panes.insert(
+                        pane_id,
+                        RuntimePane {
+                            session,
+                            last_valid_cwd: cwd,
+                            recovered: true,
+                            exit_status: None,
+                        },
+                    );
+                }
+                Err(error) => {
+                    terminate_runtime_panes(&panes);
+                    return Err(error).context("recreate fresh shell for recovered pane");
+                }
+            }
+        }
+        for pane_id in panes.keys().copied().collect::<Vec<_>>() {
+            set_pane_runtime_label(&mut recovered.snapshot, pane_id, true, None);
+        }
+        let next_terminal_number = u32::try_from(panes.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let registry = Self {
+            state: Arc::new(RwLock::new(RegistryState {
+                snapshot: recovered.snapshot,
+                panes,
+                next_terminal_number,
+                store: Some(store),
+            })),
+        };
+        registry.persist()?;
+        Ok(registry)
+    }
+
+    fn seeded(store: Option<SnapshotStore>) -> Result<Self> {
         let mut snapshot = SessionSnapshot::seeded();
         let pane_id = first_pane_id(&snapshot).context("seeded snapshot has no pane")?;
         if let Some(pane) = find_pane_mut_in_snapshot(&mut snapshot, pane_id) {
             pane.shell = shell_title();
         }
-        let session = PtySession::spawn(pane_id)?;
+        let cwd = fallback_cwd()?;
+        let session = PtySession::spawn(pane_id, &cwd)?;
         Ok(Self {
             state: Arc::new(RwLock::new(RegistryState {
                 snapshot,
-                panes: HashMap::from([(pane_id, session)]),
+                panes: HashMap::from([(
+                    pane_id,
+                    RuntimePane {
+                        session,
+                        last_valid_cwd: cwd,
+                        recovered: false,
+                        exit_status: None,
+                    },
+                )]),
                 next_terminal_number: 2,
+                store,
             })),
         })
     }
 
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
-        self.state
-            .read()
-            .map(|state| state.snapshot.clone())
-            .map_err(|_| anyhow!("session state lock was poisoned"))
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        refresh_runtime_metadata(&mut state)?;
+        Ok(state.snapshot.clone())
     }
 
     pub fn state(&self) -> Result<(SessionSnapshot, Vec<TerminalScreen>)> {
-        let state = self
+        let mut state = self
             .state
-            .read()
+            .write()
             .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        refresh_runtime_metadata(&mut state)?;
         let snapshot = state.snapshot.clone();
         let screens = state
             .panes
             .iter()
-            .map(|(pane_id, session)| session.screen(*pane_id))
+            .map(|(pane_id, runtime)| runtime.session.screen(*pane_id))
             .collect::<Result<Vec<_>>>()?;
         Ok((snapshot, screens))
     }
 
+    pub fn persist(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        refresh_runtime_metadata(&mut state)?;
+        persist_state(&state)
+    }
+
     pub fn create_pane(&self, target_pane: Uuid, axis: SplitAxis) -> Result<Uuid> {
         let new_id = Uuid::new_v4();
-        let session = PtySession::spawn(new_id)?;
+        let cwd = self.cwd_for_pane(target_pane)?;
+        let session = PtySession::spawn(new_id, &cwd)?;
         let mut state = self
             .state
             .write()
@@ -348,14 +478,24 @@ impl SessionRegistry {
         if !did_split {
             bail!("target pane {target_pane} does not exist");
         }
-        state.panes.insert(new_id, session);
+        state.panes.insert(
+            new_id,
+            RuntimePane {
+                session,
+                last_valid_cwd: cwd,
+                recovered: false,
+                exit_status: None,
+            },
+        );
         state.snapshot.revision += 1;
+        persist_state(&state)?;
         Ok(new_id)
     }
 
     pub fn create_tab(&self, target_pane: Uuid) -> Result<Uuid> {
         let new_id = Uuid::new_v4();
-        let session = PtySession::spawn(new_id)?;
+        let cwd = self.cwd_for_pane(target_pane)?;
+        let session = PtySession::spawn(new_id, &cwd)?;
         let mut state = self
             .state
             .write()
@@ -373,8 +513,17 @@ impl SessionRegistry {
         if !did_add {
             bail!("target pane {target_pane} does not exist");
         }
-        state.panes.insert(new_id, session);
+        state.panes.insert(
+            new_id,
+            RuntimePane {
+                session,
+                last_valid_cwd: cwd,
+                recovered: false,
+                exit_status: None,
+            },
+        );
         state.snapshot.revision += 1;
+        persist_state(&state)?;
         Ok(new_id)
     }
 
@@ -393,6 +542,7 @@ impl SessionRegistry {
             bail!("pane tab {pane_id} does not exist");
         }
         state.snapshot.revision += 1;
+        persist_state(&state)?;
         Ok(())
     }
 
@@ -426,6 +576,7 @@ impl SessionRegistry {
             bail!("panes can only be rearranged inside the same workspace layout");
         }
         state.snapshot.revision += 1;
+        persist_state(&state)?;
         Ok(())
     }
 
@@ -451,6 +602,7 @@ impl SessionRegistry {
             bail!("source and target terminals must exist in the same workspace layout");
         }
         state.snapshot.revision += 1;
+        persist_state(&state)?;
         Ok(())
     }
 
@@ -460,7 +612,8 @@ impl SessionRegistry {
         placement: DropPlacement,
     ) -> Result<()> {
         let replacement_id = Uuid::new_v4();
-        let replacement_session = PtySession::spawn(replacement_id)?;
+        let cwd = self.cwd_for_pane(pane_id)?;
+        let replacement_session = PtySession::spawn(replacement_id, &cwd)?;
         let result = (|| {
             let mut state = self
                 .state
@@ -483,14 +636,21 @@ impl SessionRegistry {
             if !did_split {
                 bail!("a self-directed drop requires a pane containing exactly one terminal");
             }
-            state
-                .panes
-                .insert(replacement_id, Arc::clone(&replacement_session));
+            state.panes.insert(
+                replacement_id,
+                RuntimePane {
+                    session: Arc::clone(&replacement_session),
+                    last_valid_cwd: cwd,
+                    recovered: false,
+                    exit_status: None,
+                },
+            );
             state.snapshot.revision += 1;
+            persist_state(&state)?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = replacement_session.terminate();
+            let _ = replacement_session.terminate_and_wait();
         }
         result
     }
@@ -516,6 +676,7 @@ impl SessionRegistry {
             bail!("source and target terminals must exist in the same workspace layout");
         }
         state.snapshot.revision += 1;
+        persist_state(&state)?;
         Ok(())
     }
 
@@ -532,6 +693,7 @@ impl SessionRegistry {
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         title.clone_into(&mut pane.title);
         state.snapshot.revision += 1;
+        persist_state(&state)?;
         Ok(())
     }
 
@@ -541,41 +703,70 @@ impl SessionRegistry {
                 .state
                 .write()
                 .map_err(|_| anyhow!("session state lock was poisoned"))?;
-            let mut did_close = false;
-            for workspace in &mut state.snapshot.workspaces {
-                let Some(tab) = workspace
+            let pane_exists = state.snapshot.workspaces.iter().any(|workspace| {
+                workspace
                     .tabs
-                    .iter_mut()
-                    .find(|tab| layout_contains(&tab.layout, pane_id))
-                else {
-                    continue;
-                };
-                if pane_count(&tab.layout) <= 1 {
-                    bail!("a workspace must keep at least one terminal");
-                }
-                let (_, remaining) = detach_pane(tab.layout.clone(), pane_id);
-                tab.layout = remaining.context("closing terminal produced an empty layout")?;
-                did_close = true;
-                break;
-            }
-            if !did_close {
+                    .iter()
+                    .any(|tab| layout_contains(&tab.layout, pane_id))
+            });
+            if !pane_exists {
                 bail!("pane {pane_id} does not exist");
             }
-            let session = state
-                .panes
-                .remove(&pane_id)
-                .context("pane process is missing")?;
+            let can_close = state.snapshot.workspaces.iter().any(|workspace| {
+                workspace
+                    .tabs
+                    .iter()
+                    .any(|tab| layout_contains(&tab.layout, pane_id) && pane_count(&tab.layout) > 1)
+            });
+            if !can_close {
+                bail!("a workspace must keep at least one terminal");
+            }
+            let session = Arc::clone(
+                &state
+                    .panes
+                    .get(&pane_id)
+                    .context("pane process is missing")?
+                    .session,
+            );
+            set_pane_runtime_label(&mut state.snapshot, pane_id, false, Some("terminating"));
             state.snapshot.revision += 1;
+            persist_state(&state)?;
             session
         };
-        session.terminate()
+        session.terminate_and_wait()?;
+
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut did_close = false;
+        for workspace in &mut state.snapshot.workspaces {
+            let Some(tab) = workspace
+                .tabs
+                .iter_mut()
+                .find(|tab| layout_contains(&tab.layout, pane_id))
+            else {
+                continue;
+            };
+            let (_, remaining) = detach_pane(tab.layout.clone(), pane_id);
+            tab.layout = remaining.context("closing terminal produced an empty layout")?;
+            did_close = true;
+            break;
+        }
+        if !did_close {
+            bail!("pane {pane_id} disappeared while waiting for process exit");
+        }
+        state.panes.remove(&pane_id);
+        state.snapshot.revision += 1;
+        persist_state(&state)
     }
 
     pub fn create_workspace(&self, title: Option<String>) -> Result<(Uuid, Uuid)> {
         let workspace_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
-        let session = PtySession::spawn(pane_id)?;
+        let cwd = fallback_cwd()?;
+        let session = PtySession::spawn(pane_id, &cwd)?;
         let mut state = self
             .state
             .write()
@@ -594,8 +785,17 @@ impl SessionRegistry {
                 layout: PaneLayout::Leaf { pane },
             }],
         });
-        state.panes.insert(pane_id, session);
+        state.panes.insert(
+            pane_id,
+            RuntimePane {
+                session,
+                last_valid_cwd: cwd,
+                recovered: false,
+                exit_status: None,
+            },
+        );
         state.snapshot.revision += 1;
+        persist_state(&state)?;
         Ok((workspace_id, pane_id))
     }
 
@@ -658,7 +858,20 @@ impl SessionRegistry {
             .map_err(|_| anyhow!("session state lock was poisoned"))?
             .panes
             .get(&pane_id)
-            .cloned()
+            .map(|runtime| Arc::clone(&runtime.session))
+            .with_context(|| format!("pane {pane_id} does not exist"))
+    }
+
+    fn cwd_for_pane(&self, pane_id: Uuid) -> Result<PathBuf> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        refresh_runtime_metadata(&mut state)?;
+        state
+            .panes
+            .get(&pane_id)
+            .map(|runtime| runtime.last_valid_cwd.clone())
             .with_context(|| format!("pane {pane_id} does not exist"))
     }
 }
@@ -667,6 +880,120 @@ impl Default for SessionRegistry {
     fn default() -> Self {
         Self::new().expect("start seeded configured-shell PTY")
     }
+}
+
+fn persist_state(state: &RegistryState) -> Result<()> {
+    let Some(store) = &state.store else {
+        return Ok(());
+    };
+    let cwd_by_pane = state
+        .panes
+        .iter()
+        .map(|(pane_id, runtime)| (*pane_id, runtime.last_valid_cwd.clone()))
+        .collect();
+    store.save(&state.snapshot, &cwd_by_pane)
+}
+
+fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
+    let pids = state
+        .panes
+        .iter()
+        .filter_map(|(pane_id, runtime)| {
+            runtime
+                .session
+                .process_id()
+                .map(|process_id| (*pane_id, Pid::from_u32(process_id)))
+        })
+        .collect::<Vec<_>>();
+    let mut system = System::new();
+    if !pids.is_empty() {
+        let process_ids = pids.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&process_ids),
+            ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
+        );
+    }
+
+    let mut labels = Vec::new();
+    for (pane_id, runtime) in &mut state.panes {
+        if runtime.exit_status.is_none()
+            && let Some((_, pid)) = pids.iter().find(|(id, _)| id == pane_id)
+            && let Some(cwd) = system.process(*pid).and_then(sysinfo::Process::cwd)
+            && valid_local_cwd(cwd)
+        {
+            runtime.last_valid_cwd = cwd.to_path_buf();
+        }
+        let observed = runtime.session.exit_status()?;
+        if observed.is_some() && observed != runtime.exit_status {
+            runtime.exit_status.clone_from(&observed);
+            labels.push((*pane_id, runtime.recovered, observed));
+        }
+    }
+    if !labels.is_empty() {
+        for (pane_id, recovered, status) in labels {
+            set_pane_runtime_label(&mut state.snapshot, pane_id, recovered, status.as_deref());
+        }
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn set_pane_runtime_label(
+    snapshot: &mut SessionSnapshot,
+    pane_id: Uuid,
+    recovered: bool,
+    status: Option<&str>,
+) {
+    let shell = shell_title();
+    let label = match status {
+        Some("terminating") => format!("{shell} · terminating"),
+        Some(status) => format!("{shell} · exited ({status})"),
+        None if recovered => format!("{shell} · recovered with a fresh shell"),
+        None => shell,
+    };
+    if let Some(pane) = find_pane_mut_in_snapshot(snapshot, pane_id) {
+        pane.shell = label;
+    }
+}
+
+fn pane_ids_in_snapshot(snapshot: &SessionSnapshot) -> Vec<Uuid> {
+    fn collect(layout: &PaneLayout, pane_ids: &mut Vec<Uuid>) {
+        match layout {
+            PaneLayout::Leaf { pane } => pane_ids.push(pane.id),
+            PaneLayout::Stack { panes, .. } => {
+                pane_ids.extend(panes.iter().map(|pane| pane.id));
+            }
+            PaneLayout::Split { first, second, .. } => {
+                collect(first, pane_ids);
+                collect(second, pane_ids);
+            }
+        }
+    }
+    let mut pane_ids = Vec::new();
+    for workspace in &snapshot.workspaces {
+        for tab in &workspace.tabs {
+            collect(&tab.layout, &mut pane_ids);
+        }
+    }
+    pane_ids
+}
+
+fn terminate_runtime_panes(panes: &HashMap<Uuid, RuntimePane>) {
+    for runtime in panes.values() {
+        let _ = runtime.session.terminate_and_wait();
+    }
+}
+
+fn fallback_cwd() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| valid_local_cwd(path))
+        .context("HOME does not name an accessible local directory")?;
+    Ok(home)
+}
+
+fn valid_local_cwd(path: &Path) -> bool {
+    path.is_absolute() && path.metadata().is_ok_and(|metadata| metadata.is_dir())
 }
 
 fn configured_shell() -> String {
@@ -1469,6 +1796,39 @@ mod tests {
     }
 
     #[test]
+    fn natural_shell_exit_stays_visible_until_explicit_layout_close() {
+        let registry = SessionRegistry::new().unwrap();
+        let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        let exiting = registry.create_pane(first, SplitAxis::Horizontal).unwrap();
+        registry.write_input(exiting, b"exit 7\r").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = registry.snapshot().unwrap();
+            let pane = snapshot
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .find_map(|tab| pane_in_layout(&tab.layout, exiting))
+                .expect("exited pane must remain in its layout");
+            if pane.shell.contains("exited") {
+                assert!(pane.shell.contains('7'));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "natural child exit was not reflected in pane metadata"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(registry.pane(exiting).is_ok());
+        registry.close_pane(exiting).unwrap();
+        assert!(registry.pane(exiting).is_err());
+        assert_eq!(first_pane_id(&registry.snapshot().unwrap()), Some(first));
+    }
+
+    #[test]
     fn pane_local_tab_actions_only_mutate_the_explicit_second_pane() {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
@@ -1549,6 +1909,16 @@ mod tests {
             PaneLayout::Leaf { pane } => pane.id,
             PaneLayout::Stack { active, .. } => *active,
             PaneLayout::Split { first, .. } => first_pane_in_layout(first),
+        }
+    }
+
+    fn pane_in_layout(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
+        match layout {
+            PaneLayout::Leaf { pane } => (pane.id == pane_id).then_some(pane),
+            PaneLayout::Stack { panes, .. } => panes.iter().find(|pane| pane.id == pane_id),
+            PaneLayout::Split { first, second, .. } => {
+                pane_in_layout(first, pane_id).or_else(|| pane_in_layout(second, pane_id))
+            }
         }
     }
 }

@@ -4482,11 +4482,13 @@ name = "rust-mux-session-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "portable-pty",
  "rust-mux-protocol",
  "rust-mux-terminal-model",
  "serde",
  "serde_json",
+ "sysinfo",
  "tokio",
  "uuid",
 ]
