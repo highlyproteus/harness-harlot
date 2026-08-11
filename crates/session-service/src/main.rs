@@ -44,7 +44,9 @@ async fn main() -> Result<()> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("restrict session socket {}", path.display()))?;
     let _guard = SocketGuard(path.clone());
-    let sessions = SessionRegistry::default();
+    let sessions = SessionRegistry::load_default()?;
+    let mut persistence_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    persistence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     println!("Rust Mux session service listening at {}", path.display());
     loop {
@@ -64,7 +66,13 @@ async fn main() -> Result<()> {
             }
             signal = tokio::signal::ctrl_c() => {
                 signal.context("install or await shutdown signal")?;
+                sessions.persist().context("persist sessions before service shutdown")?;
                 break;
+            }
+            _ = persistence_tick.tick() => {
+                if let Err(error) = sessions.persist() {
+                    eprintln!("failed to persist session recovery state: {error:#}");
+                }
             }
         }
     }
