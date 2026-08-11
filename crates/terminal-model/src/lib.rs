@@ -135,11 +135,15 @@ impl TerminalModel {
                         cell.c != ' '
                             || cell.bg != Color::Named(NamedColor::Background)
                             || cell.flags.contains(Flags::INVERSE)
+                            || cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                     })
                     .map_or(0, |index| index + 1);
                 let mut runs: Vec<TerminalRun> = Vec::new();
                 for cell in cells.into_iter().take(end) {
                     if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        if let Some(previous) = runs.last_mut() {
+                            previous.columns = previous.columns.saturating_add(1);
+                        }
                         continue;
                     }
                     let mut foreground = terminal_color(cell.fg);
@@ -180,6 +184,7 @@ impl TerminalModel {
                     }
                     let run = TerminalRun {
                         text,
+                        columns: 1,
                         foreground,
                         background,
                         attributes: TerminalAttributes::new(attributes),
@@ -188,6 +193,7 @@ impl TerminalModel {
                         && same_style(previous, &run)
                     {
                         previous.text.push_str(&run.text);
+                        previous.columns = previous.columns.saturating_add(run.columns);
                     } else {
                         runs.push(run);
                     }
@@ -305,5 +311,15 @@ mod tests {
             }
         );
         assert_eq!(model.cursor(), Some(TerminalCursor { row: 0, column: 2 }));
+    }
+
+    #[test]
+    fn styled_runs_preserve_terminal_cell_spans() {
+        let mut model = TerminalModel::new(12, 3);
+        model.process_output("A界B".as_bytes());
+
+        let run = &model.styled_lines()[0].runs[0];
+        assert_eq!(run.text, "A界B");
+        assert_eq!(run.columns, 4);
     }
 }

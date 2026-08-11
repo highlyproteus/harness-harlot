@@ -167,8 +167,8 @@
   "goal_id": "rust-mux-mvp",
   "goal": "Deliver a reliability-first local and SSH terminal workspace for macOS and Linux whose live sessions survive desktop-client restarts",
   "created": "2026-08-11",
-  "last_updated": "2026-08-11T19:17:10Z",
-  "context": "Rust Mux is a compact terminal workspace: a dense workspace list on the left and real local shell panes on the right. Users create and switch workspaces, add as many panes as needed, split, resize, focus, and rearrange them. The first usable checkpoint is explicitly local-only and must run the user's configured shell in daemon-owned PTYs with real keyboard input, output, terminal parsing, and resize; fake terminal cards, activity dashboards, health badges, agent status, and browser surfaces are not acceptable. SSH remains the next core milestone after this local end-to-end flow. Behavior and layout may be informed by public cmux material, but Rust Mux will use no cmux source, branding, icons, assets, or documentation prose. The desktop remains Rust-authored, GPU-rendered, WebView-free, and restartable independently of sessions on macOS and Linux. The terminal stack is a hard all-Rust boundary: Alacritty owns VT/grid semantics and GPUI/Rust owns rendering; Ghostty, libghostty, GhosttyKit, and other non-Rust terminal engines are excluded unless a future approved PDR revision reverses that decision.",
+  "last_updated": "2026-08-11T20:23:23Z",
+  "context": "Rust Mux is a compact terminal workspace: a dense workspace list on the left and real local shell panes on the right. Users create and switch workspaces, add as many panes as needed, split, resize, focus, and rearrange them. The first usable checkpoint is explicitly local-only and must run the user's configured shell in daemon-owned PTYs with real keyboard input, output, terminal parsing, and resize; fake terminal cards, activity dashboards, health badges, and agent status are not acceptable. SSH is the next core networked milestone after this local end-to-end flow; a privacy-focused isolated browser pane is explicitly later, after terminal reliability and agent-as-terminal-workload support. Behavior and layout may be informed by public cmux material, but Rust Mux will use no cmux source, branding, icons, assets, or documentation prose. The desktop remains Rust-authored, GPU-rendered, WebView-free, and restartable independently of sessions on macOS and Linux. The terminal stack is a hard all-Rust boundary: Alacritty owns VT/grid semantics and GPUI/Rust owns rendering; Ghostty, libghostty, GhosttyKit, and other non-Rust terminal engines are excluded unless a future approved PDR revision reverses that decision. The application is network-silent by default: SSH and any later remote or browser capability connect only after explicit user action, with no unauthenticated listener or background telemetry.",
   "objectives": [
     "Keep PTYs, processes, terminal state, and canonical layouts alive in a separate Rust service when the desktop exits or restarts",
     "Ship the same focused workspace, tab, split-pane, drag-rearrange, and keyboard-navigation experience on macOS and Linux",
@@ -177,7 +177,14 @@
     "Keep the terminal engine and renderer all Rust, using Alacritty grid state plus GPUI text/GPU facilities rather than libghostty or another non-Rust engine",
     "Make the first runnable product proof a real configured-shell command flow across two daemon-owned local panes, not synthetic terminal content",
     "Select a WebView-free native GPU UI through a measured GPUI-first spike before locking the frontend framework",
-    "Prove reliability with bounded streaming, deterministic state mutations, local and SSH reconnect tests, and platform-specific lifecycle tests"
+    "Prove reliability with bounded streaming, deterministic state mutations, local and SSH reconnect tests, and platform-specific lifecycle tests",
+    "Remain network-silent by default, with network access occurring only for explicit SSH or later user-initiated isolated-browser actions"
+  ],
+  "roadmap": [
+    "Finish responsive terminal fidelity and text correctness across supported scale factors and macOS/Linux runtime coverage",
+    "After a clean checkpoint, run parallel tracks for terminal interaction; session reliability and recovery; commands/navigation; and native system-OpenSSH panes",
+    "Treat agents as ordinary terminal workloads, then add a thin provider-neutral status and resume layer",
+    "Later evaluate a privacy-focused isolated browser pane and richer optional agent workflows after the terminal and reliability core is mature"
   ],
   "tasks": [
     { "id": "task-01", "title": "Lock the source-informed architecture contract", "file": "tasks/task-01-source-informed-architecture.html", "status": "done", "block_reason": null, "depends_on": [] },
@@ -198,6 +205,7 @@
     <nav class="topnav">
       <a href="#objectives">Objectives</a>
       <a href="#plan">Plan</a>
+      <a href="#roadmap">Roadmap</a>
       <a href="#progress">Progress</a>
     </nav>
     <span id="status-pill" class="pill"></span>
@@ -220,6 +228,11 @@
   <section id="plan">
     <h2>Plan</h2>
     <ol id="task-list" class="task-list"></ol>
+  </section>
+
+  <section id="roadmap">
+    <h2>Approved roadmap</h2>
+    <ol id="roadmap-list"></ol>
   </section>
 
   <section id="progress">
@@ -262,6 +275,14 @@
     var li = document.createElement('li');
     li.textContent = o;
     objList.appendChild(li);
+  });
+
+  var roadmapList = document.getElementById('roadmap-list');
+  (state.roadmap || []).forEach(function (item) {
+    var li = document.createElement('li');
+    li.textContent = item;
+    li.style.marginBottom = '8px';
+    roadmapList.appendChild(li);
   });
 
   var taskListEl = document.getElementById('task-list');
