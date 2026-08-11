@@ -60,6 +60,27 @@ cargo run -p rust-mux-desktop
 
 Set `RUST_MUX_SOCKET` in both processes to override the default socket path. The service is intentionally foreground-only for now so lifecycle behavior is visible during development.
 
+### Command bindings
+
+Rust Mux loads optional JSON configuration from `RUST_MUX_CONFIG`, then
+`$XDG_CONFIG_HOME/rust-mux/config.json`, then
+`$HOME/.config/rust-mux/config.json`. Key sequences use GPUI syntax; multiple
+space-separated strokes form a chord. A configured action replaces its
+defaults, and an empty list unbinds it while keeping it in the command palette.
+
+```json
+{
+  "keybindings": {
+    "app.command-palette": ["cmd-shift-p", "ctrl-b p"],
+    "pane.equalize": ["ctrl-b ="],
+    "pane.split-down": []
+  }
+}
+```
+
+Press `Cmd-Shift-P` to inspect all stable action IDs and bindings. Invalid
+configuration is reported on stderr and the complete built-in keymap is used.
+
 ## Development
 
 ```bash

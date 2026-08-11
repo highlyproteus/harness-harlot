@@ -25,9 +25,14 @@ use rust_mux_protocol::{
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
+mod commands;
 mod theme;
 mod typography;
 
+use commands::{
+    AppCommand, AppConfig, ROOT_KEY_CONTEXT, ResolvedBinding, ResolvedKeymap, descriptor,
+    palette_matches,
+};
 use theme::{AppTheme, BuiltInTheme};
 use typography::TerminalFontProfile;
 
@@ -42,6 +47,10 @@ actions!(
         FocusRight,
         FocusUp,
         FocusDown,
+        ShowCommandPalette,
+        TogglePaneZoom,
+        EqualizePanes,
+        ConsumeChordPrefix,
     ]
 );
 
@@ -54,6 +63,7 @@ const TERMINAL_VERTICAL_PADDING: f32 = 12.0;
 const TERMINAL_FOCUS_BORDER_WIDTH: f32 = 1.0;
 const MIN_PANE_WIDTH: f32 = 140.0;
 const MIN_PANE_HEIGHT: f32 = 90.0;
+const COMMAND_PALETTE_LIMIT: usize = 32;
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 
 #[derive(Clone, Debug)]
@@ -148,8 +158,28 @@ enum PaneControlIcon {
 
 #[derive(Clone, Copy, Debug)]
 struct ResizeDrag {
-    split_key: Uuid,
+    split_id: SplitControlId,
     axis: SplitAxis,
+}
+
+/// Client-local split identity. The current protocol has no split IDs, so this
+/// wraps its deterministic compatibility key behind one boundary. A future
+/// protocol `SplitId` can replace the field without changing layout controls.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SplitControlId {
+    first: Uuid,
+    second: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayoutControlMutation {
+    Equalize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommandPaletteState {
+    query: String,
+    selected: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -207,11 +237,14 @@ impl DragHoverState {
 struct RustMux {
     focus_handle: FocusHandle,
     terminal_font: TerminalFontProfile,
+    keymap: ResolvedKeymap,
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
     active_workspace: Option<Uuid>,
     focused_pane: Option<Uuid>,
-    split_ratios: HashMap<Uuid, f32>,
+    split_ratios: HashMap<SplitControlId, f32>,
+    zoomed_pane: Option<Uuid>,
+    command_palette: Option<CommandPaletteState>,
     resizing: Option<ResizeDrag>,
     last_sizes: HashMap<Uuid, (u16, u16)>,
     workspace_pixels: (f32, f32),
@@ -224,18 +257,21 @@ struct RustMux {
 }
 
 impl RustMux {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, keymap: ResolvedKeymap, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         let terminal_font = TerminalFontProfile::resolve(cx.text_system());
         let mut app = Self {
             focus_handle,
             terminal_font,
+            keymap,
             snapshot: None,
             screens: HashMap::new(),
             active_workspace: None,
             focused_pane: None,
             split_ratios: HashMap::new(),
+            zoomed_pane: None,
+            command_palette: None,
             resizing: None,
             last_sizes: HashMap::new(),
             workspace_pixels: (0.0, 0.0),
@@ -293,6 +329,13 @@ impl RustMux {
                     .and_then(|workspace| workspace.tabs.first())
                     .map(|tab| visible_panes(&tab.layout))
                     .unwrap_or_default();
+                if self
+                    .zoomed_pane
+                    .is_some_and(|pane| !visible.contains(&pane))
+                {
+                    self.zoomed_pane = None;
+                    self.last_sizes.clear();
+                }
                 if self.focused_pane.is_none()
                     || !visible.iter().any(|pane| Some(*pane) == self.focused_pane)
                 {
@@ -372,6 +415,7 @@ impl RustMux {
 
     fn split_at(&mut self, target_pane: Uuid, axis: SplitAxis, cx: &mut Context<Self>) {
         self.focused_pane = Some(target_pane);
+        self.zoomed_pane = None;
         match request(ClientRequest::CreatePane { target_pane, axis }) {
             Ok(ServiceResponse::PaneCreated { pane_id }) => self.focused_pane = Some(pane_id),
             Ok(response) => {
@@ -392,6 +436,7 @@ impl RustMux {
 
     fn swap_panes(&mut self, source_pane: Uuid, target_pane: Uuid, cx: &mut Context<Self>) {
         if source_pane != target_pane {
+            self.zoomed_pane = None;
             self.send(ClientRequest::SwapPanes {
                 source_pane,
                 target_pane,
@@ -411,6 +456,7 @@ impl RustMux {
     ) {
         self.dragging_pane = None;
         self.drag_hover.clear();
+        self.zoomed_pane = None;
         self.send(ClientRequest::MovePaneToSplit {
             source_pane,
             target_pane,
@@ -424,6 +470,7 @@ impl RustMux {
     fn move_pane_to_tab(&mut self, source_pane: Uuid, target_pane: Uuid, cx: &mut Context<Self>) {
         self.dragging_pane = None;
         self.drag_hover.clear();
+        self.zoomed_pane = None;
         self.send(ClientRequest::MovePaneToTab {
             source_pane,
             target_pane,
@@ -519,10 +566,125 @@ impl RustMux {
             index - 1
         };
         self.focused_pane = Some(panes[next]);
+        if self.zoomed_pane.is_some() {
+            self.zoomed_pane = self.focused_pane;
+            self.last_sizes.clear();
+            self.sync_pty_sizes();
+        }
         cx.notify();
     }
 
+    fn execute_command(&mut self, command: AppCommand, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        match command {
+            AppCommand::NewWorkspace => self.new_workspace(cx),
+            AppCommand::NewTab => self.new_tab(cx),
+            AppCommand::SplitRight => self.split(SplitAxis::Horizontal, cx),
+            AppCommand::SplitDown => self.split(SplitAxis::Vertical, cx),
+            AppCommand::FocusLeft | AppCommand::FocusUp => self.focus_direction(false, cx),
+            AppCommand::FocusRight | AppCommand::FocusDown => self.focus_direction(true, cx),
+            AppCommand::ShowCommandPalette => {
+                self.command_palette = Some(CommandPaletteState::default());
+                cx.notify();
+            }
+            AppCommand::TogglePaneZoom => self.toggle_pane_zoom(cx),
+            AppCommand::EqualizePanes => self.equalize_panes(cx),
+        }
+    }
+
+    fn toggle_pane_zoom(&mut self, cx: &mut Context<Self>) {
+        let Some(focused) = self.focused_pane else {
+            return;
+        };
+        self.zoomed_pane = if self.zoomed_pane == Some(focused) {
+            None
+        } else {
+            Some(focused)
+        };
+        self.last_sizes.clear();
+        self.sync_pty_sizes();
+        cx.notify();
+    }
+
+    fn equalize_panes(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let Some(layout) = self
+            .active_workspace_in(snapshot)
+            .and_then(|workspace| workspace.tabs.first())
+            .map(|tab| tab.layout.clone())
+        else {
+            return;
+        };
+        if apply_layout_control_mutation(
+            &layout,
+            &mut self.split_ratios,
+            LayoutControlMutation::Equalize,
+        ) > 0
+        {
+            self.last_sizes.clear();
+            self.sync_pty_sizes();
+            cx.notify();
+        }
+    }
+
+    fn handle_palette_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let mut execute = None;
+        let mut close = false;
+        if let Some(palette) = self.command_palette.as_mut() {
+            let result_count = palette_matches(&palette.query, COMMAND_PALETTE_LIMIT).len();
+            match keystroke.key.as_str() {
+                "escape" => close = true,
+                "enter" => {
+                    execute = palette_matches(&palette.query, COMMAND_PALETTE_LIMIT)
+                        .get(palette.selected)
+                        .map(|item| item.command);
+                }
+                "up" => {
+                    palette.selected = palette.selected.saturating_sub(1);
+                    cx.notify();
+                }
+                "down" => {
+                    palette.selected = (palette.selected + 1).min(result_count.saturating_sub(1));
+                    cx.notify();
+                }
+                "backspace" => {
+                    palette.query.pop();
+                    palette.selected = 0;
+                    cx.notify();
+                }
+                _ if !keystroke.modifiers.platform
+                    && !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt =>
+                {
+                    if let Some(text) = &keystroke.key_char
+                        && !text.chars().any(char::is_control)
+                    {
+                        palette.query.push_str(text);
+                        palette.selected = 0;
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            self.command_palette = None;
+            cx.notify();
+        } else if let Some(command) = execute {
+            self.execute_command(command, cx);
+        }
+        // Palette keystrokes are modal and can never become PTY input.
+        cx.stop_propagation();
+    }
+
     fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.command_palette.is_some() {
+            self.handle_palette_key(event, cx);
+            return;
+        }
         let keystroke = &event.keystroke;
         if let Some(editor) = self.rename_editor.as_mut() {
             if keystroke.modifiers.platform && keystroke.key.eq_ignore_ascii_case("a") {
@@ -589,37 +751,13 @@ impl RustMux {
             cx.notify();
             return;
         }
-        if keystroke.modifiers.platform {
-            return;
-        }
-        let bytes = if keystroke.modifiers.control && keystroke.key.len() == 1 {
-            keystroke
-                .key
-                .as_bytes()
-                .first()
-                .map(|byte| vec![byte.to_ascii_lowercase() & 0x1f])
-        } else {
-            match keystroke.key.as_str() {
-                "enter" => Some(vec![b'\r']),
-                "backspace" => Some(vec![0x7f]),
-                "tab" => Some(vec![b'\t']),
-                "escape" => Some(vec![0x1b]),
-                "left" => Some(b"\x1b[D".to_vec()),
-                "right" => Some(b"\x1b[C".to_vec()),
-                "up" => Some(b"\x1b[A".to_vec()),
-                "down" => Some(b"\x1b[B".to_vec()),
-                "home" => Some(b"\x1b[H".to_vec()),
-                "end" => Some(b"\x1b[F".to_vec()),
-                "delete" => Some(b"\x1b[3~".to_vec()),
-                _ => keystroke.key_char.as_ref().map(|text| {
-                    let mut bytes = text.as_bytes().to_vec();
-                    if keystroke.modifiers.alt {
-                        bytes.insert(0, 0x1b);
-                    }
-                    bytes
-                }),
-            }
-        };
+        let bytes = terminal_input_bytes(
+            &keystroke.key,
+            keystroke.key_char.as_deref(),
+            keystroke.modifiers.control,
+            keystroke.modifiers.alt,
+            keystroke.modifiers.platform,
+        );
         if let (Some(pane_id), Some(bytes)) = (self.focused_pane, bytes) {
             self.send(ClientRequest::WriteInput { pane_id, bytes });
             cx.stop_propagation();
@@ -646,7 +784,7 @@ impl RustMux {
             width: self.workspace_pixels.0,
             height: self.workspace_pixels.1,
         };
-        let Some(split) = find_split_rect(layout, drag.split_key, root, &self.split_ratios) else {
+        let Some(split) = find_split_rect(layout, drag.split_id, root, &self.split_ratios) else {
             return;
         };
         let workspace_x = f32::from(event.position.x) - SIDEBAR_WIDTH;
@@ -656,7 +794,7 @@ impl RustMux {
             SplitAxis::Vertical => (workspace_y - split.y) / split.height.max(1.0),
         };
         self.split_ratios.insert(
-            drag.split_key,
+            drag.split_id,
             effective_split_ratio(drag.axis, split.width, split.height, ratio),
         );
         self.last_sizes.clear();
@@ -688,8 +826,11 @@ impl RustMux {
             return;
         };
         let mut sizes = Vec::new();
+        let projected = self
+            .zoomed_pane
+            .and_then(|pane_id| zoom_projection(&tab.layout, pane_id));
         collect_pane_sizes(
-            &tab.layout,
+            projected.as_ref().unwrap_or(&tab.layout),
             self.workspace_pixels.0,
             self.workspace_pixels.1,
             self.terminal_font.metrics,
@@ -1649,12 +1790,12 @@ impl RustMux {
                 first,
                 second,
             } => {
-                let split_key = first_visible_pane(&first);
+                let split_id = split_control_id(&first, &second);
                 let ratio = effective_split_ratio(
                     axis,
                     width,
                     height,
-                    self.split_ratios.get(&split_key).copied().unwrap_or(ratio),
+                    self.split_ratios.get(&split_id).copied().unwrap_or(ratio),
                 );
                 let vertical = axis == SplitAxis::Vertical;
                 let (first_width, first_height, second_width, second_height) =
@@ -1673,7 +1814,7 @@ impl RustMux {
                             .when(!vertical, |element| element.w(relative(ratio)).h_full())
                             .child(self.render_layout(*first, first_width, first_height, cx)),
                     )
-                    .child(self.render_divider(split_key, axis, cx))
+                    .child(self.render_divider(split_id, axis, cx))
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -1688,13 +1829,13 @@ impl RustMux {
 
     fn render_divider(
         &self,
-        split_key: Uuid,
+        split_id: SplitControlId,
         axis: SplitAxis,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let vertical = axis == SplitAxis::Vertical;
         div()
-            .id(("divider", element_key(split_key)))
+            .id(("divider", split_element_key(split_id)))
             .flex_none()
             .when(vertical, |element| {
                 element
@@ -1712,9 +1853,125 @@ impl RustMux {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                    this.resizing = Some(ResizeDrag { split_key, axis });
+                    this.resizing = Some(ResizeDrag { split_id, axis });
                     cx.notify();
                 }),
+            )
+            .into_any_element()
+    }
+
+    fn binding_label(&self, command: AppCommand) -> String {
+        self.keymap
+            .bindings
+            .iter()
+            .filter(|binding| binding.command == command)
+            .map(|binding| binding.sequence.as_str())
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+
+    fn render_command_palette(
+        &self,
+        palette: &CommandPaletteState,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let matches = palette_matches(&palette.query, COMMAND_PALETTE_LIMIT);
+        let query = if palette.query.is_empty() {
+            "Type a command…".to_owned()
+        } else {
+            palette.query.clone()
+        };
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(rgba(0x00000070))
+            .flex()
+            .justify_center()
+            .pt(px(92.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.command_palette = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("command-palette")
+                    .w(px(620.0))
+                    .h_auto()
+                    .max_h(relative(0.75))
+                    .overflow_y_scroll()
+                    .rounded(px(9.0))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .bg(rgb(THEME.elevated))
+                    .shadow_lg()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        div()
+                            .h(px(48.0))
+                            .px(px(15.0))
+                            .border_b_1()
+                            .border_color(rgb(THEME.border))
+                            .flex()
+                            .items_center()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(if palette.query.is_empty() {
+                                rgb(THEME.dim)
+                            } else {
+                                rgb(THEME.foreground)
+                            })
+                            .child(query),
+                    )
+                    .children(matches.into_iter().enumerate().map(|(index, item)| {
+                        let command = item.command;
+                        let metadata = descriptor(command);
+                        let selected = index == palette.selected;
+                        div()
+                            .id(("palette-command", index))
+                            .h(px(44.0))
+                            .px(px(13.0))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .when(selected, |element| element.bg(rgb(THEME.selection)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.execute_command(command, cx);
+                                cx.stop_propagation();
+                            }))
+                            .child(
+                                div()
+                                    .w(px(210.0))
+                                    .font_family(".SystemUIFont")
+                                    .text_xs()
+                                    .text_color(rgb(THEME.dim))
+                                    .child(format!("{} · {}", metadata.category, metadata.id)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .font_family(".SystemUIFont")
+                                    .text_sm()
+                                    .text_color(rgb(THEME.foreground))
+                                    .child(metadata.title),
+                            )
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_xs()
+                                    .text_color(rgb(THEME.muted))
+                                    .child(self.binding_label(command)),
+                            )
+                    })),
             )
             .into_any_element()
     }
@@ -1736,7 +1993,12 @@ impl RustMux {
         let Some(workspace) = self.active_workspace_in(snapshot) else {
             return div().size_full().bg(rgb(THEME.terminal)).into_any_element();
         };
-        let layout = workspace.tabs.first().map(|tab| tab.layout.clone());
+        let canonical_layout = workspace.tabs.first().map(|tab| tab.layout.clone());
+        let layout = canonical_layout.as_ref().map(|layout| {
+            self.zoomed_pane
+                .and_then(|pane_id| zoom_projection(layout, pane_id))
+                .unwrap_or_else(|| layout.clone())
+        });
         div()
             .min_w(px(0.0))
             .h_full()
@@ -1776,8 +2038,14 @@ impl RustMux {
                             .text_xs()
                             .text_color(rgb(THEME.dim))
                             .child(format!(
-                                "{} · {}  ·  ⌘T tab   ⌘D split   ⇧⌘D down",
-                                THEME.name, self.terminal_font.family
+                                "{} · {}{}  ·  ⇧⌘P commands",
+                                THEME.name,
+                                self.terminal_font.family,
+                                if self.zoomed_pane.is_some() {
+                                    " · ZOOMED"
+                                } else {
+                                    ""
+                                }
                             )),
                     ),
             )
@@ -1796,7 +2064,11 @@ impl Render for RustMux {
         self.update_window_geometry(window);
 
         div()
-            .key_context("RustMux")
+            .key_context(if self.command_palette.is_some() {
+                "RustMuxPalette"
+            } else {
+                ROOT_KEY_CONTEXT
+            })
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
@@ -1834,18 +2106,55 @@ impl Render for RustMux {
                     }
                 }),
             )
-            .on_action(cx.listener(|this, _: &NewWorkspace, _, cx| this.new_workspace(cx)))
-            .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
+            .on_action(cx.listener(|this, _: &NewWorkspace, _, cx| {
+                this.execute_command(AppCommand::NewWorkspace, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| {
+                this.execute_command(AppCommand::NewTab, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &SplitRight, _, cx| {
+                this.execute_command(AppCommand::SplitRight, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, _, cx| {
+                this.execute_command(AppCommand::SplitDown, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &FocusLeft, _, cx| {
+                this.execute_command(AppCommand::FocusLeft, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &FocusUp, _, cx| {
+                this.execute_command(AppCommand::FocusUp, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &FocusRight, _, cx| {
+                this.execute_command(AppCommand::FocusRight, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &FocusDown, _, cx| {
+                this.execute_command(AppCommand::FocusDown, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &ShowCommandPalette, _, cx| {
+                this.execute_command(AppCommand::ShowCommandPalette, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &TogglePaneZoom, _, cx| {
+                this.execute_command(AppCommand::TogglePaneZoom, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &EqualizePanes, _, cx| {
+                this.execute_command(AppCommand::EqualizePanes, cx);
+                cx.stop_propagation();
+            }))
             .on_action(
-                cx.listener(|this, _: &SplitRight, _, cx| this.split(SplitAxis::Horizontal, cx)),
+                cx.listener(|_: &mut RustMux, _: &ConsumeChordPrefix, _, cx| {
+                    cx.stop_propagation();
+                }),
             )
-            .on_action(
-                cx.listener(|this, _: &SplitDown, _, cx| this.split(SplitAxis::Vertical, cx)),
-            )
-            .on_action(cx.listener(|this, _: &FocusLeft, _, cx| this.focus_direction(false, cx)))
-            .on_action(cx.listener(|this, _: &FocusUp, _, cx| this.focus_direction(false, cx)))
-            .on_action(cx.listener(|this, _: &FocusRight, _, cx| this.focus_direction(true, cx)))
-            .on_action(cx.listener(|this, _: &FocusDown, _, cx| this.focus_direction(true, cx)))
             .child(self.render_sidebar(cx))
             .child(self.render_workspace(cx))
             .when_some(self.tab_menu, |element, menu| {
@@ -1856,6 +2165,9 @@ impl Render for RustMux {
             })
             .when_some(self.close_confirmation.as_ref(), |element, confirmation| {
                 element.child(self.render_close_dialog(confirmation, cx))
+            })
+            .when_some(self.command_palette.as_ref(), |element, palette| {
+                element.child(self.render_command_palette(palette, cx))
             })
     }
 }
@@ -1974,11 +2286,50 @@ fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
     }
 }
 
-fn first_visible_pane(layout: &PaneLayout) -> Uuid {
+fn stable_representative_pane(layout: &PaneLayout) -> Uuid {
     match layout {
         PaneLayout::Leaf { pane } => pane.id,
-        PaneLayout::Stack { active, .. } => *active,
-        PaneLayout::Split { first, .. } => first_visible_pane(first),
+        PaneLayout::Stack { panes, active } => panes.first().map_or(*active, |pane| pane.id),
+        PaneLayout::Split { first, .. } => stable_representative_pane(first),
+    }
+}
+
+fn split_control_id(first: &PaneLayout, second: &PaneLayout) -> SplitControlId {
+    SplitControlId {
+        first: stable_representative_pane(first),
+        second: stable_representative_pane(second),
+    }
+}
+
+fn zoom_projection(layout: &PaneLayout, pane_id: Uuid) -> Option<PaneLayout> {
+    match layout {
+        PaneLayout::Leaf { pane } => (pane.id == pane_id).then(|| layout.clone()),
+        PaneLayout::Stack { panes, .. } => panes
+            .iter()
+            .any(|pane| pane.id == pane_id)
+            .then(|| layout.clone()),
+        PaneLayout::Split { first, second, .. } => {
+            zoom_projection(first, pane_id).or_else(|| zoom_projection(second, pane_id))
+        }
+    }
+}
+
+fn apply_layout_control_mutation(
+    layout: &PaneLayout,
+    ratios: &mut HashMap<SplitControlId, f32>,
+    mutation: LayoutControlMutation,
+) -> usize {
+    match layout {
+        PaneLayout::Leaf { .. } | PaneLayout::Stack { .. } => 0,
+        PaneLayout::Split { first, second, .. } => {
+            match mutation {
+                LayoutControlMutation::Equalize => {
+                    ratios.insert(split_control_id(first, second), 0.5);
+                }
+            }
+            1 + apply_layout_control_mutation(first, ratios, mutation)
+                + apply_layout_control_mutation(second, ratios, mutation)
+        }
     }
 }
 
@@ -2029,9 +2380,9 @@ fn split_child_dimensions(
 
 fn find_split_rect(
     layout: &PaneLayout,
-    target_split_key: Uuid,
+    target_split_id: SplitControlId,
     rect: PixelRect,
-    ratios: &HashMap<Uuid, f32>,
+    ratios: &HashMap<SplitControlId, f32>,
 ) -> Option<PixelRect> {
     let PaneLayout::Split {
         axis,
@@ -2042,15 +2393,15 @@ fn find_split_rect(
     else {
         return None;
     };
-    let split_key = first_visible_pane(first);
-    if split_key == target_split_key {
+    let split_id = split_control_id(first, second);
+    if split_id == target_split_id {
         return Some(rect);
     }
     let ratio = effective_split_ratio(
         *axis,
         rect.width,
         rect.height,
-        ratios.get(&split_key).copied().unwrap_or(*ratio),
+        ratios.get(&split_id).copied().unwrap_or(*ratio),
     );
     let (first_width, first_height, second_width, second_height) =
         split_child_dimensions(*axis, rect.width, rect.height, ratio);
@@ -2073,8 +2424,8 @@ fn find_split_rect(
             height: second_height,
         },
     };
-    find_split_rect(first, target_split_key, first_rect, ratios)
-        .or_else(|| find_split_rect(second, target_split_key, second_rect, ratios))
+    find_split_rect(first, target_split_id, first_rect, ratios)
+        .or_else(|| find_split_rect(second, target_split_id, second_rect, ratios))
 }
 
 fn collect_pane_sizes(
@@ -2082,7 +2433,7 @@ fn collect_pane_sizes(
     width: f32,
     height: f32,
     metrics: typography::TerminalCellMetrics,
-    ratios: &HashMap<Uuid, f32>,
+    ratios: &HashMap<SplitControlId, f32>,
     output: &mut Vec<(Uuid, u16, u16)>,
 ) {
     match layout {
@@ -2105,7 +2456,7 @@ fn collect_pane_sizes(
                 width,
                 height,
                 ratios
-                    .get(&first_visible_pane(first))
+                    .get(&split_control_id(first, second))
                     .copied()
                     .unwrap_or(*ratio),
             );
@@ -2115,6 +2466,44 @@ fn collect_pane_sizes(
             collect_pane_sizes(second, second_width, second_height, metrics, ratios, output);
         }
     }
+}
+
+fn terminal_input_bytes(
+    key: &str,
+    key_char: Option<&str>,
+    control: bool,
+    alt: bool,
+    platform: bool,
+) -> Option<Vec<u8>> {
+    // Command/Super is an application modifier, not a PTY modifier. Unmatched
+    // platform shortcuts remain available to the OS instead of becoming text.
+    if platform {
+        return None;
+    }
+    if control && key.len() == 1 {
+        return key
+            .as_bytes()
+            .first()
+            .map(|byte| vec![byte.to_ascii_lowercase() & 0x1f]);
+    }
+    let mut bytes = match key {
+        "enter" => vec![b'\r'],
+        "backspace" => vec![0x7f],
+        "tab" => vec![b'\t'],
+        "escape" => vec![0x1b],
+        "left" => b"\x1b[D".to_vec(),
+        "right" => b"\x1b[C".to_vec(),
+        "up" => b"\x1b[A".to_vec(),
+        "down" => b"\x1b[B".to_vec(),
+        "home" => b"\x1b[H".to_vec(),
+        "end" => b"\x1b[F".to_vec(),
+        "delete" => b"\x1b[3~".to_vec(),
+        _ => key_char?.as_bytes().to_vec(),
+    };
+    if alt {
+        bytes.insert(0, 0x1b);
+    }
+    Some(bytes)
 }
 
 fn terminal_grid_for_pane(
@@ -2136,18 +2525,65 @@ fn element_key(id: Uuid) -> u64 {
     high ^ low
 }
 
+fn split_element_key(id: SplitControlId) -> u64 {
+    element_key(id.first).rotate_left(17) ^ element_key(id.second)
+}
+
+fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
+    match binding.command {
+        AppCommand::NewWorkspace => {
+            KeyBinding::new(&binding.sequence, NewWorkspace, Some(ROOT_KEY_CONTEXT))
+        }
+        AppCommand::NewTab => KeyBinding::new(&binding.sequence, NewTab, Some(ROOT_KEY_CONTEXT)),
+        AppCommand::SplitRight => {
+            KeyBinding::new(&binding.sequence, SplitRight, Some(ROOT_KEY_CONTEXT))
+        }
+        AppCommand::SplitDown => {
+            KeyBinding::new(&binding.sequence, SplitDown, Some(ROOT_KEY_CONTEXT))
+        }
+        AppCommand::FocusLeft => {
+            KeyBinding::new(&binding.sequence, FocusLeft, Some(ROOT_KEY_CONTEXT))
+        }
+        AppCommand::FocusRight => {
+            KeyBinding::new(&binding.sequence, FocusRight, Some(ROOT_KEY_CONTEXT))
+        }
+        AppCommand::FocusUp => KeyBinding::new(&binding.sequence, FocusUp, Some(ROOT_KEY_CONTEXT)),
+        AppCommand::FocusDown => {
+            KeyBinding::new(&binding.sequence, FocusDown, Some(ROOT_KEY_CONTEXT))
+        }
+        AppCommand::ShowCommandPalette => KeyBinding::new(
+            &binding.sequence,
+            ShowCommandPalette,
+            Some(ROOT_KEY_CONTEXT),
+        ),
+        AppCommand::TogglePaneZoom => {
+            KeyBinding::new(&binding.sequence, TogglePaneZoom, Some(ROOT_KEY_CONTEXT))
+        }
+        AppCommand::EqualizePanes => {
+            KeyBinding::new(&binding.sequence, EqualizePanes, Some(ROOT_KEY_CONTEXT))
+        }
+    }
+}
+
 fn main() {
     Application::new().run(|cx: &mut App| {
-        cx.bind_keys([
-            KeyBinding::new("cmd-n", NewWorkspace, Some("RustMux")),
-            KeyBinding::new("cmd-t", NewTab, Some("RustMux")),
-            KeyBinding::new("cmd-d", SplitRight, Some("RustMux")),
-            KeyBinding::new("cmd-shift-d", SplitDown, Some("RustMux")),
-            KeyBinding::new("cmd-alt-left", FocusLeft, Some("RustMux")),
-            KeyBinding::new("cmd-alt-right", FocusRight, Some("RustMux")),
-            KeyBinding::new("cmd-alt-up", FocusUp, Some("RustMux")),
-            KeyBinding::new("cmd-alt-down", FocusDown, Some("RustMux")),
-        ]);
+        let keymap = match AppConfig::load().and_then(|config| config.resolve_keymap()) {
+            Ok(keymap) => keymap,
+            Err(error) => {
+                eprintln!("Rust Mux config ignored: {error}");
+                AppConfig::default()
+                    .resolve_keymap()
+                    .expect("built-in keymap must be valid")
+            }
+        };
+        let mut bindings = keymap.bindings.iter().map(gpui_binding).collect::<Vec<_>>();
+        bindings.extend(
+            keymap
+                .chord_prefixes
+                .iter()
+                .map(|prefix| KeyBinding::new(prefix, ConsumeChordPrefix, Some(ROOT_KEY_CONTEXT))),
+        );
+        cx.bind_keys(bindings);
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
         cx.open_window(
             WindowOptions {
@@ -2160,7 +2596,7 @@ fn main() {
                 window_min_size: Some(size(px(720.0), px(460.0))),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| RustMux::new(window, cx)),
+            |window, cx| cx.new(|cx| RustMux::new(window, keymap.clone(), cx)),
         )
         .expect("open Rust Mux window");
         cx.activate(true);
@@ -2401,5 +2837,123 @@ mod tests {
 
         let too_short = effective_split_ratio(SplitAxis::Vertical, 530.0, 150.0, 0.9);
         assert!((too_short - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn terminal_input_encodes_unmatched_keys_once_with_control_and_alt_semantics() {
+        assert_eq!(
+            terminal_input_bytes("x", Some("x"), false, false, false),
+            Some(vec![b'x'])
+        );
+        assert_eq!(
+            terminal_input_bytes("c", Some("c"), true, false, false),
+            Some(vec![0x03])
+        );
+        assert_eq!(
+            terminal_input_bytes("x", Some("x"), false, true, false),
+            Some(vec![0x1b, b'x'])
+        );
+        assert_eq!(
+            terminal_input_bytes("up", None, false, false, false),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            terminal_input_bytes("x", Some("x"), false, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn zoom_is_a_projection_that_does_not_mutate_canonical_layout() {
+        let first = Pane {
+            id: Uuid::from_u128(101),
+            title: "one".to_owned(),
+            shell: "zsh".to_owned(),
+        };
+        let second = Pane {
+            id: Uuid::from_u128(102),
+            title: "two".to_owned(),
+            shell: "zsh".to_owned(),
+        };
+        let layout = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.3,
+            first: Box::new(PaneLayout::Leaf {
+                pane: first.clone(),
+            }),
+            second: Box::new(PaneLayout::Stack {
+                panes: vec![second.clone()],
+                active: second.id,
+            }),
+        };
+        let before = layout.clone();
+
+        assert_eq!(
+            zoom_projection(&layout, second.id),
+            Some(PaneLayout::Stack {
+                panes: vec![second.clone()],
+                active: second.id
+            })
+        );
+        assert_eq!(layout, before);
+        assert_eq!(zoom_projection(&layout, Uuid::from_u128(999)), None);
+    }
+
+    #[test]
+    fn equalize_is_a_controlled_mutation_over_all_current_split_identities() {
+        let pane = |id| Pane {
+            id: Uuid::from_u128(id),
+            title: format!("pane {id}"),
+            shell: "zsh".to_owned(),
+        };
+        let nested = PaneLayout::Split {
+            axis: SplitAxis::Vertical,
+            ratio: 0.8,
+            first: Box::new(PaneLayout::Leaf { pane: pane(2) }),
+            second: Box::new(PaneLayout::Leaf { pane: pane(3) }),
+        };
+        let layout = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.2,
+            first: Box::new(PaneLayout::Leaf { pane: pane(1) }),
+            second: Box::new(nested),
+        };
+        let mut ratios = HashMap::from([
+            (
+                SplitControlId {
+                    first: Uuid::from_u128(1),
+                    second: Uuid::from_u128(2),
+                },
+                0.1,
+            ),
+            (
+                SplitControlId {
+                    first: Uuid::from_u128(2),
+                    second: Uuid::from_u128(3),
+                },
+                0.9,
+            ),
+        ]);
+
+        let changed =
+            apply_layout_control_mutation(&layout, &mut ratios, LayoutControlMutation::Equalize);
+
+        assert_eq!(changed, 2);
+        assert!(
+            (ratios[&SplitControlId {
+                first: Uuid::from_u128(1),
+                second: Uuid::from_u128(2)
+            }] - 0.5)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (ratios[&SplitControlId {
+                first: Uuid::from_u128(2),
+                second: Uuid::from_u128(3)
+            }] - 0.5)
+                .abs()
+                < f32::EPSILON
+        );
     }
 }

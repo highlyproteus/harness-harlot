@@ -4461,6 +4461,8 @@ dependencies = [
  "gpui",
  "rust-mux-protocol",
  "rust-mux-terminal-model",
+ "serde",
+ "serde_json",
  "unicode-width",
  "uuid",
 ]
