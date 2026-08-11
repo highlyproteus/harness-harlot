@@ -145,4 +145,25 @@ mod tests {
     fn built_in_themes_are_named_and_selectable_without_session_state() {
         assert_eq!(BuiltInTheme::HarborNight.theme().name, "Harbor Night");
     }
+
+    #[test]
+    fn hermes_256_color_indices_follow_the_xterm_palette() {
+        let theme = AppTheme::HARBOR_NIGHT;
+        assert_eq!(
+            theme.terminal_color(TerminalColor::DefaultForeground, false, false),
+            theme.foreground
+        );
+        assert_eq!(
+            theme.terminal_color(TerminalColor::Indexed { index: 136 }, false, false),
+            0xaf8700
+        );
+        assert_eq!(
+            theme.terminal_color(TerminalColor::Indexed { index: 220 }, false, false),
+            0xffd700
+        );
+        assert_eq!(
+            theme.terminal_color(TerminalColor::Indexed { index: 234 }, false, false),
+            0x1c1c1c
+        );
+    }
 }
