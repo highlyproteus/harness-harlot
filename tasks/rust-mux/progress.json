@@ -1,8 +1,8 @@
 {
   "task_dir": "tasks/rust-mux",
-  "complete": 26,
+  "complete": 38,
   "total": 53,
-  "percent": 49,
+  "percent": 72,
   "tasks": [
     {
       "file": "tasks/rust-mux/00-vision.md",
@@ -108,9 +108,9 @@
       "file": "tasks/rust-mux/02-pty-sessions.md",
       "title": "Persistent PTY Sessions",
       "goal": "Make the session service own real local and system-SSH shell processes and terminal byte streams.",
-      "complete": 2,
+      "complete": 7,
       "total": 10,
-      "percent": 20,
+      "percent": 70,
       "checks": [
         {
           "text": "Add `portable-pty` behind a narrow service-owned Unix PTY abstraction on macOS and Linux.",
@@ -119,7 +119,7 @@
         },
         {
           "text": "Create, resize, write to, and terminate panes through explicit protocol commands.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -129,7 +129,7 @@
         },
         {
           "text": "Define graceful exit, forced termination, and service-shutdown semantics.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -139,7 +139,7 @@
         },
         {
           "text": "Launch configured-host remote shells through system OpenSSH without bypassing SSH config, agents, host-key checks, or jump hosts.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -149,12 +149,12 @@
         },
         {
           "text": "Integration tests cover create/input/output/resize/exit.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         },
         {
           "text": "A reconnect test proves the PTY survives desktop-client teardown.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         },
         {
@@ -168,9 +168,9 @@
       "file": "tasks/rust-mux/03-terminal-rendering.md",
       "title": "Terminal Rendering and Input",
       "goal": "Render interactive terminal panes in the native desktop without duplicating terminal-emulation logic.",
-      "complete": 6,
+      "complete": 8,
       "total": 9,
-      "percent": 67,
+      "percent": 89,
       "checks": [
         {
           "text": "Expand the `alacritty_terminal` adapter around parsing, resize, and visible-grid snapshots.",
@@ -194,7 +194,7 @@
         },
         {
           "text": "Add scrollback, selection, copy, and search.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -209,7 +209,7 @@
         },
         {
           "text": "Unicode, colors, cursor modes, resize, and scrollback have regression coverage.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         },
         {
@@ -223,9 +223,9 @@
       "file": "tasks/rust-mux/04-layout-interactions.md",
       "title": "Workspace and Pane Interactions",
       "goal": "Deliver the workspace, tab, split, and freely rearrangeable pane workflow.",
-      "complete": 2,
+      "complete": 5,
       "total": 9,
-      "percent": 22,
+      "percent": 56,
       "checks": [
         {
           "text": "Implement create/rename/reorder/delete for workspaces and tabs.",
@@ -244,7 +244,7 @@
         },
         {
           "text": "Persist layout changes atomically in the session service.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -254,7 +254,7 @@
         },
         {
           "text": "Display and move local and SSH panes uniformly while retaining explicit connection state.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -269,7 +269,7 @@
         },
         {
           "text": "Persisted layouts survive service and desktop restarts.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         }
       ]
@@ -278,9 +278,9 @@
       "file": "tasks/rust-mux/05-reliability-hardening.md",
       "title": "macOS Reliability Hardening",
       "goal": "Validate the reliability claim under desktop, display, daemon, and SSH lifecycle stress on macOS and Linux.",
-      "complete": 0,
+      "complete": 2,
       "total": 9,
-      "percent": 0,
+      "percent": 22,
       "checks": [
         {
           "text": "Add structured service logs and opt-in diagnostics without recording terminal contents.",
@@ -304,7 +304,7 @@
         },
         {
           "text": "Add atomic state persistence and corruption recovery.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -319,7 +319,7 @@
         },
         {
           "text": "Recovery behavior is documented for desktop crash, service crash, and corrupt state.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         },
         {

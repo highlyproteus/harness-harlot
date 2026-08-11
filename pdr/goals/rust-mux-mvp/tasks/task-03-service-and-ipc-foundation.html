@@ -149,8 +149,8 @@
   "depends_on": ["task-01"],
   "status": "in_progress",
   "block_reason": null,
-  "notes": [{ "timestamp": "2026-08-11T18:01:19Z", "text": "The protocol-v2 checkpoint now has a bounded handshake/request path over an owner-only Unix socket, no TCP listener, independent PTY reader threads, and live client reconnect proof. Request IDs, subscriptions/sequence resync, and Linux CI execution remain before this task is complete." }],
-  "last_updated": "2026-08-11T18:01:19Z"
+  "notes": [{ "timestamp": "2026-08-11T18:01:19Z", "text": "The protocol-v2 checkpoint now has a bounded handshake/request path over an owner-only Unix socket, no TCP listener, independent PTY reader threads, and live client reconnect proof. Request IDs, subscriptions/sequence resync, and Linux CI execution remain before this task is complete." }, { "timestamp": "2026-08-11T21:22:24Z", "text": "The four parallel tracks now share one coherent protocol v5: commands retain the desktop key-forwarding boundary, terminal interaction adds structured requests and responses, and ConnectSsh uses the same handshake without a second incompatible version. The local owner-only Unix socket remains the sole default endpoint. Request IDs, subscription resync, and Linux CI remain." }],
+  "last_updated": "2026-08-11T21:22:24Z"
 }
 </script>
 

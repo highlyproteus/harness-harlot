@@ -88,10 +88,10 @@
         <p>Generated from Markdown task files. Refresh this page after Codex updates checkboxes and re-renders the dashboard.</p>
       </div>
       <div class="project-planner-progress">
-        <strong>49%</strong>
-        <span>26 of 53 checklist items complete</span>
+        <strong>72%</strong>
+        <span>38 of 53 checklist items complete</span>
         <div class="project-planner-bar" aria-label="Overall task progress">
-          <span style="width: 49%"></span>
+          <span style="width: 72%"></span>
         </div>
       </div>
     </div>
@@ -142,22 +142,22 @@
         <h3><a href="tasks/rust-mux/02-pty-sessions.md">Persistent PTY Sessions</a></h3>
         <p>Make the session service own real local and system-SSH shell processes and terminal byte streams.</p>
         <div class="project-planner-meta">
-          <span>2 / 10 complete</span>
-          <span>20%</span>
+          <span>7 / 10 complete</span>
+          <span>70%</span>
         </div>
         <div class="project-planner-bar" aria-label="Task progress">
-          <span style="width: 20%"></span>
+          <span style="width: 70%"></span>
         </div>
         <ul class="project-planner-checks">
-          <li><span class="project-planner-box checked"></span><span>Add `portable-pty` behind a narrow service-owned Unix PTY abstraction on macOS and Linux.</span></li>
-          <li><span class="project-planner-box"></span><span>Create, resize, write to, and terminate panes through explicit protocol commands.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add `portable-pty` behind a narrow service-owned Unix PTY abstraction on macOS and Linux.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Create, resize, write to, and terminate panes through explicit protocol commands.</span></li>
           <li><span class="project-planner-box"></span><span>Stream ordered output with bounded queues and reconnect-safe sequence numbers.</span></li>
-          <li><span class="project-planner-box"></span><span>Define graceful exit, forced termination, and service-shutdown semantics.</span></li>
-          <li><span class="project-planner-box checked"></span><span>Prove that closing and reopening a client preserves the shell and its output.</span></li>
-          <li><span class="project-planner-box"></span><span>Launch configured-host remote shells through system OpenSSH without bypassing SSH config, agents, host-key checks, or jump hosts.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Define graceful exit, forced termination, and service-shutdown semantics.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Prove that closing and reopening a client preserves the shell and its output.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Launch configured-host remote shells through system OpenSSH without bypassing SSH config, agents, host-key checks, or jump hosts.</span></li>
           <li><span class="project-planner-box"></span><span>Prove that desktop reconnect and pane movement preserve the OpenSSH PID and remote session identity.</span></li>
-          <li><span class="project-planner-box"></span><span>Integration tests cover create/input/output/resize/exit.</span></li>
-          <li><span class="project-planner-box"></span><span>A reconnect test proves the PTY survives desktop-client teardown.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Integration tests cover create/input/output/resize/exit.</span></li>
+          <li><span class="project-planner-box done">x</span><span>A reconnect test proves the PTY survives desktop-client teardown.</span></li>
           <li><span class="project-planner-box"></span><span>Backpressure behavior is documented and tested.</span></li>
         </ul>
       </article>
@@ -165,27 +165,49 @@
         <h3><a href="tasks/rust-mux/03-terminal-rendering.md">Terminal Rendering and Input</a></h3>
         <p>Render interactive terminal panes in the native desktop without duplicating terminal-emulation logic.</p>
         <div class="project-planner-meta">
-          <span>6 / 9 complete</span>
-          <span>67%</span>
+          <span>8 / 9 complete</span>
+          <span>89%</span>
         </div>
         <div class="project-planner-bar" aria-label="Task progress">
-          <span style="width: 67%"></span>
+          <span style="width: 89%"></span>
         </div>
         <ul class="project-planner-checks">
-          <li><span class="project-planner-box checked"></span><span>Expand the `alacritty_terminal` adapter around parsing, resize, and visible-grid snapshots.</span></li>
-          <li><span class="project-planner-box checked"></span><span>Add a GPUI terminal surface with monospaced text and HiDPI-aware PTY sizing.</span></li>
-          <li><span class="project-planner-box checked"></span><span>Translate core keyboard and focus events into PTY input.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Expand the `alacritty_terminal` adapter around parsing, resize, and visible-grid snapshots.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add a GPUI terminal surface with monospaced text and HiDPI-aware PTY sizing.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Translate core keyboard and focus events into PTY input.</span></li>
           <li><span class="project-planner-box"></span><span>Add styled cells, cursor rendering, Unicode-width handling, IME, mouse reporting, and paste/clipboard integration.</span></li>
-          <li><span class="project-planner-box"></span><span>Add scrollback, selection, copy, and search.</span></li>
-          <li><span class="project-planner-box checked"></span><span>Keep terminal-model APIs independent of GPUI.</span></li>
-          <li><span class="project-planner-box checked"></span><span>Interactive local shells render and accept input.</span></li>
-          <li><span class="project-planner-box"></span><span>Unicode, colors, cursor modes, resize, and scrollback have regression coverage.</span></li>
-          <li><span class="project-planner-box checked"></span><span>Desktop restart reconnects to the current rendered state.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add scrollback, selection, copy, and search.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Keep terminal-model APIs independent of GPUI.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Interactive local shells render and accept input.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Unicode, colors, cursor modes, resize, and scrollback have regression coverage.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Desktop restart reconnects to the current rendered state.</span></li>
         </ul>
       </article>
       <article class="project-planner-task">
         <h3><a href="tasks/rust-mux/04-layout-interactions.md">Workspace and Pane Interactions</a></h3>
         <p>Deliver the workspace, tab, split, and freely rearrangeable pane workflow.</p>
+        <div class="project-planner-meta">
+          <span>5 / 9 complete</span>
+          <span>56%</span>
+        </div>
+        <div class="project-planner-bar" aria-label="Task progress">
+          <span style="width: 56%"></span>
+        </div>
+        <ul class="project-planner-checks">
+          <li><span class="project-planner-box"></span><span>Implement create/rename/reorder/delete for workspaces and tabs.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Implement horizontal and vertical split-tree mutations.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Implement pane drag/drop with visible targets and cancel-safe behavior.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Persist layout changes atomically in the session service.</span></li>
+          <li><span class="project-planner-box"></span><span>Restore focus and layout consistently after desktop restart.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Display and move local and SSH panes uniformly while retaining explicit connection state.</span></li>
+          <li><span class="project-planner-box"></span><span>Every layout mutation has deterministic model tests.</span></li>
+          <li><span class="project-planner-box"></span><span>Drag/drop works across splits and tabs without losing a local or SSH session.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Persisted layouts survive service and desktop restarts.</span></li>
+        </ul>
+      </article>
+      <article class="project-planner-task">
+        <h3><a href="tasks/rust-mux/05-reliability-hardening.md">macOS Reliability Hardening</a></h3>
+        <p>Validate the reliability claim under desktop, display, daemon, and SSH lifecycle stress on macOS and Linux.</p>
         <div class="project-planner-meta">
           <span>2 / 9 complete</span>
           <span>22%</span>
@@ -194,36 +216,14 @@
           <span style="width: 22%"></span>
         </div>
         <ul class="project-planner-checks">
-          <li><span class="project-planner-box"></span><span>Implement create/rename/reorder/delete for workspaces and tabs.</span></li>
-          <li><span class="project-planner-box checked"></span><span>Implement horizontal and vertical split-tree mutations.</span></li>
-          <li><span class="project-planner-box checked"></span><span>Implement pane drag/drop with visible targets and cancel-safe behavior.</span></li>
-          <li><span class="project-planner-box"></span><span>Persist layout changes atomically in the session service.</span></li>
-          <li><span class="project-planner-box"></span><span>Restore focus and layout consistently after desktop restart.</span></li>
-          <li><span class="project-planner-box"></span><span>Display and move local and SSH panes uniformly while retaining explicit connection state.</span></li>
-          <li><span class="project-planner-box"></span><span>Every layout mutation has deterministic model tests.</span></li>
-          <li><span class="project-planner-box"></span><span>Drag/drop works across splits and tabs without losing a local or SSH session.</span></li>
-          <li><span class="project-planner-box"></span><span>Persisted layouts survive service and desktop restarts.</span></li>
-        </ul>
-      </article>
-      <article class="project-planner-task">
-        <h3><a href="tasks/rust-mux/05-reliability-hardening.md">macOS Reliability Hardening</a></h3>
-        <p>Validate the reliability claim under desktop, display, daemon, and SSH lifecycle stress on macOS and Linux.</p>
-        <div class="project-planner-meta">
-          <span>0 / 9 complete</span>
-          <span>0%</span>
-        </div>
-        <div class="project-planner-bar" aria-label="Task progress">
-          <span style="width: 0%"></span>
-        </div>
-        <ul class="project-planner-checks">
           <li><span class="project-planner-box"></span><span>Add structured service logs and opt-in diagnostics without recording terminal contents.</span></li>
           <li><span class="project-planner-box"></span><span>Add crash/reconnect, slow-client, high-output, and service-upgrade scenarios.</span></li>
           <li><span class="project-planner-box"></span><span>Test repeated Space switches, display attach/detach, sleep/wake, and fullscreen transitions.</span></li>
           <li><span class="project-planner-box"></span><span>Test Linux compositor/display-session changes and SSH network loss, host-key failure, jump-host, and desktop-reconnect behavior.</span></li>
-          <li><span class="project-planner-box"></span><span>Add atomic state persistence and corruption recovery.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add atomic state persistence and corruption recovery.</span></li>
           <li><span class="project-planner-box"></span><span>Package the service and desktop with clear start/stop/uninstall behavior.</span></li>
           <li><span class="project-planner-box"></span><span>Repeatable macOS and Linux soak tests run without UI freezes or lost local/SSH sessions.</span></li>
-          <li><span class="project-planner-box"></span><span>Recovery behavior is documented for desktop crash, service crash, and corrupt state.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Recovery behavior is documented for desktop crash, service crash, and corrupt state.</span></li>
           <li><span class="project-planner-box"></span><span>Release packaging preserves the independent service lifecycle.</span></li>
         </ul>
       </article>

@@ -11,7 +11,7 @@ Alacritty's engine should own VT parsing and terminal cell state while Rust Mux 
 - [x] Add a GPUI terminal surface with monospaced text and HiDPI-aware PTY sizing.
 - [x] Translate core keyboard and focus events into PTY input.
 - [ ] Add styled cells, cursor rendering, Unicode-width handling, IME, mouse reporting, and paste/clipboard integration.
-- [ ] Add scrollback, selection, copy, and search.
+- [x] Add scrollback, selection, copy, and search.
 - [x] Keep terminal-model APIs independent of GPUI.
 
 ## Technical Notes
@@ -21,5 +21,5 @@ Current checkpoint: the original `Harbor Night` built-in theme maps Alacritty AN
 
 ## Acceptance Criteria
 - [x] Interactive local shells render and accept input.
-- [ ] Unicode, colors, cursor modes, resize, and scrollback have regression coverage.
+- [x] Unicode, colors, cursor modes, resize, and scrollback have regression coverage.
 - [x] Desktop restart reconnects to the current rendered state.

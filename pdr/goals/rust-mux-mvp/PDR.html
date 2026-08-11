@@ -167,8 +167,8 @@
   "goal_id": "rust-mux-mvp",
   "goal": "Deliver a reliability-first local and SSH terminal workspace for macOS and Linux whose live sessions survive desktop-client restarts",
   "created": "2026-08-11",
-  "last_updated": "2026-08-11T20:23:23Z",
-  "context": "Rust Mux is a compact terminal workspace: a dense workspace list on the left and real local shell panes on the right. Users create and switch workspaces, add as many panes as needed, split, resize, focus, and rearrange them. The first usable checkpoint is explicitly local-only and must run the user's configured shell in daemon-owned PTYs with real keyboard input, output, terminal parsing, and resize; fake terminal cards, activity dashboards, health badges, and agent status are not acceptable. SSH is the next core networked milestone after this local end-to-end flow; a privacy-focused isolated browser pane is explicitly later, after terminal reliability and agent-as-terminal-workload support. Behavior and layout may be informed by public cmux material, but Rust Mux will use no cmux source, branding, icons, assets, or documentation prose. The desktop remains Rust-authored, GPU-rendered, WebView-free, and restartable independently of sessions on macOS and Linux. The terminal stack is a hard all-Rust boundary: Alacritty owns VT/grid semantics and GPUI/Rust owns rendering; Ghostty, libghostty, GhosttyKit, and other non-Rust terminal engines are excluded unless a future approved PDR revision reverses that decision. The application is network-silent by default: SSH and any later remote or browser capability connect only after explicit user action, with no unauthenticated listener or background telemetry.",
+  "last_updated": "2026-08-11T21:22:24Z",
+  "context": "Rust Mux is a compact terminal workspace: a dense workspace list on the left and real terminal panes on the right. Users create and switch workspaces, add panes, split, resize, focus, and rearrange them. The integrated checkpoint runs configured local shells in daemon-owned PTYs with real input, output, parsing, resize, terminal interaction, restricted desired-state recovery, stable commands/navigation, and an explicit two-step system-OpenSSH action; fake terminal cards, activity dashboards, health badges, and agent status are not acceptable. SSH host discovery, remote lifecycle soak, and durable remote reattachment remain later slices, and a privacy-focused isolated browser pane remains after terminal reliability and agent-as-terminal-workload support. Behavior and layout may be informed by public cmux material, but Rust Mux will use no cmux source, branding, icons, assets, or documentation prose. The desktop remains Rust-authored, GPU-rendered, WebView-free, and restartable independently of sessions on macOS and Linux. The terminal stack is a hard all-Rust boundary: Alacritty owns VT/grid semantics and GPUI/Rust owns rendering; Ghostty, libghostty, GhosttyKit, and other non-Rust terminal engines are excluded unless a future approved PDR revision reverses that decision. The application is network-silent by default: recovery snapshots exclude SSH host intent, and network access occurs only after explicit user confirmation, with no unauthenticated listener or background telemetry.",
   "objectives": [
     "Keep PTYs, processes, terminal state, and canonical layouts alive in a separate Rust service when the desktop exits or restarts",
     "Ship the same focused workspace, tab, split-pane, drag-rearrange, and keyboard-navigation experience on macOS and Linux",
@@ -182,7 +182,7 @@
   ],
   "roadmap": [
     "Finish responsive terminal fidelity and text correctness across supported scale factors and macOS/Linux runtime coverage",
-    "After a clean checkpoint, run parallel tracks for terminal interaction; session reliability and recovery; commands/navigation; and native system-OpenSSH panes",
+    "Continue hardening the now-integrated terminal interaction, session recovery, commands/navigation, and native system-OpenSSH tracks from their shared local checkpoint",
     "Treat agents as ordinary terminal workloads, then add a thin provider-neutral status and resume layer",
     "Later evaluate a privacy-focused isolated browser pane and richer optional agent workflows after the terminal and reliability core is mature"
   ],
@@ -191,10 +191,10 @@
     { "id": "task-02", "title": "Run the native GPU UI spike", "file": "tasks/task-02-cross-platform-ui-spike.html", "status": "done", "block_reason": null, "depends_on": ["task-01"] },
     { "id": "task-03", "title": "Build the Tokio service and local IPC foundation", "file": "tasks/task-03-service-and-ipc-foundation.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-01"] },
     { "id": "task-04", "title": "Implement persistent local Unix PTY sessions", "file": "tasks/task-04-persistent-pty-sessions.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-03"] },
-    { "id": "task-05", "title": "Implement secure SSH remote workspaces", "file": "tasks/task-05-remote-workspaces.html", "status": "not_started", "block_reason": null, "depends_on": ["task-03", "task-04"] },
+    { "id": "task-05", "title": "Implement secure SSH remote workspaces", "file": "tasks/task-05-remote-workspaces.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-03", "task-04"] },
     { "id": "task-06", "title": "Integrate terminal streaming and rendering", "file": "tasks/task-06-terminal-streaming-and-rendering.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-02", "task-04"] },
     { "id": "task-07", "title": "Build the workspace and pane experience", "file": "tasks/task-07-workspace-pane-experience.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-02", "task-03", "task-04", "task-06"] },
-    { "id": "task-08", "title": "Harden reliability and package macOS and Linux", "file": "tasks/task-08-reliability-and-packaging.html", "status": "not_started", "block_reason": null, "depends_on": ["task-04", "task-05", "task-06", "task-07"] }
+    { "id": "task-08", "title": "Harden reliability and package macOS and Linux", "file": "tasks/task-08-reliability-and-packaging.html", "status": "in_progress", "block_reason": null, "depends_on": ["task-04", "task-05", "task-06", "task-07"] }
   ]
 }
 </script>
