@@ -20,6 +20,7 @@ pub struct AppTheme {
     pub accent_soft: u32,
     pub selection: u32,
     pub cursor: u32,
+    pub focus_ring: u32,
     pub danger: u32,
     pub ansi: [u32; 16],
 }
@@ -30,24 +31,25 @@ impl AppTheme {
     /// editors, including Zed, without reusing any product palette or assets.
     pub const HARBOR_NIGHT: Self = Self {
         name: "Harbor Night",
-        window: 0x17191e,
-        sidebar: 0x181a1f,
-        terminal: 0x15171b,
-        surface: 0x1d2026,
-        elevated: 0x242832,
-        border: 0x2c313b,
-        border_strong: 0x3a414e,
-        foreground: 0xd9dce3,
-        muted: 0x9299a6,
-        dim: 0x626975,
-        accent: 0x58a9ff,
-        accent_soft: 0x253b55,
-        selection: 0x294563,
-        cursor: 0x70b7ff,
+        window: 0x14161b,
+        sidebar: 0x15171c,
+        terminal: 0x101217,
+        surface: 0x191c22,
+        elevated: 0x22262f,
+        border: 0x292e37,
+        border_strong: 0x3b424f,
+        foreground: 0xe2e5eb,
+        muted: 0x9aa2af,
+        dim: 0x68717f,
+        accent: 0x62adff,
+        accent_soft: 0x243b55,
+        selection: 0x294766,
+        cursor: 0x8bc7ff,
+        focus_ring: 0x4f9fea,
         danger: 0xef6b73,
         ansi: [
-            0x1d2026, 0xef6b73, 0x91c77b, 0xe2b96b, 0x68a6ed, 0xc58be2, 0x61c2c0, 0xcbd0d8,
-            0x69717f, 0xff838b, 0xa9dc90, 0xf3ce83, 0x82baff, 0xd7a2ef, 0x7bd7d3, 0xf2f4f7,
+            0x20242b, 0xef717a, 0x95cc7f, 0xe4bd72, 0x6faaf2, 0xc990e5, 0x67c8c6, 0xd2d7df,
+            0x6e7785, 0xff858d, 0xaddf95, 0xf4d087, 0x87bdff, 0xdaa6f0, 0x80d9d6, 0xf5f7fa,
         ],
     };
 
@@ -80,6 +82,19 @@ impl AppTheme {
             blend(color, self.terminal, 58)
         } else {
             color
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuiltInTheme {
+    HarborNight,
+}
+
+impl BuiltInTheme {
+    pub const fn theme(self) -> AppTheme {
+        match self {
+            Self::HarborNight => AppTheme::HARBOR_NIGHT,
         }
     }
 }
@@ -124,5 +139,10 @@ mod tests {
             ),
             0x0c2238
         );
+    }
+
+    #[test]
+    fn built_in_themes_are_named_and_selectable_without_session_state() {
+        assert_eq!(BuiltInTheme::HarborNight.theme().name, "Harbor Night");
     }
 }

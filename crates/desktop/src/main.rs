@@ -15,18 +15,21 @@ use gpui::{
     AnyElement, App, Application, Bounds, Context, CursorStyle, FocusHandle, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, StrikethroughStyle,
     StyledText, TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions,
-    actions, div, font, point, prelude::*, px, relative, rgb, rgba, size,
+    actions, div, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use rust_mux_desktop::request;
 use rust_mux_protocol::{
     ClientRequest, DropPlacement, Pane, PaneLayout, ServiceResponse, SessionSnapshot, SplitAxis,
-    TerminalAttributes, TerminalColor, TerminalLine, TerminalScreen, Workspace,
+    TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, TerminalScreen, Workspace,
 };
+use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 mod theme;
+mod typography;
 
-use theme::AppTheme;
+use theme::{AppTheme, BuiltInTheme};
+use typography::TerminalFontProfile;
 
 actions!(
     rust_mux,
@@ -45,10 +48,13 @@ actions!(
 const SIDEBAR_WIDTH: f32 = 190.0;
 const TITLEBAR_HEIGHT: f32 = 38.0;
 const PANE_HEADER_HEIGHT: f32 = 29.0;
-const TERMINAL_FONT_SIZE: f32 = 13.0;
-const TERMINAL_LINE_HEIGHT: f32 = 18.0;
-const TERMINAL_CELL_WIDTH: f32 = 7.83;
-const THEME: AppTheme = AppTheme::HARBOR_NIGHT;
+const SPLIT_DIVIDER_SIZE: f32 = 4.0;
+const TERMINAL_HORIZONTAL_PADDING: f32 = 18.0;
+const TERMINAL_VERTICAL_PADDING: f32 = 12.0;
+const TERMINAL_FOCUS_BORDER_WIDTH: f32 = 1.0;
+const MIN_PANE_WIDTH: f32 = 140.0;
+const MIN_PANE_HEIGHT: f32 = 90.0;
+const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 
 #[derive(Clone, Debug)]
 struct PaneDrag {
@@ -146,6 +152,14 @@ struct ResizeDrag {
     axis: SplitAxis,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PixelRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DragDestination {
     Split {
@@ -192,6 +206,7 @@ impl DragHoverState {
 #[derive(Debug)]
 struct RustMux {
     focus_handle: FocusHandle,
+    terminal_font: TerminalFontProfile,
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
     active_workspace: Option<Uuid>,
@@ -199,7 +214,7 @@ struct RustMux {
     split_ratios: HashMap<Uuid, f32>,
     resizing: Option<ResizeDrag>,
     last_sizes: HashMap<Uuid, (u16, u16)>,
-    viewport: (u16, u16),
+    workspace_pixels: (f32, f32),
     connection_error: Option<String>,
     tab_menu: Option<TabMenu>,
     rename_editor: Option<RenameEditor>,
@@ -212,8 +227,10 @@ impl RustMux {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
+        let terminal_font = TerminalFontProfile::resolve(cx.text_system());
         let mut app = Self {
             focus_handle,
+            terminal_font,
             snapshot: None,
             screens: HashMap::new(),
             active_workspace: None,
@@ -221,7 +238,7 @@ impl RustMux {
             split_ratios: HashMap::new(),
             resizing: None,
             last_sizes: HashMap::new(),
-            viewport: (100, 30),
+            workspace_pixels: (0.0, 0.0),
             connection_error: None,
             tab_menu: None,
             rename_editor: None,
@@ -229,7 +246,16 @@ impl RustMux {
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
         };
+        app.update_window_geometry(window);
         app.refresh_state();
+
+        cx.observe_window_bounds(window, |this, window, cx| {
+            if this.update_window_geometry(window) {
+                this.sync_pty_sizes();
+                cx.notify();
+            }
+        })
+        .detach();
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -603,21 +629,52 @@ impl RustMux {
 
     fn handle_resize(&mut self, event: &MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
         let Some(drag) = self.resizing else { return };
-        let width = f32::from(window.bounds().size.width).max(SIDEBAR_WIDTH + 100.0);
-        let height = f32::from(window.bounds().size.height).max(TITLEBAR_HEIGHT + 100.0);
-        let ratio = match drag.axis {
-            SplitAxis::Horizontal => {
-                (f32::from(event.position.x) - SIDEBAR_WIDTH) / (width - SIDEBAR_WIDTH)
-            }
-            SplitAxis::Vertical => {
-                (f32::from(event.position.y) - TITLEBAR_HEIGHT) / (height - TITLEBAR_HEIGHT)
-            }
+        self.update_window_geometry(window);
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
         };
-        self.split_ratios
-            .insert(drag.split_key, ratio.clamp(0.18, 0.82));
+        let Some(layout) = self
+            .active_workspace_in(snapshot)
+            .and_then(|workspace| workspace.tabs.first())
+            .map(|tab| &tab.layout)
+        else {
+            return;
+        };
+        let root = PixelRect {
+            x: 0.0,
+            y: 0.0,
+            width: self.workspace_pixels.0,
+            height: self.workspace_pixels.1,
+        };
+        let Some(split) = find_split_rect(layout, drag.split_key, root, &self.split_ratios) else {
+            return;
+        };
+        let workspace_x = f32::from(event.position.x) - SIDEBAR_WIDTH;
+        let workspace_y = f32::from(event.position.y) - TITLEBAR_HEIGHT;
+        let ratio = match drag.axis {
+            SplitAxis::Horizontal => (workspace_x - split.x) / split.width.max(1.0),
+            SplitAxis::Vertical => (workspace_y - split.y) / split.height.max(1.0),
+        };
+        self.split_ratios.insert(
+            drag.split_key,
+            effective_split_ratio(drag.axis, split.width, split.height, ratio),
+        );
         self.last_sizes.clear();
         self.sync_pty_sizes();
         cx.notify();
+    }
+
+    fn update_window_geometry(&mut self, window: &Window) -> bool {
+        let next = workspace_pixel_size(
+            f32::from(window.bounds().size.width),
+            f32::from(window.bounds().size.height),
+        );
+        if self.workspace_pixels == next {
+            return false;
+        }
+        self.workspace_pixels = next;
+        self.last_sizes.clear();
+        true
     }
 
     fn sync_pty_sizes(&mut self) {
@@ -631,10 +688,11 @@ impl RustMux {
             return;
         };
         let mut sizes = Vec::new();
-        collect_sizes(
+        collect_pane_sizes(
             &tab.layout,
-            self.viewport.0,
-            self.viewport.1,
+            self.workspace_pixels.0,
+            self.workspace_pixels.1,
+            self.terminal_font.metrics,
             &self.split_ratios,
             &mut sizes,
         );
@@ -642,14 +700,20 @@ impl RustMux {
             if self.last_sizes.get(&pane_id) == Some(&(columns, rows)) {
                 continue;
             }
-            if request(ClientRequest::ResizePane {
+            match request(ClientRequest::ResizePane {
                 pane_id,
                 columns,
                 rows,
-            })
-            .is_ok()
-            {
-                self.last_sizes.insert(pane_id, (columns, rows));
+            }) {
+                Ok(ServiceResponse::Ack) => {
+                    self.last_sizes.insert(pane_id, (columns, rows));
+                }
+                Ok(response) => {
+                    self.connection_error = Some(format!(
+                        "unexpected resize response for {pane_id}: {response:?}"
+                    ));
+                }
+                Err(error) => self.connection_error = Some(format!("{error:#}")),
             }
         }
     }
@@ -832,119 +896,138 @@ impl RustMux {
                 this.move_pane_to_tab(info.pane_id, active, cx);
                 cx.stop_propagation();
             }))
-            .children(panes.into_iter().map(|pane| {
-                let pane_id = pane.id;
-                let selected = pane_id == active;
-                let close_tooltip = format!("Close {}…", pane.title);
-                let drag = PaneDrag {
-                    pane_id,
-                    title: pane.title.clone(),
-                    position: Point::default(),
-                };
+            .child(
                 div()
-                    .id(("pane-tab", element_key(pane_id)))
+                    .min_w(px(0.0))
                     .h_full()
-                    .max_w(px(220.0))
-                    .pl(px(8.0))
-                    .pr(px(4.0))
-                    .cursor_pointer()
+                    .flex_1()
+                    .overflow_hidden()
                     .flex()
-                    .items_center()
-                    .gap(px(7.0))
-                    .border_t(if selected { px(2.0) } else { px(0.0) })
-                    .border_color(rgb(THEME.accent))
-                    .border_r_1()
-                    .border_color(rgb(THEME.border))
-                    .when(selected, |element| element.bg(rgb(THEME.selection)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.activate_tab(pane_id, cx)))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.open_tab_menu(pane_id, event.position, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_drag(drag, |info: &PaneDrag, position, _, cx| {
-                        cx.new(|_| PaneDrag {
-                            position,
-                            ..info.clone()
-                        })
-                    })
-                    .child(
+                    .children(panes.into_iter().map(|pane| {
+                        let pane_id = pane.id;
+                        let selected = pane_id == active;
+                        let close_tooltip = format!("Close {}…", pane.title);
+                        let drag = PaneDrag {
+                            pane_id,
+                            title: pane.title.clone(),
+                            position: Point::default(),
+                        };
                         div()
-                            .w(px(8.0))
-                            .h(px(8.0))
-                            .rounded(px(2.0))
-                            .border_1()
-                            .border_color(if selected {
-                                rgb(THEME.accent)
-                            } else {
-                                rgb(THEME.muted)
-                            }),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.0))
+                            .id(("pane-tab", element_key(pane_id)))
+                            .h_full()
+                            .min_w(px(54.0))
+                            .max_w(px(220.0))
+                            .flex_shrink()
                             .overflow_hidden()
-                            .font_family(".SystemUIFont")
-                            .text_xs()
-                            .font_weight(if selected {
-                                gpui::FontWeight::MEDIUM
-                            } else {
-                                gpui::FontWeight::NORMAL
-                            })
-                            .text_color(if selected {
-                                rgb(THEME.foreground)
-                            } else {
-                                rgb(THEME.muted)
-                            })
-                            .child(pane.title),
-                    )
-                    .child(
-                        div()
-                            .font_family("SF Mono")
-                            .text_size(px(9.5))
-                            .text_color(rgb(THEME.dim))
-                            .child(pane.shell),
-                    )
-                    .child(
-                        div()
-                            .id(("close-tab", element_key(pane_id)))
-                            .ml(px(1.0))
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .rounded(px(4.0))
+                            .pl(px(8.0))
+                            .pr(px(4.0))
                             .cursor_pointer()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .line_height(px(14.0))
-                            .text_color(rgb(THEME.dim))
-                            .hover(|element| {
-                                element
-                                    .bg(rgb(THEME.elevated))
-                                    .text_color(rgb(THEME.foreground))
-                            })
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: close_tooltip.clone(),
-                                })
-                                .into()
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                            .gap(px(7.0))
+                            .border_t(if selected { px(2.0) } else { px(0.0) })
+                            .border_color(rgb(THEME.accent))
+                            .border_r_1()
+                            .border_color(rgb(THEME.border))
+                            .when(selected, |element| element.bg(rgb(THEME.selection)))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.activate_tab(pane_id, cx)),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.begin_close(pane_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child("×"),
-                    )
-            }))
-            .child(div().flex_1())
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.open_tab_menu(pane_id, event.position, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_drag(drag, |info: &PaneDrag, position, _, cx| {
+                                cx.new(|_| PaneDrag {
+                                    position,
+                                    ..info.clone()
+                                })
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(8.0))
+                                    .h(px(8.0))
+                                    .rounded(px(2.0))
+                                    .border_1()
+                                    .border_color(if selected {
+                                        rgb(THEME.accent)
+                                    } else {
+                                        rgb(THEME.muted)
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex_1()
+                                    .truncate()
+                                    .font_family(".SystemUIFont")
+                                    .text_xs()
+                                    .font_weight(if selected {
+                                        gpui::FontWeight::MEDIUM
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(if selected {
+                                        rgb(THEME.foreground)
+                                    } else {
+                                        rgb(THEME.muted)
+                                    })
+                                    .child(pane.title),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex_shrink()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .font_family("SF Mono")
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(THEME.dim))
+                                    .child(pane.shell),
+                            )
+                            .child(
+                                div()
+                                    .id(("close-tab", element_key(pane_id)))
+                                    .ml(px(1.0))
+                                    .flex_none()
+                                    .w(px(18.0))
+                                    .h(px(18.0))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .font_family(".SystemUIFont")
+                                    .text_sm()
+                                    .line_height(px(14.0))
+                                    .text_color(rgb(THEME.dim))
+                                    .hover(|element| {
+                                        element
+                                            .bg(rgb(THEME.elevated))
+                                            .text_color(rgb(THEME.foreground))
+                                    })
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: close_tooltip.clone(),
+                                        })
+                                        .into()
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.begin_close(pane_id, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("×"),
+                            )
+                    })),
+            )
             .child(self.pane_control(
                 active,
                 "new-tab",
@@ -983,6 +1066,7 @@ impl RustMux {
     ) -> AnyElement {
         div()
             .id((id, element_key(pane_id)))
+            .flex_none()
             .w(px(27.0))
             .h_full()
             .cursor_pointer()
@@ -1095,11 +1179,15 @@ impl RustMux {
                     .flex_1()
                     .px(px(9.0))
                     .py(px(6.0))
-                    .border_l(if focused { px(2.0) } else { px(0.0) })
-                    .border_color(rgb(THEME.accent))
-                    .font_family("SF Mono")
-                    .text_size(px(TERMINAL_FONT_SIZE))
-                    .line_height(px(TERMINAL_LINE_HEIGHT))
+                    .border_l_1()
+                    .border_color(if focused {
+                        rgb(THEME.focus_ring)
+                    } else {
+                        rgb(THEME.terminal)
+                    })
+                    .font(self.terminal_font.font(false, false))
+                    .text_size(px(self.terminal_font.metrics.font_size))
+                    .line_height(px(self.terminal_font.metrics.line_height))
                     .text_color(rgb(THEME.foreground))
                     .children(screen.clone().into_iter().flat_map(|screen| {
                         let cursor = screen.cursor;
@@ -1125,74 +1213,110 @@ impl RustMux {
         cursor: Option<rust_mux_protocol::TerminalCursor>,
         focused: bool,
     ) -> AnyElement {
-        let mut text = String::new();
-        let mut runs = Vec::new();
-        for style in line.runs {
-            let bold = style.attributes.contains(TerminalAttributes::BOLD);
-            let dim = style.attributes.contains(TerminalAttributes::DIM);
-            let italic = style.attributes.contains(TerminalAttributes::ITALIC);
-            let underline = style.attributes.contains(TerminalAttributes::UNDERLINE);
-            let strikethrough = style.attributes.contains(TerminalAttributes::STRIKETHROUGH);
-            let foreground = THEME.terminal_color(style.foreground, bold, dim);
-            let background = THEME.terminal_color(style.background, false, false);
-            let mut run_font = font("SF Mono");
-            if bold {
-                run_font = run_font.bold();
-            }
-            if italic {
-                run_font = run_font.italic();
-            }
-            let len = style.text.len();
-            text.push_str(&style.text);
-            runs.push(TextRun {
-                len,
-                font: run_font,
-                color: rgb(foreground).into(),
-                background_color: (style.background != TerminalColor::DefaultBackground)
-                    .then(|| rgb(background).into()),
-                underline: underline.then_some(UnderlineStyle {
-                    thickness: px(1.0),
-                    color: Some(rgb(foreground).into()),
-                    wavy: false,
-                }),
-                strikethrough: strikethrough.then_some(StrikethroughStyle {
-                    thickness: px(1.0),
-                    color: Some(rgb(foreground).into()),
-                }),
-            });
-        }
-        if text.is_empty() {
-            text.push(' ');
-            runs.push(TextRun {
-                len: 1,
-                font: font("SF Mono"),
-                color: rgb(THEME.foreground).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-        }
+        let mut start_column = 0_u16;
+        let styled_runs = line
+            .runs
+            .into_iter()
+            .map(|mut style| {
+                let columns = terminal_run_columns(&style, start_column);
+                if style.text.contains('\t') {
+                    style.text = terminal_run_display_text(&style, start_column);
+                }
+                let element = self.render_terminal_run(style, start_column, columns);
+                start_column = start_column.saturating_add(columns);
+                element
+            })
+            .collect::<Vec<_>>();
         let cursor_column = cursor
-            .filter(|cursor| focused && usize::from(cursor.row) == row)
+            .filter(|cursor| usize::from(cursor.row) == row)
             .map(|cursor| cursor.column);
+        let metrics = self.terminal_font.metrics;
         div()
             .relative()
-            .h(px(TERMINAL_LINE_HEIGHT))
+            .h(px(metrics.line_height))
             .flex_none()
             .overflow_hidden()
-            .child(StyledText::new(text).with_runs(runs))
+            .children(styled_runs)
             .when_some(cursor_column, |element, column| {
+                let cursor = metrics.span(column, 1);
                 element.child(
                     div()
                         .absolute()
-                        .left(px(f32::from(column) * TERMINAL_CELL_WIDTH))
-                        .top(px(1.0))
-                        .w(px(TERMINAL_CELL_WIDTH))
-                        .h(px(TERMINAL_LINE_HEIGHT - 2.0))
+                        .left(px(cursor.x))
+                        .top(px(0.0))
+                        .w(px(cursor.width))
+                        .h(px(cursor.height))
                         .rounded(px(1.0))
-                        .bg(rgba((THEME.cursor << 8) | 0x88)),
+                        .border_1()
+                        .border_color(if focused {
+                            rgb(THEME.cursor)
+                        } else {
+                            rgb(THEME.muted)
+                        })
+                        .when(focused, |cursor| {
+                            cursor.bg(rgba((THEME.cursor << 8) | 0x30))
+                        }),
                 )
             })
+            .into_any_element()
+    }
+
+    fn render_terminal_run(
+        &self,
+        style: TerminalRun,
+        start_column: u16,
+        columns: u16,
+    ) -> AnyElement {
+        let bold = style.attributes.contains(TerminalAttributes::BOLD);
+        let dim = style.attributes.contains(TerminalAttributes::DIM);
+        let italic = style.attributes.contains(TerminalAttributes::ITALIC);
+        let underline = style.attributes.contains(TerminalAttributes::UNDERLINE);
+        let strikethrough = style.attributes.contains(TerminalAttributes::STRIKETHROUGH);
+        let foreground = THEME.terminal_color(style.foreground, bold, dim);
+        let background = THEME.terminal_color(style.background, false, false);
+        let metrics = self.terminal_font.metrics;
+        let span = metrics.span(start_column, columns);
+        let glyph_top = (metrics.baseline - metrics.ascent).max(0.0);
+        let glyph_height = metrics.ascent + metrics.descent;
+        let text_len = style.text.len();
+        div()
+            .absolute()
+            .left(px(span.x))
+            .top(px(0.0))
+            .w(px(span.width))
+            .h(px(span.height))
+            .overflow_hidden()
+            .when(
+                style.background != TerminalColor::DefaultBackground,
+                |element| element.bg(rgb(background)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(glyph_top))
+                    .w_full()
+                    .h(px(glyph_height))
+                    .whitespace_nowrap()
+                    .font(self.terminal_font.font(bold, italic))
+                    .text_size(px(metrics.font_size))
+                    .line_height(px(glyph_height))
+                    .child(StyledText::new(style.text).with_runs(vec![TextRun {
+                        len: text_len,
+                        font: self.terminal_font.font(bold, italic),
+                        color: rgb(foreground).into(),
+                        background_color: None,
+                        underline: underline.then_some(UnderlineStyle {
+                            thickness: px(1.0),
+                            color: Some(rgb(foreground).into()),
+                            wavy: false,
+                        }),
+                        strikethrough: strikethrough.then_some(StrikethroughStyle {
+                            thickness: px(1.0),
+                            color: Some(rgb(foreground).into()),
+                        }),
+                    }])),
+            )
             .into_any_element()
     }
 
@@ -1506,7 +1630,13 @@ impl RustMux {
             .into_any_element()
     }
 
-    fn render_layout(&self, layout: PaneLayout, cx: &mut Context<Self>) -> AnyElement {
+    fn render_layout(
+        &self,
+        layout: PaneLayout,
+        width: f32,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match layout {
             PaneLayout::Leaf { pane } => {
                 let active = pane.id;
@@ -1520,8 +1650,15 @@ impl RustMux {
                 second,
             } => {
                 let split_key = first_visible_pane(&first);
-                let ratio = self.split_ratios.get(&split_key).copied().unwrap_or(ratio);
+                let ratio = effective_split_ratio(
+                    axis,
+                    width,
+                    height,
+                    self.split_ratios.get(&split_key).copied().unwrap_or(ratio),
+                );
                 let vertical = axis == SplitAxis::Vertical;
+                let (first_width, first_height, second_width, second_height) =
+                    split_child_dimensions(axis, width, height, ratio);
                 div()
                     .size_full()
                     .min_w(px(0.0))
@@ -1534,7 +1671,7 @@ impl RustMux {
                             .min_h(px(0.0))
                             .when(vertical, |element| element.h(relative(ratio)).w_full())
                             .when(!vertical, |element| element.w(relative(ratio)).h_full())
-                            .child(self.render_layout(*first, cx)),
+                            .child(self.render_layout(*first, first_width, first_height, cx)),
                     )
                     .child(self.render_divider(split_key, axis, cx))
                     .child(
@@ -1542,7 +1679,7 @@ impl RustMux {
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .flex_1()
-                            .child(self.render_layout(*second, cx)),
+                            .child(self.render_layout(*second, second_width, second_height, cx)),
                     )
                     .into_any_element()
             }
@@ -1638,12 +1775,17 @@ impl RustMux {
                             .font_family("SF Mono")
                             .text_xs()
                             .text_color(rgb(THEME.dim))
-                            .child(format!("{}  ·  ⌘T tab   ⌘D split   ⇧⌘D down", THEME.name)),
+                            .child(format!(
+                                "{} · {}  ·  ⌘T tab   ⌘D split   ⇧⌘D down",
+                                THEME.name, self.terminal_font.family
+                            )),
                     ),
             )
             .child(div().min_h(px(0.0)).flex_1().child(layout.map_or_else(
                 || div().size_full().bg(rgb(THEME.terminal)).into_any_element(),
-                |layout| self.render_layout(layout, cx),
+                |layout| {
+                    self.render_layout(layout, self.workspace_pixels.0, self.workspace_pixels.1, cx)
+                },
             )))
             .into_any_element()
     }
@@ -1651,12 +1793,7 @@ impl RustMux {
 
 impl Render for RustMux {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let width = (f32::from(window.bounds().size.width) - SIDEBAR_WIDTH).max(160.0);
-        let height = (f32::from(window.bounds().size.height) - TITLEBAR_HEIGHT).max(100.0);
-        self.viewport = (
-            ((width / 7.6).floor() as u16).clamp(20, 300),
-            ((height / 16.0).floor() as u16).clamp(5, 120),
-        );
+        self.update_window_geometry(window);
 
         div()
             .key_context("RustMux")
@@ -1774,6 +1911,58 @@ fn split_placement_at(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Option
     }
 }
 
+fn terminal_run_columns(run: &TerminalRun, start_column: u16) -> u16 {
+    if run.columns == 0 {
+        legacy_text_columns(&run.text, start_column)
+    } else {
+        run.columns
+    }
+}
+
+fn legacy_text_columns(text: &str, start_column: u16) -> u16 {
+    const TAB_WIDTH: u16 = 8;
+    let mut column = start_column;
+    for character in text.chars() {
+        if character == '\t' {
+            let remainder = column % TAB_WIDTH;
+            column = column.saturating_add(TAB_WIDTH - remainder);
+        } else {
+            let width = u16::try_from(character.width().unwrap_or(0)).unwrap_or(u16::MAX);
+            column = column.saturating_add(width);
+        }
+    }
+    column.saturating_sub(start_column)
+}
+
+fn expand_terminal_tabs(text: &str, start_column: u16) -> String {
+    const TAB_WIDTH: u16 = 8;
+    let mut column = start_column;
+    let mut expanded = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '\t' {
+            let spaces = TAB_WIDTH - (column % TAB_WIDTH);
+            expanded.extend(std::iter::repeat_n(' ', usize::from(spaces)));
+            column = column.saturating_add(spaces);
+        } else {
+            expanded.push(character);
+            let width = u16::try_from(character.width().unwrap_or(0)).unwrap_or(u16::MAX);
+            column = column.saturating_add(width);
+        }
+    }
+    expanded
+}
+
+fn terminal_run_display_text(run: &TerminalRun, start_column: u16) -> String {
+    if run.columns == 0 {
+        expand_terminal_tabs(&run.text, start_column)
+    } else {
+        // The terminal model already represents every occupied grid cell,
+        // including the cells skipped by a tab. Render its tab cell as one
+        // blank cell instead of asking GPUI to apply proportional tab stops.
+        run.text.replace('\t', " ")
+    }
+}
+
 fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
     match layout {
         PaneLayout::Leaf { pane } if pane.id == pane_id => Some(pane),
@@ -1793,19 +1982,117 @@ fn first_visible_pane(layout: &PaneLayout) -> Uuid {
     }
 }
 
-fn collect_sizes(
+fn workspace_pixel_size(window_width: f32, window_height: f32) -> (f32, f32) {
+    (
+        (window_width - SIDEBAR_WIDTH).max(1.0),
+        (window_height - TITLEBAR_HEIGHT).max(1.0),
+    )
+}
+
+fn effective_split_ratio(axis: SplitAxis, width: f32, height: f32, ratio: f32) -> f32 {
+    let extent = match axis {
+        SplitAxis::Horizontal => width,
+        SplitAxis::Vertical => height,
+    }
+    .max(1.0);
+    let minimum = match axis {
+        SplitAxis::Horizontal => MIN_PANE_WIDTH,
+        SplitAxis::Vertical => MIN_PANE_HEIGHT,
+    };
+    if extent < minimum * 2.0 + SPLIT_DIVIDER_SIZE {
+        return 0.5;
+    }
+    let low = minimum / extent;
+    let high = (extent - SPLIT_DIVIDER_SIZE - minimum) / extent;
+    ratio.clamp(low, high)
+}
+
+fn split_child_dimensions(
+    axis: SplitAxis,
+    width: f32,
+    height: f32,
+    ratio: f32,
+) -> (f32, f32, f32, f32) {
+    match axis {
+        SplitAxis::Horizontal => {
+            let first_width = (width * ratio).floor().max(1.0);
+            let second_width = (width - first_width - SPLIT_DIVIDER_SIZE).max(1.0);
+            (first_width, height, second_width, height)
+        }
+        SplitAxis::Vertical => {
+            let first_height = (height * ratio).floor().max(1.0);
+            let second_height = (height - first_height - SPLIT_DIVIDER_SIZE).max(1.0);
+            (width, first_height, width, second_height)
+        }
+    }
+}
+
+fn find_split_rect(
     layout: &PaneLayout,
-    columns: u16,
-    rows: u16,
+    target_split_key: Uuid,
+    rect: PixelRect,
+    ratios: &HashMap<Uuid, f32>,
+) -> Option<PixelRect> {
+    let PaneLayout::Split {
+        axis,
+        ratio,
+        first,
+        second,
+    } = layout
+    else {
+        return None;
+    };
+    let split_key = first_visible_pane(first);
+    if split_key == target_split_key {
+        return Some(rect);
+    }
+    let ratio = effective_split_ratio(
+        *axis,
+        rect.width,
+        rect.height,
+        ratios.get(&split_key).copied().unwrap_or(*ratio),
+    );
+    let (first_width, first_height, second_width, second_height) =
+        split_child_dimensions(*axis, rect.width, rect.height, ratio);
+    let first_rect = PixelRect {
+        width: first_width,
+        height: first_height,
+        ..rect
+    };
+    let second_rect = match axis {
+        SplitAxis::Horizontal => PixelRect {
+            x: rect.x + first_width + SPLIT_DIVIDER_SIZE,
+            y: rect.y,
+            width: second_width,
+            height: second_height,
+        },
+        SplitAxis::Vertical => PixelRect {
+            x: rect.x,
+            y: rect.y + first_height + SPLIT_DIVIDER_SIZE,
+            width: second_width,
+            height: second_height,
+        },
+    };
+    find_split_rect(first, target_split_key, first_rect, ratios)
+        .or_else(|| find_split_rect(second, target_split_key, second_rect, ratios))
+}
+
+fn collect_pane_sizes(
+    layout: &PaneLayout,
+    width: f32,
+    height: f32,
+    metrics: typography::TerminalCellMetrics,
     ratios: &HashMap<Uuid, f32>,
     output: &mut Vec<(Uuid, u16, u16)>,
 ) {
     match layout {
         PaneLayout::Leaf { pane } => {
-            output.push((pane.id, columns.max(20), rows.saturating_sub(2).max(5)));
+            let (columns, rows) = terminal_grid_for_pane(width, height, metrics);
+            output.push((pane.id, columns, rows));
         }
         PaneLayout::Stack { active, .. } => {
-            output.push((*active, columns.max(20), rows.saturating_sub(2).max(5)));
+            let (columns, rows) = terminal_grid_for_pane(width, height, metrics);
+            output.push((*active, columns, rows));
         }
         PaneLayout::Split {
             axis,
@@ -1813,37 +2100,35 @@ fn collect_sizes(
             first,
             second,
         } => {
-            let ratio = ratios
-                .get(&first_visible_pane(first))
-                .copied()
-                .unwrap_or(*ratio)
-                .clamp(0.18, 0.82);
-            match axis {
-                SplitAxis::Horizontal => {
-                    let first_columns = (f32::from(columns) * ratio).floor() as u16;
-                    collect_sizes(first, first_columns, rows, ratios, output);
-                    collect_sizes(
-                        second,
-                        columns.saturating_sub(first_columns),
-                        rows,
-                        ratios,
-                        output,
-                    );
-                }
-                SplitAxis::Vertical => {
-                    let first_rows = (f32::from(rows) * ratio).floor() as u16;
-                    collect_sizes(first, columns, first_rows, ratios, output);
-                    collect_sizes(
-                        second,
-                        columns,
-                        rows.saturating_sub(first_rows),
-                        ratios,
-                        output,
-                    );
-                }
-            }
+            let ratio = effective_split_ratio(
+                *axis,
+                width,
+                height,
+                ratios
+                    .get(&first_visible_pane(first))
+                    .copied()
+                    .unwrap_or(*ratio),
+            );
+            let (first_width, first_height, second_width, second_height) =
+                split_child_dimensions(*axis, width, height, ratio);
+            collect_pane_sizes(first, first_width, first_height, metrics, ratios, output);
+            collect_pane_sizes(second, second_width, second_height, metrics, ratios, output);
         }
     }
+}
+
+fn terminal_grid_for_pane(
+    pane_width: f32,
+    pane_height: f32,
+    metrics: typography::TerminalCellMetrics,
+) -> (u16, u16) {
+    let content_width =
+        (pane_width - TERMINAL_HORIZONTAL_PADDING - TERMINAL_FOCUS_BORDER_WIDTH).max(1.0);
+    let content_height = (pane_height - PANE_HEADER_HEIGHT - TERMINAL_VERTICAL_PADDING).max(1.0);
+    (
+        metrics.columns_for_width(content_width),
+        metrics.rows_for_height(content_height),
+    )
 }
 
 fn element_key(id: Uuid) -> u64 {
@@ -1957,5 +2242,164 @@ mod tests {
             Some(DropPlacement::Bottom)
         );
         assert_eq!(split_placement_at(point(px(101.0), px(50.0)), bounds), None);
+    }
+
+    #[test]
+    fn multi_column_terminal_rows_keep_spaces_and_wide_cells_on_one_grid() {
+        let listing = TerminalRun {
+            text: "Applications                         Music                 Work".to_owned(),
+            columns: 0,
+            foreground: TerminalColor::DefaultForeground,
+            background: TerminalColor::DefaultBackground,
+            attributes: TerminalAttributes::default(),
+        };
+        assert_eq!(
+            terminal_run_columns(&listing, 0),
+            u16::try_from(listing.text.chars().count()).unwrap()
+        );
+
+        let wide = TerminalRun {
+            text: "A界B".to_owned(),
+            columns: 4,
+            foreground: TerminalColor::DefaultForeground,
+            background: TerminalColor::DefaultBackground,
+            attributes: TerminalAttributes::default(),
+        };
+        assert_eq!(terminal_run_columns(&wide, 0), 4);
+
+        let combining = TerminalRun {
+            text: "e\u{301}".to_owned(),
+            columns: 1,
+            foreground: TerminalColor::DefaultForeground,
+            background: TerminalColor::DefaultBackground,
+            attributes: TerminalAttributes::default(),
+        };
+        assert_eq!(terminal_run_columns(&combining, 0), 1);
+
+        let tabbed = TerminalRun {
+            text: "Applications\tMusic\tWork".to_owned(),
+            columns: 0,
+            foreground: TerminalColor::DefaultForeground,
+            background: TerminalColor::DefaultBackground,
+            attributes: TerminalAttributes::default(),
+        };
+        assert_eq!(terminal_run_columns(&tabbed, 0), 28);
+        assert_eq!(legacy_text_columns("\tWork", 32), 12);
+        assert_eq!(
+            expand_terminal_tabs(&tabbed.text, 0),
+            "Applications    Music   Work"
+        );
+        assert!(!expand_terminal_tabs(&tabbed.text, 0).contains('\t'));
+
+        let modeled_cells = TerminalRun {
+            text: "A\t  B".to_owned(),
+            columns: 5,
+            ..tabbed
+        };
+        assert_eq!(terminal_run_display_text(&modeled_cells, 0), "A   B");
+        assert_eq!(terminal_run_columns(&modeled_cells, 0), 5);
+    }
+
+    #[test]
+    fn pane_geometry_tracks_narrow_medium_and_wide_windows_without_fixed_columns() {
+        let pane = Pane {
+            id: Uuid::from_u128(10),
+            title: "Terminal 1".to_owned(),
+            shell: "zsh".to_owned(),
+        };
+        let layout = PaneLayout::Leaf { pane };
+        let metrics = typography::TerminalCellMetrics {
+            font_size: 13.5,
+            cell_width: 8.0,
+            ascent: 10.0,
+            descent: 3.0,
+            baseline: 13.0,
+            line_height: 19.0,
+        };
+        let ratios = HashMap::new();
+
+        let dimensions = [(720.0, 460.0), (1280.0, 820.0), (1800.0, 1000.0)]
+            .into_iter()
+            .map(|(window_width, window_height)| {
+                let workspace = workspace_pixel_size(window_width, window_height);
+                let mut sizes = Vec::new();
+                collect_pane_sizes(
+                    &layout,
+                    workspace.0,
+                    workspace.1,
+                    metrics,
+                    &ratios,
+                    &mut sizes,
+                );
+                sizes[0]
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(dimensions[0], (Uuid::from_u128(10), 63, 20));
+        assert_eq!(dimensions[1], (Uuid::from_u128(10), 133, 39));
+        assert_eq!(dimensions[2], (Uuid::from_u128(10), 198, 48));
+        assert!(
+            dimensions
+                .windows(2)
+                .all(|pair| { pair[0].1 < pair[1].1 && pair[0].2 < pair[1].2 })
+        );
+    }
+
+    #[test]
+    fn split_geometry_accounts_for_the_divider_and_each_panes_chrome() {
+        let first = Pane {
+            id: Uuid::from_u128(21),
+            title: "Terminal 1".to_owned(),
+            shell: "zsh".to_owned(),
+        };
+        let second = Pane {
+            id: Uuid::from_u128(22),
+            title: "Terminal 2".to_owned(),
+            shell: "zsh".to_owned(),
+        };
+        let layout = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneLayout::Leaf {
+                pane: first.clone(),
+            }),
+            second: Box::new(PaneLayout::Leaf { pane: second }),
+        };
+        let metrics = typography::TerminalCellMetrics {
+            font_size: 13.5,
+            cell_width: 8.0,
+            ascent: 10.0,
+            descent: 3.0,
+            baseline: 13.0,
+            line_height: 19.0,
+        };
+        let workspace = workspace_pixel_size(1280.0, 820.0);
+        let mut sizes = Vec::new();
+        collect_pane_sizes(
+            &layout,
+            workspace.0,
+            workspace.1,
+            metrics,
+            &HashMap::new(),
+            &mut sizes,
+        );
+
+        assert_eq!(
+            sizes,
+            vec![(first.id, 65, 39), (Uuid::from_u128(22), 65, 39)]
+        );
+        let used_pixel_width = 545.0 + SPLIT_DIVIDER_SIZE + 541.0;
+        assert!((used_pixel_width - workspace.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn split_ratio_respects_practical_pane_constraints_at_each_window_size() {
+        let narrow = effective_split_ratio(SplitAxis::Horizontal, 530.0, 422.0, 0.05);
+        let wide = effective_split_ratio(SplitAxis::Horizontal, 1610.0, 962.0, 0.05);
+        assert!((narrow - (MIN_PANE_WIDTH / 530.0)).abs() < 0.0001);
+        assert!((wide - (MIN_PANE_WIDTH / 1610.0)).abs() < 0.0001);
+
+        let too_short = effective_split_ratio(SplitAxis::Vertical, 530.0, 150.0, 0.9);
+        assert!((too_short - 0.5).abs() < 0.0001);
     }
 }

@@ -4461,6 +4461,7 @@ dependencies = [
  "gpui",
  "rust-mux-protocol",
  "rust-mux-terminal-model",
+ "unicode-width",
  "uuid",
 ]
 

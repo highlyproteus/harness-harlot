@@ -121,8 +121,8 @@ impl PtySession {
     }
 
     fn resize(&self, columns: u16, rows: u16) -> Result<()> {
-        let columns = columns.clamp(20, 300);
-        let rows = rows.clamp(5, 120);
+        let columns = columns.max(1);
+        let rows = rows.max(1);
         self.master
             .lock()
             .map_err(|_| anyhow!("PTY master lock was poisoned"))?
@@ -1068,6 +1068,21 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         assert!(registry.pane_process_id(pane_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn resize_propagates_the_exact_requested_grid_to_the_terminal_model() {
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+
+        registry.resize_pane(pane_id, 13, 3).unwrap();
+
+        let (_, screens) = registry.state().unwrap();
+        let screen = screens
+            .iter()
+            .find(|screen| screen.pane_id == pane_id)
+            .unwrap();
+        assert_eq!((screen.columns, screen.rows), (13, 3));
     }
 
     #[test]

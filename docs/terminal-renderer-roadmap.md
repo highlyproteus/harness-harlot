@@ -6,7 +6,7 @@ Rust Mux will remain an all-Rust application. The daemon continues to own PTYs a
 
 This is an architecture boundary, not a judgment about Ghostty's quality. Embedding libghostty would add a Zig/C ABI build and lifecycle boundary, couple the GPUI surface to an evolving library API, and split terminal behavior across two engines while the daemon still needs a serializable canonical grid. That change is too large for a typography fix and would weaken the current Rust ownership and restart-isolation model.
 
-## Current diagnosis
+## Pre-R1 diagnosis
 
 The PTY and terminal model are not the likely source of the visible text problem. The service already parses real output with `alacritty_terminal` and transmits styled visible runs. The weak link is the first-pass GPUI projection:
 
@@ -17,6 +17,16 @@ The PTY and terminal model are not the likely source of the visible text problem
 - it flattens terminal cells into text runs, so cell occupancy, fallback glyph width, selection, and background painting are not yet authoritative.
 
 GPUI already provides OS font discovery, font resolution, shaping, platform rasterization, subpixel variants, and a GPU sprite atlas. On Linux its text system uses `cosmic-text`; on macOS it uses the native platform text system. Rust Mux should use this existing GPUI path before adding a second rasterizer or atlas.
+
+## R1 implementation checkpoint
+
+The first typography slice now resolves an installed macOS/Linux monospace family through GPUI, installs explicit monospace and symbol/emoji fallbacks, and disables contextual ligatures for stable terminal cells. Measured advance, ascent, descent, baseline, and line height drive glyph placement, fixed cell spans, ANSI backgrounds, cursor geometry, and PTY viewport sizing. The Alacritty adapter now preserves each styled run's authoritative cell count, including wide-character spacer cells, while protocol-v4 clients retain a text-length fallback for older daemon snapshots.
+
+Terminal rows use explicit no-wrap shaping. This is required because ordinary UI whitespace behavior can wrap long `ls`-style space-padded rows inside their exact cell span and then clip the wrapped fragments. Tab normalization distinguishes two protocol-v4 cases: an older daemon run without authoritative cell counts expands tabs at eight-column terminal stops, while a current terminal-model run replaces each tab glyph with one blank cell because Alacritty has already populated the intervening grid cells. Applying tab stops a second time reproduced the clipped tail of wide `ls` listings. Unicode display width remains the legacy fallback only; current model cell counts are authoritative. Generated captures remain local and excluded from source control.
+
+The responsive follow-up now derives each pane's PTY grid from its live pixel allocation after sidebar width, workspace header, pane header, terminal padding, focus border, split dividers, and the effective local split ratio. GPUI window-bound observation pushes size changes immediately, the daemon applies the exact requested rows and columns without a second hidden clamp, and tab/control chrome shrinks independently of terminal content. Native macOS validation exercised one-pane and two-pane layouts at 720×460, 1280×820, and 1600×900. Shell-reported sizes changed from 20×62 to 39×131 to 43×171 for one pane and from 20×29/30 to 39×64/64 to 43×84/83 for two panes. Fresh directory listings selected natural one-, two-, three-, or four-column layouts for the available grid with complete filenames; real ANSI color, underline, 256-color background, and truecolor remained aligned.
+
+This checkpoint does not claim the rest of R1/R2: user font overrides, Linux runtime screenshots, scale-factor coverage beyond the current Retina run, comprehensive fallback glyph fixtures, selection, scrollback/search, IME, mouse, and clipboard remain open.
 
 ## Crate and subsystem choices
 
@@ -61,6 +71,21 @@ This is the first incremental implementation to authorize. It should visibly imp
 - Expose bounded Alacritty scrollback through the service protocol without copying an unbounded client buffer.
 - Add wheel/trackpad scroll, scrollbar affordance, search, next/previous match, and selection across history.
 - Preserve deterministic reconnect/snapshot behavior and measure high-output backpressure before calling the renderer complete.
+
+## Approved product sequence after responsive fidelity
+
+This order is canonical and should be advanced from the repository rather than reconstructed in conversation:
+
+1. Finish responsive terminal fidelity and text correctness, including supported scale-factor and Linux runtime coverage.
+2. After a clean local checkpoint, open parallel worktree tracks for:
+   - terminal interaction: selection, copy/paste, scrollback, search, Unicode/grapheme handling, and IME;
+   - session reliability: current-working-directory inheritance, exit/close semantics, disk snapshots, and recovery;
+   - commands and navigation: stable action IDs, remapping, command palette, pane zoom, and equalize;
+   - native system-OpenSSH panes that honor existing SSH config, agent/key handling, host keys, ProxyJump, and resize.
+3. Treat coding agents as ordinary terminal workloads first, then add only a thin status/resume layer that does not couple session ownership to an AI provider.
+4. Only after the terminal and reliability core is mature, evaluate a privacy-focused isolated browser pane type and richer optional agent workflows.
+
+The sequence retains four non-negotiable boundaries: the renderer and terminal engine remain all Rust; macOS and Linux are first-class; CMUX influence stays clean-room and behavior-level only; and Rust Mux is network-silent by default. SSH or a later browser/remote feature may make network connections only after an explicit user action, with no unauthenticated listener or background telemetry.
 
 ## Acceptance gate for R1
 

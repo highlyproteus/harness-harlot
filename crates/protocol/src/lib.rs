@@ -104,6 +104,11 @@ pub struct TerminalLine {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalRun {
     pub text: String,
+    /// Number of terminal grid cells occupied by this run. Older protocol-v4
+    /// peers omit this field, so renderers must fall back to the text width
+    /// when it is zero.
+    #[serde(default)]
+    pub columns: u16,
     pub foreground: TerminalColor,
     pub background: TerminalColor,
     pub attributes: TerminalAttributes,
