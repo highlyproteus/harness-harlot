@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rust Mux scaffold and source-informed PDR - Implementation Notes</title>
+  <style>
+    :root {
+      --ink: #171b1c;
+      --muted: #5f6867;
+      --paper: #fbfbf8;
+      --panel: #fff;
+      --line: #d9ded9;
+      --teal: #087f7b;
+      --coral: #d85d4f;
+      --gold: #b87902;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+    main {
+      width: min(1040px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 48px 0 72px;
+    }
+    h1, h2, h3 { margin: 0; line-height: 1.12; letter-spacing: 0; }
+    h1 { font-size: clamp(38px, 6vw, 64px); }
+    h2 { margin-top: 34px; font-size: clamp(26px, 4vw, 38px); }
+    h3 { font-size: 19px; }
+    a { color: var(--teal); text-underline-offset: 3px; }
+    code { background: #eef3f1; border-radius: 5px; padding: 2px 5px; }
+    .meta, .resume, .panel {
+      margin-top: 20px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .meta-grid p { margin: 0; color: var(--muted); }
+    .resume {
+      border-left: 5px solid var(--teal);
+    }
+    .resume ul, .panel ul { margin-bottom: 0; }
+    .timeline {
+      display: grid;
+      gap: 10px;
+      max-height: 420px;
+      overflow: auto;
+      margin-top: 14px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f4f7f4;
+    }
+    .event {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .event-head {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 7px;
+    }
+    .badge, .phase, .actor {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 8px;
+      border-radius: 7px;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .badge { background: #e2f4f1; color: #075d59; }
+    .status-done, .status-validated { background: #e6f4ea; color: #137333; }
+    .status-blocked, .status-failed, .status-incomplete { background: #fde8e2; color: #9a352c; }
+    .status-decision { background: #fff3ce; color: #72510a; }
+    .phase, .actor { background: #eef3f1; color: #3e4846; }
+    .event p { margin: 0; color: var(--muted); }
+    time { color: var(--muted); font-size: 13px; }
+    @media (max-width: 720px) { .meta-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <p><a href="../../..">Project root</a></p>
+    <h1>Rust Mux scaffold and source-informed PDR</h1>
+    <p>Create and validate the Rust Mux open-source scaffold plus a cmux-informed macOS/Linux local-and-SSH MVP plan</p>
+
+    <section class="meta" aria-label="Run metadata">
+      <div class="meta-grid">
+        <p><strong>Goal ID:</strong> <code>rust-mux-scaffold</code></p>
+        <p><strong>Started:</strong> 2026-08-11T16:56:29Z</p>
+        <p><strong>Parent:</strong> none</p>
+        <p><strong>Mode:</strong> full</p>
+        <p><strong>Dashboard:</strong> <a href="index.html">index.html</a></p>
+        <p><strong>Tasks:</strong> <a href="tasks/rust-mux">tasks/rust-mux</a></p>
+      </div>
+    </section>
+
+    <section class="resume">
+      <h2>Resume Here</h2>
+      <!-- RESUME_HERE_START -->
+      <ul>
+        <li><strong>Status:</strong> [todo] Run ledger created. Implementation has not started.</li>
+        <li><strong>Current phase:</strong> Define validation, then start the first task.</li>
+        <li><strong>Completed work:</strong> None recorded.</li>
+        <li><strong>Active work:</strong> None recorded.</li>
+        <li><strong>Blockers:</strong> None recorded.</li>
+        <li><strong>Next exact action:</strong> Read the first task file and define verification before editing.</li>
+        <li><strong>Last validation:</strong> None recorded.</li>
+        <li><strong>Protected paths:</strong> User-owned work must not be reverted.</li>
+      </ul>
+      <!-- RESUME_HERE_END -->
+    </section>
+
+    <section>
+      <h2>Progress Timeline</h2>
+      <p>Progress is rendered from the inline <code>progressEvents</code> array in this file.</p>
+      <div id="progress-timeline" class="timeline"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Decisions Outside The Plan</h2>
+      <ul>
+        <li>Empty at start.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Changes And Tradeoffs</h2>
+      <ul>
+        <li>Empty at start.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Validation</h2>
+      <ul>
+        <li>Validation is pending.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Evidence</h2>
+      <ul>
+        <li>Evidence links are pending. Put large logs, screenshots, command output, or traces in <code>evidence/</code>.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Next Goal Candidates</h2>
+      <ul>
+        <li>Empty at start.</li>
+      </ul>
+    </section>
+
+    <script>
+      const progressEvents = [
+        {
+          ts: "2026-08-11T16:56:29Z",
+          status: "created",
+          phase: "start",
+          actor: "agent",
+          summary: "Project run ledger created.",
+          evidence: []
+        },
+        {
+        "ts": "2026-08-11T16:56:30Z",
+        "status": "done",
+        "phase": "PDR",
+        "actor": "agent",
+        "summary": "Reviewed cmux at commit 93118b3, documented preserve/replace/avoid and licensing boundaries, and created the approved eight-task PDR.",
+        "evidence": []
+},
+        {
+        "ts": "2026-08-11T16:56:30Z",
+        "status": "done",
+        "phase": "Validation",
+        "actor": "agent",
+        "summary": "Formatting, strict Clippy, workspace tests, and a live daemon hello/snapshot exchange passed.",
+        "evidence": []
+},
+        {
+        "ts": "2026-08-11T16:59:12Z",
+        "status": "done",
+        "phase": "Service scaffold",
+        "actor": "agent",
+        "summary": "Aligned the daemon scaffold with the PDR: Tokio runtime, graceful Ctrl-C cleanup, and size-limited length-prefixed JSON framing over the Unix socket.",
+        "evidence": []
+},
+        {
+        "ts": "2026-08-11T16:59:12Z",
+        "status": "done",
+        "phase": "Live validation",
+        "actor": "agent",
+        "summary": "Verified the final Tokio daemon with a real framed hello and snapshot exchange; graceful shutdown removed the socket.",
+        "evidence": []
+}
+      ];
+
+      function escapeHtml(value) {
+        return String(value || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function renderEvent(event) {
+        const status = escapeHtml(event.status || "event");
+        const phase = escapeHtml(event.phase || "general");
+        const actor = escapeHtml(event.actor || "agent");
+        const ts = escapeHtml(event.ts || "");
+        const summary = escapeHtml(event.summary || "");
+        const evidence = Array.isArray(event.evidence) ? event.evidence : [];
+        const evidenceHtml = evidence.length
+          ? `<p>Evidence: ${evidence.map((item) => `<a href="${escapeHtml(item)}">${escapeHtml(item)}</a>`).join(", ")}</p>`
+          : "";
+        return `
+          <article class="event">
+            <div class="event-head">
+              <span class="badge status-${status}">${status}</span>
+              <span class="phase">${phase}</span>
+              <span class="actor">${actor}</span>
+              <time datetime="${ts}">${ts}</time>
+            </div>
+            <p>${summary}</p>
+            ${evidenceHtml}
+          </article>
+        `;
+      }
+
+      function renderProgressTimeline() {
+        const target = document.getElementById("progress-timeline");
+        const events = Array.isArray(progressEvents) ? progressEvents : [];
+        target.innerHTML = events.length
+          ? events.map(renderEvent).join("")
+          : "<p>No progress events recorded yet.</p>";
+      }
+
+      renderProgressTimeline();
+    </script>
+  </main>
+</body>
+</html>

@@ -1,0 +1,16 @@
+[package]
+name = "rust-mux-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+rust-mux-protocol = { path = "../protocol" }
+rust-mux-terminal-model = { path = "../terminal-model" }
+uuid.workspace = true
+
+[lints]
+workspace = true

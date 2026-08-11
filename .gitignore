@@ -1,0 +1,6 @@
+/target/
+/.idea/
+/.vscode/
+*.swp
+.DS_Store
+/docs/assets/
