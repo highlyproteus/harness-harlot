@@ -140,21 +140,22 @@
   "why": "Remote development is a core workflow. Reusing system OpenSSH maximizes compatibility and keeps authentication, host-key verification, and proxy behavior in the user's audited toolchain instead of creating a new security surface.",
   "acceptance_criteria": [
     { "text": "Host discovery shows concrete SSH aliases while ssh -G remains the source of truth for resolved configuration", "met": false },
-    { "text": "OpenSSH is spawned with structured argv and rejects control-character or option-injection host aliases", "met": false },
-    { "text": "Existing SSH agent, key, Include, wildcard, Match, ProxyJump or ProxyCommand, and multiplexing behavior is honored without reading private keys", "met": false },
-    { "text": "Unknown and changed host keys retain normal OpenSSH prompts or failures and are never bypassed", "met": false },
+    { "text": "OpenSSH is spawned with structured argv and rejects control-character or option-injection host aliases", "met": true },
+    { "text": "Existing SSH agent, key, Include, wildcard, Match, ProxyJump or ProxyCommand, and multiplexing behavior is honored without reading private keys", "met": true },
+    { "text": "Unknown and changed host keys retain normal OpenSSH prompts or failures and are never bypassed", "met": true },
     { "text": "Remote stty size follows pane resize and moving a pane never changes its SSH process or session ID", "met": false },
     { "text": "Desktop disconnect and restart preserve the daemon-owned SSH PID and replay missed output", "met": false },
-    { "text": "Terminal contents, prompts, keys, and secret-bearing config values are excluded from default logs and crash reports", "met": false },
-    { "text": "Session metadata can later distinguish an optional rmuxd-backed remote PTY without making rmuxd an MVP dependency", "met": false }
+    { "text": "Terminal contents, prompts, keys, and secret-bearing config values are excluded from default logs and crash reports", "met": true },
+    { "text": "Session metadata can later distinguish an optional rmuxd-backed remote PTY without making rmuxd an MVP dependency", "met": true }
   ],
   "depends_on": ["task-03", "task-04"],
-  "status": "not_started",
+  "status": "in_progress",
   "block_reason": null,
   "notes": [
-    { "timestamp": "2026-08-11T16:46:38Z", "text": "Security boundary: system OpenSSH owns protocol, authentication, host-key verification, and jump-host behavior; Rust Mux owns only the local PTY, process lifecycle, metadata, and UI projection." }
+    { "timestamp": "2026-08-11T16:46:38Z", "text": "Security boundary: system OpenSSH owns protocol, authentication, host-key verification, and jump-host behavior; Rust Mux owns only the local PTY, process lifecycle, metadata, and UI projection." },
+    { "timestamp": "2026-08-11T21:22:24Z", "text": "Integrated the first native system-SSH slice on protocol v5 alongside terminal interaction. The desktop requires destination review and a second explicit confirmation; the daemon validates a conservative host alias and launches only structured argv equivalent to /usr/bin/ssh -- host in a managed PTY. OpenSSH alone resolves config, keys, agents, known hosts, Match, and proxy rules. Runtime metadata distinguishes system SSH, while host intent is removed from owner-only recovery snapshots so daemon restart remains network-silent. Host discovery plus real remote resize, movement, reconnect, and failure-path tests remain, so this task is in progress rather than complete." }
   ],
-  "last_updated": "2026-08-11T16:46:38Z"
+  "last_updated": "2026-08-11T21:22:24Z"
 }
 </script>
 

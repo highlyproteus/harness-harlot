@@ -10,9 +10,9 @@ Layout interaction is the central product experience, but it must operate on ser
 - [ ] Implement create/rename/reorder/delete for workspaces and tabs.
 - [x] Implement horizontal and vertical split-tree mutations.
 - [x] Implement pane drag/drop with visible targets and cancel-safe behavior.
-- [ ] Persist layout changes atomically in the session service.
+- [x] Persist layout changes atomically in the session service.
 - [ ] Restore focus and layout consistently after desktop restart.
-- [ ] Display and move local and SSH panes uniformly while retaining explicit connection state.
+- [x] Display and move local and SSH panes uniformly while retaining explicit connection state.
 
 ## Technical Notes
 Use stable IDs in drag payloads and protocol commands. Validate split ratios and reject mutations based on stale revisions.
@@ -22,4 +22,4 @@ Current checkpoint: pane headers now pass their own pane ID into add, split, ren
 ## Acceptance Criteria
 - [ ] Every layout mutation has deterministic model tests.
 - [ ] Drag/drop works across splits and tabs without losing a local or SSH session.
-- [ ] Persisted layouts survive service and desktop restarts.
+- [x] Persisted layouts survive service and desktop restarts.
