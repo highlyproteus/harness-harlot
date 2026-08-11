@@ -22,10 +22,10 @@ use gpui::{
 };
 use rust_mux_desktop::request;
 use rust_mux_protocol::{
-    ClientRequest, DropPlacement, Pane, PaneLayout, ServiceResponse, SessionSnapshot, SplitAxis,
-    TerminalAttributes, TerminalColor, TerminalLine, TerminalModes, TerminalModifiers,
-    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalRun, TerminalScreen,
-    TerminalSelection, TerminalSelectionKind, Workspace,
+    ClientRequest, DropPlacement, MAX_SSH_HOST_LEN, Pane, PaneLayout, ServiceResponse,
+    SessionSnapshot, SplitAxis, TerminalAttributes, TerminalColor, TerminalLine, TerminalModes,
+    TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalRun,
+    TerminalScreen, TerminalSelection, TerminalSelectionKind, Workspace, validate_ssh_host,
 };
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
@@ -167,6 +167,50 @@ struct CloseConfirmation {
     title: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshConnectStep {
+    Destination,
+    Confirm,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SshConnectDialog {
+    target_pane: Uuid,
+    host: String,
+    step: SshConnectStep,
+    error: Option<String>,
+}
+
+impl SshConnectDialog {
+    fn new(target_pane: Uuid) -> Self {
+        Self {
+            target_pane,
+            host: String::new(),
+            step: SshConnectStep::Destination,
+            error: None,
+        }
+    }
+
+    fn review(&mut self) {
+        match validate_ssh_host(&self.host) {
+            Ok(()) => {
+                self.step = SshConnectStep::Confirm;
+                self.error = None;
+            }
+            Err(message) => self.error = Some(message.to_owned()),
+        }
+    }
+
+    fn approved_request(&self) -> Option<ClientRequest> {
+        (self.step == SshConnectStep::Confirm && validate_ssh_host(&self.host).is_ok()).then(|| {
+            ClientRequest::ConnectSsh {
+                target_pane: self.target_pane,
+                host: self.host.clone(),
+            }
+        })
+    }
+}
+
 impl CloseConfirmation {
     fn for_pane(pane: &Pane) -> Self {
         Self {
@@ -286,6 +330,7 @@ struct RustMux {
     rename_editor: Option<RenameEditor>,
     search_editor: Option<SearchEditor>,
     close_confirmation: Option<CloseConfirmation>,
+    ssh_connect: Option<SshConnectDialog>,
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
     selection_drag: Option<SelectionDrag>,
@@ -316,6 +361,7 @@ impl RustMux {
             rename_editor: None,
             search_editor: None,
             close_confirmation: None,
+            ssh_connect: None,
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
             selection_drag: None,
@@ -577,6 +623,52 @@ impl RustMux {
         };
         self.send(confirmation.request());
         self.last_sizes.clear();
+        cx.notify();
+    }
+
+    fn begin_ssh_connect(&mut self, cx: &mut Context<Self>) {
+        let Some(target_pane) = self.focused_pane else {
+            return;
+        };
+        self.ssh_connect = Some(SshConnectDialog::new(target_pane));
+        self.tab_menu = None;
+        self.rename_editor = None;
+        self.close_confirmation = None;
+        cx.notify();
+    }
+
+    fn review_ssh_connect(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.ssh_connect.as_mut() {
+            dialog.review();
+            cx.notify();
+        }
+    }
+
+    fn confirm_ssh_connect(&mut self, cx: &mut Context<Self>) {
+        let Some(request_message) = self
+            .ssh_connect
+            .as_ref()
+            .and_then(SshConnectDialog::approved_request)
+        else {
+            return;
+        };
+        match request(request_message) {
+            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                self.focused_pane = Some(pane_id);
+                self.ssh_connect = None;
+                self.refresh_state();
+            }
+            Ok(response) => {
+                if let Some(dialog) = self.ssh_connect.as_mut() {
+                    dialog.error = Some(format!("unexpected response: {response:?}"));
+                }
+            }
+            Err(error) => {
+                if let Some(dialog) = self.ssh_connect.as_mut() {
+                    dialog.error = Some(format!("{error:#}"));
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -996,6 +1088,43 @@ impl RustMux {
             return;
         }
         let keystroke = &event.keystroke;
+        if self.ssh_connect.is_some() {
+            let step = self.ssh_connect.as_ref().map(|dialog| dialog.step);
+            match keystroke.key.as_str() {
+                "enter" if step == Some(SshConnectStep::Destination) => {
+                    self.review_ssh_connect(cx);
+                }
+                "enter" => self.confirm_ssh_connect(cx),
+                "escape" => {
+                    self.ssh_connect = None;
+                    cx.notify();
+                }
+                "backspace" if step == Some(SshConnectStep::Destination) => {
+                    if let Some(dialog) = self.ssh_connect.as_mut() {
+                        dialog.host.pop();
+                        dialog.error = None;
+                        cx.notify();
+                    }
+                }
+                _ if step == Some(SshConnectStep::Destination)
+                    && !keystroke.modifiers.platform
+                    && !keystroke.modifiers.control =>
+                {
+                    if let Some(text) = &keystroke.key_char
+                        && let Some(dialog) = self.ssh_connect.as_mut()
+                        && dialog.host.len() + text.len() <= MAX_SSH_HOST_LEN
+                        && !text.chars().any(char::is_control)
+                    {
+                        dialog.host.push_str(text);
+                        dialog.error = None;
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
         if let Some(editor) = self.rename_editor.as_mut() {
             if keystroke.modifiers.platform && keystroke.key.eq_ignore_ascii_case("a") {
                 editor.replace_on_type = true;
@@ -1308,6 +1437,25 @@ impl RustMux {
                     }),
             )
             .child(div().flex_1())
+            .child(
+                div()
+                    .id("connect-ssh")
+                    .mx(px(9.0))
+                    .mb(px(8.0))
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .bg(rgb(THEME.surface))
+                    .border_1()
+                    .border_color(rgb(THEME.border))
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.border_color(rgb(THEME.accent)))
+                    .on_click(cx.listener(|this, _, _, cx| this.begin_ssh_connect(cx)))
+                    .child("Connect with SSH…"),
+            )
             .child(
                 div()
                     .px(px(11.0))
@@ -2182,6 +2330,187 @@ impl RustMux {
             .into_any_element()
     }
 
+    fn render_ssh_dialog(&self, dialog: &SshConnectDialog, cx: &mut Context<Self>) -> AnyElement {
+        let host = dialog.host.clone();
+        let error = dialog.error.clone();
+        let content = match dialog.step {
+            SshConnectStep::Destination => div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(THEME.foreground))
+                        .child("Connect with system OpenSSH"),
+                )
+                .child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.muted))
+                        .child(
+                            "Enter one host or alias. OpenSSH will resolve your existing SSH config, agent, keys, proxies, and known_hosts. No connection starts until you confirm the next screen.",
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(36.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .bg(rgb(THEME.terminal))
+                        .border_1()
+                        .border_color(rgb(THEME.accent))
+                        .flex()
+                        .items_center()
+                        .font_family("SF Mono")
+                        .text_sm()
+                        .text_color(rgb(THEME.foreground))
+                        .child(host)
+                        .child("│"),
+                )
+                .when_some(error, |element, message| {
+                    element.child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.danger))
+                            .child(message),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id("cancel-ssh")
+                                .px(px(12.0))
+                                .py(px(7.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .text_sm()
+                                .text_color(rgb(THEME.muted))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.ssh_connect = None;
+                                    cx.notify();
+                                }))
+                                .child("Cancel"),
+                        )
+                        .child(
+                            div()
+                                .id("review-ssh")
+                                .px(px(12.0))
+                                .py(px(7.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .bg(rgb(THEME.accent))
+                                .text_sm()
+                                .text_color(rgb(0xffffff))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.review_ssh_connect(cx)
+                                }))
+                                .child("Review"),
+                        ),
+                )
+                .into_any_element(),
+            SshConnectStep::Confirm => div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(THEME.foreground))
+                        .child(format!("Connect to {host}?")),
+                )
+                .child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.muted))
+                        .child(
+                            "This explicit action starts the installed OpenSSH client in a new managed terminal. Rust Mux will not answer password or host-key prompts, forward an agent automatically, or change host-key policy.",
+                        ),
+                )
+                .when_some(error, |element, message| {
+                    element.child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.danger))
+                            .child(message),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id("back-ssh")
+                                .px(px(12.0))
+                                .py(px(7.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .text_sm()
+                                .text_color(rgb(THEME.muted))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(dialog) = this.ssh_connect.as_mut() {
+                                        dialog.step = SshConnectStep::Destination;
+                                        dialog.error = None;
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("Back"),
+                        )
+                        .child(
+                            div()
+                                .id("confirm-ssh")
+                                .px(px(12.0))
+                                .py(px(7.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .bg(rgb(THEME.accent))
+                                .text_sm()
+                                .text_color(rgb(0xffffff))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_ssh_connect(cx)
+                                }))
+                                .child("Connect with OpenSSH"),
+                        ),
+                )
+                .into_any_element(),
+        };
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(rgba(0x090b0f88))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(480.0))
+                    .p(px(18.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(THEME.elevated))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .shadow_lg()
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
     fn render_close_dialog(
         &self,
         confirmation: &CloseConfirmation,
@@ -2673,6 +3002,9 @@ impl Render for RustMux {
             })
             .when_some(self.command_palette.as_ref(), |element, palette| {
                 element.child(self.render_command_palette(palette, cx))
+            })
+            .when_some(self.ssh_connect.as_ref(), |element, dialog| {
+                element.child(self.render_ssh_dialog(dialog, cx))
             })
     }
 }
@@ -3337,6 +3669,38 @@ mod tests {
             confirmation.request(),
             ClientRequest::ClosePane { pane_id: pane.id }
         );
+    }
+
+    #[test]
+    fn ssh_draft_cannot_create_a_network_action_before_review_and_confirmation() {
+        let target_pane = Uuid::from_u128(7);
+        let mut dialog = SshConnectDialog::new(target_pane);
+        dialog.host = "prod-east".to_owned();
+
+        assert_eq!(dialog.approved_request(), None);
+
+        dialog.review();
+
+        assert_eq!(dialog.step, SshConnectStep::Confirm);
+        assert_eq!(
+            dialog.approved_request(),
+            Some(ClientRequest::ConnectSsh {
+                target_pane,
+                host: "prod-east".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn ssh_review_keeps_invalid_input_out_of_the_network_action_boundary() {
+        let mut dialog = SshConnectDialog::new(Uuid::from_u128(8));
+        dialog.host = "-oProxyCommand=bad".to_owned();
+
+        dialog.review();
+
+        assert_eq!(dialog.step, SshConnectStep::Destination);
+        assert!(dialog.error.is_some());
+        assert_eq!(dialog.approved_request(), None);
     }
 
     #[test]
