@@ -9,18 +9,23 @@
 )]
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, CursorStyle, FocusHandle, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, StrikethroughStyle,
-    StyledText, TextRun, TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions,
-    actions, div, point, prelude::*, px, relative, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId,
+    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, StrikethroughStyle, Style,
+    StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds,
+    WindowOptions, actions, div, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use rust_mux_desktop::request;
 use rust_mux_protocol::{
     ClientRequest, DropPlacement, Pane, PaneLayout, ServiceResponse, SessionSnapshot, SplitAxis,
-    TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, TerminalScreen, Workspace,
+    TerminalAttributes, TerminalColor, TerminalLine, TerminalModes, TerminalModifiers,
+    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalRun, TerminalScreen,
+    TerminalSelection, TerminalSelectionKind, Workspace,
 };
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
@@ -51,6 +56,10 @@ actions!(
         TogglePaneZoom,
         EqualizePanes,
         ConsumeChordPrefix,
+        CopyTerminal,
+        PasteTerminal,
+        FindTerminal,
+        FindNextTerminal,
     ]
 );
 
@@ -64,6 +73,7 @@ const TERMINAL_FOCUS_BORDER_WIDTH: f32 = 1.0;
 const MIN_PANE_WIDTH: f32 = 140.0;
 const MIN_PANE_HEIGHT: f32 = 90.0;
 const COMMAND_PALETTE_LIMIT: usize = 32;
+const MAX_PASTE_BYTES: usize = 64 * 1024;
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 
 #[derive(Clone, Debug)]
@@ -126,6 +136,29 @@ struct RenameEditor {
     pane_id: Uuid,
     value: String,
     replace_on_type: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SearchEditor {
+    query: String,
+    no_match: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalLineRender {
+    row: usize,
+    cursor: Option<rust_mux_protocol::TerminalCursor>,
+    focused: bool,
+    pane_id: Uuid,
+    columns: u16,
+    selection: Option<TerminalSelection>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SelectionDrag {
+    pane_id: Uuid,
+    anchor: TerminalPoint,
+    preserve_single_cell: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -251,9 +284,12 @@ struct RustMux {
     connection_error: Option<String>,
     tab_menu: Option<TabMenu>,
     rename_editor: Option<RenameEditor>,
+    search_editor: Option<SearchEditor>,
     close_confirmation: Option<CloseConfirmation>,
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
+    selection_drag: Option<SelectionDrag>,
+    ime_preedit: String,
 }
 
 impl RustMux {
@@ -278,9 +314,12 @@ impl RustMux {
             connection_error: None,
             tab_menu: None,
             rename_editor: None,
+            search_editor: None,
             close_confirmation: None,
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
+            selection_drag: None,
+            ime_preedit: String::new(),
         };
         app.update_window_geometry(window);
         app.refresh_state();
@@ -680,6 +719,277 @@ impl RustMux {
         cx.stop_propagation();
     }
 
+    fn copy_terminal(&mut self, _: &CopyTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.focused_pane else {
+            return;
+        };
+        match request(ClientRequest::CopySelection { pane_id }) {
+            Ok(ServiceResponse::SelectionText { text: Some(text) }) if !text.is_empty() => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.connection_error = None;
+            }
+            Ok(ServiceResponse::SelectionText { .. }) => {}
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn paste_terminal(&mut self, _: &PasteTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.focused_pane else {
+            return;
+        };
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let bracketed = self
+            .screens
+            .get(&pane_id)
+            .is_some_and(|screen| screen.modes.contains(TerminalModes::BRACKETED_PASTE));
+        match prepare_paste(&text, bracketed) {
+            Ok(bytes) => self.send(ClientRequest::WriteInput { pane_id, bytes }),
+            Err(message) => self.connection_error = Some(message.to_owned()),
+        }
+        cx.notify();
+    }
+
+    fn find_terminal(&mut self, _: &FindTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.search_editor = Some(SearchEditor::default());
+        self.ime_preedit.clear();
+        cx.notify();
+    }
+
+    fn find_next_terminal(&mut self, _: &FindNextTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_search(true, cx);
+    }
+
+    fn run_search(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.focused_pane else {
+            return;
+        };
+        let Some(editor) = self.search_editor.as_mut() else {
+            return;
+        };
+        if editor.query.is_empty() {
+            editor.no_match = false;
+            cx.notify();
+            return;
+        }
+        match request(ClientRequest::SearchPane {
+            pane_id,
+            query: editor.query.clone(),
+            forward,
+        }) {
+            Ok(ServiceResponse::SearchResult { found }) => {
+                editor.no_match = !found;
+                self.connection_error = None;
+                self.refresh_state();
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() || text.chars().any(|character| character == '\0') {
+            return;
+        }
+        if let Some(editor) = self.rename_editor.as_mut() {
+            if editor.replace_on_type {
+                editor.value.clear();
+            }
+            let remaining = 80_usize.saturating_sub(editor.value.chars().count());
+            editor
+                .value
+                .extend(text.chars().filter(|c| !c.is_control()).take(remaining));
+            editor.replace_on_type = false;
+            cx.notify();
+            return;
+        }
+        if let Some(editor) = self.search_editor.as_mut() {
+            let remaining = 256_usize.saturating_sub(editor.query.chars().count());
+            editor
+                .query
+                .extend(text.chars().filter(|c| !c.is_control()).take(remaining));
+            editor.no_match = false;
+            self.run_search(true, cx);
+            return;
+        }
+        if let Some(pane_id) = self.focused_pane {
+            self.send(ClientRequest::WriteInput {
+                pane_id,
+                bytes: text.as_bytes().to_vec(),
+            });
+            cx.notify();
+        }
+    }
+
+    fn begin_terminal_pointer(
+        &mut self,
+        pane_id: Uuid,
+        point: TerminalPoint,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focused_pane = Some(pane_id);
+        self.focus_handle.focus(window);
+        let mouse_reporting = self
+            .screens
+            .get(&pane_id)
+            .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING));
+        if mouse_reporting && !event.modifiers.shift {
+            if let Some(button) = terminal_mouse_button(event.button) {
+                self.send(ClientRequest::MouseInput {
+                    pane_id,
+                    point,
+                    button,
+                    action: TerminalMouseAction::Press,
+                    modifiers: terminal_modifiers(event.modifiers),
+                });
+            }
+        } else if event.button == MouseButton::Left {
+            let kind = if event.modifiers.alt {
+                TerminalSelectionKind::Block
+            } else if event.click_count >= 3 {
+                TerminalSelectionKind::Lines
+            } else if event.click_count == 2 {
+                TerminalSelectionKind::Semantic
+            } else {
+                TerminalSelectionKind::Simple
+            };
+            self.selection_drag = Some(SelectionDrag {
+                pane_id,
+                anchor: point,
+                preserve_single_cell: matches!(
+                    kind,
+                    TerminalSelectionKind::Semantic | TerminalSelectionKind::Lines
+                ),
+            });
+            self.send(ClientRequest::BeginSelection {
+                pane_id,
+                point,
+                kind,
+            });
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn move_terminal_pointer(
+        &mut self,
+        pane_id: Uuid,
+        point: TerminalPoint,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .selection_drag
+            .is_some_and(|selection| selection.pane_id == pane_id)
+            && event.dragging()
+        {
+            self.send(ClientRequest::UpdateSelection { pane_id, point });
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let mouse_motion = self
+            .screens
+            .get(&pane_id)
+            .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_MOTION));
+        if mouse_motion && let Some(button) = event.pressed_button.and_then(terminal_mouse_button) {
+            self.send(ClientRequest::MouseInput {
+                pane_id,
+                point,
+                button,
+                action: TerminalMouseAction::Move,
+                modifiers: terminal_modifiers(event.modifiers),
+            });
+            cx.stop_propagation();
+        }
+    }
+
+    fn end_terminal_pointer(
+        &mut self,
+        pane_id: Uuid,
+        point: TerminalPoint,
+        event: &MouseUpEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(selection) = self
+            .selection_drag
+            .take()
+            .filter(|selection| selection.pane_id == pane_id)
+        {
+            if point == selection.anchor && !selection.preserve_single_cell {
+                self.send(ClientRequest::ClearSelection { pane_id });
+            } else {
+                self.send(ClientRequest::UpdateSelection { pane_id, point });
+            }
+        } else if self
+            .screens
+            .get(&pane_id)
+            .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING))
+            && !event.modifiers.shift
+            && let Some(button) = terminal_mouse_button(event.button)
+        {
+            self.send(ClientRequest::MouseInput {
+                pane_id,
+                point,
+                button,
+                action: TerminalMouseAction::Release,
+                modifiers: terminal_modifiers(event.modifiers),
+            });
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn scroll_terminal(
+        &mut self,
+        pane_id: Uuid,
+        point: TerminalPoint,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let pixels = event
+            .delta
+            .pixel_delta(px(self.terminal_font.metrics.line_height));
+        let lines = (f32::from(pixels.y) / self.terminal_font.metrics.line_height).round() as i32;
+        let lines = if lines == 0 {
+            if pixels.y < px(0.0) { -1 } else { 1 }
+        } else {
+            lines
+        };
+        if self
+            .screens
+            .get(&pane_id)
+            .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING))
+            && !event.modifiers.shift
+        {
+            self.send(ClientRequest::MouseInput {
+                pane_id,
+                point,
+                button: if lines > 0 {
+                    TerminalMouseButton::WheelUp
+                } else {
+                    TerminalMouseButton::WheelDown
+                },
+                action: TerminalMouseAction::Press,
+                modifiers: terminal_modifiers(event.modifiers),
+            });
+        } else {
+            self.send(ClientRequest::ScrollPane { pane_id, lines });
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if self.command_palette.is_some() {
             self.handle_palette_key(event, cx);
@@ -708,18 +1018,30 @@ impl RustMux {
                     editor.replace_on_type = false;
                     cx.notify();
                 }
-                _ if !keystroke.modifiers.platform && !keystroke.modifiers.control => {
-                    if let Some(text) = &keystroke.key_char
-                        && editor.value.chars().count() < 80
-                        && !text.chars().any(char::is_control)
-                    {
-                        if editor.replace_on_type {
-                            editor.value.clear();
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(editor) = self.search_editor.as_mut() {
+            match keystroke.key.as_str() {
+                "enter" => self.run_search(!keystroke.modifiers.shift, cx),
+                "escape" => {
+                    self.search_editor = None;
+                    self.ime_preedit.clear();
+                    cx.notify();
+                }
+                "backspace" => {
+                    editor.query.pop();
+                    editor.no_match = false;
+                    if editor.query.is_empty() {
+                        if let Some(pane_id) = self.focused_pane {
+                            self.send(ClientRequest::ClearSelection { pane_id });
                         }
-                        editor.value.push_str(text);
-                        editor.replace_on_type = false;
-                        cx.notify();
+                    } else {
+                        self.run_search(true, cx);
                     }
+                    cx.notify();
                 }
                 _ => {}
             }
@@ -1276,6 +1598,31 @@ impl RustMux {
             .dragging_pane
             .and_then(|source| split_target_for_drag(source, &panes, active));
         let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
+        let rendered_lines = screen
+            .as_ref()
+            .map(|screen| {
+                screen
+                    .lines
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(row, line)| {
+                        self.render_terminal_line(
+                            line,
+                            TerminalLineRender {
+                                row,
+                                cursor: screen.cursor,
+                                focused,
+                                pane_id: active,
+                                columns: screen.columns,
+                                selection: screen.selection,
+                            },
+                            cx,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         div()
             .id(("terminal", element_key(active)))
             .size_full()
@@ -1330,16 +1677,36 @@ impl RustMux {
                     .text_size(px(self.terminal_font.metrics.font_size))
                     .line_height(px(self.terminal_font.metrics.line_height))
                     .text_color(rgb(THEME.foreground))
-                    .children(screen.clone().into_iter().flat_map(|screen| {
-                        let cursor = screen.cursor;
-                        screen
-                            .lines
-                            .into_iter()
-                            .enumerate()
-                            .map(move |(row, line)| {
-                                self.render_terminal_line(line, row, cursor, focused)
+                    .children(rendered_lines)
+                    .when(
+                        focused
+                            && self.search_editor.is_none()
+                            && self.rename_editor.is_none()
+                            && !self.ime_preedit.is_empty(),
+                        |element| {
+                            let cursor = screen.as_ref().and_then(|screen| screen.cursor);
+                            element.when_some(cursor, |element, cursor| {
+                                let span = self.terminal_font.metrics.span(cursor.column, 1);
+                                element.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(span.x))
+                                        .top(px(f32::from(cursor.row)
+                                            * self.terminal_font.metrics.line_height))
+                                        .font(self.terminal_font.font(false, false))
+                                        .text_size(px(self.terminal_font.metrics.font_size))
+                                        .text_color(rgb(THEME.foreground))
+                                        .border_b_1()
+                                        .border_color(rgb(THEME.accent))
+                                        .child(self.ime_preedit.clone()),
+                                )
                             })
-                    }))
+                        },
+                    )
+                    .when_some(
+                        self.search_editor.as_ref().filter(|_| focused),
+                        |element, editor| element.child(self.render_search_bar(editor)),
+                    )
                     .when_some(drop_target, |element, target| {
                         element.child(self.render_drop_layer(target, cx))
                     }),
@@ -1350,10 +1717,17 @@ impl RustMux {
     fn render_terminal_line(
         &self,
         line: TerminalLine,
-        row: usize,
-        cursor: Option<rust_mux_protocol::TerminalCursor>,
-        focused: bool,
+        render: TerminalLineRender,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
+        let TerminalLineRender {
+            row,
+            cursor,
+            focused,
+            pane_id,
+            columns,
+            selection,
+        } = render;
         let mut start_column = 0_u16;
         let styled_runs = line
             .runs
@@ -1377,6 +1751,21 @@ impl RustMux {
             .h(px(metrics.line_height))
             .flex_none()
             .overflow_hidden()
+            .when_some(
+                selection.and_then(|selection| selection_span(selection, row, columns)),
+                |element, (start, width)| {
+                    let span = metrics.span(start, width);
+                    element.child(
+                        div()
+                            .absolute()
+                            .left(px(span.x))
+                            .top(px(0.0))
+                            .w(px(span.width))
+                            .h(px(span.height))
+                            .bg(rgb(THEME.selection)),
+                    )
+                },
+            )
             .children(styled_runs)
             .when_some(cursor_column, |element, column| {
                 let cursor = metrics.span(column, 1);
@@ -1398,6 +1787,111 @@ impl RustMux {
                             cursor.bg(rgba((THEME.cursor << 8) | 0x30))
                         }),
                 )
+            })
+            .children((0..columns).map(|column| {
+                let point = TerminalPoint {
+                    row: u16::try_from(row).unwrap_or(u16::MAX),
+                    column,
+                };
+                let span = metrics.span(column, 1);
+                div()
+                    .id((
+                        "terminal-cell",
+                        element_key(pane_id)
+                            ^ (u64::try_from(row).unwrap_or(u64::MAX) << 16)
+                            ^ u64::from(column),
+                    ))
+                    .absolute()
+                    .left(px(span.x))
+                    .top(px(0.0))
+                    .w(px(span.width))
+                    .h(px(span.height))
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.begin_terminal_pointer(pane_id, point, event, window, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.begin_terminal_pointer(pane_id, point, event, window, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.begin_terminal_pointer(pane_id, point, event, window, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        this.move_terminal_pointer(pane_id, point, event, cx);
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            this.end_terminal_pointer(pane_id, point, event, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            this.end_terminal_pointer(pane_id, point, event, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            this.end_terminal_pointer(pane_id, point, event, cx);
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                        this.scroll_terminal(pane_id, point, event, cx);
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    fn render_search_bar(&self, editor: &SearchEditor) -> AnyElement {
+        div()
+            .absolute()
+            .right(px(8.0))
+            .top(px(7.0))
+            .w(px(280.0))
+            .h(px(34.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .bg(rgb(THEME.elevated))
+            .border_1()
+            .border_color(if editor.no_match {
+                rgb(THEME.danger)
+            } else {
+                rgb(THEME.border_strong)
+            })
+            .shadow_lg()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .font_family(".SystemUIFont")
+            .text_sm()
+            .text_color(rgb(THEME.foreground))
+            .child("Find")
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .font(self.terminal_font.font(false, false))
+                    .child(if editor.query.is_empty() && self.ime_preedit.is_empty() {
+                        "Type to search…".to_owned()
+                    } else {
+                        format!("{}{}", editor.query, self.ime_preedit)
+                    }),
+            )
+            .child(if editor.no_match {
+                "No match"
+            } else {
+                "↵ next"
             })
             .into_any_element()
     }
@@ -1645,7 +2139,7 @@ impl RustMux {
                                     .when(editor.replace_on_type, |element| {
                                         element.bg(rgb(THEME.selection))
                                     })
-                                    .child(editor.value.clone()),
+                                    .child(format!("{}{}", editor.value, self.ime_preedit)),
                             )
                             .child("│"),
                     )
@@ -2155,6 +2649,17 @@ impl Render for RustMux {
                     cx.stop_propagation();
                 }),
             )
+            .on_action(cx.listener(RustMux::copy_terminal))
+            .on_action(cx.listener(RustMux::paste_terminal))
+            .on_action(cx.listener(RustMux::find_terminal))
+            .on_action(cx.listener(RustMux::find_next_terminal))
+            .child(
+                div()
+                    .absolute()
+                    .w(px(1.0))
+                    .h(px(1.0))
+                    .child(TerminalInputElement { input: cx.entity() }),
+            )
             .child(self.render_sidebar(cx))
             .child(self.render_workspace(cx))
             .when_some(self.tab_menu, |element, menu| {
@@ -2169,6 +2674,206 @@ impl Render for RustMux {
             .when_some(self.command_palette.as_ref(), |element, palette| {
                 element.child(self.render_command_palette(palette, cx))
             })
+    }
+}
+
+impl EntityInputHandler for RustMux {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        actual_range.replace(0..self.ime_preedit.encode_utf16().count());
+        Some(self.ime_preedit.clone())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self.ime_preedit.encode_utf16().count();
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        (!self.ime_preedit.is_empty()).then(|| 0..self.ime_preedit.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.ime_preedit.clear();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_preedit.clear();
+        self.commit_text(text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        text.clone_into(&mut self.ime_preedit);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(
+            bounds.bottom_left(),
+            size(px(1.0), px(self.terminal_font.metrics.line_height)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(0)
+    }
+}
+
+struct TerminalInputElement {
+    input: Entity<RustMux>,
+}
+
+impl IntoElement for TerminalInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TerminalInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        (): &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.input.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
+    }
+}
+
+fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
+    match button {
+        MouseButton::Left => Some(TerminalMouseButton::Left),
+        MouseButton::Middle => Some(TerminalMouseButton::Middle),
+        MouseButton::Right => Some(TerminalMouseButton::Right),
+        MouseButton::Navigate(_) => None,
+    }
+}
+
+fn terminal_modifiers(modifiers: gpui::Modifiers) -> TerminalModifiers {
+    TerminalModifiers {
+        shift: modifiers.shift,
+        alt: modifiers.alt,
+        control: modifiers.control,
+    }
+}
+
+fn selection_span(selection: TerminalSelection, row: usize, columns: u16) -> Option<(u16, u16)> {
+    let row = u16::try_from(row).ok()?;
+    if row < selection.start.row || row > selection.end.row || columns == 0 {
+        return None;
+    }
+    let start = if selection.is_block || row == selection.start.row {
+        selection.start.column.min(columns - 1)
+    } else {
+        0
+    };
+    let end = if selection.is_block || row == selection.end.row {
+        selection.end.column.min(columns - 1)
+    } else {
+        columns - 1
+    };
+    (end >= start).then_some((start, end - start + 1))
+}
+
+fn prepare_paste(text: &str, bracketed: bool) -> Result<Vec<u8>, &'static str> {
+    let normalized = text.replace("\r\n", "\n").replace('\n', "\r");
+    let sanitized = normalized.replace(['\0', '\u{1b}'], "");
+    let wrapper_size = if bracketed { 12 } else { 0 };
+    if sanitized.len().saturating_add(wrapper_size) > MAX_PASTE_BYTES {
+        return Err("paste rejected: clipboard text exceeds 64 KiB");
+    }
+    if bracketed {
+        let mut bytes = Vec::with_capacity(sanitized.len() + wrapper_size);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(sanitized.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        Ok(bytes)
+    } else {
+        Ok(sanitized.into_bytes())
     }
 }
 
@@ -2583,6 +3288,15 @@ fn main() {
                 .iter()
                 .map(|prefix| KeyBinding::new(prefix, ConsumeChordPrefix, Some(ROOT_KEY_CONTEXT))),
         );
+        bindings.extend([
+            KeyBinding::new("cmd-c", CopyTerminal, Some(ROOT_KEY_CONTEXT)),
+            KeyBinding::new("cmd-v", PasteTerminal, Some(ROOT_KEY_CONTEXT)),
+            KeyBinding::new("cmd-f", FindTerminal, Some(ROOT_KEY_CONTEXT)),
+            KeyBinding::new("cmd-g", FindNextTerminal, Some(ROOT_KEY_CONTEXT)),
+            KeyBinding::new("ctrl-shift-c", CopyTerminal, Some(ROOT_KEY_CONTEXT)),
+            KeyBinding::new("ctrl-shift-v", PasteTerminal, Some(ROOT_KEY_CONTEXT)),
+            KeyBinding::new("ctrl-shift-f", FindTerminal, Some(ROOT_KEY_CONTEXT)),
+        ]);
         cx.bind_keys(bindings);
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
         cx.open_window(
@@ -2864,6 +3578,19 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_paste_normalizes_newlines_and_cannot_inject_an_early_end_marker() {
+        let bytes = prepare_paste("one\n\x1b[201~two\r\n", true).unwrap();
+        assert_eq!(bytes, b"\x1b[200~one\r[201~two\r\x1b[201~");
+        assert_eq!(
+            bytes
+                .windows(b"\x1b[201~".len())
+                .filter(|window| *window == b"\x1b[201~")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn zoom_is_a_projection_that_does_not_mutate_canonical_layout() {
         let first = Pane {
             id: Uuid::from_u128(101),
@@ -2955,5 +3682,26 @@ mod tests {
                 .abs()
                 < f32::EPSILON
         );
+    }
+
+    #[test]
+    fn oversized_paste_is_rejected_before_it_reaches_the_protocol() {
+        let text = "x".repeat(MAX_PASTE_BYTES + 1);
+        assert_eq!(
+            prepare_paste(&text, false),
+            Err("paste rejected: clipboard text exceeds 64 KiB")
+        );
+    }
+
+    #[test]
+    fn selection_highlight_spans_exact_grid_cells_across_rows() {
+        let selection = TerminalSelection {
+            start: TerminalPoint { row: 1, column: 3 },
+            end: TerminalPoint { row: 2, column: 4 },
+            is_block: false,
+        };
+        assert_eq!(selection_span(selection, 0, 10), None);
+        assert_eq!(selection_span(selection, 1, 10), Some((3, 7)));
+        assert_eq!(selection_span(selection, 2, 10), Some((0, 5)));
     }
 }

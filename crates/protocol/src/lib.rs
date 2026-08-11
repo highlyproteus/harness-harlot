@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const SOCKET_ENV: &str = "RUST_MUX_SOCKET";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
@@ -94,6 +94,78 @@ pub struct TerminalScreen {
     pub rows: u16,
     pub lines: Vec<TerminalLine>,
     pub cursor: Option<TerminalCursor>,
+    pub selection: Option<TerminalSelection>,
+    pub display_offset: u32,
+    pub history_size: u32,
+    pub modes: TerminalModes,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TerminalModes {
+    bits: u8,
+}
+
+impl TerminalModes {
+    pub const BRACKETED_PASTE: u8 = 1 << 0;
+    pub const MOUSE_REPORTING: u8 = 1 << 1;
+    pub const MOUSE_MOTION: u8 = 1 << 2;
+    pub const SGR_MOUSE: u8 = 1 << 3;
+
+    pub const fn new(bits: u8) -> Self {
+        Self { bits }
+    }
+
+    pub const fn contains(self, mode: u8) -> bool {
+        self.bits & mode != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalSelection {
+    pub start: TerminalPoint,
+    pub end: TerminalPoint,
+    pub is_block: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalPoint {
+    pub row: u16,
+    pub column: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSelectionKind {
+    Simple,
+    Block,
+    Semantic,
+    Lines,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMouseAction {
+    Press,
+    Release,
+    Move,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -206,6 +278,37 @@ pub enum ClientRequest {
         pane_id: Uuid,
         bytes: Vec<u8>,
     },
+    BeginSelection {
+        pane_id: Uuid,
+        point: TerminalPoint,
+        kind: TerminalSelectionKind,
+    },
+    UpdateSelection {
+        pane_id: Uuid,
+        point: TerminalPoint,
+    },
+    ClearSelection {
+        pane_id: Uuid,
+    },
+    CopySelection {
+        pane_id: Uuid,
+    },
+    ScrollPane {
+        pane_id: Uuid,
+        lines: i32,
+    },
+    SearchPane {
+        pane_id: Uuid,
+        query: String,
+        forward: bool,
+    },
+    MouseInput {
+        pane_id: Uuid,
+        point: TerminalPoint,
+        button: TerminalMouseButton,
+        action: TerminalMouseAction,
+        modifiers: TerminalModifiers,
+    },
     ResizePane {
         pane_id: Uuid,
         columns: u16,
@@ -234,6 +337,12 @@ pub enum ServiceResponse {
         pane_id: Uuid,
     },
     Ack,
+    SelectionText {
+        text: Option<String>,
+    },
+    SearchResult {
+        found: bool,
+    },
     Error {
         message: String,
     },
