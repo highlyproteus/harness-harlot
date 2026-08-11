@@ -2,7 +2,7 @@
 
 Rust Mux is a reliability-first native workspace application for local and SSH terminal work on macOS and Linux. It takes behavior-level inspiration from cmux's workspace, sidebar, tab, split-pane, and freely rearrangeable pane experience while deliberately separating session lifetime from desktop UI lifetime.
 
-The repository now contains a runnable local-terminal checkpoint: the GPUI client opens the user's configured shell, sends keyboard input to service-owned PTYs, renders ANSI SGR color and style from the Alacritty grid, resizes PTYs, creates pane-local tabs and horizontal/vertical splits, and can restart without ending those shells. SSH, Unicode-width hardening, selection, scrollback controls, and durable on-disk recovery are still roadmap work.
+The repository now contains runnable local terminals plus a thin system-SSH checkpoint: the GPUI client opens the user's configured shell, sends keyboard and mouse input to service-owned PTYs, renders ANSI SGR color and style from the Alacritty grid, supports selection/copy/paste, bounded scrollback and literal search, resizes PTYs, and creates pane-local tabs and splits. The daemon persists a restricted local desired-state snapshot for fresh-shell recovery, while an explicit two-step SSH action can launch the installed OpenSSH client in the same kind of daemon-owned PTY. Unicode shaping and broader platform soak remain roadmap work.
 
 ## Architecture
 
@@ -26,7 +26,9 @@ The Rust workspace keeps those responsibilities explicit:
 - `rust-mux-protocol`: versioned transport messages and shared layout types.
 - `rust-mux-terminal-model`: a narrow adapter around Alacritty's established terminal engine. Rust Mux will not implement VT parsing from scratch.
 
-The client is only a projection of daemon state. Closing it does not stop the service or its local PTYs; a new client fetches the current layouts and terminal screens from the owner-only Unix socket.
+The client is only a projection of daemon state. Closing it does not stop the service or its PTYs; a new client fetches the current layouts and terminal screens from the owner-only Unix socket. A daemon restart recreates fresh local shells from a restricted owner-only snapshot; it does not claim to preserve live processes.
+
+For SSH, Rust Mux validates one conservative host or alias and launches structured argv equivalent to `ssh -- <host>`. It does not read SSH keys or config, probe hosts with `ssh -G`, add agent forwarding, change host-key policy, or answer prompts. The installed OpenSSH client remains the sole authority for `~/.ssh/config`, `Include`/`Match`, agents and identity files, known hosts, proxies, multiplexing, authentication, and host-key verification. SSH sessions are runtime-only in this checkpoint: their host intent is deliberately excluded from recovery snapshots, so restarting the daemon cannot initiate network access.
 
 See [the terminal theme architecture](docs/terminal-theme.md) for the `Harbor Night` palette boundary and [the all-Rust renderer roadmap](docs/terminal-renderer-roadmap.md) for the hard no-libghostty decision and the measured typography/cell-rendering plan.
 
@@ -93,10 +95,10 @@ See [the project plan](index.html) and [`tasks/rust-mux`](tasks/rust-mux) for ph
 
 ## Roadmap
 
-1. Finish terminal interaction beyond the current ANSI/cursor checkpoint: Unicode-width handling, selection, clipboard, scrollback, search, mouse reporting, and IME.
+1. Harden terminal interaction beyond the current selection, clipboard, bounded scrollback, literal-search, mouse-reporting, and foundational IME checkpoint: grapheme shaping, wide-cell edge cases, richer search, and accessibility.
 2. Harden the framed IPC with request IDs, event subscriptions, sequence-gap recovery, and reconnect/backpressure tests.
-3. Harden child-exit semantics beyond the current confirmed pane-close path, add CWD inheritance, and add atomic on-disk workspace persistence.
-4. Add configured-host SSH workspaces by launching system OpenSSH inside managed PTYs.
+3. Harden the current CWD inheritance, exit/close semantics, and atomic desired-state recovery with crash fault injection and longer lifecycle soak.
+4. Add conservative, side-effect-free configured-host suggestions and harden SSH child-exit presentation without changing the system-OpenSSH authority boundary.
 5. Validate GPUI on real Linux Wayland/X11 GPU sessions and retain Iced/wgpu as the portability fallback.
 6. Soak macOS Spaces/display switching, Linux compositors, high-output terminals, and service/client crash paths before packaging.
 

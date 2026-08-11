@@ -2,8 +2,10 @@
 
 mod persistence;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -15,7 +17,7 @@ use rust_mux_protocol::{
     ClientRequest, DropPlacement, MAX_FRAME_SIZE, PROTOCOL_VERSION, Pane, PaneLayout,
     ServiceResponse, SessionSnapshot, SplitAxis, Tab, TerminalModes, TerminalModifiers,
     TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
-    Workspace,
+    Workspace, validate_ssh_host,
 };
 use rust_mux_terminal_model::TerminalModel;
 use serde::Serialize;
@@ -62,7 +64,28 @@ impl Drop for PtySession {
 }
 
 impl PtySession {
-    fn spawn(pane_id: Uuid, cwd: &Path) -> Result<Arc<Self>> {
+    fn spawn_local(pane_id: Uuid, cwd: &Path) -> Result<Arc<Self>> {
+        let shell = configured_shell();
+        Self::spawn_command(
+            pane_id,
+            local_shell_command(pane_id, cwd),
+            &format!("configured shell {shell}"),
+        )
+    }
+
+    fn spawn_ssh(pane_id: Uuid, host: &str) -> Result<Arc<Self>> {
+        Self::spawn_command(
+            pane_id,
+            system_ssh_command(pane_id, host)?,
+            "system OpenSSH",
+        )
+    }
+
+    fn spawn_command(
+        pane_id: Uuid,
+        command: CommandBuilder,
+        description: &str,
+    ) -> Result<Arc<Self>> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: INITIAL_ROWS,
@@ -72,17 +95,10 @@ impl PtySession {
             })
             .context("open native PTY")?;
 
-        let shell = configured_shell();
-        let mut command = CommandBuilder::new(&shell);
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command.env("RUST_MUX_PANE_ID", pane_id.to_string());
-        command.cwd(cwd);
-
         let child = pair
             .slave
             .spawn_command(command)
-            .with_context(|| format!("spawn configured shell {shell}"))?;
+            .with_context(|| format!("spawn {description}"))?;
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
@@ -303,8 +319,28 @@ impl PtySession {
 struct RuntimePane {
     session: Arc<PtySession>,
     last_valid_cwd: PathBuf,
+    kind: RuntimePaneKind,
     recovered: bool,
     exit_status: Option<String>,
+}
+
+#[derive(Debug)]
+enum RuntimePaneKind {
+    Local,
+    SystemSsh { host: String },
+}
+
+impl RuntimePaneKind {
+    fn is_local(&self) -> bool {
+        matches!(self, Self::Local)
+    }
+
+    fn shell_label(&self) -> String {
+        match self {
+            Self::Local => shell_title(),
+            Self::SystemSsh { host } => format!("ssh {host}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -362,13 +398,14 @@ impl SessionRegistry {
                 .remove(&pane_id)
                 .filter(|cwd| valid_local_cwd(cwd))
                 .unwrap_or_else(|| fallback.clone());
-            match PtySession::spawn(pane_id, &cwd) {
+            match PtySession::spawn_local(pane_id, &cwd) {
                 Ok(session) => {
                     panes.insert(
                         pane_id,
                         RuntimePane {
                             session,
                             last_valid_cwd: cwd,
+                            kind: RuntimePaneKind::Local,
                             recovered: true,
                             exit_status: None,
                         },
@@ -381,7 +418,7 @@ impl SessionRegistry {
             }
         }
         for pane_id in panes.keys().copied().collect::<Vec<_>>() {
-            set_pane_runtime_label(&mut recovered.snapshot, pane_id, true, None);
+            set_pane_runtime_label(&mut recovered.snapshot, pane_id, true, None, &shell_title());
         }
         let next_terminal_number = u32::try_from(panes.len())
             .unwrap_or(u32::MAX)
@@ -405,7 +442,7 @@ impl SessionRegistry {
             pane.shell = shell_title();
         }
         let cwd = fallback_cwd()?;
-        let session = PtySession::spawn(pane_id, &cwd)?;
+        let session = PtySession::spawn_local(pane_id, &cwd)?;
         Ok(Self {
             state: Arc::new(RwLock::new(RegistryState {
                 snapshot,
@@ -414,6 +451,7 @@ impl SessionRegistry {
                     RuntimePane {
                         session,
                         last_valid_cwd: cwd,
+                        kind: RuntimePaneKind::Local,
                         recovered: false,
                         exit_status: None,
                     },
@@ -460,7 +498,7 @@ impl SessionRegistry {
     pub fn create_pane(&self, target_pane: Uuid, axis: SplitAxis) -> Result<Uuid> {
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
-        let session = PtySession::spawn(new_id, &cwd)?;
+        let session = PtySession::spawn_local(new_id, &cwd)?;
         let mut state = self
             .state
             .write()
@@ -483,6 +521,7 @@ impl SessionRegistry {
             RuntimePane {
                 session,
                 last_valid_cwd: cwd,
+                kind: RuntimePaneKind::Local,
                 recovered: false,
                 exit_status: None,
             },
@@ -495,7 +534,7 @@ impl SessionRegistry {
     pub fn create_tab(&self, target_pane: Uuid) -> Result<Uuid> {
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
-        let session = PtySession::spawn(new_id, &cwd)?;
+        let session = PtySession::spawn_local(new_id, &cwd)?;
         let mut state = self
             .state
             .write()
@@ -518,6 +557,7 @@ impl SessionRegistry {
             RuntimePane {
                 session,
                 last_valid_cwd: cwd,
+                kind: RuntimePaneKind::Local,
                 recovered: false,
                 exit_status: None,
             },
@@ -525,6 +565,75 @@ impl SessionRegistry {
         state.snapshot.revision += 1;
         persist_state(&state)?;
         Ok(new_id)
+    }
+
+    /// Starts the installed OpenSSH client only for an explicit, validated
+    /// destination and places it in the target pane's tab strip.
+    pub fn connect_ssh(&self, target_pane: Uuid, host: &str) -> Result<Uuid> {
+        validate_ssh_host(host).map_err(|message| anyhow!(message))?;
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            if !state
+                .snapshot
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .any(|tab| layout_contains(&tab.layout, target_pane))
+            {
+                bail!("target pane {target_pane} does not exist");
+            }
+        }
+
+        let pane_id = Uuid::new_v4();
+        let cwd = fallback_cwd()?;
+        let session = PtySession::spawn_ssh(pane_id, host)?;
+        let result = (|| {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            let pane = Pane {
+                id: pane_id,
+                title: format!("SSH {host}"),
+                shell: "ssh".to_owned(),
+            };
+            let did_add = state.snapshot.workspaces.iter_mut().any(|workspace| {
+                workspace
+                    .tabs
+                    .iter_mut()
+                    .any(|tab| add_tab(&mut tab.layout, target_pane, pane.clone()))
+            });
+            if !did_add {
+                bail!("target pane {target_pane} does not exist");
+            }
+            state.panes.insert(
+                pane_id,
+                RuntimePane {
+                    session: Arc::clone(&session),
+                    last_valid_cwd: cwd,
+                    kind: RuntimePaneKind::SystemSsh {
+                        host: host.to_owned(),
+                    },
+                    recovered: false,
+                    exit_status: None,
+                },
+            );
+            state.snapshot.revision += 1;
+            Ok(pane_id)
+        })();
+        if result.is_err() {
+            let _ = session.terminate_and_wait();
+        }
+        result
     }
 
     pub fn activate_tab(&self, pane_id: Uuid) -> Result<()> {
@@ -613,7 +722,7 @@ impl SessionRegistry {
     ) -> Result<()> {
         let replacement_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(pane_id)?;
-        let replacement_session = PtySession::spawn(replacement_id, &cwd)?;
+        let replacement_session = PtySession::spawn_local(replacement_id, &cwd)?;
         let result = (|| {
             let mut state = self
                 .state
@@ -641,6 +750,7 @@ impl SessionRegistry {
                 RuntimePane {
                     session: Arc::clone(&replacement_session),
                     last_valid_cwd: cwd,
+                    kind: RuntimePaneKind::Local,
                     recovered: false,
                     exit_status: None,
                 },
@@ -721,14 +831,19 @@ impl SessionRegistry {
             if !can_close {
                 bail!("a workspace must keep at least one terminal");
             }
-            let session = Arc::clone(
-                &state
-                    .panes
-                    .get(&pane_id)
-                    .context("pane process is missing")?
-                    .session,
+            let runtime = state
+                .panes
+                .get(&pane_id)
+                .context("pane process is missing")?;
+            let session = Arc::clone(&runtime.session);
+            let shell_label = runtime.kind.shell_label();
+            set_pane_runtime_label(
+                &mut state.snapshot,
+                pane_id,
+                false,
+                Some("terminating"),
+                &shell_label,
             );
-            set_pane_runtime_label(&mut state.snapshot, pane_id, false, Some("terminating"));
             state.snapshot.revision += 1;
             persist_state(&state)?;
             session
@@ -766,7 +881,7 @@ impl SessionRegistry {
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
-        let session = PtySession::spawn(pane_id, &cwd)?;
+        let session = PtySession::spawn_local(pane_id, &cwd)?;
         let mut state = self
             .state
             .write()
@@ -790,6 +905,7 @@ impl SessionRegistry {
             RuntimePane {
                 session,
                 last_valid_cwd: cwd,
+                kind: RuntimePaneKind::Local,
                 recovered: false,
                 exit_status: None,
             },
@@ -868,11 +984,14 @@ impl SessionRegistry {
             .write()
             .map_err(|_| anyhow!("session state lock was poisoned"))?;
         refresh_runtime_metadata(&mut state)?;
-        state
+        let runtime = state
             .panes
             .get(&pane_id)
-            .map(|runtime| runtime.last_valid_cwd.clone())
-            .with_context(|| format!("pane {pane_id} does not exist"))
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        match &runtime.kind {
+            RuntimePaneKind::Local => Ok(runtime.last_valid_cwd.clone()),
+            RuntimePaneKind::SystemSsh { .. } => fallback_cwd(),
+        }
     }
 }
 
@@ -886,12 +1005,53 @@ fn persist_state(state: &RegistryState) -> Result<()> {
     let Some(store) = &state.store else {
         return Ok(());
     };
+    let ephemeral_panes = state
+        .panes
+        .iter()
+        .filter_map(|(pane_id, runtime)| (!runtime.kind.is_local()).then_some(*pane_id))
+        .collect::<HashSet<_>>();
+    let Some(snapshot) = local_persistence_projection(&state.snapshot, &ephemeral_panes) else {
+        // A workspace containing only live remote sessions has no safe,
+        // network-silent restart representation. Keep the previous complete
+        // local snapshot instead of serializing remote intent or host data.
+        return Ok(());
+    };
     let cwd_by_pane = state
         .panes
         .iter()
+        .filter(|(_, runtime)| runtime.kind.is_local())
         .map(|(pane_id, runtime)| (*pane_id, runtime.last_valid_cwd.clone()))
         .collect();
-    store.save(&state.snapshot, &cwd_by_pane)
+    store.save(&snapshot, &cwd_by_pane)
+}
+
+fn local_persistence_projection(
+    snapshot: &SessionSnapshot,
+    ephemeral_panes: &HashSet<Uuid>,
+) -> Option<SessionSnapshot> {
+    let mut snapshot = snapshot.clone();
+    for workspace in &mut snapshot.workspaces {
+        workspace.tabs.retain_mut(|tab| {
+            let mut remaining = Some(tab.layout.clone());
+            for pane_id in ephemeral_panes {
+                let Some(layout) = remaining.take() else {
+                    break;
+                };
+                let (_, next) = detach_pane(layout, *pane_id);
+                remaining = next;
+            }
+            if let Some(layout) = remaining {
+                tab.layout = layout;
+                true
+            } else {
+                false
+            }
+        });
+    }
+    snapshot
+        .workspaces
+        .retain(|workspace| !workspace.tabs.is_empty());
+    (!snapshot.workspaces.is_empty()).then_some(snapshot)
 }
 
 fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
@@ -916,7 +1076,8 @@ fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
 
     let mut labels = Vec::new();
     for (pane_id, runtime) in &mut state.panes {
-        if runtime.exit_status.is_none()
+        if runtime.kind.is_local()
+            && runtime.exit_status.is_none()
             && let Some((_, pid)) = pids.iter().find(|(id, _)| id == pane_id)
             && let Some(cwd) = system.process(*pid).and_then(sysinfo::Process::cwd)
             && valid_local_cwd(cwd)
@@ -926,12 +1087,23 @@ fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
         let observed = runtime.session.exit_status()?;
         if observed.is_some() && observed != runtime.exit_status {
             runtime.exit_status.clone_from(&observed);
-            labels.push((*pane_id, runtime.recovered, observed));
+            labels.push((
+                *pane_id,
+                runtime.recovered,
+                observed,
+                runtime.kind.shell_label(),
+            ));
         }
     }
     if !labels.is_empty() {
-        for (pane_id, recovered, status) in labels {
-            set_pane_runtime_label(&mut state.snapshot, pane_id, recovered, status.as_deref());
+        for (pane_id, recovered, status, shell_label) in labels {
+            set_pane_runtime_label(
+                &mut state.snapshot,
+                pane_id,
+                recovered,
+                status.as_deref(),
+                &shell_label,
+            );
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
     }
@@ -943,13 +1115,13 @@ fn set_pane_runtime_label(
     pane_id: Uuid,
     recovered: bool,
     status: Option<&str>,
+    shell_label: &str,
 ) {
-    let shell = shell_title();
     let label = match status {
-        Some("terminating") => format!("{shell} · terminating"),
-        Some(status) => format!("{shell} · exited ({status})"),
-        None if recovered => format!("{shell} · recovered with a fresh shell"),
-        None => shell,
+        Some("terminating") => format!("{shell_label} · terminating"),
+        Some(status) => format!("{shell_label} · exited ({status})"),
+        None if recovered => format!("{shell_label} · recovered with a fresh shell"),
+        None => shell_label.to_owned(),
     };
     if let Some(pane) = find_pane_mut_in_snapshot(snapshot, pane_id) {
         pane.shell = label;
@@ -1001,6 +1173,69 @@ fn configured_shell() -> String {
         .ok()
         .filter(|shell| shell.starts_with('/') && std::path::Path::new(shell).exists())
         .unwrap_or_else(|| "/bin/sh".to_owned())
+}
+
+fn local_shell_command(pane_id: Uuid, cwd: &Path) -> CommandBuilder {
+    let mut command = command_with_terminal_env([OsString::from(configured_shell())], pane_id);
+    command.cwd(cwd);
+    command
+}
+
+fn system_ssh_command(pane_id: Uuid, host: &str) -> Result<CommandBuilder> {
+    validate_ssh_host(host).map_err(|message| anyhow!(message))?;
+    system_ssh_command_with(system_ssh_binary()?, pane_id, host)
+}
+
+fn system_ssh_command_with(
+    binary: impl AsRef<OsStr>,
+    pane_id: Uuid,
+    host: &str,
+) -> Result<CommandBuilder> {
+    validate_ssh_host(host).map_err(|message| anyhow!(message))?;
+    Ok(command_with_terminal_env(
+        [
+            binary.as_ref().to_owned(),
+            OsString::from("--"),
+            OsString::from(host),
+        ],
+        pane_id,
+    ))
+}
+
+fn command_with_terminal_env(
+    argv: impl IntoIterator<Item = OsString>,
+    pane_id: Uuid,
+) -> CommandBuilder {
+    let mut command = CommandBuilder::from_argv(argv.into_iter().collect());
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("RUST_MUX_PANE_ID", pane_id.to_string());
+    if let Some(home) = std::env::var_os("HOME") {
+        command.cwd(home);
+    }
+    command
+}
+
+fn system_ssh_binary() -> Result<PathBuf> {
+    for path in [Path::new("/usr/bin/ssh"), Path::new("/bin/ssh")] {
+        if is_executable_file(path) {
+            return Ok(path.to_path_buf());
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+            let candidate = directory.join("ssh");
+            if is_executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    bail!("installed system OpenSSH client was not found")
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn shell_title() -> String {
@@ -1415,6 +1650,9 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         ClientRequest::CreateTab { target_pane } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.create_tab(target_pane)?,
         }),
+        ClientRequest::ConnectSsh { target_pane, host } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.connect_ssh(target_pane, &host)?,
+        }),
         ClientRequest::ActivateTab { pane_id } => {
             sessions.activate_tab(pane_id)?;
             Ok(ServiceResponse::Ack)
@@ -1569,6 +1807,88 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn local_terminal_command_remains_the_configured_shell_without_arguments() {
+        let pane_id = Uuid::nil();
+        let cwd = fallback_cwd().unwrap();
+        let command = local_shell_command(pane_id, &cwd);
+
+        assert_eq!(
+            command.get_argv(),
+            &[OsString::from(configured_shell())],
+            "the SSH track must not wrap or alter local shell startup"
+        );
+    }
+
+    #[test]
+    fn ssh_command_uses_structured_argv_without_security_overrides() {
+        let command = system_ssh_command_with("/usr/bin/ssh", Uuid::nil(), "prod-east").unwrap();
+
+        assert_eq!(
+            command.get_argv(),
+            &[
+                OsString::from("/usr/bin/ssh"),
+                OsString::from("--"),
+                OsString::from("prod-east"),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_ssh_destinations_are_rejected_before_command_construction() {
+        for host in [
+            "-oProxyCommand=bad",
+            "user@host",
+            "host command",
+            "host\n-A",
+        ] {
+            assert!(
+                system_ssh_command_with("/usr/bin/ssh", Uuid::nil(), host).is_err(),
+                "host: {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_ssh_intent_does_not_create_or_replace_a_terminal() {
+        let registry = SessionRegistry::new().unwrap();
+        let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        let first_pid = registry.pane_process_id(first).unwrap();
+
+        assert!(registry.connect_ssh(first, "-A").is_err());
+
+        assert_eq!(registry.pane_process_id(first).unwrap(), first_pid);
+        assert_eq!(registry.state().unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn remote_panes_are_excluded_from_the_network_silent_recovery_projection() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let local = first_pane_id(&snapshot).unwrap();
+        let local_pane = find_pane_mut_in_snapshot(&mut snapshot, local)
+            .expect("seeded local pane")
+            .clone();
+        let remote = Uuid::new_v4();
+        snapshot.workspaces[0].tabs[0].layout = PaneLayout::Stack {
+            panes: vec![
+                local_pane,
+                Pane {
+                    id: remote,
+                    title: "SSH private-alias".to_owned(),
+                    shell: "ssh".to_owned(),
+                },
+            ],
+            active: remote,
+        };
+
+        let projected = local_persistence_projection(&snapshot, &HashSet::from([remote]))
+            .expect("the local pane remains recoverable");
+
+        assert_eq!(pane_ids_in_snapshot(&projected), vec![local]);
+        assert!(!format!("{projected:?}").contains("private-alias"));
+        assert!(local_persistence_projection(&snapshot, &HashSet::from([local, remote])).is_none());
+    }
 
     #[test]
     fn configured_shell_pty_accepts_input_and_produces_real_output() {

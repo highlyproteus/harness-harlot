@@ -38,6 +38,24 @@ async fn client_can_handshake_and_fetch_snapshot() {
     match response {
         ServiceResponse::Snapshot { snapshot } => {
             assert_eq!(snapshot.workspaces.len(), 1);
+            let target_pane = match &snapshot.workspaces[0].tabs[0].layout {
+                rust_mux_protocol::PaneLayout::Leaf { pane } => pane.id,
+                other => panic!("unexpected initial layout: {other:?}"),
+            };
+            write_message(
+                &mut client,
+                &ClientRequest::ConnectSsh {
+                    target_pane,
+                    host: "-A".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_message::<ServiceResponse>(&mut client).await.unwrap(),
+                ServiceResponse::Error { message }
+                    if message.contains("must start with a letter or number")
+            ));
         }
         other => panic!("unexpected response: {other:?}"),
     }

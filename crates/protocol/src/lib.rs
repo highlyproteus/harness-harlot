@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub const PROTOCOL_VERSION: u16 = 5;
 pub const SOCKET_ENV: &str = "RUST_MUX_SOCKET";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const MAX_SSH_HOST_LEN: usize = 253;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -248,6 +249,10 @@ pub enum ClientRequest {
     CreateTab {
         target_pane: Uuid,
     },
+    ConnectSsh {
+        target_pane: Uuid,
+        host: String,
+    },
     ActivateTab {
         pane_id: Uuid,
     },
@@ -314,6 +319,39 @@ pub enum ClientRequest {
         columns: u16,
         rows: u16,
     },
+}
+
+/// Validates the single OpenSSH destination accepted from the desktop UI.
+///
+/// Rust Mux deliberately accepts only a conservative host or `Host` alias
+/// subset. In particular, option prefixes, usernames, ports, commands, shell
+/// syntax, whitespace, and control characters are not part of this value.
+/// OpenSSH remains responsible for resolving all connection configuration.
+///
+/// # Errors
+///
+/// Returns a user-facing validation message when `host` is empty, too long,
+/// starts like an option, or contains anything outside the accepted subset.
+pub fn validate_ssh_host(host: &str) -> Result<(), &'static str> {
+    if host.is_empty() {
+        return Err("SSH host or alias is required");
+    }
+    if host.len() > MAX_SSH_HOST_LEN {
+        return Err("SSH host or alias is too long");
+    }
+    let mut bytes = host.bytes();
+    let Some(first) = bytes.next() else {
+        return Err("SSH host or alias is required");
+    };
+    if !first.is_ascii_alphanumeric() {
+        return Err("SSH host or alias must start with a letter or number");
+    }
+    if !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')) {
+        return Err(
+            "SSH host or alias may contain only letters, numbers, dots, underscores, and hyphens",
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -440,5 +478,35 @@ mod tests {
             snapshot.workspaces[0].tabs[0].layout,
             PaneLayout::Leaf { .. }
         ));
+    }
+
+    #[test]
+    fn ssh_host_validation_accepts_conservative_config_aliases() {
+        for host in [
+            "build",
+            "build-01",
+            "prod_us",
+            "host.example.com",
+            "192.0.2.10",
+        ] {
+            assert_eq!(validate_ssh_host(host), Ok(()), "host: {host}");
+        }
+    }
+
+    #[test]
+    fn ssh_host_validation_rejects_option_command_and_shell_injection() {
+        for host in [
+            "",
+            "-A",
+            "user@host",
+            "host:22",
+            "host command",
+            "host\nProxyCommand=bad",
+            "host;bad",
+            "*.example.com",
+            "café",
+        ] {
+            assert!(validate_ssh_host(host).is_err(), "host: {host:?}");
+        }
     }
 }
