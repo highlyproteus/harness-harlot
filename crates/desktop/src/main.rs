@@ -13,12 +13,13 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Application, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId,
-    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, StrikethroughStyle, Style,
-    StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowOptions, actions, div, point, prelude::*, px, relative, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, KeyBinding, KeyDownEvent,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollWheelEvent, StrikethroughStyle, Style, StyledText, TextRun, TitlebarOptions,
+    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, point,
+    prelude::*, px, relative, rgb, rgba, size,
 };
 use rust_mux_desktop::request;
 use rust_mux_protocol::{
@@ -74,6 +75,8 @@ const MIN_PANE_WIDTH: f32 = 140.0;
 const MIN_PANE_HEIGHT: f32 = 90.0;
 const COMMAND_PALETTE_LIMIT: usize = 32;
 const MAX_PASTE_BYTES: usize = 64 * 1024;
+const ACTIVE_TERMINAL_POLL_MS: u64 = 33;
+const IDLE_TERMINAL_POLL_MS: u64 = 250;
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 
 #[derive(Clone, Debug)]
@@ -379,27 +382,36 @@ impl RustMux {
         .detach();
 
         cx.spawn(async move |this, cx| {
+            let mut poll_delay_ms = ACTIVE_TERMINAL_POLL_MS;
             loop {
-                gpui::Timer::after(Duration::from_millis(70)).await;
-                if this
-                    .update(cx, |this, cx| {
-                        this.refresh_state();
-                        this.sync_pty_sizes();
+                gpui::Timer::after(Duration::from_millis(poll_delay_ms)).await;
+                let Ok(state_changed) = this.update(cx, |this, cx| {
+                    let state_changed = this.refresh_state();
+                    this.sync_pty_sizes();
+                    if state_changed {
                         cx.notify();
-                    })
-                    .is_err()
-                {
+                    }
+                    state_changed
+                }) else {
                     break;
-                }
+                };
+                poll_delay_ms = next_terminal_poll_delay_ms(poll_delay_ms, state_changed);
             }
         })
         .detach();
         app
     }
 
-    fn refresh_state(&mut self) {
+    fn refresh_state(&mut self) -> bool {
         match request(ClientRequest::GetState) {
             Ok(ServiceResponse::State { snapshot, screens }) => {
+                let state_changed = self.snapshot.as_ref() != Some(&snapshot)
+                    || screens.len() != self.screens.len()
+                    || screens.iter().any(|screen| {
+                        self.screens
+                            .get(&screen.pane_id)
+                            .is_none_or(|current| current.revision != screen.revision)
+                    });
                 if self.active_workspace.is_none()
                     || !snapshot
                         .workspaces
@@ -426,17 +438,29 @@ impl RustMux {
                 {
                     self.focused_pane = visible.first().copied();
                 }
-                self.screens = screens
-                    .into_iter()
-                    .map(|screen| (screen.pane_id, screen))
-                    .collect();
-                self.snapshot = Some(snapshot);
+                if state_changed {
+                    self.screens = screens
+                        .into_iter()
+                        .map(|screen| (screen.pane_id, screen))
+                        .collect();
+                    self.snapshot = Some(snapshot);
+                }
+                let connection_changed = self.connection_error.take().is_some();
                 self.connection_error = None;
+                state_changed || connection_changed
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"))
+                let error = format!("unexpected response: {response:?}");
+                let changed = self.connection_error.as_deref() != Some(error.as_str());
+                self.connection_error = Some(error);
+                changed
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => {
+                let error = format!("{error:#}");
+                let changed = self.connection_error.as_deref() != Some(error.as_str());
+                self.connection_error = Some(error);
+                changed
+            }
         }
     }
 
@@ -1936,68 +1960,20 @@ impl RustMux {
                         }),
                 )
             })
-            .children((0..columns).map(|column| {
-                let point = TerminalPoint {
-                    row: u16::try_from(row).unwrap_or(u16::MAX),
-                    column,
-                };
-                let span = metrics.span(column, 1);
+            .child(
                 div()
-                    .id((
-                        "terminal-cell",
-                        element_key(pane_id)
-                            ^ (u64::try_from(row).unwrap_or(u64::MAX) << 16)
-                            ^ u64::from(column),
-                    ))
                     .absolute()
-                    .left(px(span.x))
+                    .left(px(0.0))
                     .top(px(0.0))
-                    .w(px(span.width))
-                    .h(px(span.height))
-                    .cursor(CursorStyle::IBeam)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.begin_terminal_pointer(pane_id, point, event, window, cx);
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.begin_terminal_pointer(pane_id, point, event, window, cx);
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.begin_terminal_pointer(pane_id, point, event, window, cx);
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                        this.move_terminal_pointer(pane_id, point, event, cx);
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
-                            this.end_terminal_pointer(pane_id, point, event, cx);
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Middle,
-                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
-                            this.end_terminal_pointer(pane_id, point, event, cx);
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
-                            this.end_terminal_pointer(pane_id, point, event, cx);
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
-                        this.scroll_terminal(pane_id, point, event, cx);
-                    }))
-            }))
+                    .size_full()
+                    .child(TerminalPointerElement {
+                        input: cx.entity(),
+                        pane_id,
+                        row: u16::try_from(row).unwrap_or(u16::MAX),
+                        columns,
+                        cell_width: metrics.cell_width,
+                    }),
+            )
             .into_any_element()
     }
 
@@ -3156,6 +3132,150 @@ impl Element for TerminalInputElement {
     }
 }
 
+/// One hit surface per terminal row keeps pointer semantics exact without
+/// forcing GPUI/Taffy to lay out an element for every visible grid cell.
+struct TerminalPointerElement {
+    input: Entity<RustMux>,
+    pane_id: Uuid,
+    row: u16,
+    columns: u16,
+    cell_width: f32,
+}
+
+impl IntoElement for TerminalPointerElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TerminalPointerElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+        window.insert_hitbox(bounds, HitboxBehavior::BlockMouse)
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        let pointer_hitbox = hitbox.clone();
+        let input = self.input.clone();
+        let pane_id = self.pane_id;
+        let row = self.row;
+        let columns = self.columns;
+        let cell_width = self.cell_width;
+        let hitbox = pointer_hitbox.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                let point = terminal_point_at(event.position, bounds, row, columns, cell_width);
+                input.update(cx, |this, cx| {
+                    this.begin_terminal_pointer(pane_id, point, event, window, cx);
+                });
+            }
+        });
+
+        let input = self.input.clone();
+        let hitbox = pointer_hitbox.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                let point = terminal_point_at(event.position, bounds, row, columns, cell_width);
+                input.update(cx, |this, cx| {
+                    this.move_terminal_pointer(pane_id, point, event, cx);
+                });
+            }
+        });
+
+        let input = self.input.clone();
+        let hitbox = pointer_hitbox.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                let point = terminal_point_at(event.position, bounds, row, columns, cell_width);
+                input.update(cx, |this, cx| {
+                    this.end_terminal_pointer(pane_id, point, event, cx);
+                });
+            }
+        });
+
+        let input = self.input.clone();
+        let hitbox = pointer_hitbox;
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                let point = terminal_point_at(event.position, bounds, row, columns, cell_width);
+                input.update(cx, |this, cx| {
+                    this.scroll_terminal(pane_id, point, event, cx);
+                });
+            }
+        });
+    }
+}
+
+fn terminal_point_at(
+    position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    row: u16,
+    columns: u16,
+    cell_width: f32,
+) -> TerminalPoint {
+    let relative_x = f32::from(position.x - bounds.origin.x).max(0.0);
+    let column = if columns == 0 || cell_width <= f32::EPSILON {
+        0
+    } else {
+        (relative_x / cell_width).floor() as u16
+    };
+    TerminalPoint {
+        row,
+        column: column.min(columns.saturating_sub(1)),
+    }
+}
+
+fn next_terminal_poll_delay_ms(current: u64, state_changed: bool) -> u64 {
+    if state_changed {
+        ACTIVE_TERMINAL_POLL_MS
+    } else {
+        current.saturating_mul(2).min(IDLE_TERMINAL_POLL_MS)
+    }
+}
+
 fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
     match button {
         MouseButton::Left => Some(TerminalMouseButton::Left),
@@ -3812,6 +3932,43 @@ mod tests {
         };
         assert_eq!(terminal_run_display_text(&modeled_cells, 0), "A   B");
         assert_eq!(terminal_run_columns(&modeled_cells, 0), 5);
+    }
+
+    #[test]
+    fn one_row_hit_surface_maps_pointer_positions_to_terminal_cells() {
+        let bounds = Bounds {
+            origin: point(px(100.0), px(40.0)),
+            size: size(px(80.0), px(18.0)),
+        };
+
+        assert_eq!(
+            terminal_point_at(point(px(100.0), px(49.0)), bounds, 7, 10, 8.0),
+            TerminalPoint { row: 7, column: 0 }
+        );
+        assert_eq!(
+            terminal_point_at(point(px(139.9), px(49.0)), bounds, 7, 10, 8.0),
+            TerminalPoint { row: 7, column: 4 }
+        );
+        assert_eq!(
+            terminal_point_at(point(px(190.0), px(49.0)), bounds, 7, 10, 8.0),
+            TerminalPoint { row: 7, column: 9 }
+        );
+    }
+
+    #[test]
+    fn terminal_polling_is_fast_while_output_changes_and_backs_off_when_idle() {
+        assert_eq!(
+            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, true),
+            ACTIVE_TERMINAL_POLL_MS
+        );
+        assert_eq!(
+            next_terminal_poll_delay_ms(ACTIVE_TERMINAL_POLL_MS, false),
+            ACTIVE_TERMINAL_POLL_MS * 2
+        );
+        assert_eq!(
+            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, false),
+            IDLE_TERMINAL_POLL_MS
+        );
     }
 
     #[test]
