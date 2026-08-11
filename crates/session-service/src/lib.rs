@@ -10,7 +10,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rust_mux_protocol::{
     ClientRequest, DropPlacement, MAX_FRAME_SIZE, PROTOCOL_VERSION, Pane, PaneLayout,
-    ServiceResponse, SessionSnapshot, SplitAxis, Tab, TerminalScreen, Workspace,
+    ServiceResponse, SessionSnapshot, SplitAxis, Tab, TerminalModes, TerminalModifiers,
+    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
+    Workspace,
 };
 use rust_mux_terminal_model::TerminalModel;
 use serde::Serialize;
@@ -147,6 +149,17 @@ impl PtySession {
             .lock()
             .map_err(|_| anyhow!("terminal grid lock was poisoned"))?;
         let (columns, rows) = terminal.dimensions();
+        let mut mode_bits = 0;
+        for (enabled, mode) in [
+            (terminal.bracketed_paste(), TerminalModes::BRACKETED_PASTE),
+            (terminal.mouse_reporting(), TerminalModes::MOUSE_REPORTING),
+            (terminal.mouse_motion(), TerminalModes::MOUSE_MOTION),
+            (terminal.sgr_mouse(), TerminalModes::SGR_MOUSE),
+        ] {
+            if enabled {
+                mode_bits |= mode;
+            }
+        }
         Ok(TerminalScreen {
             pane_id,
             revision: self.revision.load(Ordering::Acquire),
@@ -154,7 +167,90 @@ impl PtySession {
             rows: u16::try_from(rows).context("terminal rows exceed protocol range")?,
             lines: terminal.styled_lines(),
             cursor: terminal.cursor(),
+            selection: terminal.selection(),
+            display_offset: u32::try_from(terminal.display_offset())
+                .context("terminal display offset exceeds protocol range")?,
+            history_size: u32::try_from(terminal.history_size())
+                .context("terminal history exceeds protocol range")?,
+            modes: TerminalModes::new(mode_bits),
         })
+    }
+
+    fn begin_selection(&self, point: TerminalPoint, kind: TerminalSelectionKind) -> Result<()> {
+        self.terminal
+            .lock()
+            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
+            .begin_selection(point, kind);
+        self.revision.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn update_selection(&self, point: TerminalPoint) -> Result<()> {
+        self.terminal
+            .lock()
+            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
+            .update_selection(point);
+        self.revision.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn clear_selection(&self) -> Result<()> {
+        self.terminal
+            .lock()
+            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
+            .clear_selection();
+        self.revision.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn selected_text(&self) -> Result<Option<String>> {
+        Ok(self
+            .terminal
+            .lock()
+            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
+            .selected_text())
+    }
+
+    fn scroll(&self, lines: i32) -> Result<()> {
+        self.terminal
+            .lock()
+            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
+            .scroll(lines.clamp(-10_000, 10_000));
+        self.revision.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn search_literal(&self, query: &str, forward: bool) -> Result<bool> {
+        if query.chars().count() > 256 || query.chars().any(char::is_control) {
+            bail!("terminal search must be at most 256 visible characters");
+        }
+        let found = self
+            .terminal
+            .lock()
+            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
+            .search_literal(query, forward);
+        if found {
+            self.revision.fetch_add(1, Ordering::Release);
+        }
+        Ok(found)
+    }
+
+    fn mouse_input(
+        &self,
+        point: TerminalPoint,
+        button: TerminalMouseButton,
+        action: TerminalMouseAction,
+        modifiers: TerminalModifiers,
+    ) -> Result<()> {
+        let report = self
+            .terminal
+            .lock()
+            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
+            .mouse_report(point, button, action, modifiers);
+        if let Some(report) = report {
+            self.write_input(&report)?;
+        }
+        Ok(())
     }
 
     fn terminate(&self) -> Result<()> {
@@ -505,6 +601,47 @@ impl SessionRegistry {
 
     pub fn write_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<()> {
         self.pane(pane_id)?.write_input(bytes)
+    }
+
+    pub fn begin_selection(
+        &self,
+        pane_id: Uuid,
+        point: TerminalPoint,
+        kind: TerminalSelectionKind,
+    ) -> Result<()> {
+        self.pane(pane_id)?.begin_selection(point, kind)
+    }
+
+    pub fn update_selection(&self, pane_id: Uuid, point: TerminalPoint) -> Result<()> {
+        self.pane(pane_id)?.update_selection(point)
+    }
+
+    pub fn clear_selection(&self, pane_id: Uuid) -> Result<()> {
+        self.pane(pane_id)?.clear_selection()
+    }
+
+    pub fn selected_text(&self, pane_id: Uuid) -> Result<Option<String>> {
+        self.pane(pane_id)?.selected_text()
+    }
+
+    pub fn scroll_pane(&self, pane_id: Uuid, lines: i32) -> Result<()> {
+        self.pane(pane_id)?.scroll(lines)
+    }
+
+    pub fn search_pane(&self, pane_id: Uuid, query: &str, forward: bool) -> Result<bool> {
+        self.pane(pane_id)?.search_literal(query, forward)
+    }
+
+    pub fn mouse_input(
+        &self,
+        pane_id: Uuid,
+        point: TerminalPoint,
+        button: TerminalMouseButton,
+        action: TerminalMouseAction,
+        modifiers: TerminalModifiers,
+    ) -> Result<()> {
+        self.pane(pane_id)?
+            .mouse_input(point, button, action, modifiers)
     }
 
     pub fn resize_pane(&self, pane_id: Uuid, columns: u16, rows: u16) -> Result<()> {
@@ -925,6 +1062,18 @@ pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry
 }
 
 fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<ServiceResponse> {
+    if matches!(
+        &request,
+        ClientRequest::BeginSelection { .. }
+            | ClientRequest::UpdateSelection { .. }
+            | ClientRequest::ClearSelection { .. }
+            | ClientRequest::CopySelection { .. }
+            | ClientRequest::ScrollPane { .. }
+            | ClientRequest::SearchPane { .. }
+            | ClientRequest::MouseInput { .. }
+    ) {
+        return handle_terminal_interaction_request(sessions, request);
+    }
     match request {
         ClientRequest::GetSnapshot => Ok(ServiceResponse::Snapshot {
             snapshot: sessions.snapshot()?,
@@ -984,6 +1133,13 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
             sessions.write_input(pane_id, &bytes)?;
             Ok(ServiceResponse::Ack)
         }
+        ClientRequest::BeginSelection { .. }
+        | ClientRequest::UpdateSelection { .. }
+        | ClientRequest::ClearSelection { .. }
+        | ClientRequest::CopySelection { .. }
+        | ClientRequest::ScrollPane { .. }
+        | ClientRequest::SearchPane { .. }
+        | ClientRequest::MouseInput { .. } => unreachable!("handled above"),
         ClientRequest::ResizePane {
             pane_id,
             columns,
@@ -995,6 +1151,55 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         ClientRequest::Hello { .. } => Ok(ServiceResponse::Error {
             message: "hello was already completed".to_owned(),
         }),
+    }
+}
+
+fn handle_terminal_interaction_request(
+    sessions: &SessionRegistry,
+    request: ClientRequest,
+) -> Result<ServiceResponse> {
+    match request {
+        ClientRequest::BeginSelection {
+            pane_id,
+            point,
+            kind,
+        } => {
+            sessions.begin_selection(pane_id, point, kind)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::UpdateSelection { pane_id, point } => {
+            sessions.update_selection(pane_id, point)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ClearSelection { pane_id } => {
+            sessions.clear_selection(pane_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::CopySelection { pane_id } => Ok(ServiceResponse::SelectionText {
+            text: sessions.selected_text(pane_id)?,
+        }),
+        ClientRequest::ScrollPane { pane_id, lines } => {
+            sessions.scroll_pane(pane_id, lines)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::SearchPane {
+            pane_id,
+            query,
+            forward,
+        } => Ok(ServiceResponse::SearchResult {
+            found: sessions.search_pane(pane_id, &query, forward)?,
+        }),
+        ClientRequest::MouseInput {
+            pane_id,
+            point,
+            button,
+            action,
+            modifiers,
+        } => {
+            sessions.mouse_input(pane_id, point, button, action, modifiers)?;
+            Ok(ServiceResponse::Ack)
+        }
+        _ => unreachable!("only terminal interactions are routed here"),
     }
 }
 
