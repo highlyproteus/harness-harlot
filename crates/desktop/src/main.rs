@@ -23,10 +23,11 @@ use gpui::{
 };
 use rust_mux_desktop::request;
 use rust_mux_protocol::{
-    ClientRequest, DropPlacement, MAX_SSH_HOST_LEN, Pane, PaneLayout, ServiceResponse,
-    SessionSnapshot, SplitAxis, TerminalAttributes, TerminalColor, TerminalLine, TerminalModes,
-    TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalRun,
-    TerminalScreen, TerminalSelection, TerminalSelectionKind, Workspace, validate_ssh_host,
+    AppearanceColor, ClientRequest, DropPlacement, MAX_SSH_HOST_LEN, Pane, PaneLayout,
+    ServiceResponse, SessionSnapshot, SplitAxis, TerminalAttributes, TerminalColor, TerminalLine,
+    TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
+    TerminalRun, TerminalScreen, TerminalSelection, TerminalSelectionKind, Workspace,
+    validate_ssh_host,
 };
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
@@ -78,6 +79,16 @@ const MAX_PASTE_BYTES: usize = 64 * 1024;
 const ACTIVE_TERMINAL_POLL_MS: u64 = 33;
 const IDLE_TERMINAL_POLL_MS: u64 = 250;
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
+const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
+    AppearanceColor::new(0x62, 0xad, 0xff),
+    AppearanceColor::new(0x67, 0xc8, 0xc6),
+    AppearanceColor::new(0x95, 0xcc, 0x7f),
+    AppearanceColor::new(0xe4, 0xbd, 0x72),
+    AppearanceColor::new(0xef, 0x71, 0x7a),
+    AppearanceColor::new(0xc9, 0x90, 0xe5),
+    AppearanceColor::new(0xf0, 0x8a, 0xc0),
+    AppearanceColor::new(0x9a, 0xa2, 0xaf),
+];
 
 #[derive(Clone, Debug)]
 struct PaneDrag {
@@ -132,6 +143,28 @@ impl Render for TooltipView {
 struct TabMenu {
     pane_id: Uuid,
     position: Point<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceMenu {
+    workspace_id: Uuid,
+    position: Point<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColorTarget {
+    DefaultTerminal,
+    DefaultWorkspace,
+    Pane(Uuid),
+    Workspace(Uuid),
+}
+
+#[derive(Clone, Debug)]
+struct ColorPickerState {
+    target: ColorTarget,
+    hex: String,
+    replace_on_type: bool,
+    invalid: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -330,6 +363,9 @@ struct RustMux {
     workspace_pixels: (f32, f32),
     connection_error: Option<String>,
     tab_menu: Option<TabMenu>,
+    workspace_menu: Option<WorkspaceMenu>,
+    appearance_settings_open: bool,
+    color_picker: Option<ColorPickerState>,
     rename_editor: Option<RenameEditor>,
     search_editor: Option<SearchEditor>,
     close_confirmation: Option<CloseConfirmation>,
@@ -361,6 +397,9 @@ impl RustMux {
             workspace_pixels: (0.0, 0.0),
             connection_error: None,
             tab_menu: None,
+            workspace_menu: None,
+            appearance_settings_open: false,
+            color_picker: None,
             rename_editor: None,
             search_editor: None,
             close_confirmation: None,
@@ -470,6 +509,118 @@ impl RustMux {
             .workspaces
             .iter()
             .find(|workspace| workspace.id == active)
+    }
+
+    fn terminal_accent(&self, pane_id: Uuid) -> AppearanceColor {
+        self.snapshot
+            .as_ref()
+            .map_or(AppearanceColor::HARBOR_BLUE, |snapshot| {
+                resolved_terminal_accent(snapshot, pane_id)
+            })
+    }
+
+    fn workspace_color(&self, workspace_id: Uuid) -> AppearanceColor {
+        self.snapshot
+            .as_ref()
+            .map_or(AppearanceColor::HARBOR_BLUE, |snapshot| {
+                resolved_workspace_color(snapshot, workspace_id)
+            })
+    }
+
+    fn appearance_choices(&self) -> Vec<AppearanceColor> {
+        let mut colors = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.appearance.recent_colors.clone())
+            .unwrap_or_default();
+        for preset in APPEARANCE_PRESETS {
+            if !colors.contains(&preset) {
+                colors.push(preset);
+            }
+        }
+        colors.truncate(12);
+        colors
+    }
+
+    fn color_for_target(&self, target: ColorTarget) -> AppearanceColor {
+        match target {
+            ColorTarget::DefaultTerminal => self
+                .snapshot
+                .as_ref()
+                .map_or(AppearanceColor::HARBOR_BLUE, |snapshot| {
+                    snapshot.appearance.default_terminal_accent
+                }),
+            ColorTarget::DefaultWorkspace => self
+                .snapshot
+                .as_ref()
+                .map_or(AppearanceColor::HARBOR_BLUE, |snapshot| {
+                    snapshot.appearance.default_workspace_color
+                }),
+            ColorTarget::Pane(pane_id) => self.terminal_accent(pane_id),
+            ColorTarget::Workspace(workspace_id) => self.workspace_color(workspace_id),
+        }
+    }
+
+    fn apply_color(
+        &mut self,
+        target: ColorTarget,
+        color: Option<AppearanceColor>,
+        cx: &mut Context<Self>,
+    ) {
+        let request = match (target, color) {
+            (ColorTarget::DefaultTerminal, Some(color)) => {
+                ClientRequest::SetDefaultTerminalAccent { color }
+            }
+            (ColorTarget::DefaultWorkspace, Some(color)) => {
+                ClientRequest::SetDefaultWorkspaceColor { color }
+            }
+            (ColorTarget::Pane(pane_id), color) => ClientRequest::SetPaneColor { pane_id, color },
+            (ColorTarget::Workspace(workspace_id), color) => ClientRequest::SetWorkspaceColor {
+                workspace_id,
+                color,
+            },
+            (ColorTarget::DefaultTerminal | ColorTarget::DefaultWorkspace, None) => return,
+        };
+        self.send(request);
+        self.tab_menu = None;
+        self.workspace_menu = None;
+        self.color_picker = None;
+        cx.notify();
+    }
+
+    fn open_color_picker(&mut self, target: ColorTarget, cx: &mut Context<Self>) {
+        let current = self.color_for_target(target).as_rgb();
+        self.color_picker = Some(ColorPickerState {
+            target,
+            hex: format!("{current:06X}"),
+            replace_on_type: true,
+            invalid: false,
+        });
+        self.tab_menu = None;
+        self.workspace_menu = None;
+        cx.notify();
+    }
+
+    fn submit_color_picker(&mut self, cx: &mut Context<Self>) {
+        let Some(picker) = self.color_picker.as_ref() else {
+            return;
+        };
+        let target = picker.target;
+        let color = parse_hex_color(&picker.hex);
+        if let Some(color) = color {
+            self.apply_color(target, Some(color), cx);
+        } else if let Some(picker) = self.color_picker.as_mut() {
+            picker.invalid = true;
+            cx.notify();
+        }
+    }
+
+    fn open_appearance_settings(&mut self, cx: &mut Context<Self>) {
+        self.appearance_settings_open = true;
+        self.tab_menu = None;
+        self.workspace_menu = None;
+        self.color_picker = None;
+        cx.notify();
     }
 
     fn send(&mut self, request_message: ClientRequest) {
@@ -603,8 +754,33 @@ impl RustMux {
         self.focused_pane = Some(pane_id);
         self.send(ClientRequest::ActivateTab { pane_id });
         self.tab_menu = Some(TabMenu { pane_id, position });
+        self.workspace_menu = None;
         self.rename_editor = None;
         self.close_confirmation = None;
+        cx.notify();
+    }
+
+    fn open_workspace_menu(
+        &mut self,
+        workspace_id: Uuid,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_workspace = Some(workspace_id);
+        self.focused_pane = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .and_then(|workspace| workspace.tabs.first())
+                .and_then(|tab| visible_panes(&tab.layout).first().copied())
+        });
+        self.workspace_menu = Some(WorkspaceMenu {
+            workspace_id,
+            position,
+        });
+        self.tab_menu = None;
+        self.last_sizes.clear();
         cx.notify();
     }
 
@@ -915,6 +1091,22 @@ impl RustMux {
         if text.is_empty() || text.chars().any(|character| character == '\0') {
             return;
         }
+        if let Some(picker) = self.color_picker.as_mut() {
+            if picker.replace_on_type {
+                picker.hex.clear();
+            }
+            let remaining = 6_usize.saturating_sub(picker.hex.len());
+            picker.hex.extend(
+                text.chars()
+                    .filter(char::is_ascii_hexdigit)
+                    .map(|character| character.to_ascii_uppercase())
+                    .take(remaining),
+            );
+            picker.replace_on_type = false;
+            picker.invalid = false;
+            cx.notify();
+            return;
+        }
         if let Some(editor) = self.rename_editor.as_mut() {
             if editor.replace_on_type {
                 editor.value.clear();
@@ -1112,6 +1304,36 @@ impl RustMux {
             return;
         }
         let keystroke = &event.keystroke;
+        if let Some(picker) = self.color_picker.as_mut() {
+            match keystroke.key.as_str() {
+                "enter" => self.submit_color_picker(cx),
+                "escape" => {
+                    self.color_picker = None;
+                    cx.notify();
+                }
+                "backspace" => {
+                    if picker.replace_on_type {
+                        picker.hex.clear();
+                    } else {
+                        picker.hex.pop();
+                    }
+                    picker.replace_on_type = false;
+                    picker.invalid = false;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.appearance_settings_open {
+            if keystroke.key == "escape" {
+                self.appearance_settings_open = false;
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.ssh_connect.is_some() {
             let step = self.ssh_connect.as_ref().map(|dialog| dialog.step);
             match keystroke.key.as_str() {
@@ -1215,6 +1437,12 @@ impl RustMux {
         }
         if self.tab_menu.is_some() && keystroke.key == "escape" {
             self.tab_menu = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.workspace_menu.is_some() && keystroke.key == "escape" {
+            self.workspace_menu = None;
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1361,7 +1589,22 @@ impl RustMux {
                     .text_sm()
                     .text_color(rgb(THEME.muted))
                     .child("▣")
-                    .child("◌")
+                    .child(
+                        div()
+                            .id("appearance-settings")
+                            .cursor_pointer()
+                            .hover(|element| element.text_color(rgb(THEME.foreground)))
+                            .tooltip(|_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: "Appearance".to_owned(),
+                                })
+                                .into()
+                            })
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.open_appearance_settings(cx)),
+                            )
+                            .child("⚙"),
+                    )
                     .child(
                         div()
                             .id("new-workspace")
@@ -1401,6 +1644,8 @@ impl RustMux {
                     .map(|(index, workspace)| {
                         let active = Some(workspace.id) == self.active_workspace;
                         let workspace_id = workspace.id;
+                        let workspace_color = self.workspace_color(workspace_id).as_rgb();
+                        let active_text = readable_text_color(workspace_color);
                         let pane_count = workspace
                             .tabs
                             .first()
@@ -1413,7 +1658,7 @@ impl RustMux {
                             .py(px(8.0))
                             .rounded(px(6.0))
                             .cursor_pointer()
-                            .when(active, |element| element.bg(rgb(THEME.accent)))
+                            .when(active, |element| element.bg(rgb(workspace_color)))
                             .hover(|element| {
                                 if active {
                                     element
@@ -1430,6 +1675,13 @@ impl RustMux {
                                 this.last_sizes.clear();
                                 cx.notify();
                             }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.open_workspace_menu(workspace_id, event.position, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .flex()
                             .flex_col()
                             .gap(px(3.0))
@@ -1438,7 +1690,7 @@ impl RustMux {
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(if active {
-                                        rgb(0xffffff)
+                                        rgb(active_text)
                                     } else {
                                         rgb(THEME.foreground)
                                     })
@@ -1449,7 +1701,7 @@ impl RustMux {
                                     .font_family("SF Mono")
                                     .text_xs()
                                     .text_color(if active {
-                                        rgb(0xe6f2ff)
+                                        rgb(active_text)
                                     } else {
                                         rgb(THEME.dim)
                                     })
@@ -1499,6 +1751,7 @@ impl RustMux {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let merge_preview = self.drag_hover.merges_into(active);
+        let active_accent = self.terminal_accent(active).as_rgb();
         div()
             .id(("pane-tab-strip", element_key(active)))
             .h(px(PANE_HEADER_HEIGHT))
@@ -1506,12 +1759,12 @@ impl RustMux {
             .bg(rgb(THEME.surface))
             .border_b(if merge_preview { px(2.0) } else { px(1.0) })
             .border_color(if merge_preview {
-                rgb(THEME.accent)
+                rgb(active_accent)
             } else {
                 rgb(THEME.border)
             })
             .when(merge_preview, |element| {
-                element.bg(rgba((THEME.accent << 8) | 0x18))
+                element.bg(rgba((active_accent << 8) | 0x18))
             })
             .flex()
             .items_center()
@@ -1541,6 +1794,10 @@ impl RustMux {
                     .children(panes.into_iter().map(|pane| {
                         let pane_id = pane.id;
                         let selected = pane_id == active;
+                        let pane_accent = pane
+                            .color
+                            .unwrap_or_else(|| self.terminal_accent(pane_id))
+                            .as_rgb();
                         let close_tooltip = format!("Close {}…", pane.title);
                         let drag = PaneDrag {
                             pane_id,
@@ -1561,9 +1818,12 @@ impl RustMux {
                             .items_center()
                             .gap(px(7.0))
                             .border_t(if selected { px(2.0) } else { px(0.0) })
-                            .border_color(rgb(THEME.accent))
                             .border_r_1()
-                            .border_color(rgb(THEME.border))
+                            .border_color(if selected {
+                                rgb(pane_accent)
+                            } else {
+                                rgb(THEME.border)
+                            })
                             .when(selected, |element| element.bg(rgb(THEME.selection)))
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.activate_tab(pane_id, cx)),
@@ -1589,7 +1849,7 @@ impl RustMux {
                                     .rounded(px(2.0))
                                     .border_1()
                                     .border_color(if selected {
-                                        rgb(THEME.accent)
+                                        rgb(pane_accent)
                                     } else {
                                         rgb(THEME.muted)
                                     }),
@@ -1765,6 +2025,7 @@ impl RustMux {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let focused = self.focused_pane == Some(active);
+        let terminal_accent = self.terminal_accent(active).as_rgb();
         let screen = self.screens.get(&active).cloned();
         let drop_target = self
             .dragging_pane
@@ -1841,7 +2102,7 @@ impl RustMux {
                     .py(px(6.0))
                     .border_l_1()
                     .border_color(if focused {
-                        rgb(THEME.focus_ring)
+                        rgb(terminal_accent)
                     } else {
                         rgb(THEME.terminal)
                     })
@@ -1869,7 +2130,7 @@ impl RustMux {
                                         .text_size(px(self.terminal_font.metrics.font_size))
                                         .text_color(rgb(THEME.foreground))
                                         .border_b_1()
-                                        .border_color(rgb(THEME.accent))
+                                        .border_color(rgb(terminal_accent))
                                         .child(self.ime_preedit.clone()),
                                 )
                             })
@@ -1918,6 +2179,7 @@ impl RustMux {
             .filter(|cursor| usize::from(cursor.row) == row)
             .map(|cursor| cursor.column);
         let metrics = self.terminal_font.metrics;
+        let pane_accent = self.terminal_accent(pane_id).as_rgb();
         div()
             .relative()
             .h(px(metrics.line_height))
@@ -1951,13 +2213,11 @@ impl RustMux {
                         .rounded(px(1.0))
                         .border_1()
                         .border_color(if focused {
-                            rgb(THEME.cursor)
+                            rgb(pane_accent)
                         } else {
                             rgb(THEME.muted)
                         })
-                        .when(focused, |cursor| {
-                            cursor.bg(rgba((THEME.cursor << 8) | 0x30))
-                        }),
+                        .when(focused, |cursor| cursor.bg(rgba((pane_accent << 8) | 0x30))),
                 )
             })
             .child(
@@ -2081,6 +2341,7 @@ impl RustMux {
 
     fn render_drop_layer(&self, target_pane: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let preview = self.drag_hover.split_for(target_pane);
+        let pane_accent = self.terminal_accent(target_pane).as_rgb();
         div()
             .absolute()
             .top(px(0.0))
@@ -2091,8 +2352,8 @@ impl RustMux {
                     div()
                         .absolute()
                         .border_2()
-                        .border_color(rgb(THEME.accent))
-                        .bg(rgba((THEME.accent << 8) | 0x24))
+                        .border_color(rgb(pane_accent))
+                        .bg(rgba((pane_accent << 8) | 0x24))
                         .when(
                             matches!(placement, DropPlacement::Left | DropPlacement::Right),
                             |element| element.w(relative(0.5)).h_full(),
@@ -2174,7 +2435,7 @@ impl RustMux {
             .absolute()
             .left(menu.position.x)
             .top(menu.position.y)
-            .w(px(170.0))
+            .w(px(232.0))
             .py(px(5.0))
             .rounded(px(7.0))
             .bg(rgb(THEME.elevated))
@@ -2199,6 +2460,53 @@ impl RustMux {
             )
             .child(
                 div()
+                    .mt(px(4.0))
+                    .mx(px(8.0))
+                    .pt(px(7.0))
+                    .border_t_1()
+                    .border_color(rgb(THEME.border))
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.dim))
+                    .child("Terminal color"),
+            )
+            .child(self.render_color_choices(ColorTarget::Pane(pane_id), "tab-menu", cx))
+            .child(
+                div()
+                    .id(("default-color-menu", element_key(pane_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_color(ColorTarget::Pane(pane_id), None, cx)
+                    }))
+                    .child("Use default"),
+            )
+            .child(
+                div()
+                    .id(("pick-color-menu", element_key(pane_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_color_picker(ColorTarget::Pane(pane_id), cx)
+                    }))
+                    .child("Pick color…"),
+            )
+            .child(
+                div()
                     .id(("close-menu", element_key(pane_id)))
                     .mx(px(5.0))
                     .px(px(9.0))
@@ -2211,6 +2519,433 @@ impl RustMux {
                     .hover(|element| element.bg(rgb(THEME.accent_soft)))
                     .on_click(cx.listener(move |this, _, _, cx| this.begin_close(pane_id, cx)))
                     .child("Close Terminal…"),
+            )
+            .into_any_element()
+    }
+
+    fn render_workspace_menu(&self, menu: WorkspaceMenu, cx: &mut Context<Self>) -> AnyElement {
+        let workspace_id = menu.workspace_id;
+        div()
+            .absolute()
+            .left(menu.position.x)
+            .top(menu.position.y)
+            .w(px(232.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .bg(rgb(THEME.elevated))
+            .border_1()
+            .border_color(rgb(THEME.border_strong))
+            .shadow_lg()
+            .occlude()
+            .child(
+                div()
+                    .mx(px(9.0))
+                    .py(px(5.0))
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.dim))
+                    .child("Workspace color"),
+            )
+            .child(self.render_color_choices(
+                ColorTarget::Workspace(workspace_id),
+                "workspace-menu",
+                cx,
+            ))
+            .child(
+                div()
+                    .id(("workspace-default-color", element_key(workspace_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_color(ColorTarget::Workspace(workspace_id), None, cx)
+                    }))
+                    .child("Use default"),
+            )
+            .child(
+                div()
+                    .id(("workspace-pick-color", element_key(workspace_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_color_picker(ColorTarget::Workspace(workspace_id), cx)
+                    }))
+                    .child("Pick color…"),
+            )
+            .into_any_element()
+    }
+
+    fn render_color_choices(
+        &self,
+        target: ColorTarget,
+        id_prefix: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .mx(px(8.0))
+            .my(px(6.0))
+            .flex()
+            .flex_wrap()
+            .gap(px(6.0))
+            .children(
+                self.appearance_choices()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, color)| {
+                        let rgb_value = color.as_rgb();
+                        div()
+                            .id((id_prefix, index))
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .bg(rgb(rgb_value))
+                            .border_1()
+                            .border_color(rgb(THEME.border_strong))
+                            .hover(|element| element.border_color(rgb(THEME.foreground)))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: format!("#{rgb_value:06X}"),
+                                })
+                                .into()
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.apply_color(target, Some(color), cx)
+                            }))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_appearance_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let appearance = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.appearance.clone())
+            .unwrap_or_default();
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(rgba(0x090b0f88))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(500.0))
+                    .p(px(18.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(THEME.elevated))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .font_family(".SystemUIFont")
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(THEME.foreground))
+                                    .child("Appearance"),
+                            )
+                            .child(
+                                div()
+                                    .id("close-appearance")
+                                    .w(px(26.0))
+                                    .h(px(26.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(rgb(THEME.muted))
+                                    .hover(|element| {
+                                        element
+                                            .bg(rgb(THEME.surface))
+                                            .text_color(rgb(THEME.foreground))
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.appearance_settings_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("×"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.muted))
+                            .child("Global defaults stay independent. Terminal accents never recolor workspaces, and workspace colors never recolor terminals."),
+                    )
+                    .child(self.render_appearance_row(
+                        "Default terminal accent",
+                        "Focus rail, active tab, cursor, and terminal focus treatment",
+                        ColorTarget::DefaultTerminal,
+                        appearance.default_terminal_accent,
+                        cx,
+                    ))
+                    .child(self.render_appearance_row(
+                        "Default workspace color",
+                        "Selected workspace and workspace marker in the left rail",
+                        ColorTarget::DefaultWorkspace,
+                        appearance.default_workspace_color,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .pt(px(2.0))
+                            .font_family("SF Mono")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child("Saved locally with session layout · no network or telemetry"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_appearance_row(
+        &self,
+        label: &'static str,
+        description: &'static str,
+        target: ColorTarget,
+        color: AppearanceColor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rgb_value = color.as_rgb();
+        div()
+            .p(px(12.0))
+            .rounded(px(7.0))
+            .bg(rgb(THEME.surface))
+            .border_1()
+            .border_color(rgb(THEME.border))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .rounded(px(7.0))
+                    .bg(rgb(rgb_value))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong)),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(THEME.foreground))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.muted))
+                            .child(description),
+                    ),
+            )
+            .child(
+                div()
+                    .font_family("SF Mono")
+                    .text_xs()
+                    .text_color(rgb(THEME.dim))
+                    .child(format!("#{rgb_value:06X}")),
+            )
+            .child(
+                div()
+                    .id(match target {
+                        ColorTarget::DefaultTerminal => "pick-default-terminal",
+                        ColorTarget::DefaultWorkspace => "pick-default-workspace",
+                        ColorTarget::Pane(_) => "pick-pane",
+                        ColorTarget::Workspace(_) => "pick-workspace",
+                    })
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .bg(rgb(THEME.elevated))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.border_color(rgb(rgb_value)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_color_picker(target, cx)))
+                    .child("Pick color…"),
+            )
+            .into_any_element()
+    }
+
+    fn render_color_picker(&self, picker: &ColorPickerState, cx: &mut Context<Self>) -> AnyElement {
+        let target = picker.target;
+        let (title, can_reset) = match target {
+            ColorTarget::DefaultTerminal => ("Pick default terminal accent", false),
+            ColorTarget::DefaultWorkspace => ("Pick default workspace color", false),
+            ColorTarget::Pane(_) => ("Pick terminal color", true),
+            ColorTarget::Workspace(_) => ("Pick workspace color", true),
+        };
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(rgba(0x090b0faa))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(340.0))
+                    .p(px(16.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(THEME.elevated))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(11.0))
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.muted))
+                            .child("Recent colors first, followed by Harbor Night presets."),
+                    )
+                    .child(self.render_color_choices(target, "color-picker", cx))
+                    .child(
+                        div()
+                            .h(px(36.0))
+                            .px(px(10.0))
+                            .rounded(px(6.0))
+                            .bg(rgb(THEME.terminal))
+                            .border_1()
+                            .border_color(if picker.invalid {
+                                rgb(THEME.danger)
+                            } else {
+                                rgb(THEME.border_strong)
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .font_family("SF Mono")
+                            .text_sm()
+                            .text_color(rgb(THEME.foreground))
+                            .child("#")
+                            .child(
+                                div()
+                                    .when(picker.replace_on_type, |element| {
+                                        element.bg(rgb(THEME.selection))
+                                    })
+                                    .child(picker.hex.clone()),
+                            )
+                            .child("│")
+                            .when(picker.invalid, |element| {
+                                element.child(
+                                    div()
+                                        .ml(px(6.0))
+                                        .font_family(".SystemUIFont")
+                                        .text_xs()
+                                        .text_color(rgb(THEME.danger))
+                                        .child("Enter six hex digits"),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .when(can_reset, |element| {
+                                element.child(
+                                    div()
+                                        .id("picker-use-default")
+                                        .px(px(11.0))
+                                        .py(px(7.0))
+                                        .rounded(px(5.0))
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .text_color(rgb(THEME.foreground))
+                                        .hover(|element| element.bg(rgb(THEME.surface)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.apply_color(target, None, cx)
+                                        }))
+                                        .child("Use default"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("cancel-color-picker")
+                                    .px(px(11.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(THEME.muted))
+                                    .hover(|element| element.bg(rgb(THEME.surface)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.color_picker = None;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id("apply-color-picker")
+                                    .px(px(11.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .bg(rgb(THEME.accent_soft))
+                                    .text_sm()
+                                    .text_color(rgb(THEME.foreground))
+                                    .hover(|element| element.bg(rgb(THEME.selection)))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.submit_color_picker(cx)),
+                                    )
+                                    .child("Apply"),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -2792,6 +3527,7 @@ impl RustMux {
         let Some(workspace) = self.active_workspace_in(snapshot) else {
             return div().size_full().bg(rgb(THEME.terminal)).into_any_element();
         };
+        let workspace_color = self.workspace_color(workspace.id).as_rgb();
         let canonical_layout = workspace.tabs.first().map(|tab| tab.layout.clone());
         let layout = canonical_layout.as_ref().map(|layout| {
             self.zoomed_pane
@@ -2820,7 +3556,7 @@ impl RustMux {
                         div()
                             .font_family("SF Mono")
                             .text_xs()
-                            .text_color(rgb(THEME.accent))
+                            .text_color(rgb(workspace_color))
                             .child("▰"),
                     )
                     .child(
@@ -2900,7 +3636,9 @@ impl Render for RustMux {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.tab_menu.take().is_some() {
+                    let dismissed_tab = this.tab_menu.take().is_some();
+                    let dismissed_workspace = this.workspace_menu.take().is_some();
+                    if dismissed_tab || dismissed_workspace {
                         cx.notify();
                     }
                 }),
@@ -2970,6 +3708,9 @@ impl Render for RustMux {
             .when_some(self.tab_menu, |element, menu| {
                 element.child(self.render_tab_menu(menu, cx))
             })
+            .when_some(self.workspace_menu, |element, menu| {
+                element.child(self.render_workspace_menu(menu, cx))
+            })
             .when_some(self.rename_editor.as_ref(), |element, editor| {
                 element.child(self.render_rename_dialog(editor, cx))
             })
@@ -2981,6 +3722,12 @@ impl Render for RustMux {
             })
             .when_some(self.ssh_connect.as_ref(), |element, dialog| {
                 element.child(self.render_ssh_dialog(dialog, cx))
+            })
+            .when(self.appearance_settings_open, |element| {
+                element.child(self.render_appearance_settings(cx))
+            })
+            .when_some(self.color_picker.as_ref(), |element, picker| {
+                element.child(self.render_color_picker(picker, cx))
             })
     }
 }
@@ -3443,6 +4190,25 @@ fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
     }
 }
 
+fn resolved_terminal_accent(snapshot: &SessionSnapshot, pane_id: Uuid) -> AppearanceColor {
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .find_map(|tab| find_pane(&tab.layout, pane_id))
+        .and_then(|pane| pane.color)
+        .unwrap_or(snapshot.appearance.default_terminal_accent)
+}
+
+fn resolved_workspace_color(snapshot: &SessionSnapshot, workspace_id: Uuid) -> AppearanceColor {
+    snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .and_then(|workspace| workspace.color)
+        .unwrap_or(snapshot.appearance.default_workspace_color)
+}
+
 fn stable_representative_pane(layout: &PaneLayout) -> Uuid {
     match layout {
         PaneLayout::Leaf { pane } => pane.id,
@@ -3495,6 +4261,30 @@ fn workspace_pixel_size(window_width: f32, window_height: f32) -> (f32, f32) {
         (window_width - SIDEBAR_WIDTH).max(1.0),
         (window_height - TITLEBAR_HEIGHT).max(1.0),
     )
+}
+
+fn readable_text_color(background: u32) -> u32 {
+    let red = (background >> 16) & 0xff;
+    let green = (background >> 8) & 0xff;
+    let blue = background & 0xff;
+    if red * 299 + green * 587 + blue * 114 > 150_000 {
+        0x111318
+    } else {
+        0xffffff
+    }
+}
+
+fn parse_hex_color(value: &str) -> Option<AppearanceColor> {
+    let value = value.strip_prefix('#').unwrap_or(value);
+    if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rgb = u32::from_str_radix(value, 16).ok()?;
+    Some(AppearanceColor::new(
+        ((rgb >> 16) & 0xff) as u8,
+        ((rgb >> 8) & 0xff) as u8,
+        (rgb & 0xff) as u8,
+    ))
 }
 
 fn effective_split_ratio(axis: SplitAxis, width: f32, height: f32, ratio: f32) -> f32 {
@@ -3779,6 +4569,7 @@ mod tests {
             id: Uuid::new_v4(),
             title: "build".to_owned(),
             shell: "zsh".to_owned(),
+            color: None,
         };
 
         let confirmation = CloseConfirmation::for_pane(&pane);
@@ -3789,6 +4580,66 @@ mod tests {
             confirmation.request(),
             ClientRequest::ClosePane { pane_id: pane.id }
         );
+    }
+
+    #[test]
+    fn appearance_color_precedence_keeps_terminal_and_workspace_scopes_independent() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let pane_id = visible_panes(&snapshot.workspaces[0].tabs[0].layout)[0];
+        let workspace_id = snapshot.workspaces[0].id;
+        let terminal_default = AppearanceColor::new(0x95, 0xcc, 0x7f);
+        let workspace_default = AppearanceColor::new(0xc9, 0x90, 0xe5);
+        let terminal_override = AppearanceColor::new(0xef, 0x71, 0x7a);
+        let workspace_override = AppearanceColor::new(0xe4, 0xbd, 0x72);
+        snapshot.appearance.default_terminal_accent = terminal_default;
+        snapshot.appearance.default_workspace_color = workspace_default;
+
+        assert_eq!(
+            resolved_terminal_accent(&snapshot, pane_id),
+            terminal_default
+        );
+        assert_eq!(
+            resolved_workspace_color(&snapshot, workspace_id),
+            workspace_default
+        );
+
+        let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[0].tabs[0].layout else {
+            panic!("expected leaf");
+        };
+        pane.color = Some(terminal_override);
+        snapshot.workspaces[0].color = Some(workspace_override);
+
+        assert_eq!(
+            resolved_terminal_accent(&snapshot, pane_id),
+            terminal_override
+        );
+        assert_eq!(
+            resolved_workspace_color(&snapshot, workspace_id),
+            workspace_override
+        );
+        snapshot.workspaces[0].color = None;
+        assert_eq!(
+            resolved_terminal_accent(&snapshot, pane_id),
+            terminal_override
+        );
+        assert_eq!(
+            resolved_workspace_color(&snapshot, workspace_id),
+            workspace_default
+        );
+    }
+
+    #[test]
+    fn color_picker_accepts_exact_hex_and_rejects_partial_or_non_hex_input() {
+        assert_eq!(
+            parse_hex_color("#67C8C6"),
+            Some(AppearanceColor::new(0x67, 0xc8, 0xc6))
+        );
+        assert_eq!(
+            parse_hex_color("62adff"),
+            Some(AppearanceColor::HARBOR_BLUE)
+        );
+        assert_eq!(parse_hex_color("FFF"), None);
+        assert_eq!(parse_hex_color("GGADFF"), None);
     }
 
     #[test]
@@ -3977,6 +4828,7 @@ mod tests {
             id: Uuid::from_u128(10),
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
+            color: None,
         };
         let layout = PaneLayout::Leaf { pane };
         let metrics = typography::TerminalCellMetrics {
@@ -4022,11 +4874,13 @@ mod tests {
             id: Uuid::from_u128(21),
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
+            color: None,
         };
         let second = Pane {
             id: Uuid::from_u128(22),
             title: "Terminal 2".to_owned(),
             shell: "zsh".to_owned(),
+            color: None,
         };
         let layout = PaneLayout::Split {
             axis: SplitAxis::Horizontal,
@@ -4117,11 +4971,13 @@ mod tests {
             id: Uuid::from_u128(101),
             title: "one".to_owned(),
             shell: "zsh".to_owned(),
+            color: None,
         };
         let second = Pane {
             id: Uuid::from_u128(102),
             title: "two".to_owned(),
             shell: "zsh".to_owned(),
+            color: None,
         };
         let layout = PaneLayout::Split {
             axis: SplitAxis::Horizontal,
@@ -4153,6 +5009,7 @@ mod tests {
             id: Uuid::from_u128(id),
             title: format!("pane {id}"),
             shell: "zsh".to_owned(),
+            color: None,
         };
         let nested = PaneLayout::Split {
             axis: SplitAxis::Vertical,

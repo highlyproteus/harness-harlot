@@ -14,8 +14,8 @@ use std::thread;
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rust_mux_protocol::{
-    ClientRequest, DropPlacement, MAX_FRAME_SIZE, PROTOCOL_VERSION, Pane, PaneLayout,
-    ServiceResponse, SessionSnapshot, SplitAxis, Tab, TerminalModes, TerminalModifiers,
+    AppearanceColor, ClientRequest, DropPlacement, MAX_FRAME_SIZE, PROTOCOL_VERSION, Pane,
+    PaneLayout, ServiceResponse, SessionSnapshot, SplitAxis, Tab, TerminalModes, TerminalModifiers,
     TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
     Workspace, validate_ssh_host,
 };
@@ -33,6 +33,7 @@ const INITIAL_COLUMNS: u16 = 100;
 const INITIAL_ROWS: u16 = 30;
 const MAX_INPUT_FRAME: usize = 64 * 1024;
 const MAX_PANES: usize = 32;
+const MAX_RECENT_COLORS: usize = 8;
 
 struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -359,6 +360,7 @@ impl RegistryState {
             id,
             title,
             shell: shell_title(),
+            color: None,
         }
     }
 }
@@ -605,6 +607,7 @@ impl SessionRegistry {
                 id: pane_id,
                 title: format!("SSH {host}"),
                 shell: "ssh".to_owned(),
+                color: None,
             };
             let did_add = state.snapshot.workspaces.iter_mut().any(|workspace| {
                 workspace
@@ -876,6 +879,66 @@ impl SessionRegistry {
         persist_state(&state)
     }
 
+    pub fn set_default_terminal_accent(&self, color: AppearanceColor) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        state.snapshot.appearance.default_terminal_accent = color;
+        remember_recent_color(&mut state.snapshot, color);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    pub fn set_default_workspace_color(&self, color: AppearanceColor) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        state.snapshot.appearance.default_workspace_color = color;
+        remember_recent_color(&mut state.snapshot, color);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    pub fn set_pane_color(&self, pane_id: Uuid, color: Option<AppearanceColor>) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        pane.color = color;
+        if let Some(color) = color {
+            remember_recent_color(&mut state.snapshot, color);
+        }
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    pub fn set_workspace_color(
+        &self,
+        workspace_id: Uuid,
+        color: Option<AppearanceColor>,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+        workspace.color = color;
+        if let Some(color) = color {
+            remember_recent_color(&mut state.snapshot, color);
+        }
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
     pub fn create_workspace(&self, title: Option<String>) -> Result<(Uuid, Uuid)> {
         let workspace_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
@@ -894,6 +957,7 @@ impl SessionRegistry {
         state.snapshot.workspaces.push(Workspace {
             id: workspace_id,
             title: title.unwrap_or_else(|| format!("Workspace {number}")),
+            color: None,
             tabs: vec![Tab {
                 id: tab_id,
                 title: "Terminals".to_owned(),
@@ -999,6 +1063,18 @@ impl Default for SessionRegistry {
     fn default() -> Self {
         Self::new().expect("start seeded configured-shell PTY")
     }
+}
+
+fn remember_recent_color(snapshot: &mut SessionSnapshot, color: AppearanceColor) {
+    snapshot
+        .appearance
+        .recent_colors
+        .retain(|recent| *recent != color);
+    snapshot.appearance.recent_colors.insert(0, color);
+    snapshot
+        .appearance
+        .recent_colors
+        .truncate(MAX_RECENT_COLORS);
 }
 
 fn persist_state(state: &RegistryState) -> Result<()> {
@@ -1636,6 +1712,9 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
     ) {
         return handle_terminal_interaction_request(sessions, request);
     }
+    if is_appearance_request(&request) {
+        return handle_appearance_request(sessions, &request);
+    }
     match request {
         ClientRequest::GetSnapshot => Ok(ServiceResponse::Snapshot {
             snapshot: sessions.snapshot()?,
@@ -1704,7 +1783,11 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         | ClientRequest::CopySelection { .. }
         | ClientRequest::ScrollPane { .. }
         | ClientRequest::SearchPane { .. }
-        | ClientRequest::MouseInput { .. } => unreachable!("handled above"),
+        | ClientRequest::MouseInput { .. }
+        | ClientRequest::SetDefaultTerminalAccent { .. }
+        | ClientRequest::SetDefaultWorkspaceColor { .. }
+        | ClientRequest::SetPaneColor { .. }
+        | ClientRequest::SetWorkspaceColor { .. } => unreachable!("handled above"),
         ClientRequest::ResizePane {
             pane_id,
             columns,
@@ -1717,6 +1800,41 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
             message: "hello was already completed".to_owned(),
         }),
     }
+}
+
+fn handle_appearance_request(
+    sessions: &SessionRegistry,
+    request: &ClientRequest,
+) -> Result<ServiceResponse> {
+    match request {
+        ClientRequest::SetDefaultTerminalAccent { color } => {
+            sessions.set_default_terminal_accent(*color)?;
+        }
+        ClientRequest::SetDefaultWorkspaceColor { color } => {
+            sessions.set_default_workspace_color(*color)?;
+        }
+        ClientRequest::SetPaneColor { pane_id, color } => {
+            sessions.set_pane_color(*pane_id, *color)?;
+        }
+        ClientRequest::SetWorkspaceColor {
+            workspace_id,
+            color,
+        } => {
+            sessions.set_workspace_color(*workspace_id, *color)?;
+        }
+        _ => unreachable!("only appearance requests are routed here"),
+    }
+    Ok(ServiceResponse::Ack)
+}
+
+fn is_appearance_request(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::SetDefaultTerminalAccent { .. }
+            | ClientRequest::SetDefaultWorkspaceColor { .. }
+            | ClientRequest::SetPaneColor { .. }
+            | ClientRequest::SetWorkspaceColor { .. }
+    )
 }
 
 fn handle_terminal_interaction_request(
@@ -1877,6 +1995,7 @@ mod tests {
                     id: remote,
                     title: "SSH private-alias".to_owned(),
                     shell: "ssh".to_owned(),
+                    color: None,
                 },
             ],
             active: remote,
@@ -1888,6 +2007,58 @@ mod tests {
         assert_eq!(pane_ids_in_snapshot(&projected), vec![local]);
         assert!(!format!("{projected:?}").contains("private-alias"));
         assert!(local_persistence_projection(&snapshot, &HashSet::from([local, remote])).is_none());
+    }
+
+    #[test]
+    fn appearance_mutations_keep_global_defaults_and_entity_overrides_independent() {
+        let registry = SessionRegistry::new().unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let workspace_id = snapshot.workspaces[0].id;
+        let pane_id = first_pane_id(&snapshot).unwrap();
+        let terminal_default = AppearanceColor::new(0x95, 0xcc, 0x7f);
+        let workspace_default = AppearanceColor::new(0xc9, 0x90, 0xe5);
+        let terminal_override = AppearanceColor::new(0xef, 0x71, 0x7a);
+        let workspace_override = AppearanceColor::new(0xe4, 0xbd, 0x72);
+
+        registry
+            .set_default_terminal_accent(terminal_default)
+            .unwrap();
+        registry
+            .set_default_workspace_color(workspace_default)
+            .unwrap();
+        registry
+            .set_pane_color(pane_id, Some(terminal_override))
+            .unwrap();
+        registry
+            .set_workspace_color(workspace_id, Some(workspace_override))
+            .unwrap();
+
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(
+            snapshot.appearance.default_terminal_accent,
+            terminal_default
+        );
+        assert_eq!(
+            snapshot.appearance.default_workspace_color,
+            workspace_default
+        );
+        assert_eq!(snapshot.workspaces[0].color, Some(workspace_override));
+        assert_eq!(
+            find_pane_mut_in_snapshot(&mut snapshot.clone(), pane_id).and_then(|pane| pane.color),
+            Some(terminal_override)
+        );
+        assert_eq!(snapshot.appearance.recent_colors[0], workspace_override);
+
+        registry.set_pane_color(pane_id, None).unwrap();
+        registry.set_workspace_color(workspace_id, None).unwrap();
+        let reset = registry.snapshot().unwrap();
+        assert_eq!(reset.workspaces[0].color, None);
+        assert_eq!(
+            find_pane_mut_in_snapshot(&mut reset.clone(), pane_id).and_then(|pane| pane.color),
+            None
+        );
+        assert_eq!(reset.appearance.default_terminal_accent, terminal_default);
+        assert_eq!(reset.appearance.default_workspace_color, workspace_default);
     }
 
     #[test]

@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use rust_mux_protocol::{Pane, PaneLayout, SessionSnapshot, SplitAxis, Tab, Workspace};
+use rust_mux_protocol::{
+    AppearanceColor, AppearanceSettings, Pane, PaneLayout, SessionSnapshot, SplitAxis, Tab,
+    Workspace,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -18,6 +21,7 @@ const MAX_PANES: usize = 32;
 const MAX_LAYOUT_DEPTH: usize = 16;
 const MAX_TITLE_CHARS: usize = 80;
 const MAX_PATH_BYTES: usize = 4096;
+const MAX_RECENT_COLORS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RecoveredState {
@@ -235,6 +239,8 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 struct DesiredState {
     schema_version: u16,
     revision: u64,
+    #[serde(default)]
+    appearance: AppearanceSettings,
     workspaces: Vec<DesiredWorkspace>,
 }
 
@@ -243,6 +249,8 @@ struct DesiredState {
 struct DesiredWorkspace {
     id: Uuid,
     title: String,
+    #[serde(default)]
+    color: Option<AppearanceColor>,
     tabs: Vec<DesiredTab>,
 }
 
@@ -277,6 +285,8 @@ enum DesiredLayout {
 struct DesiredPane {
     id: Uuid,
     title: String,
+    #[serde(default)]
+    color: Option<AppearanceColor>,
     local_cwd: PathBuf,
 }
 
@@ -292,6 +302,7 @@ impl DesiredState {
                 Ok(DesiredWorkspace {
                     id: workspace.id,
                     title: workspace.title.clone(),
+                    color: workspace.color,
                     tabs: workspace
                         .tabs
                         .iter()
@@ -309,6 +320,7 @@ impl DesiredState {
         Ok(Self {
             schema_version: SCHEMA_VERSION,
             revision: snapshot.revision,
+            appearance: snapshot.appearance.clone(),
             workspaces,
         })
     }
@@ -321,6 +333,7 @@ impl DesiredState {
             .map(|workspace| Workspace {
                 id: workspace.id,
                 title: workspace.title,
+                color: workspace.color,
                 tabs: workspace
                     .tabs
                     .into_iter()
@@ -335,6 +348,7 @@ impl DesiredState {
         RecoveredState {
             snapshot: SessionSnapshot {
                 revision: self.revision.saturating_add(1),
+                appearance: self.appearance,
                 workspaces,
             },
             cwd_by_pane,
@@ -347,6 +361,9 @@ impl DesiredState {
                 "unsupported recovery schema {}, expected {SCHEMA_VERSION}",
                 self.schema_version
             );
+        }
+        if self.appearance.recent_colors.len() > MAX_RECENT_COLORS {
+            bail!("appearance recent colors exceed {MAX_RECENT_COLORS}");
         }
         if self.workspaces.is_empty() || self.workspaces.len() > MAX_WORKSPACES {
             bail!("snapshot must contain 1 to {MAX_WORKSPACES} workspaces");
@@ -469,6 +486,7 @@ impl DesiredPane {
         Ok(Self {
             id: pane.id,
             title: pane.title.clone(),
+            color: pane.color,
             local_cwd: cwd_by_pane
                 .get(&pane.id)
                 .cloned()
@@ -482,6 +500,7 @@ impl DesiredPane {
             id: self.id,
             title: self.title,
             shell: String::new(),
+            color: self.color,
         }
     }
 
@@ -590,6 +609,66 @@ mod tests {
                 .count(),
             1
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn appearance_defaults_and_overrides_round_trip_with_old_snapshot_fallback() {
+        let directory = test_directory("appearance-round-trip");
+        let path = directory.join("sessions.json");
+        let store = SnapshotStore::new(path);
+        let mut snapshot = SessionSnapshot::seeded();
+        snapshot.appearance.default_terminal_accent = AppearanceColor::new(0x95, 0xcc, 0x7f);
+        snapshot.appearance.default_workspace_color = AppearanceColor::new(0xc9, 0x90, 0xe5);
+        snapshot.appearance.recent_colors = vec![AppearanceColor::new(0xef, 0x71, 0x7a)];
+        snapshot.workspaces[0].color = Some(AppearanceColor::new(0xe4, 0xbd, 0x72));
+        let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[0].tabs[0].layout else {
+            panic!("expected leaf");
+        };
+        pane.color = Some(AppearanceColor::new(0x67, 0xc8, 0xc6));
+
+        store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
+        let recovered = store.load().unwrap().snapshot;
+
+        assert_eq!(recovered.appearance, snapshot.appearance);
+        assert_eq!(recovered.workspaces[0].color, snapshot.workspaces[0].color);
+        let PaneLayout::Leaf {
+            pane: recovered_pane,
+        } = &recovered.workspaces[0].tabs[0].layout
+        else {
+            panic!("expected recovered leaf");
+        };
+        assert_eq!(
+            recovered_pane.color,
+            Some(AppearanceColor::new(0x67, 0xc8, 0xc6))
+        );
+
+        let old: DesiredState = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "revision": 1,
+                "workspaces": [{
+                    "id": "00000000-0000-0000-0000-000000000011",
+                    "title": "Old workspace",
+                    "tabs": [{
+                        "id": "00000000-0000-0000-0000-000000000012",
+                        "title": "Terminals",
+                        "layout": {
+                            "kind": "leaf",
+                            "pane": {
+                                "id": "00000000-0000-0000-0000-000000000013",
+                                "title": "Terminal 1",
+                                "local_cwd": "/tmp"
+                            }
+                        }
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(old.appearance, AppearanceSettings::default());
+        assert_eq!(old.workspaces[0].color, None);
+
         fs::remove_dir_all(directory).unwrap();
     }
 
