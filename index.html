@@ -88,19 +88,19 @@
         <p>Generated from Markdown task files. Refresh this page after Codex updates checkboxes and re-renders the dashboard.</p>
       </div>
       <div class="project-planner-progress">
-        <strong>72%</strong>
-        <span>38 of 53 checklist items complete</span>
+        <strong>65%</strong>
+        <span>40 of 62 checklist items complete</span>
         <div class="project-planner-bar" aria-label="Overall task progress">
-          <span style="width: 72%"></span>
+          <span style="width: 65%"></span>
         </div>
       </div>
     </div>
     <div class="project-planner-grid">
       <article class="project-planner-task">
         <h3><a href="tasks/rust-mux/00-vision.md">Rust Mux Vision</a></h3>
-        <p>Define a reliability-first native local and SSH terminal workspace whose sessions outlive its desktop UI.</p>
+        <p>Define a lightweight, reliability-first native local and SSH terminal workspace whose sessions outlive its desktop UI without becoming an agent harness or runtime.</p>
         <div class="project-planner-meta">
-          <span>7 / 7 complete</span>
+          <span>9 / 9 complete</span>
           <span>100%</span>
         </div>
         <div class="project-planner-bar" aria-label="Task progress">
@@ -112,6 +112,8 @@
           <li><span class="project-planner-box done">x</span><span>Preserve workspaces, sidebar, tabs, split panes, drag-to-rearrange panes, and configured-host SSH workspaces in the product direction.</span></li>
           <li><span class="project-planner-box done">x</span><span>Reuse an established terminal engine rather than implementing VT behavior.</span></li>
           <li><span class="project-planner-box done">x</span><span>Defer browser, mobile, generic remote-control UI, worktree/diff, AI integrations, and optional remote-rmuxd reattachment.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Treat terminals and agents as ordinary shell workloads; Rust Mux must stay out of their way rather than own or supervise an agent runtime.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Make bounded history, change-only updates, off-UI-thread work, and content-safe performance diagnostics part of the product contract.</span></li>
           <li><span class="project-planner-box done">x</span><span>The architecture and scope boundary are documented in the repository.</span></li>
           <li><span class="project-planner-box done">x</span><span>Future tasks preserve the service/UI ownership boundary.</span></li>
         </ul>
@@ -142,16 +144,17 @@
         <h3><a href="tasks/rust-mux/02-pty-sessions.md">Persistent PTY Sessions</a></h3>
         <p>Make the session service own real local and system-SSH shell processes and terminal byte streams.</p>
         <div class="project-planner-meta">
-          <span>7 / 10 complete</span>
-          <span>70%</span>
+          <span>7 / 12 complete</span>
+          <span>58%</span>
         </div>
         <div class="project-planner-bar" aria-label="Task progress">
-          <span style="width: 70%"></span>
+          <span style="width: 58%"></span>
         </div>
         <ul class="project-planner-checks">
           <li><span class="project-planner-box done">x</span><span>Add `portable-pty` behind a narrow service-owned Unix PTY abstraction on macOS and Linux.</span></li>
           <li><span class="project-planner-box done">x</span><span>Create, resize, write to, and terminate panes through explicit protocol commands.</span></li>
           <li><span class="project-planner-box"></span><span>Stream ordered output with bounded queues and reconnect-safe sequence numbers.</span></li>
+          <li><span class="project-planner-box"></span><span>Keep every PTY draining into bounded daemon-owned history even when its desktop subscription is idle or disconnected.</span></li>
           <li><span class="project-planner-box done">x</span><span>Define graceful exit, forced termination, and service-shutdown semantics.</span></li>
           <li><span class="project-planner-box done">x</span><span>Prove that closing and reopening a client preserves the shell and its output.</span></li>
           <li><span class="project-planner-box done">x</span><span>Launch configured-host remote shells through system OpenSSH without bypassing SSH config, agents, host-key checks, or jump hosts.</span></li>
@@ -159,17 +162,18 @@
           <li><span class="project-planner-box done">x</span><span>Integration tests cover create/input/output/resize/exit.</span></li>
           <li><span class="project-planner-box done">x</span><span>A reconnect test proves the PTY survives desktop-client teardown.</span></li>
           <li><span class="project-planner-box"></span><span>Backpressure behavior is documented and tested.</span></li>
+          <li><span class="project-planner-box"></span><span>A pane left unattended beyond the idle threshold cannot block its local or SSH child and can resume from a fresh snapshot without lost output.</span></li>
         </ul>
       </article>
       <article class="project-planner-task">
         <h3><a href="tasks/rust-mux/03-terminal-rendering.md">Terminal Rendering and Input</a></h3>
         <p>Render interactive terminal panes in the native desktop without duplicating terminal-emulation logic.</p>
         <div class="project-planner-meta">
-          <span>8 / 9 complete</span>
-          <span>89%</span>
+          <span>8 / 12 complete</span>
+          <span>67%</span>
         </div>
         <div class="project-planner-bar" aria-label="Task progress">
-          <span style="width: 89%"></span>
+          <span style="width: 67%"></span>
         </div>
         <ul class="project-planner-checks">
           <li><span class="project-planner-box done">x</span><span>Expand the `alacritty_terminal` adapter around parsing, resize, and visible-grid snapshots.</span></li>
@@ -178,9 +182,12 @@
           <li><span class="project-planner-box"></span><span>Add styled cells, cursor rendering, Unicode-width handling, IME, mouse reporting, and paste/clipboard integration.</span></li>
           <li><span class="project-planner-box done">x</span><span>Add scrollback, selection, copy, and search.</span></li>
           <li><span class="project-planner-box done">x</span><span>Keep terminal-model APIs independent of GPUI.</span></li>
+          <li><span class="project-planner-box"></span><span>Move protocol decoding, terminal update preparation, and other non-paint work off the UI thread.</span></li>
+          <li><span class="project-planner-box"></span><span>Render revision-aware deltas only for changed, actively subscribed panes and resync stale panes from one fresh snapshot on focus.</span></li>
           <li><span class="project-planner-box done">x</span><span>Interactive local shells render and accept input.</span></li>
           <li><span class="project-planner-box done">x</span><span>Unicode, colors, cursor modes, resize, and scrollback have regression coverage.</span></li>
           <li><span class="project-planner-box done">x</span><span>Desktop restart reconnects to the current rendered state.</span></li>
+          <li><span class="project-planner-box"></span><span>Size and activity matrix measurements cover update volume, UI-thread work, resume latency, CPU, and memory for focused, recent, and stale panes.</span></li>
         </ul>
       </article>
       <article class="project-planner-task">
@@ -209,15 +216,16 @@
         <h3><a href="tasks/rust-mux/05-reliability-hardening.md">macOS Reliability Hardening</a></h3>
         <p>Validate the reliability claim under desktop, display, daemon, and SSH lifecycle stress on macOS and Linux.</p>
         <div class="project-planner-meta">
-          <span>2 / 9 complete</span>
-          <span>22%</span>
+          <span>2 / 11 complete</span>
+          <span>18%</span>
         </div>
         <div class="project-planner-bar" aria-label="Task progress">
-          <span style="width: 22%"></span>
+          <span style="width: 18%"></span>
         </div>
         <ul class="project-planner-checks">
           <li><span class="project-planner-box"></span><span>Add structured service logs and opt-in diagnostics without recording terminal contents.</span></li>
           <li><span class="project-planner-box"></span><span>Add crash/reconnect, slow-client, high-output, and service-upgrade scenarios.</span></li>
+          <li><span class="project-planner-box"></span><span>Define and measure idle-pane CPU, memory, serialized-byte, UI-thread, and focus-resume targets with diagnostics that never record terminal contents.</span></li>
           <li><span class="project-planner-box"></span><span>Test repeated Space switches, display attach/detach, sleep/wake, and fullscreen transitions.</span></li>
           <li><span class="project-planner-box"></span><span>Test Linux compositor/display-session changes and SSH network loss, host-key failure, jump-host, and desktop-reconnect behavior.</span></li>
           <li><span class="project-planner-box done">x</span><span>Add atomic state persistence and corruption recovery.</span></li>
@@ -225,6 +233,7 @@
           <li><span class="project-planner-box"></span><span>Repeatable macOS and Linux soak tests run without UI freezes or lost local/SSH sessions.</span></li>
           <li><span class="project-planner-box done">x</span><span>Recovery behavior is documented for desktop crash, service crash, and corrupt state.</span></li>
           <li><span class="project-planner-box"></span><span>Release packaging preserves the independent service lifecycle.</span></li>
+          <li><span class="project-planner-box"></span><span>Focused/recent panes remain responsive, stale panes stop generating live desktop traffic, and refocus performs one bounded fresh-snapshot resync before live deltas resume.</span></li>
         </ul>
       </article>
     </div>

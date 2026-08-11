@@ -144,14 +144,15 @@
     { "text": "Desktop crashes and upgrades do not terminate live local or SSH PTYs or lose canonical layout state", "met": false },
     { "text": "Daemon crash, network loss, changed host key, and corrupt-state recovery are explicit, tested, and not overstated", "met": false },
     { "text": "Install, start, stop, upgrade, and uninstall keep desktop and daemon lifecycles independently observable", "met": false },
+    { "text": "Content-safe diagnostics and activity-matrix tests prove bounded memory, near-zero stale-pane desktop traffic, responsive focused deltas, and bounded focus-to-fresh-frame latency without pausing any PTY", "met": false },
     { "text": "Future Windows local IPC and ConPTY plus optional remote rmuxd boundaries are documented without constraining MVP", "met": false },
     { "text": "Release artifacts include dependency licenses and attribution without cmux branding, assets, or copied GPL source", "met": false }
   ],
   "depends_on": ["task-04", "task-05", "task-06", "task-07"],
   "status": "in_progress",
   "block_reason": null,
-  "notes": [{ "timestamp": "2026-08-11T21:22:24Z", "text": "Reliability hardening has begun with owner-only atomic desired-state snapshots, last-valid-CWD recovery, corrupt and symlink snapshot quarantine, explicit natural-exit versus close behavior, and a daemon restart round trip. System-SSH host intent is excluded from recovery so startup remains network-silent. macOS and Linux soak, SSH failure scenarios, packaging, and lifecycle tooling remain before this task can complete." }],
-  "last_updated": "2026-08-11T21:22:24Z"
+  "notes": [{ "timestamp": "2026-08-11T21:22:24Z", "text": "Reliability hardening has begun with owner-only atomic desired-state snapshots, last-valid-CWD recovery, corrupt and symlink snapshot quarantine, explicit natural-exit versus close behavior, and a daemon restart round trip. System-SSH host intent is excluded from recovery so startup remains network-silent. macOS and Linux soak, SSH failure scenarios, packaging, and lifecycle tooling remain before this task can complete." }, { "timestamp": "2026-08-11T22:22:58Z", "text": "Added the idle-pane performance acceptance boundary: transparent revision, queue, byte, timing, CPU, and memory diagnostics may be exposed, but terminal text, keys, SSH secrets, and telemetry remain excluded. Exact thresholds must be measured and set during the delta-streaming slice." }],
+  "last_updated": "2026-08-11T22:22:58Z"
 }
 </script>
 
