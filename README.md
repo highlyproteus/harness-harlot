@@ -38,6 +38,10 @@ For SSH, Rust Mux validates one conservative host or alias and launches structur
 
 See [the terminal theme architecture](docs/terminal-theme.md) for the `Harbor Night` palette boundary and [the all-Rust renderer roadmap](docs/terminal-renderer-roadmap.md) for the hard no-libghostty decision and the measured typography/cell-rendering plan.
 
+### Appearance colors
+
+Harbor Night remains the built-in visual foundation, with two independent local defaults: a terminal accent for focus rails, active tabs, and cursor treatment, and a workspace color for the selected workspace in the sidebar. Appearance settings offer a restrained preset/recent-color picker. A terminal tab or workspace can override only its own color from its right-click menu, or return to its matching default. These choices persist in the owner-only desired-state file and never trigger network access or telemetry.
+
 ## MVP boundary
 
 The first usable milestone includes:

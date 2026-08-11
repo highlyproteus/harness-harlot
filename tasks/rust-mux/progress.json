@@ -1,8 +1,8 @@
 {
   "task_dir": "tasks/rust-mux",
-  "complete": 40,
-  "total": 62,
-  "percent": 65,
+  "complete": 42,
+  "total": 64,
+  "percent": 66,
   "tasks": [
     {
       "file": "tasks/rust-mux/00-vision.md",
@@ -258,9 +258,9 @@
       "file": "tasks/rust-mux/04-layout-interactions.md",
       "title": "Workspace and Pane Interactions",
       "goal": "Deliver the workspace, tab, split, and freely rearrangeable pane workflow.",
-      "complete": 5,
-      "total": 9,
-      "percent": 56,
+      "complete": 7,
+      "total": 11,
+      "percent": 64,
       "checks": [
         {
           "text": "Implement create/rename/reorder/delete for workspaces and tabs.",
@@ -293,6 +293,11 @@
           "section": "Requirements"
         },
         {
+          "text": "Add independent persisted terminal-accent and workspace-color defaults with explicit per-terminal and per-workspace overrides.",
+          "done": true,
+          "section": "Requirements"
+        },
+        {
           "text": "Every layout mutation has deterministic model tests.",
           "done": false,
           "section": "Acceptance Criteria"
@@ -304,6 +309,11 @@
         },
         {
           "text": "Persisted layouts survive service and desktop restarts.",
+          "done": true,
+          "section": "Acceptance Criteria"
+        },
+        {
+          "text": "Appearance defaults and entity overrides survive desired-state migration and restart without changing PTY identity.",
           "done": true,
           "section": "Acceptance Criteria"
         }

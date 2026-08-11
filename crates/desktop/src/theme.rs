@@ -19,8 +19,6 @@ pub struct AppTheme {
     pub accent: u32,
     pub accent_soft: u32,
     pub selection: u32,
-    pub cursor: u32,
-    pub focus_ring: u32,
     pub danger: u32,
     pub ansi: [u32; 16],
 }
@@ -44,8 +42,6 @@ impl AppTheme {
         accent: 0x62adff,
         accent_soft: 0x243b55,
         selection: 0x294766,
-        cursor: 0x8bc7ff,
-        focus_ring: 0x4f9fea,
         danger: 0xef6b73,
         ansi: [
             0x20242b, 0xef717a, 0x95cc7f, 0xe4bd72, 0x6faaf2, 0xc990e5, 0x67c8c6, 0xd2d7df,

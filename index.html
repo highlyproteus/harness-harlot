@@ -88,10 +88,10 @@
         <p>Generated from Markdown task files. Refresh this page after Codex updates checkboxes and re-renders the dashboard.</p>
       </div>
       <div class="project-planner-progress">
-        <strong>65%</strong>
-        <span>40 of 62 checklist items complete</span>
+        <strong>66%</strong>
+        <span>42 of 64 checklist items complete</span>
         <div class="project-planner-bar" aria-label="Overall task progress">
-          <span style="width: 65%"></span>
+          <span style="width: 66%"></span>
         </div>
       </div>
     </div>
@@ -194,11 +194,11 @@
         <h3><a href="tasks/rust-mux/04-layout-interactions.md">Workspace and Pane Interactions</a></h3>
         <p>Deliver the workspace, tab, split, and freely rearrangeable pane workflow.</p>
         <div class="project-planner-meta">
-          <span>5 / 9 complete</span>
-          <span>56%</span>
+          <span>7 / 11 complete</span>
+          <span>64%</span>
         </div>
         <div class="project-planner-bar" aria-label="Task progress">
-          <span style="width: 56%"></span>
+          <span style="width: 64%"></span>
         </div>
         <ul class="project-planner-checks">
           <li><span class="project-planner-box"></span><span>Implement create/rename/reorder/delete for workspaces and tabs.</span></li>
@@ -207,9 +207,11 @@
           <li><span class="project-planner-box done">x</span><span>Persist layout changes atomically in the session service.</span></li>
           <li><span class="project-planner-box"></span><span>Restore focus and layout consistently after desktop restart.</span></li>
           <li><span class="project-planner-box done">x</span><span>Display and move local and SSH panes uniformly while retaining explicit connection state.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Add independent persisted terminal-accent and workspace-color defaults with explicit per-terminal and per-workspace overrides.</span></li>
           <li><span class="project-planner-box"></span><span>Every layout mutation has deterministic model tests.</span></li>
           <li><span class="project-planner-box"></span><span>Drag/drop works across splits and tabs without losing a local or SSH session.</span></li>
           <li><span class="project-planner-box done">x</span><span>Persisted layouts survive service and desktop restarts.</span></li>
+          <li><span class="project-planner-box done">x</span><span>Appearance defaults and entity overrides survive desired-state migration and restart without changing PTY identity.</span></li>
         </ul>
       </article>
       <article class="project-planner-task">

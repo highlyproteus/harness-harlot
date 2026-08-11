@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const SOCKET_ENV: &str = "RUST_MUX_SOCKET";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_SSH_HOST_LEN: usize = 253;
@@ -14,7 +14,54 @@ pub const MAX_SSH_HOST_LEN: usize = 253;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub revision: u64,
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
     pub workspaces: Vec<Workspace>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct AppearanceColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl AppearanceColor {
+    pub const HARBOR_BLUE: Self = Self::new(0x62, 0xad, 0xff);
+
+    pub const fn new(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
+    }
+
+    pub const fn as_rgb(self) -> u32 {
+        ((self.red as u32) << 16) | ((self.green as u32) << 8) | self.blue as u32
+    }
+}
+
+impl Default for AppearanceColor {
+    fn default() -> Self {
+        Self::HARBOR_BLUE
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppearanceSettings {
+    #[serde(default)]
+    pub default_terminal_accent: AppearanceColor,
+    #[serde(default)]
+    pub default_workspace_color: AppearanceColor,
+    #[serde(default)]
+    pub recent_colors: Vec<AppearanceColor>,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            default_terminal_accent: AppearanceColor::HARBOR_BLUE,
+            default_workspace_color: AppearanceColor::HARBOR_BLUE,
+            recent_colors: Vec::new(),
+        }
+    }
 }
 
 impl SessionSnapshot {
@@ -23,6 +70,7 @@ impl SessionSnapshot {
             id: Uuid::new_v4(),
             title: "Terminal 1".to_owned(),
             shell: "shell".to_owned(),
+            color: None,
         };
         let tab = Tab {
             id: Uuid::new_v4(),
@@ -32,9 +80,11 @@ impl SessionSnapshot {
 
         Self {
             revision: 0,
+            appearance: AppearanceSettings::default(),
             workspaces: vec![Workspace {
                 id: Uuid::new_v4(),
                 title: "Workspace 1".to_owned(),
+                color: None,
                 tabs: vec![tab],
             }],
         }
@@ -45,6 +95,8 @@ impl SessionSnapshot {
 pub struct Workspace {
     pub id: Uuid,
     pub title: String,
+    #[serde(default)]
+    pub color: Option<AppearanceColor>,
     pub tabs: Vec<Tab>,
 }
 
@@ -85,6 +137,8 @@ pub struct Pane {
     pub id: Uuid,
     pub title: String,
     pub shell: String,
+    #[serde(default)]
+    pub color: Option<AppearanceColor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -275,6 +329,20 @@ pub enum ClientRequest {
     },
     ClosePane {
         pane_id: Uuid,
+    },
+    SetDefaultTerminalAccent {
+        color: AppearanceColor,
+    },
+    SetDefaultWorkspaceColor {
+        color: AppearanceColor,
+    },
+    SetPaneColor {
+        pane_id: Uuid,
+        color: Option<AppearanceColor>,
+    },
+    SetWorkspaceColor {
+        workspace_id: Uuid,
+        color: Option<AppearanceColor>,
     },
     CreateWorkspace {
         title: Option<String>,
@@ -478,6 +546,39 @@ mod tests {
             snapshot.workspaces[0].tabs[0].layout,
             PaneLayout::Leaf { .. }
         ));
+    }
+
+    #[test]
+    fn older_snapshot_without_appearance_fields_uses_harbor_defaults() {
+        let snapshot: SessionSnapshot = serde_json::from_str(
+            r#"{
+                "revision": 3,
+                "workspaces": [{
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "title": "Old workspace",
+                    "tabs": [{
+                        "id": "00000000-0000-0000-0000-000000000002",
+                        "title": "Shell",
+                        "layout": {
+                            "kind": "leaf",
+                            "pane": {
+                                "id": "00000000-0000-0000-0000-000000000003",
+                                "title": "Terminal 1",
+                                "shell": "zsh"
+                            }
+                        }
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.appearance, AppearanceSettings::default());
+        assert_eq!(snapshot.workspaces[0].color, None);
+        let PaneLayout::Leaf { pane } = &snapshot.workspaces[0].tabs[0].layout else {
+            panic!("expected leaf");
+        };
+        assert_eq!(pane.color, None);
     }
 
     #[test]
