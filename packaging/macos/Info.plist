@@ -7,9 +7,9 @@
   <key>CFBundleDisplayName</key>
   <string>Not a Harness</string>
   <key>CFBundleExecutable</key>
-  <string>not-a-harness</string>
+  <string>nah</string>
   <key>CFBundleIdentifier</key>
-  <string>com.notaharness.desktop</string>
+  <string>com.nah.desktop</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

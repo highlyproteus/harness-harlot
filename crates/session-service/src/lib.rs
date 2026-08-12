@@ -14,8 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use rust_mux_protocol::{
+use nah_protocol::{
     AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryClearScope,
     HistoryCursor, HistoryPageDirection, HistorySettings, MAX_FRAME_SIZE, PROTOCOL_VERSION, Pane,
     PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionSnapshot, SplitAxis,
@@ -25,7 +24,8 @@ use rust_mux_protocol::{
     WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
     terminal_profile_for_executable, terminal_profile_for_title, validate_ssh_host,
 };
-use rust_mux_terminal_model::TerminalModel;
+use nah_terminal_model::TerminalModel;
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -2401,8 +2401,7 @@ fn command_with_terminal_env(
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     let pane_id = pane_id.to_string();
-    command.env(rust_mux_protocol::PANE_ID_ENV, &pane_id);
-    command.env(rust_mux_protocol::LEGACY_PANE_ID_ENV, pane_id);
+    command.env(nah_protocol::pane_id_env(), pane_id);
     if let Some(home) = std::env::var_os("HOME") {
         command.cwd(home);
     }
@@ -2826,7 +2825,7 @@ pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry
     loop {
         let request = match read_message(&mut stream).await {
             Ok(request) => request,
-            Err(rust_mux_protocol::WireError::Closed) => return Ok(()),
+            Err(nah_protocol::WireError::Closed) => return Ok(()),
             Err(error) => return Err(error).context("read client request"),
         };
 
@@ -3232,13 +3231,13 @@ fn handle_terminal_interaction_request(
 async fn write_message<T: Serialize>(
     stream: &mut UnixStream,
     message: &T,
-) -> Result<(), rust_mux_protocol::WireError> {
+) -> Result<(), nah_protocol::WireError> {
     let payload = serde_json::to_vec(message)?;
     if payload.len() > MAX_FRAME_SIZE {
-        return Err(rust_mux_protocol::WireError::FrameTooLarge(payload.len()));
+        return Err(nah_protocol::WireError::FrameTooLarge(payload.len()));
     }
     let length = u32::try_from(payload.len())
-        .map_err(|_| rust_mux_protocol::WireError::FrameTooLarge(payload.len()))?;
+        .map_err(|_| nah_protocol::WireError::FrameTooLarge(payload.len()))?;
     stream.write_u32(length).await?;
     stream.write_all(&payload).await?;
     stream.flush().await?;
@@ -3247,16 +3246,16 @@ async fn write_message<T: Serialize>(
 
 async fn read_message<T: DeserializeOwned>(
     stream: &mut UnixStream,
-) -> Result<T, rust_mux_protocol::WireError> {
+) -> Result<T, nah_protocol::WireError> {
     let length = match stream.read_u32().await {
         Ok(length) => length as usize,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(rust_mux_protocol::WireError::Closed);
+            return Err(nah_protocol::WireError::Closed);
         }
-        Err(error) => return Err(rust_mux_protocol::WireError::Io(error)),
+        Err(error) => return Err(nah_protocol::WireError::Io(error)),
     };
     if length > MAX_FRAME_SIZE {
-        return Err(rust_mux_protocol::WireError::FrameTooLarge(length));
+        return Err(nah_protocol::WireError::FrameTooLarge(length));
     }
     let mut payload = vec![0_u8; length];
     stream.read_exact(&mut payload).await?;

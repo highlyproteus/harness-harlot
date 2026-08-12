@@ -1,35 +1,16 @@
-# Not a Harness identity migration
+# Not a Harness runtime identity
 
-The user-facing product, native window, executables, default runtime paths, and
-diagnostics use **Not a Harness**. Existing local data remains readable without
-an eager move or copy.
+The public product name is **Not a Harness**. Its technical prefix is `nah`.
+The supported environment interface is `NAH_SOCKET`, `NAH_STATE_DIR`,
+`NAH_CONFIG`, and `NAH_PANE_ID`.
 
-## Compatibility rules
+Fresh runtime data uses `nah-session.sock` in the temporary directory, the
+macOS `~/Library/Application Support/Not a Harness` state directory, and `nah`
+directories under XDG state and config roots on Linux and other Unix platforms.
+No legacy configuration or runtime fallback is supported by this release.
 
-New environment variables take precedence. Their Rust Mux equivalents are used
-only when the new variable is unset:
-
-| Current | Legacy fallback |
-| --- | --- |
-| `NOT_A_HARNESS_SOCKET` | `RUST_MUX_SOCKET` |
-| `NOT_A_HARNESS_STATE_DIR` | `RUST_MUX_STATE_DIR` |
-| `NOT_A_HARNESS_CONFIG` | `RUST_MUX_CONFIG` |
-| `NOT_A_HARNESS_PANE_ID` | `RUST_MUX_PANE_ID` |
-
-Child shells receive both pane-ID variables during the compatibility period.
-For default config, state, and socket paths, the new `not-a-harness` location is
-used for fresh installs. If the new location is absent and the corresponding
-legacy `rust-mux` location exists, Not a Harness reuses the legacy location in
-place. Once a new location exists, it takes precedence.
-
-This strategy avoids destructive automatic moves and keeps rollback possible.
-Users can migrate deliberately by stopping both processes, copying the legacy
-contents to the new owner-only location, verifying them, and only then removing
-the legacy copy.
-
-## Intentionally stable internal identifiers
-
-The Cargo package names, Rust crate import names, historical task/PDR goal IDs,
-and their directory paths remain `rust-mux-*` or `rust-mux`. They are internal
-compatibility and history surfaces rather than user-facing branding. The built
-binary names are `not-a-harness` and `not-a-harness-service`.
+The migration audit performed with this change found no existing local state,
+configuration, or socket data to move. No user data was removed. The only
+remaining historical references are the checkout path and Codex project mapping,
+plus preserved historical task and PDR identifiers; changing those can detach
+established Codex task history.

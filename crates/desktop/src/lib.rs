@@ -2,7 +2,7 @@ use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result, bail};
-use rust_mux_protocol::{
+use nah_protocol::{
     ClientRequest, PROTOCOL_VERSION, ServiceResponse, read_message, socket_path, write_message,
 };
 
@@ -41,7 +41,7 @@ pub fn request(request: ClientRequest) -> Result<ServiceResponse> {
 
 #[cfg(test)]
 mod tests {
-    use rust_mux_protocol::MAX_FRAME_SIZE;
+    use nah_protocol::MAX_FRAME_SIZE;
 
     #[test]
     fn protocol_keeps_individual_input_frames_bounded() {

@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rust_mux_protocol::{
+use nah_protocol::{
     HistoryArchiveStatus, HistoryCleanupPolicy, HistoryClearScope, HistoryCursor,
     HistoryPageDirection, HistoryPageFlags, HistoryRetention, HistorySettings, HistoryWarning,
     TerminalHistoryPage,
@@ -1324,7 +1324,7 @@ mod tests {
     use super::*;
 
     fn test_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("not-a-harness-history-{label}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("nah-history-{label}-{}", Uuid::new_v4()))
     }
 
     fn open_store(label: &str) -> (PathBuf, Store) {

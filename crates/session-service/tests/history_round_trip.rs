@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rust_mux_protocol::{
+use nah_protocol::{
     HistoryClearScope, HistoryPageDirection, PaneLayout, PaneRevisionCursor, TerminalProfile,
 };
-use rust_mux_session_service::SessionRegistry;
+use nah_session_service::SessionRegistry;
 use uuid::Uuid;
 
 #[test]
@@ -93,7 +93,7 @@ fn leaf(layout: &PaneLayout) -> Uuid {
     pane(layout).id
 }
 
-fn pane(layout: &PaneLayout) -> &rust_mux_protocol::Pane {
+fn pane(layout: &PaneLayout) -> &nah_protocol::Pane {
     match layout {
         PaneLayout::Leaf { pane } => pane,
         _ => panic!("expected a leaf pane"),
@@ -101,8 +101,5 @@ fn pane(layout: &PaneLayout) -> &rust_mux_protocol::Pane {
 }
 
 fn test_directory(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "not-a-harness-integration-{label}-{}",
-        Uuid::new_v4()
-    ))
+    std::env::temp_dir().join(format!("nah-integration-{label}-{}", Uuid::new_v4()))
 }

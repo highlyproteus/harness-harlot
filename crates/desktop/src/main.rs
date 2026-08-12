@@ -21,8 +21,8 @@ use gpui::{
     TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions,
     div, fill, img, point, prelude::*, px, relative, rgb, rgba, size, svg,
 };
-use rust_mux_desktop::request;
-use rust_mux_protocol::{
+use nah_desktop::request;
+use nah_protocol::{
     AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryCleanupPolicy,
     HistoryClearScope, HistoryPageDirection, HistoryPageFlags, HistoryRetention, HistorySettings,
     HistoryWarning, MAX_SSH_INPUT_LEN, Pane, PaneLayout, PaneRevisionCursor, PaneStreamState,
@@ -51,7 +51,7 @@ use typography::TerminalFontProfile;
 use ui_state::UiStateStore;
 
 actions!(
-    not_a_harness,
+    nah_app,
     [
         NewWorkspace,
         ToggleSidebar,
@@ -223,7 +223,7 @@ struct HistoryEditor {
 #[derive(Clone, Copy, Debug)]
 struct TerminalLineRender {
     row: usize,
-    cursor: Option<rust_mux_protocol::TerminalCursor>,
+    cursor: Option<nah_protocol::TerminalCursor>,
     focused: bool,
     pane_id: Uuid,
     columns: u16,
@@ -789,7 +789,7 @@ impl DragHoverState {
 }
 
 #[derive(Debug)]
-struct NotAHarness {
+struct NahApp {
     focus_handle: FocusHandle,
     terminal_font: TerminalFontProfile,
     keymap: ResolvedKeymap,
@@ -836,7 +836,7 @@ struct NotAHarness {
     workspace_input_bounds: [Option<Bounds<Pixels>>; 2],
 }
 
-impl NotAHarness {
+impl NahApp {
     fn new(window: &mut Window, keymap: ResolvedKeymap, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
@@ -2402,7 +2402,7 @@ impl NotAHarness {
     fn load_archived_page(
         &mut self,
         pane_id: Uuid,
-        cursor: Option<rust_mux_protocol::HistoryCursor>,
+        cursor: Option<nah_protocol::HistoryCursor>,
         direction: HistoryPageDirection,
         cx: &mut Context<Self>,
     ) {
@@ -3699,7 +3699,7 @@ impl NotAHarness {
                 PaneControlIcon::Add,
                 "New terminal tab (⌘T)",
                 cx,
-                NotAHarness::new_tab_at,
+                NahApp::new_tab_at,
             ))
             .child(self.pane_control(
                 active,
@@ -6462,7 +6462,7 @@ impl NotAHarness {
     }
 }
 
-impl Render for NotAHarness {
+impl Render for NahApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_window_geometry(window);
 
@@ -6475,7 +6475,7 @@ impl Render for NotAHarness {
 
         div()
             .key_context(if self.command_palette.is_some() {
-                "NotAHarnessPalette"
+                "NahPalette"
             } else {
                 ROOT_KEY_CONTEXT
             })
@@ -6562,14 +6562,14 @@ impl Render for NotAHarness {
                 cx.stop_propagation();
             }))
             .on_action(
-                cx.listener(|_: &mut NotAHarness, _: &ConsumeChordPrefix, _, cx| {
+                cx.listener(|_: &mut NahApp, _: &ConsumeChordPrefix, _, cx| {
                     cx.stop_propagation();
                 }),
             )
-            .on_action(cx.listener(NotAHarness::copy_terminal))
-            .on_action(cx.listener(NotAHarness::paste_terminal))
-            .on_action(cx.listener(NotAHarness::find_terminal))
-            .on_action(cx.listener(NotAHarness::find_next_terminal))
+            .on_action(cx.listener(NahApp::copy_terminal))
+            .on_action(cx.listener(NahApp::paste_terminal))
+            .on_action(cx.listener(NahApp::find_terminal))
+            .on_action(cx.listener(NahApp::find_next_terminal))
             .child(
                 div()
                     .absolute()
@@ -6628,7 +6628,7 @@ impl Render for NotAHarness {
     }
 }
 
-impl EntityInputHandler for NotAHarness {
+impl EntityInputHandler for NahApp {
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -6807,7 +6807,7 @@ impl EntityInputHandler for NotAHarness {
 }
 
 struct WorkspaceTextInputElement {
-    input: Entity<NotAHarness>,
+    input: Entity<NahApp>,
     field: WorkspaceCreationField,
     placeholder: &'static str,
 }
@@ -7014,7 +7014,7 @@ impl Element for WorkspaceTextInputElement {
 }
 
 struct TerminalInputElement {
-    input: Entity<NotAHarness>,
+    input: Entity<NahApp>,
 }
 
 impl IntoElement for TerminalInputElement {
@@ -7087,7 +7087,7 @@ impl Element for TerminalInputElement {
 /// resize capture must continue to receive drag and release events outside the
 /// divider (and even outside the window bounds when the platform delivers them).
 struct SidebarResizeCaptureElement {
-    input: Entity<NotAHarness>,
+    input: Entity<NahApp>,
 }
 
 impl IntoElement for SidebarResizeCaptureElement {
@@ -7162,7 +7162,7 @@ impl Element for SidebarResizeCaptureElement {
 /// One hit surface per terminal row keeps pointer semantics exact without
 /// forcing GPUI/Taffy to lay out an element for every visible grid cell.
 struct TerminalPointerElement {
-    input: Entity<NotAHarness>,
+    input: Entity<NahApp>,
     pane_id: Uuid,
     row: u16,
     columns: u16,
@@ -7616,15 +7616,15 @@ fn terminal_tab_count_label(count: usize) -> String {
 
 fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
     let detection_detail = match pane.identity.source {
-        rust_mux_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
-        rust_mux_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
-        rust_mux_protocol::TerminalIdentitySource::TerminalTitle => {
+        nah_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
+        nah_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
+        nah_protocol::TerminalIdentitySource::TerminalTitle => {
             "Detected from a bounded terminal-title signal; terminal content is not inspected"
         }
-        rust_mux_protocol::TerminalIdentitySource::Command => {
+        nah_protocol::TerminalIdentitySource::Command => {
             "Detected from a bounded local child-process name; terminal content is not inspected"
         }
-        rust_mux_protocol::TerminalIdentitySource::Fallback => "Ordinary terminal",
+        nah_protocol::TerminalIdentitySource::Fallback => "Ordinary terminal",
     };
     let definition = agent_icon_definition(pane.identity.profile);
     let asset_detail = if definition.asset.is_some() {
@@ -8147,7 +8147,7 @@ fn main() {
                     window_min_size: Some(size(px(720.0), px(460.0))),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| NotAHarness::new(window, keymap.clone(), cx)),
+                |window, cx| cx.new(|cx| NahApp::new(window, keymap.clone(), cx)),
             )
             .expect("open Not a Harness window");
             cx.activate(true);
@@ -8165,7 +8165,7 @@ mod tests {
             title: "build".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: rust_mux_protocol::TerminalIdentity::default(),
+            identity: nah_protocol::TerminalIdentity::default(),
             custom_title: Some("build".to_owned()),
             profile_override: None,
         };
@@ -8218,12 +8218,12 @@ mod tests {
                 title: label.to_owned(),
                 shell: "zsh".to_owned(),
                 color: None,
-                identity: rust_mux_protocol::TerminalIdentity {
+                identity: nah_protocol::TerminalIdentity {
                     profile,
                     source: if profile == TerminalProfile::Terminal {
-                        rust_mux_protocol::TerminalIdentitySource::Fallback
+                        nah_protocol::TerminalIdentitySource::Fallback
                     } else {
-                        rust_mux_protocol::TerminalIdentitySource::Command
+                        nah_protocol::TerminalIdentitySource::Command
                     },
                 },
                 custom_title: None,
@@ -8258,9 +8258,9 @@ mod tests {
             title: title.to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: rust_mux_protocol::TerminalIdentity {
+            identity: nah_protocol::TerminalIdentity {
                 profile,
-                source: rust_mux_protocol::TerminalIdentitySource::Command,
+                source: nah_protocol::TerminalIdentitySource::Command,
             },
             custom_title: None,
             profile_override: None,
@@ -8722,7 +8722,7 @@ mod tests {
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: rust_mux_protocol::TerminalIdentity::default(),
+            identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
         };
@@ -8842,7 +8842,7 @@ mod tests {
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: rust_mux_protocol::TerminalIdentity::default(),
+            identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
         };
@@ -8851,7 +8851,7 @@ mod tests {
             title: "Terminal 2".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: rust_mux_protocol::TerminalIdentity::default(),
+            identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
         };
@@ -8945,7 +8945,7 @@ mod tests {
             title: "one".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: rust_mux_protocol::TerminalIdentity::default(),
+            identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
         };
@@ -8954,7 +8954,7 @@ mod tests {
             title: "two".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: rust_mux_protocol::TerminalIdentity::default(),
+            identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
         };
@@ -8989,7 +8989,7 @@ mod tests {
             title: format!("pane {id}"),
             shell: "zsh".to_owned(),
             color: None,
-            identity: rust_mux_protocol::TerminalIdentity::default(),
+            identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
         };

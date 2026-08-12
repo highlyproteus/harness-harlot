@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use gpui::{AssetSource, SharedString};
-use rust_mux_protocol::TerminalProfile;
+use nah_protocol::TerminalProfile;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentIconFormat {

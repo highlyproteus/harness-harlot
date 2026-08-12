@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use rust_mux_protocol::{
+use nah_protocol::{
     AppearanceColor, AppearanceSettings, Pane, PaneLayout, SessionSnapshot, SplitAxis, Tab,
     TerminalIdentity, TerminalProfile, Workspace, WorkspaceConnection, WorkspaceConnectionStatus,
     validate_ssh_host,
@@ -209,7 +209,7 @@ impl SnapshotStore {
 }
 
 pub(crate) fn default_snapshot_path() -> Result<PathBuf> {
-    let directory = rust_mux_protocol::state_directory().context("HOME is not set")?;
+    let directory = nah_protocol::state_directory().context("HOME is not set")?;
     Ok(directory.join("sessions.json"))
 }
 
@@ -639,7 +639,7 @@ mod tests {
     use super::*;
 
     fn test_directory(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("not-a-harness-{label}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("nah-{label}-{}", Uuid::new_v4()))
     }
 
     fn cwd_map(snapshot: &SessionSnapshot) -> HashMap<Uuid, PathBuf> {
@@ -816,9 +816,9 @@ mod tests {
         };
         pane.color = Some(AppearanceColor::new(0x67, 0xc8, 0xc6));
         pane.title = "Live-detected Claude".to_owned();
-        pane.identity = rust_mux_protocol::TerminalIdentity {
+        pane.identity = nah_protocol::TerminalIdentity {
             profile: TerminalProfile::Claude,
-            source: rust_mux_protocol::TerminalIdentitySource::Command,
+            source: nah_protocol::TerminalIdentitySource::Command,
         };
         pane.custom_title = Some("Release shell".to_owned());
         pane.profile_override = Some(TerminalProfile::Gemini);

@@ -5,7 +5,7 @@ use std::fs;
 use gpui::Keystroke;
 use serde::{Deserialize, Serialize};
 
-pub const ROOT_KEY_CONTEXT: &str = "NotAHarnessTerminal";
+pub const ROOT_KEY_CONTEXT: &str = "NAHTerminal";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -208,7 +208,7 @@ impl AppConfig {
     }
 
     pub fn load() -> Result<Self, ConfigError> {
-        let Some(path) = rust_mux_protocol::config_path() else {
+        let Some(path) = nah_protocol::config_path() else {
             return Ok(Self::default());
         };
         if !path.exists() {
