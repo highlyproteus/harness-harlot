@@ -93,6 +93,8 @@ const MAX_PASTE_BYTES: usize = 64 * 1024;
 const ACTIVE_TERMINAL_POLL_MS: u64 = 33;
 const IDLE_TERMINAL_POLL_MS: u64 = 250;
 const COLD_PANE_AFTER: Duration = Duration::from_mins(1);
+const STABLE_PRODUCT_NAME: &str = "Not a Harness";
+const DEVELOPMENT_PRODUCT_NAME: &str = "Not a Harness Dev";
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
     AppearanceColor::new(0x62, 0xad, 0xff),
@@ -8143,22 +8145,36 @@ fn ensure_bundled_session_service() {
     eprintln!("Not a Harness session service did not become ready within one second");
 }
 
+fn development_build() -> bool {
+    std::env::var("NAH_DEVELOPMENT_BUILD").as_deref() == Ok("1")
+}
+
+fn product_name(development_build: bool) -> &'static str {
+    if development_build {
+        DEVELOPMENT_PRODUCT_NAME
+    } else {
+        STABLE_PRODUCT_NAME
+    }
+}
+
 /// Sets the live Dock icon explicitly. `AppKit` otherwise retains the generic
 /// placeholder selected while a development bundle is being rebuilt in place.
 #[cfg(target_os = "macos")]
-fn install_macos_dock_icon() {
-    nah_macos_icon::install_dock_icon();
+fn install_macos_dock_icon(development_build: bool) {
+    nah_macos_icon::install_dock_icon(development_build);
 }
 
 #[cfg(not(target_os = "macos"))]
-fn install_macos_dock_icon() {}
+fn install_macos_dock_icon(_: bool) {}
 
 fn main() {
+    let development_build = development_build();
+    let product_name = product_name(development_build);
     ensure_bundled_session_service();
     Application::new()
         .with_assets(AgentIconAssets)
-        .run(|cx: &mut App| {
-            install_macos_dock_icon();
+        .run(move |cx: &mut App| {
+            install_macos_dock_icon(development_build);
             let keymap = match AppConfig::load().and_then(|config| config.resolve_keymap()) {
                 Ok(keymap) => keymap,
                 Err(error) => {
@@ -8188,7 +8204,7 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Not a Harness".into()),
+                        title: Some(product_name.into()),
                         appears_transparent: true,
                         traffic_light_position: Some(point(px(13.0), px(13.0))),
                     }),
