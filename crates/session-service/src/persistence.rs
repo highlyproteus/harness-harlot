@@ -248,6 +248,8 @@ struct DesiredWorkspace {
     #[serde(default)]
     pin_order: u32,
     #[serde(default)]
+    order: u32,
+    #[serde(default)]
     connection: WorkspaceConnection,
     tabs: Vec<DesiredTab>,
 }
@@ -311,6 +313,7 @@ impl DesiredState {
                     color: workspace.color,
                     pinned: workspace.pinned,
                     pin_order: workspace.pin_order,
+                    order: workspace.order,
                     connection: match &workspace.connection {
                         WorkspaceConnection::Local => WorkspaceConnection::Local,
                         WorkspaceConnection::SystemSsh { destination, .. } => {
@@ -358,6 +361,7 @@ impl DesiredState {
                 color: workspace.color,
                 pinned: workspace.pinned,
                 pin_order: workspace.pin_order,
+                order: workspace.order,
                 active_terminal_count: 0,
                 connection: match workspace.connection {
                     WorkspaceConnection::Local => WorkspaceConnection::Local,
