@@ -86,15 +86,27 @@ cargo run -p nah-desktop
 ```
 
 On macOS, `scripts/build-macos-app.sh` creates the debug
-`target/debug/Not a Harness.app`; pass `release` for a release bundle. Its
-display name, executable, and bundle identifier are `Not a Harness`,
-`nah`, and `com.nah.desktop`.
+`target/debug/Not a Harness.app`; pass `release` for a release bundle. The
+bundle includes the desktop, its service, the local update verifier, and the
+Not a Harness icon. Its display name, executable, and bundle identifier are
+`Not a Harness`, `nah`, and `com.nah.desktop`. The desktop starts its bundled
+service only when a local service is unavailable; closing the desktop leaves
+active terminal sessions alone.
 
 The technical package, crate, and executable prefix is `nah`. The built
 executables are `nah-service` and `nah`. Set `NAH_SOCKET` in both processes to
 override the default socket path. The default is `nah-session.sock` in the
-system temporary directory. The service is intentionally foreground-only for
-now so lifecycle behavior is visible during development.
+system temporary directory. `NAH_DISABLE_BUNDLED_SERVICE=1` keeps desktop
+startup from launching a sibling service for focused development tests.
+
+## macOS releases and updates
+
+Not a Harness has one stable channel. It does not make update network requests
+yet. The checked-in release scripts make versioned DMGs and testable signed
+metadata, while deliberately stopping short of signing, notarizing, or hosting
+anything. See the [macOS release foundation](docs/macos-release.md) for the
+credential/hosting handoff, update safety rule for active PTYs, rollback
+behavior, Sparkle assessment, and release checklist.
 
 ### Command bindings
 

@@ -10,6 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::process::Command;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -8106,7 +8108,43 @@ fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
     }
 }
 
+/// Starts the bundled session service only when no compatible local service is
+/// reachable. The service is deliberately detached from the desktop lifetime:
+/// closing or replacing the app UI never asks it to stop, preserving active
+/// terminal sessions. A future updater must instead defer until the service is
+/// explicitly quiescent (see `docs/macos-release.md`).
+fn ensure_bundled_session_service() {
+    if std::env::var_os("NAH_DISABLE_BUNDLED_SERVICE").is_some()
+        || request(ClientRequest::GetSnapshot).is_ok()
+    {
+        return;
+    }
+
+    let Some(service) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("nah-service")))
+    else {
+        return;
+    };
+    if !service.is_file() {
+        return;
+    }
+    if let Err(error) = Command::new(service).spawn() {
+        eprintln!("Not a Harness could not start its bundled session service: {error}");
+        return;
+    }
+
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(50));
+        if request(ClientRequest::GetSnapshot).is_ok() {
+            return;
+        }
+    }
+    eprintln!("Not a Harness session service did not become ready within one second");
+}
+
 fn main() {
+    ensure_bundled_session_service();
     Application::new()
         .with_assets(AgentIconAssets)
         .run(|cx: &mut App| {
