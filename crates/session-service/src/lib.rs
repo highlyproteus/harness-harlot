@@ -21,8 +21,9 @@ use rust_mux_protocol::{
     PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionSnapshot, SplitAxis,
     StreamDiagnostics, Tab, TerminalHistoryPage, TerminalIdentity, TerminalIdentitySource,
     TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
-    TerminalProfile, TerminalScreen, TerminalSelectionKind, Workspace,
-    terminal_profile_for_command, terminal_profile_for_title, validate_ssh_host,
+    TerminalProfile, TerminalScreen, TerminalSelectionKind, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
+    terminal_profile_for_title, validate_ssh_host,
 };
 use rust_mux_terminal_model::TerminalModel;
 use serde::Serialize;
@@ -39,6 +40,8 @@ const INITIAL_COLUMNS: u16 = 100;
 const INITIAL_ROWS: u16 = 30;
 const MAX_INPUT_FRAME: usize = 64 * 1024;
 const MAX_PANES: usize = 32;
+const MAX_WORKSPACES: usize = 16;
+const MAX_WORKSPACE_TITLE_CHARS: usize = 80;
 const MAX_RECENT_COLORS: usize = 8;
 const DIAGNOSTICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -484,6 +487,9 @@ impl SessionRegistry {
         let pane_ids = pane_ids_in_snapshot(&recovered.snapshot);
         let mut panes = HashMap::new();
         for pane_id in pane_ids {
+            if recovered.offline_panes.contains(&pane_id) {
+                continue;
+            }
             let workspace_id = workspace_id_for_pane(&recovered.snapshot, pane_id)
                 .context("recovered pane has no workspace")?;
             let cwd = recovered
@@ -865,6 +871,107 @@ impl SessionRegistry {
         Ok(new_id)
     }
 
+    /// Opens the sole initial terminal in a deliberately empty saved workspace.
+    /// This request is rejected once any layout exists, so a repeated click or
+    /// retried request cannot create duplicate terminals.
+    pub fn create_workspace_terminal(&self, workspace_id: Uuid) -> Result<Uuid> {
+        let connection = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+            if !workspace.tabs.is_empty() {
+                bail!("workspace {workspace_id} already has a terminal layout");
+            }
+            workspace.connection.clone()
+        };
+
+        let pane_id = Uuid::new_v4();
+        let cwd = fallback_cwd()?;
+        let (session, kind, pane_title, pane_shell, tab_title) = match &connection {
+            WorkspaceConnection::Local => (
+                PtySession::spawn_local(pane_id, workspace_id, &cwd, &self.history)?,
+                RuntimePaneKind::Local,
+                "Terminal 1".to_owned(),
+                shell_title(),
+                "Terminals".to_owned(),
+            ),
+            WorkspaceConnection::SystemSsh { destination, .. } => (
+                PtySession::spawn_ssh(pane_id, workspace_id, destination, &self.history)?,
+                RuntimePaneKind::SystemSsh {
+                    host: destination.clone(),
+                },
+                format!("SSH {destination}"),
+                "ssh".to_owned(),
+                "Remote".to_owned(),
+            ),
+        };
+
+        let result = (|| {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+            if !workspace.tabs.is_empty() {
+                bail!("workspace {workspace_id} already has a terminal layout");
+            }
+            let pane = Pane {
+                id: pane_id,
+                title: pane_title,
+                shell: pane_shell,
+                color: None,
+                identity: TerminalIdentity::default(),
+                custom_title: None,
+                profile_override: None,
+            };
+            workspace.tabs.push(Tab {
+                id: Uuid::new_v4(),
+                title: tab_title,
+                layout: PaneLayout::Leaf { pane },
+            });
+            workspace.active_terminal_count = 1;
+            if let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection {
+                *status = WorkspaceConnectionStatus::Connected;
+            }
+            state.panes.insert(
+                pane_id,
+                RuntimePane {
+                    session: Arc::clone(&session),
+                    last_valid_cwd: cwd,
+                    kind,
+                    recovered: false,
+                    exit_status: None,
+                    detected_command_profile: None,
+                },
+            );
+            state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+            persist_state(&state)?;
+            Ok(pane_id)
+        })();
+        if result.is_err() {
+            let _ = session.terminate_and_wait();
+        }
+        result
+    }
+
     /// Starts the installed OpenSSH client only for an explicit, validated
     /// destination and places it in the target pane's tab strip.
     pub fn connect_ssh(&self, target_pane: Uuid, host: &str) -> Result<Uuid> {
@@ -1181,15 +1288,6 @@ impl SessionRegistry {
             if !pane_exists {
                 bail!("pane {pane_id} does not exist");
             }
-            let can_close = state.snapshot.workspaces.iter().any(|workspace| {
-                workspace
-                    .tabs
-                    .iter()
-                    .any(|tab| layout_contains(&tab.layout, pane_id) && pane_count(&tab.layout) > 1)
-            });
-            if !can_close {
-                bail!("a workspace must keep at least one terminal");
-            }
             let runtime = state
                 .panes
                 .get(&pane_id)
@@ -1215,15 +1313,25 @@ impl SessionRegistry {
             .map_err(|_| anyhow!("session state lock was poisoned"))?;
         let mut did_close = false;
         for workspace in &mut state.snapshot.workspaces {
-            let Some(tab) = workspace
+            let Some(tab_index) = workspace
                 .tabs
-                .iter_mut()
-                .find(|tab| layout_contains(&tab.layout, pane_id))
+                .iter()
+                .position(|tab| layout_contains(&tab.layout, pane_id))
             else {
                 continue;
             };
-            let (_, remaining) = detach_pane(tab.layout.clone(), pane_id);
-            tab.layout = remaining.context("closing terminal produced an empty layout")?;
+            let (_, remaining) = detach_pane(workspace.tabs[tab_index].layout.clone(), pane_id);
+            if let Some(remaining) = remaining {
+                workspace.tabs[tab_index].layout = remaining;
+            } else {
+                workspace.tabs.remove(tab_index);
+            }
+            workspace.active_terminal_count = workspace.active_terminal_count.saturating_sub(1);
+            if workspace.tabs.is_empty()
+                && let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection
+            {
+                *status = WorkspaceConnectionStatus::Offline;
+            }
             did_close = true;
             break;
         }
@@ -1295,7 +1403,20 @@ impl SessionRegistry {
         persist_state(&state)
     }
 
-    pub fn create_workspace(&self, title: Option<String>) -> Result<(Uuid, Uuid)> {
+    pub fn create_workspace(&self, title: Option<&str>) -> Result<(Uuid, Uuid)> {
+        let title = normalize_workspace_title(title)?;
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+                bail!("workspace limit of {MAX_WORKSPACES} reached");
+            }
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+        }
         let workspace_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
@@ -1305,7 +1426,12 @@ impl SessionRegistry {
             .state
             .write()
             .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+            let _ = session.terminate_and_wait();
+            bail!("workspace limit of {MAX_WORKSPACES} reached");
+        }
         if state.panes.len() >= MAX_PANES {
+            let _ = session.terminate_and_wait();
             bail!("pane limit of {MAX_PANES} reached");
         }
         let number = state.snapshot.workspaces.len() + 1;
@@ -1314,6 +1440,10 @@ impl SessionRegistry {
             id: workspace_id,
             title: title.unwrap_or_else(|| format!("Workspace {number}")),
             color: None,
+            pinned: false,
+            pin_order: 0,
+            active_terminal_count: 1,
+            connection: WorkspaceConnection::Local,
             tabs: vec![Tab {
                 id: tab_id,
                 title: "Terminals".to_owned(),
@@ -1334,6 +1464,416 @@ impl SessionRegistry {
         state.snapshot.revision += 1;
         persist_state(&state)?;
         Ok((workspace_id, pane_id))
+    }
+
+    pub fn create_ssh_workspace(
+        &self,
+        title: Option<&str>,
+        destination: &str,
+    ) -> Result<(Uuid, Uuid)> {
+        validate_ssh_host(destination).map_err(|message| anyhow!(message))?;
+        let title = normalize_workspace_title(title)?;
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+                bail!("workspace limit of {MAX_WORKSPACES} reached");
+            }
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+        }
+
+        let workspace_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let cwd = fallback_cwd()?;
+        let session = PtySession::spawn_ssh(pane_id, workspace_id, destination, &self.history)?;
+        let result = (|| {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+                bail!("workspace limit of {MAX_WORKSPACES} reached");
+            }
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            let number = state.snapshot.workspaces.len() + 1;
+            let pane = Pane {
+                id: pane_id,
+                title: format!("SSH {destination}"),
+                shell: "ssh".to_owned(),
+                color: None,
+                identity: TerminalIdentity::default(),
+                custom_title: None,
+                profile_override: None,
+            };
+            state.snapshot.workspaces.push(Workspace {
+                id: workspace_id,
+                title: title.unwrap_or_else(|| format!("SSH Workspace {number}")),
+                color: None,
+                pinned: false,
+                pin_order: 0,
+                active_terminal_count: 1,
+                connection: WorkspaceConnection::SystemSsh {
+                    destination: destination.to_owned(),
+                    status: WorkspaceConnectionStatus::Connected,
+                },
+                tabs: vec![Tab {
+                    id: tab_id,
+                    title: "Remote".to_owned(),
+                    layout: PaneLayout::Leaf { pane },
+                }],
+            });
+            state.panes.insert(
+                pane_id,
+                RuntimePane {
+                    session: Arc::clone(&session),
+                    last_valid_cwd: cwd,
+                    kind: RuntimePaneKind::SystemSsh {
+                        host: destination.to_owned(),
+                    },
+                    recovered: false,
+                    exit_status: None,
+                    detected_command_profile: None,
+                },
+            );
+            state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+            persist_state(&state)?;
+            Ok((workspace_id, pane_id))
+        })();
+        if result.is_err() {
+            let _ = session.terminate_and_wait();
+        }
+        result
+    }
+
+    pub fn rename_workspace(&self, workspace_id: Uuid, title: &str) -> Result<()> {
+        let title =
+            normalize_workspace_title(Some(title))?.context("workspace name cannot be empty")?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+        workspace.title = title;
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    pub fn set_workspace_pinned(&self, workspace_id: Uuid, pinned: bool) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let next_order = state
+            .snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.pinned)
+            .map(|workspace| workspace.pin_order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+        workspace.pinned = pinned;
+        workspace.pin_order = if pinned { next_order } else { 0 };
+        normalize_pin_orders(&mut state.snapshot.workspaces);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    pub fn move_pinned_workspace(
+        &self,
+        workspace_id: Uuid,
+        direction: WorkspacePinMove,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        normalize_pin_orders(&mut state.snapshot.workspaces);
+        let mut pinned = state
+            .snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.pinned)
+            .map(|workspace| (workspace.id, workspace.pin_order))
+            .collect::<Vec<_>>();
+        pinned.sort_by_key(|(_, order)| *order);
+        let index = pinned
+            .iter()
+            .position(|(id, _)| *id == workspace_id)
+            .with_context(|| format!("workspace {workspace_id} is not pinned"))?;
+        let other = match direction {
+            WorkspacePinMove::Up => index.checked_sub(1),
+            WorkspacePinMove::Down => (index + 1 < pinned.len()).then_some(index + 1),
+        };
+        let Some(other) = other else {
+            return Ok(());
+        };
+        let first = pinned[index];
+        let second = pinned[other];
+        for workspace in &mut state.snapshot.workspaces {
+            if workspace.id == first.0 {
+                workspace.pin_order = second.1;
+            } else if workspace.id == second.0 {
+                workspace.pin_order = first.1;
+            }
+        }
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    pub fn disconnect_workspace(&self, workspace_id: Uuid) -> Result<()> {
+        let sessions = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+            if !matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. }) {
+                bail!("only a system-SSH workspace can be disconnected");
+            }
+            pane_ids_for_workspace(workspace)
+                .into_iter()
+                .filter_map(|pane_id| {
+                    state.panes.get(&pane_id).and_then(|runtime| {
+                        matches!(runtime.kind, RuntimePaneKind::SystemSsh { .. })
+                            .then(|| (pane_id, Arc::clone(&runtime.session)))
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for (_, session) in &sessions {
+            session.terminate_and_wait()?;
+        }
+
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workspace {workspace_id} disappeared while disconnecting"))?;
+        let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection else {
+            bail!("only a system-SSH workspace can be disconnected");
+        };
+        *status = WorkspaceConnectionStatus::Offline;
+        workspace.active_terminal_count = workspace
+            .active_terminal_count
+            .saturating_sub(u32::try_from(sessions.len()).unwrap_or(u32::MAX));
+        for (pane_id, _) in sessions {
+            if let Some(runtime) = state.panes.get_mut(&pane_id) {
+                runtime.exit_status = Some("disconnected".to_owned());
+            }
+            set_pane_runtime_label(
+                &mut state.snapshot,
+                pane_id,
+                false,
+                Some("disconnected"),
+                "system OpenSSH",
+            );
+        }
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn reconnect_workspace(&self, workspace_id: Uuid) -> Result<Uuid> {
+        let (destination, mut pane_ids) = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+            let WorkspaceConnection::SystemSsh {
+                destination,
+                status,
+            } = &workspace.connection
+            else {
+                bail!("only a system-SSH workspace can be reconnected");
+            };
+            if *status == WorkspaceConnectionStatus::Connected {
+                bail!("workspace is already connected");
+            }
+            let pane_ids = pane_ids_for_workspace(workspace)
+                .into_iter()
+                .filter(|pane_id| {
+                    state.panes.get(pane_id).is_none_or(|runtime| {
+                        matches!(runtime.kind, RuntimePaneKind::SystemSsh { .. })
+                            && runtime.exit_status.is_some()
+                    })
+                })
+                .collect::<Vec<_>>();
+            (destination.clone(), pane_ids)
+        };
+        validate_ssh_host(&destination).map_err(|message| anyhow!(message))?;
+        let created_layout = pane_ids.is_empty();
+        if created_layout {
+            pane_ids.push(Uuid::new_v4());
+        }
+        let mut sessions = Vec::with_capacity(pane_ids.len());
+        for pane_id in &pane_ids {
+            match PtySession::spawn_ssh(*pane_id, workspace_id, &destination, &self.history) {
+                Ok(session) => sessions.push((*pane_id, session)),
+                Err(error) => {
+                    for (_, session) in sessions {
+                        let _ = session.terminate_and_wait();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let result = (|| {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| {
+                    format!("workspace {workspace_id} disappeared while reconnecting")
+                })?;
+            let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection else {
+                bail!("only a system-SSH workspace can be reconnected");
+            };
+            if created_layout {
+                let pane_id = pane_ids[0];
+                let pane = Pane {
+                    id: pane_id,
+                    title: format!("SSH {destination}"),
+                    shell: "ssh".to_owned(),
+                    color: None,
+                    identity: TerminalIdentity::default(),
+                    custom_title: None,
+                    profile_override: None,
+                };
+                workspace.tabs.push(Tab {
+                    id: Uuid::new_v4(),
+                    title: "Remote".to_owned(),
+                    layout: PaneLayout::Leaf { pane },
+                });
+            } else {
+                for pane_id in &pane_ids {
+                    if let Some(pane) = workspace
+                        .tabs
+                        .iter_mut()
+                        .find_map(|tab| find_pane_mut(&mut tab.layout, *pane_id))
+                    {
+                        pane.title = format!("SSH {destination}");
+                        "ssh".clone_into(&mut pane.shell);
+                    }
+                }
+            }
+            *status = WorkspaceConnectionStatus::Connected;
+            workspace.active_terminal_count = workspace
+                .active_terminal_count
+                .saturating_add(u32::try_from(sessions.len()).unwrap_or(u32::MAX));
+            let cwd = fallback_cwd()?;
+            for (pane_id, session) in &sessions {
+                state.panes.insert(
+                    *pane_id,
+                    RuntimePane {
+                        session: Arc::clone(session),
+                        last_valid_cwd: cwd.clone(),
+                        kind: RuntimePaneKind::SystemSsh {
+                            host: destination.clone(),
+                        },
+                        recovered: false,
+                        exit_status: None,
+                        detected_command_profile: None,
+                    },
+                );
+            }
+            state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+            persist_state(&state)?;
+            Ok(pane_ids[0])
+        })();
+        if result.is_err() {
+            for (_, session) in sessions {
+                let _ = session.terminate_and_wait();
+            }
+        }
+        result
+    }
+
+    pub fn delete_workspace(&self, workspace_id: Uuid) -> Result<()> {
+        let sessions = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.snapshot.workspaces.len() <= 1 {
+                bail!("the last workspace cannot be deleted");
+            }
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+            pane_ids_for_workspace(workspace)
+                .into_iter()
+                .filter_map(|pane_id| {
+                    state
+                        .panes
+                        .get(&pane_id)
+                        .map(|runtime| (pane_id, Arc::clone(&runtime.session)))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (_, session) in &sessions {
+            session.terminate_and_wait()?;
+        }
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let before = state.snapshot.workspaces.len();
+        state
+            .snapshot
+            .workspaces
+            .retain(|workspace| workspace.id != workspace_id);
+        if state.snapshot.workspaces.len() == before {
+            bail!("workspace {workspace_id} disappeared while deleting");
+        }
+        for (pane_id, _) in sessions {
+            state.panes.remove(&pane_id);
+        }
+        normalize_pin_orders(&mut state.snapshot.workspaces);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
     }
 
     pub fn write_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<()> {
@@ -1461,17 +2001,7 @@ fn persist_state(state: &RegistryState) -> Result<()> {
     let Some(store) = &state.store else {
         return Ok(());
     };
-    let ephemeral_panes = state
-        .panes
-        .iter()
-        .filter_map(|(pane_id, runtime)| (!runtime.kind.is_local()).then_some(*pane_id))
-        .collect::<HashSet<_>>();
-    let Some(snapshot) = local_persistence_projection(&state.snapshot, &ephemeral_panes) else {
-        // A workspace containing only live remote sessions has no safe,
-        // network-silent restart representation. Keep the previous complete
-        // local snapshot instead of serializing remote intent or host data.
-        return Ok(());
-    };
+    let snapshot = state.snapshot.clone();
     let cwd_by_pane = state
         .panes
         .iter()
@@ -1479,35 +2009,6 @@ fn persist_state(state: &RegistryState) -> Result<()> {
         .map(|(pane_id, runtime)| (*pane_id, runtime.last_valid_cwd.clone()))
         .collect();
     store.save(&snapshot, &cwd_by_pane)
-}
-
-fn local_persistence_projection(
-    snapshot: &SessionSnapshot,
-    ephemeral_panes: &HashSet<Uuid>,
-) -> Option<SessionSnapshot> {
-    let mut snapshot = snapshot.clone();
-    for workspace in &mut snapshot.workspaces {
-        workspace.tabs.retain_mut(|tab| {
-            let mut remaining = Some(tab.layout.clone());
-            for pane_id in ephemeral_panes {
-                let Some(layout) = remaining.take() else {
-                    break;
-                };
-                let (_, next) = detach_pane(layout, *pane_id);
-                remaining = next;
-            }
-            if let Some(layout) = remaining {
-                tab.layout = layout;
-                true
-            } else {
-                false
-            }
-        });
-    }
-    snapshot
-        .workspaces
-        .retain(|workspace| !workspace.tabs.is_empty());
-    (!snapshot.workspaces.is_empty()).then_some(snapshot)
 }
 
 fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
@@ -1593,7 +2094,56 @@ fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
     if identity_changed {
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
     }
+    if refresh_workspace_activity(state) {
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+    }
     Ok(())
+}
+
+fn refresh_workspace_activity(state: &mut RegistryState) -> bool {
+    let workspace_activity = state
+        .snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let mut active = 0_u32;
+            let mut ssh_active = false;
+            for pane_id in pane_ids_for_workspace(workspace) {
+                if let Some(runtime) = state.panes.get(&pane_id)
+                    && runtime.exit_status.is_none()
+                {
+                    active = active.saturating_add(1);
+                    ssh_active |= matches!(runtime.kind, RuntimePaneKind::SystemSsh { .. });
+                }
+            }
+            (workspace.id, active, ssh_active)
+        })
+        .collect::<Vec<_>>();
+    let mut workspace_changed = false;
+    for workspace in &mut state.snapshot.workspaces {
+        let Some((_, active, ssh_active)) = workspace_activity
+            .iter()
+            .find(|(workspace_id, _, _)| *workspace_id == workspace.id)
+        else {
+            continue;
+        };
+        if workspace.active_terminal_count != *active {
+            workspace.active_terminal_count = *active;
+            workspace_changed = true;
+        }
+        if let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection {
+            let next = if *ssh_active {
+                WorkspaceConnectionStatus::Connected
+            } else {
+                WorkspaceConnectionStatus::Offline
+            };
+            if *status != next {
+                *status = next;
+                workspace_changed = true;
+            }
+        }
+    }
+    workspace_changed
 }
 
 fn refresh_command_profiles(state: &mut RegistryState) {
@@ -1722,25 +2272,67 @@ fn set_pane_runtime_label(
 }
 
 fn pane_ids_in_snapshot(snapshot: &SessionSnapshot) -> Vec<Uuid> {
-    fn collect(layout: &PaneLayout, pane_ids: &mut Vec<Uuid>) {
-        match layout {
-            PaneLayout::Leaf { pane } => pane_ids.push(pane.id),
-            PaneLayout::Stack { panes, .. } => {
-                pane_ids.extend(panes.iter().map(|pane| pane.id));
-            }
-            PaneLayout::Split { first, second, .. } => {
-                collect(first, pane_ids);
-                collect(second, pane_ids);
-            }
-        }
-    }
     let mut pane_ids = Vec::new();
     for workspace in &snapshot.workspaces {
         for tab in &workspace.tabs {
-            collect(&tab.layout, &mut pane_ids);
+            collect_pane_ids(&tab.layout, &mut pane_ids);
         }
     }
     pane_ids
+}
+
+fn pane_ids_for_workspace(workspace: &Workspace) -> Vec<Uuid> {
+    let mut pane_ids = Vec::new();
+    for tab in &workspace.tabs {
+        collect_pane_ids(&tab.layout, &mut pane_ids);
+    }
+    pane_ids
+}
+
+fn collect_pane_ids(layout: &PaneLayout, pane_ids: &mut Vec<Uuid>) {
+    match layout {
+        PaneLayout::Leaf { pane } => pane_ids.push(pane.id),
+        PaneLayout::Stack { panes, .. } => {
+            pane_ids.extend(panes.iter().map(|pane| pane.id));
+        }
+        PaneLayout::Split { first, second, .. } => {
+            collect_pane_ids(first, pane_ids);
+            collect_pane_ids(second, pane_ids);
+        }
+    }
+}
+
+fn normalize_workspace_title(title: Option<&str>) -> Result<Option<String>> {
+    let Some(title) = title else {
+        return Ok(None);
+    };
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if title.chars().count() > MAX_WORKSPACE_TITLE_CHARS {
+        bail!("workspace name may contain at most {MAX_WORKSPACE_TITLE_CHARS} characters");
+    }
+    if title.chars().any(char::is_control) {
+        bail!("workspace name may not contain control characters");
+    }
+    Ok(Some(title.to_owned()))
+}
+
+fn normalize_pin_orders(workspaces: &mut [Workspace]) {
+    let mut pinned = workspaces
+        .iter()
+        .enumerate()
+        .filter(|(_, workspace)| workspace.pinned)
+        .map(|(index, workspace)| (index, workspace.pin_order))
+        .collect::<Vec<_>>();
+    pinned.sort_by_key(|(index, order)| (*order, *index));
+    for (order, (index, _)) in pinned.into_iter().enumerate() {
+        workspaces[index].pin_order = u32::try_from(order + 1).unwrap_or(u32::MAX);
+    }
+    for workspace in workspaces.iter_mut().filter(|workspace| !workspace.pinned) {
+        workspace.pin_order = 0;
+    }
 }
 
 fn terminate_runtime_panes(panes: &HashMap<Uuid, RuntimePane>) {
@@ -1980,14 +2572,6 @@ fn workspace_id_for_pane(snapshot: &SessionSnapshot, pane_id: Uuid) -> Option<Uu
                 .any(|tab| layout_contains(&tab.layout, pane_id))
         })
         .map(|workspace| workspace.id)
-}
-
-fn pane_count(layout: &PaneLayout) -> usize {
-    match layout {
-        PaneLayout::Leaf { .. } => 1,
-        PaneLayout::Stack { panes, .. } => panes.len(),
-        PaneLayout::Split { first, second, .. } => pane_count(first) + pane_count(second),
-    }
 }
 
 fn move_existing_pane_to_split(
@@ -2276,6 +2860,7 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         &request,
         ClientRequest::CreatePane { .. }
             | ClientRequest::CreateTab { .. }
+            | ClientRequest::CreateWorkspaceTerminal { .. }
             | ClientRequest::ConnectSsh { .. }
     ) {
         return handle_pane_creation_request(sessions, request);
@@ -2316,6 +2901,7 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         | ClientRequest::SetWorkspaceColor { .. }
         | ClientRequest::CreatePane { .. }
         | ClientRequest::CreateTab { .. }
+        | ClientRequest::CreateWorkspaceTerminal { .. }
         | ClientRequest::ConnectSsh { .. }
         | ClientRequest::ActivateTab { .. }
         | ClientRequest::SwapPanes { .. }
@@ -2323,6 +2909,13 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         | ClientRequest::MovePaneToTab { .. }
         | ClientRequest::ClosePane { .. }
         | ClientRequest::CreateWorkspace { .. }
+        | ClientRequest::CreateSshWorkspace { .. }
+        | ClientRequest::RenameWorkspace { .. }
+        | ClientRequest::SetWorkspacePinned { .. }
+        | ClientRequest::MovePinnedWorkspace { .. }
+        | ClientRequest::DisconnectWorkspace { .. }
+        | ClientRequest::ReconnectWorkspace { .. }
+        | ClientRequest::DeleteWorkspace { .. }
         | ClientRequest::GetHistoryStatus
         | ClientRequest::SetHistorySettings { .. }
         | ClientRequest::ClearHistory { .. }
@@ -2343,6 +2936,13 @@ fn is_layout_request(request: &ClientRequest) -> bool {
             | ClientRequest::MovePaneToTab { .. }
             | ClientRequest::ClosePane { .. }
             | ClientRequest::CreateWorkspace { .. }
+            | ClientRequest::CreateSshWorkspace { .. }
+            | ClientRequest::RenameWorkspace { .. }
+            | ClientRequest::SetWorkspacePinned { .. }
+            | ClientRequest::MovePinnedWorkspace { .. }
+            | ClientRequest::DisconnectWorkspace { .. }
+            | ClientRequest::ReconnectWorkspace { .. }
+            | ClientRequest::DeleteWorkspace { .. }
     )
 }
 
@@ -2367,11 +2967,41 @@ fn handle_layout_request(
         } => sessions.move_pane_to_tab(source_pane, target_pane)?,
         ClientRequest::ClosePane { pane_id } => sessions.close_pane(pane_id)?,
         ClientRequest::CreateWorkspace { title } => {
-            let (workspace_id, pane_id) = sessions.create_workspace(title)?;
+            let (workspace_id, pane_id) = sessions.create_workspace(title.as_deref())?;
             return Ok(ServiceResponse::WorkspaceCreated {
                 workspace_id,
                 pane_id,
             });
+        }
+        ClientRequest::CreateSshWorkspace { title, destination } => {
+            let (workspace_id, pane_id) =
+                sessions.create_ssh_workspace(title.as_deref(), &destination)?;
+            return Ok(ServiceResponse::WorkspaceCreated {
+                workspace_id,
+                pane_id,
+            });
+        }
+        ClientRequest::RenameWorkspace {
+            workspace_id,
+            title,
+        } => sessions.rename_workspace(workspace_id, &title)?,
+        ClientRequest::SetWorkspacePinned {
+            workspace_id,
+            pinned,
+        } => sessions.set_workspace_pinned(workspace_id, pinned)?,
+        ClientRequest::MovePinnedWorkspace {
+            workspace_id,
+            direction,
+        } => sessions.move_pinned_workspace(workspace_id, direction)?,
+        ClientRequest::DisconnectWorkspace { workspace_id } => {
+            sessions.disconnect_workspace(workspace_id)?;
+        }
+        ClientRequest::ReconnectWorkspace { workspace_id } => {
+            let pane_id = sessions.reconnect_workspace(workspace_id)?;
+            return Ok(ServiceResponse::PaneCreated { pane_id });
+        }
+        ClientRequest::DeleteWorkspace { workspace_id } => {
+            sessions.delete_workspace(workspace_id)?;
         }
         _ => unreachable!("only layout requests are routed here"),
     }
@@ -2387,6 +3017,9 @@ fn handle_pane_creation_request(
             sessions.create_pane(target_pane, axis)?
         }
         ClientRequest::CreateTab { target_pane } => sessions.create_tab(target_pane)?,
+        ClientRequest::CreateWorkspaceTerminal { workspace_id } => {
+            sessions.create_workspace_terminal(workspace_id)?
+        }
         ClientRequest::ConnectSsh { target_pane, host } => {
             sessions.connect_ssh(target_pane, &host)?
         }
@@ -2643,14 +3276,15 @@ mod tests {
 
     #[test]
     fn ssh_command_uses_structured_argv_without_security_overrides() {
-        let command = system_ssh_command_with("/usr/bin/ssh", Uuid::nil(), "prod-east").unwrap();
+        let command =
+            system_ssh_command_with("/usr/bin/ssh", Uuid::nil(), "admin@prod-east").unwrap();
 
         assert_eq!(
             command.get_argv(),
             &[
                 OsString::from("/usr/bin/ssh"),
                 OsString::from("--"),
-                OsString::from("prod-east"),
+                OsString::from("admin@prod-east"),
             ]
         );
     }
@@ -2659,7 +3293,7 @@ mod tests {
     fn invalid_ssh_destinations_are_rejected_before_command_construction() {
         for host in [
             "-oProxyCommand=bad",
-            "user@host",
+            "user@@host",
             "host command",
             "host\n-A",
         ] {
@@ -2683,7 +3317,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_precedence_is_rename_then_profile_then_title_then_command_then_fallback() {
+    fn identity_precedence_is_rename_then_profile_then_command_then_fallback() {
         let mut snapshot = SessionSnapshot::seeded();
         let pane_id = first_pane_id(&snapshot).unwrap();
         let pane = find_pane_mut_in_snapshot(&mut snapshot, pane_id).unwrap();
@@ -2696,16 +3330,16 @@ mod tests {
 
         pane.custom_title = None;
         resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
-        assert_eq!(pane.title, "Hermes");
+        assert_eq!(pane.title, "Hermes Agent");
         assert_eq!(pane.identity.source, TerminalIdentitySource::UserProfile);
 
         pane.profile_override = None;
         resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
-        assert_eq!(pane.title, "Claude");
-        assert_eq!(pane.identity.source, TerminalIdentitySource::TerminalTitle);
+        assert_eq!(pane.title, "Codex CLI");
+        assert_eq!(pane.identity.source, TerminalIdentitySource::Command);
 
         resolve_pane_identity(pane, Some("editor"), Some(TerminalProfile::Codex));
-        assert_eq!(pane.title, "Codex");
+        assert_eq!(pane.title, "Codex CLI");
         assert_eq!(pane.identity.source, TerminalIdentitySource::Command);
 
         resolve_pane_identity(pane, Some("editor"), None);
@@ -2724,7 +3358,7 @@ mod tests {
 
         let snapshot = registry.snapshot().unwrap();
         let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
-        assert_eq!(pane.title, "Claude");
+        assert_eq!(pane.title, "Claude Code");
         assert_eq!(pane.custom_title, None);
         assert_eq!(pane.profile_override, Some(TerminalProfile::Claude));
         assert_eq!(pane.identity.source, TerminalIdentitySource::UserProfile);
@@ -2734,38 +3368,6 @@ mod tests {
         let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
         assert_eq!(pane.custom_title, None);
         assert_eq!(pane.profile_override, None);
-    }
-
-    #[test]
-    fn remote_panes_are_excluded_from_the_network_silent_recovery_projection() {
-        let mut snapshot = SessionSnapshot::seeded();
-        let local = first_pane_id(&snapshot).unwrap();
-        let local_pane = find_pane_mut_in_snapshot(&mut snapshot, local)
-            .expect("seeded local pane")
-            .clone();
-        let remote = Uuid::new_v4();
-        snapshot.workspaces[0].tabs[0].layout = PaneLayout::Stack {
-            panes: vec![
-                local_pane,
-                Pane {
-                    id: remote,
-                    title: "SSH private-alias".to_owned(),
-                    shell: "ssh".to_owned(),
-                    color: None,
-                    identity: TerminalIdentity::default(),
-                    custom_title: None,
-                    profile_override: None,
-                },
-            ],
-            active: remote,
-        };
-
-        let projected = local_persistence_projection(&snapshot, &HashSet::from([remote]))
-            .expect("the local pane remains recoverable");
-
-        assert_eq!(pane_ids_in_snapshot(&projected), vec![local]);
-        assert!(!format!("{projected:?}").contains("private-alias"));
-        assert!(local_persistence_projection(&snapshot, &HashSet::from([local, remote])).is_none());
     }
 
     #[test]
@@ -2818,6 +3420,93 @@ mod tests {
         );
         assert_eq!(reset.appearance.default_terminal_accent, terminal_default);
         assert_eq!(reset.appearance.default_workspace_color, workspace_default);
+    }
+
+    #[test]
+    fn saved_workspace_management_renames_pins_reorders_and_deletes_deterministically() {
+        let registry = SessionRegistry::new().unwrap();
+        let first = registry.snapshot().unwrap().workspaces[0].id;
+        let (second, _) = registry.create_workspace(Some("Second")).unwrap();
+        let (third, _) = registry.create_workspace(Some("Third")).unwrap();
+
+        registry.rename_workspace(second, "Build tools").unwrap();
+        registry.set_workspace_pinned(second, true).unwrap();
+        registry.set_workspace_pinned(third, true).unwrap();
+        registry
+            .move_pinned_workspace(third, WorkspacePinMove::Up)
+            .unwrap();
+
+        let snapshot = registry.snapshot().unwrap();
+        let build = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == second)
+            .unwrap();
+        let third_workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == third)
+            .unwrap();
+        assert_eq!(build.title, "Build tools");
+        assert!(build.pinned);
+        assert!(third_workspace.pinned);
+        assert_eq!(third_workspace.pin_order, 1);
+        assert_eq!(build.pin_order, 2);
+
+        registry.delete_workspace(second).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.id != second)
+        );
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == third)
+                .unwrap()
+                .pin_order,
+            1
+        );
+        assert!(registry.delete_workspace(first).is_ok());
+        assert!(registry.delete_workspace(third).is_err());
+    }
+
+    #[test]
+    fn disconnect_keeps_saved_workspace_tabs_and_layout_offline() {
+        let registry = SessionRegistry::new().unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let workspace_id = snapshot.workspaces[0].id;
+        let pane_id = first_pane_id(&snapshot).unwrap();
+        let expected_panes = pane_ids_for_workspace(&snapshot.workspaces[0]);
+        {
+            let mut state = registry.state.write().unwrap();
+            state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
+                destination: "build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Connected,
+            };
+            state.panes.get_mut(&pane_id).unwrap().kind = RuntimePaneKind::SystemSsh {
+                host: "build-node".to_owned(),
+            };
+        }
+
+        registry.disconnect_workspace(workspace_id).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let workspace = &snapshot.workspaces[0];
+
+        assert_eq!(pane_ids_for_workspace(workspace), expected_panes);
+        assert!(matches!(workspace.tabs[0].layout, PaneLayout::Leaf { .. }));
+        assert_eq!(workspace.active_terminal_count, 0);
+        assert_eq!(
+            workspace.connection,
+            WorkspaceConnection::SystemSsh {
+                destination: "build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Offline,
+            }
+        );
+        assert!(registry.state.read().unwrap().panes.contains_key(&pane_id));
     }
 
     #[test]
@@ -3030,9 +3719,11 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_terminal_collapses_the_layout_and_keeps_its_neighbor() {
+    fn closing_the_last_terminal_leaves_a_saved_empty_workspace_until_explicit_reopen() {
         let registry = SessionRegistry::new().unwrap();
-        let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        let initial = registry.snapshot().unwrap();
+        let workspace_id = initial.workspaces[0].id;
+        let first = first_pane_id(&initial).unwrap();
         let second = registry.create_pane(first, SplitAxis::Vertical).unwrap();
         let second_pid = registry.pane_process_id(second).unwrap();
 
@@ -3042,7 +3733,21 @@ mod tests {
         assert_eq!(first_pane_id(&snapshot), Some(second));
         assert_eq!(registry.pane_process_id(second).unwrap(), second_pid);
         assert!(registry.pane_process_id(first).is_err());
-        assert!(registry.close_pane(second).is_err());
+
+        registry.close_pane(second).unwrap();
+
+        let empty = registry.snapshot().unwrap();
+        assert_eq!(empty.workspaces.len(), 1);
+        assert_eq!(empty.workspaces[0].id, workspace_id);
+        assert!(empty.workspaces[0].tabs.is_empty());
+        assert_eq!(empty.workspaces[0].active_terminal_count, 0);
+        assert!(registry.state().unwrap().1.is_empty());
+
+        let reopened = registry.create_workspace_terminal(workspace_id).unwrap();
+        let reopened_snapshot = registry.snapshot().unwrap();
+        assert_eq!(first_pane_id(&reopened_snapshot), Some(reopened));
+        assert_eq!(reopened_snapshot.workspaces[0].active_terminal_count, 1);
+        assert!(registry.create_workspace_terminal(workspace_id).is_err());
     }
 
     #[test]

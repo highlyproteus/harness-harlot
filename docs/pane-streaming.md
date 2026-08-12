@@ -1,6 +1,6 @@
 # Revision-aware pane streaming
 
-Protocol v8 replaces repeated full-workspace terminal-screen polling with coalesced, revision-aware pane delivery over the existing owner-only Unix socket. The same coherent protocol also carries the separately authorized private history controls and terminal identity metadata; it adds no listener, account, telemetry, vendor asset, or non-Rust terminal engine.
+Protocol v10 retains v8's coalesced, revision-aware pane delivery over the existing owner-only Unix socket and adds saved workspace lifecycle metadata, explicit empty-workspace terminal creation, and controls. The same coherent protocol also carries private history controls and terminal identity metadata; official identity artwork is compiled into the desktop and never crosses IPC or the network. It adds no listener, account, telemetry, or non-Rust terminal engine.
 
 ## Ownership and attention
 
