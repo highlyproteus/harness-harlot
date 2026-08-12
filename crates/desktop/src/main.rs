@@ -15,13 +15,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
-    DispatchPhase, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, KeyBinding,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ScrollWheelEvent, ShapedLine, StrikethroughStyle, Style, StyledText, TextRun,
-    TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions,
-    div, fill, img, point, prelude::*, px, relative, rgb, rgba, size, svg,
+    AnyElement, App, Application, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, KeyBinding, KeyDownEvent,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    ScrollWheelEvent, ShapedLine, StrikethroughStyle, Style, StyledText, TextRun, TitlebarOptions,
+    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, fill, img,
+    point, prelude::*, px, relative, rgb, rgba, size, svg,
 };
 use nah_desktop::request;
 use nah_protocol::{
@@ -431,6 +431,57 @@ impl DialogTextEditor {
 
     fn select_all(&mut self) {
         self.selected_range = 0..self.text.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
+    }
+
+    /// Select the word under a double-click using the same practical
+    /// boundaries people expect in workstation names and SSH destinations.
+    /// Keep connection punctuation together so `user@build-node` is useful as
+    /// a single editable unit rather than a series of tiny selections.
+    fn select_word_at(&mut self, offset: usize) {
+        if self.text.is_empty() {
+            self.move_to(0);
+            return;
+        }
+
+        let mut cursor = offset.min(self.text.len());
+        if cursor == self.text.len() {
+            cursor = self.previous_boundary(cursor);
+        }
+        let is_word = |character: char| {
+            character.is_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '@' | '/' | ':' | '~')
+        };
+        let Some(character) = self.text[cursor..].chars().next() else {
+            self.move_to(cursor);
+            return;
+        };
+        let word = is_word(character);
+
+        let mut start = cursor;
+        while start > 0 {
+            let previous = self.previous_boundary(start);
+            let Some(previous_character) = self.text[previous..].chars().next() else {
+                break;
+            };
+            if is_word(previous_character) != word {
+                break;
+            }
+            start = previous;
+        }
+
+        let mut end = cursor + character.len_utf8();
+        while end < self.text.len() {
+            let Some(next_character) = self.text[end..].chars().next() else {
+                break;
+            };
+            if is_word(next_character) != word {
+                break;
+            }
+            end += next_character.len_utf8();
+        }
+        self.selected_range = start..end;
         self.selection_reversed = false;
         self.marked_range = None;
     }
@@ -1704,6 +1755,8 @@ impl NahApp {
         field: WorkspaceCreationField,
         position: Option<Point<Pixels>>,
         extend_selection: bool,
+        click_count: usize,
+        window: &mut Window,
     ) {
         let index = field.index();
         let offset = position.and_then(|position| {
@@ -1715,8 +1768,14 @@ impl NahApp {
             return;
         };
         dialog.field = field;
+        // Give the custom GPUI input the platform text focus immediately on
+        // mouse-down. Waiting for the next render left click/keyboard routing
+        // competing with the terminal behind the modal on macOS.
+        self.workspace_input_focus[index].focus(window);
         let editor = dialog.active_editor_mut();
         match offset {
+            Some(_) if click_count >= 3 => editor.select_all(),
+            Some(offset) if click_count == 2 => editor.select_word_at(offset),
             Some(offset) if extend_selection => editor.select_to(offset),
             Some(offset) => editor.move_to(offset),
             None => editor.move_end(false),
@@ -2983,7 +3042,9 @@ impl NahApp {
             .h_full()
             .flex_none()
             .bg(rgb(THEME.sidebar))
-            .border_r_1()
+            // The resize target remains a generous 12 px, while the visible
+            // rail separation is intentionally a restrained hairline.
+            .border_r(px(0.5))
             .border_color(rgb(THEME.border))
             .flex()
             .flex_col()
@@ -3464,10 +3525,10 @@ impl NahApp {
             )
             .child(
                 div()
-                    .w(px(2.0))
-                    .h(px(38.0))
+                    .w(px(1.0))
+                    .h(px(30.0))
                     .rounded_full()
-                    .bg(rgb(THEME.border_strong)),
+                    .bg(rgb(THEME.border)),
             )
             .into_any_element()
     }
@@ -5658,14 +5719,19 @@ impl NahApp {
                         .font_family(".SystemUIFont")
                         .text_sm()
                         .text_color(rgb(THEME.foreground))
-                        .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             this.focus_workspace_creation_field(
                                 WorkspaceCreationField::Name,
-                                event.mouse_position(),
-                                event.modifiers().shift,
+                                Some(event.position),
+                                event.modifiers.shift,
+                                event.click_count,
+                                window,
                             );
                             cx.notify();
-                        }))
+                            }),
+                        )
                         .child(WorkspaceTextInputElement {
                             input: cx.entity(),
                             field: WorkspaceCreationField::Name,
@@ -5704,14 +5770,19 @@ impl NahApp {
                                 .font_family("SF Mono")
                                 .text_sm()
                                 .text_color(rgb(THEME.foreground))
-                                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
                                     this.focus_workspace_creation_field(
                                         WorkspaceCreationField::Destination,
-                                        event.mouse_position(),
-                                        event.modifiers().shift,
+                                        Some(event.position),
+                                        event.modifiers.shift,
+                                        event.click_count,
+                                        window,
                                     );
                                     cx.notify();
-                                }))
+                                    }),
+                                )
                                 .child(WorkspaceTextInputElement {
                                     input: cx.entity(),
                                     field: WorkspaceCreationField::Destination,
@@ -8570,6 +8641,36 @@ mod tests {
 
         assert_eq!(editor.text, "tailscale-node");
         assert_eq!(editor.selected_range, editor.text.len()..editor.text.len());
+    }
+
+    #[test]
+    fn workspace_dialog_double_click_selection_replaces_a_name_or_destination_unit() {
+        let mut name = DialogTextEditor::with_text("Build workstation");
+        name.select_word_at(2);
+        assert_eq!(name.selected_text(), Some("Build"));
+        name.replace(None, "Deploy", 80, false, false, None);
+        assert_eq!(name.text, "Deploy workstation");
+
+        let mut destination = DialogTextEditor::with_text("admin@build-node");
+        destination.select_word_at(7);
+        assert_eq!(destination.selected_text(), Some("admin@build-node"));
+        destination.replace(None, "ops@edge", MAX_SSH_INPUT_LEN, true, false, None);
+        assert_eq!(destination.text, "ops@edge");
+    }
+
+    #[test]
+    fn workspace_dialog_select_all_supports_cut_or_replacement_without_terminal_input() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.name = DialogTextEditor::with_text("Default workstation name");
+        dialog.name.select_all();
+        assert_eq!(
+            dialog.name.selected_text(),
+            Some("Default workstation name")
+        );
+
+        dialog.replace_text(None, "My Mac", false, None);
+        assert_eq!(dialog.name.text, "My Mac");
+        assert!(dialog.name.selected_text().is_none());
     }
 
     #[test]
