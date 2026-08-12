@@ -171,6 +171,7 @@ impl Render for TooltipView {
 struct TabMenu {
     pane_id: Uuid,
     position: Point<Pixels>,
+    identity_picker_open: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,6 +201,21 @@ struct RenameEditor {
     pane_id: Uuid,
     value: String,
     replace_on_type: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkstationGroupExpansion {
+    pinned: bool,
+    ordinary: bool,
+}
+
+impl Default for WorkstationGroupExpansion {
+    fn default() -> Self {
+        Self {
+            pinned: true,
+            ordinary: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -872,6 +888,7 @@ struct NahApp {
     stream_diagnostics: StreamDiagnostics,
     active_workspace: Option<Uuid>,
     expanded_workspaces: HashSet<Uuid>,
+    workstation_groups: WorkstationGroupExpansion,
     focused_pane: Option<Uuid>,
     split_ratios: HashMap<SplitControlId, f32>,
     zoomed_pane: Option<Uuid>,
@@ -952,6 +969,7 @@ impl NahApp {
             stream_diagnostics: StreamDiagnostics::default(),
             active_workspace: None,
             expanded_workspaces: HashSet::new(),
+            workstation_groups: WorkstationGroupExpansion::default(),
             focused_pane: None,
             split_ratios: HashMap::new(),
             zoomed_pane: None,
@@ -1321,8 +1339,8 @@ impl NahApp {
             replace_on_type: true,
             invalid: false,
         });
-        self.tab_menu = None;
-        if !matches!(target, ColorTarget::Workspace(_)) {
+        if !matches!(target, ColorTarget::Pane(_) | ColorTarget::Workspace(_)) {
+            self.tab_menu = None;
             self.workspace_menu = None;
         }
         cx.notify();
@@ -1529,6 +1547,16 @@ impl NahApp {
         cx.notify();
     }
 
+    fn toggle_workstation_group(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        let expanded = if pinned {
+            &mut self.workstation_groups.pinned
+        } else {
+            &mut self.workstation_groups.ordinary
+        };
+        *expanded = !*expanded;
+        cx.notify();
+    }
+
     fn select_workspace_tab(&mut self, workspace_id: Uuid, pane_id: Uuid, cx: &mut Context<Self>) {
         self.active_workspace = Some(workspace_id);
         self.activate_tab(pane_id, cx);
@@ -1676,7 +1704,11 @@ impl NahApp {
         }
         self.focus_pane_with_snapshot(pane_id);
         self.refresh_state();
-        self.tab_menu = Some(TabMenu { pane_id, position });
+        self.tab_menu = Some(TabMenu {
+            pane_id,
+            position,
+            identity_picker_open: false,
+        });
         self.workspace_menu = None;
         self.rename_editor = None;
         self.close_confirmation = None;
@@ -1708,6 +1740,18 @@ impl NahApp {
                 replace_on_type: true,
             });
             self.tab_menu = None;
+            cx.notify();
+        }
+    }
+
+    fn toggle_tab_identity_picker(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        if let Some(menu) = self
+            .tab_menu
+            .as_mut()
+            .filter(|menu| menu.pane_id == pane_id)
+        {
+            menu.identity_picker_open = !menu.identity_picker_open;
+            self.color_picker = None;
             cx.notify();
         }
     }
@@ -2333,26 +2377,12 @@ impl NahApp {
             return;
         }
         if let Some(editor) = self.workspace_rename_editor.as_mut() {
-            if editor.replace_on_type {
-                editor.value.clear();
-            }
-            let remaining = 80_usize.saturating_sub(editor.value.chars().count());
-            editor
-                .value
-                .extend(text.chars().filter(|c| !c.is_control()).take(remaining));
-            editor.replace_on_type = false;
+            append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
             cx.notify();
             return;
         }
         if let Some(editor) = self.rename_editor.as_mut() {
-            if editor.replace_on_type {
-                editor.value.clear();
-            }
-            let remaining = 80_usize.saturating_sub(editor.value.chars().count());
-            editor
-                .value
-                .extend(text.chars().filter(|c| !c.is_control()).take(remaining));
-            editor.replace_on_type = false;
+            append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
             cx.notify();
             return;
         }
@@ -2831,6 +2861,19 @@ impl NahApp {
                     editor.replace_on_type = false;
                     cx.notify();
                 }
+                _ if !keystroke.modifiers.platform
+                    && !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt =>
+                {
+                    // macOS occasionally delivers printable keys to the
+                    // modal's key route without a matching text-input event.
+                    // Keep the rename field focused and accept those keys
+                    // instead of leaving a cleared editor unable to type.
+                    if let Some(text) = &keystroke.key_char {
+                        append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
+                        cx.notify();
+                    }
+                }
                 _ => {}
             }
             cx.stop_propagation();
@@ -2857,6 +2900,17 @@ impl NahApp {
                     }
                     editor.replace_on_type = false;
                     cx.notify();
+                }
+                _ if !keystroke.modifiers.platform
+                    && !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt =>
+                {
+                    // See the workspace rename path above. This fallback is
+                    // deliberately modal, so text cannot leak to the PTY.
+                    if let Some(text) = &keystroke.key_char {
+                        append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
+                        cx.notify();
+                    }
                 }
                 _ => {}
             }
@@ -3136,6 +3190,11 @@ impl NahApp {
             .history_status
             .as_ref()
             .is_some_and(|status| status.warning.is_some());
+        let pinned_workspace_count = workspaces
+            .iter()
+            .filter(|workspace| workspace.pinned)
+            .count();
+        let workstation_count = workspaces.len().saturating_sub(pinned_workspace_count);
         let sidebar_content_width = self.sidebar_pixels - SIDEBAR_RESIZE_HIT_WIDTH;
         div()
             .w(px(sidebar_content_width))
@@ -3169,89 +3228,116 @@ impl NahApp {
                             .left(px(0.0))
                             .size_full()
                             .object_fit(gpui::ObjectFit::Contain),
+                    ),
+            )
+            .child(div().h(px(1.0)).flex_none().bg(rgb(THEME.border)))
+            .child(
+                div()
+                    .h(px(40.0))
+                    .px(px(8.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("new-workspace")
+                            .flex_none()
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .bg(rgb(THEME.surface))
+                            .border_1()
+                            .border_color(rgb(THEME.border))
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.foreground))
+                            .hover(|element| element.border_color(rgb(THEME.accent)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_click(cx.listener(|this, _, _, cx| this.new_workspace(cx)))
+                            .tooltip(|_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: "Add workstation (⌘N)".to_owned(),
+                                })
+                                .into()
+                            })
+                            .child("＋"),
                     )
                     .child(
                         div()
-                            .absolute()
-                            .top(px(0.0))
-                            .left(px(0.0))
-                            .w_full()
-                            .h(px(TITLEBAR_HEIGHT))
-                            .pl(px(79.0))
-                            .pr(px(8.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
+                            .id("appearance-settings")
+                            .relative()
+                            .flex_none()
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .font_family(".SystemUIFont")
                             .text_sm()
                             .text_color(rgb(THEME.muted))
-                            .child(
-                                div()
-                                    .id("hide-workspace-sidebar")
-                                    .w(px(20.0))
-                                    .h(px(20.0))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .hover(|element| {
-                                        element
-                                            .bg(rgb(THEME.elevated))
-                                            .text_color(rgb(THEME.foreground))
-                                    })
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| TooltipView {
-                                            text: "Hide workstation sidebar (⌘B)".to_owned(),
-                                        })
-                                        .into()
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-                                    .child(render_sidebar_toggle_icon(true)),
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(THEME.elevated))
+                                    .text_color(rgb(THEME.foreground))
+                            })
+                            .tooltip(|_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: "Settings".to_owned(),
+                                })
+                                .into()
+                            })
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.open_appearance_settings(cx)),
                             )
-                            .child(
-                                div()
-                                    .id("appearance-settings")
-                                    .relative()
-                                    .cursor_pointer()
-                                    .hover(|element| element.text_color(rgb(THEME.foreground)))
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| TooltipView {
-                                            text: "Settings".to_owned(),
-                                        })
-                                        .into()
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_appearance_settings(cx)
-                                    }))
-                                    .child("⚙")
-                                    .when(history_needs_attention, |element| {
-                                        element.child(
-                                            div()
-                                                .absolute()
-                                                .top(px(-2.0))
-                                                .right(px(-4.0))
-                                                .w(px(5.0))
-                                                .h(px(5.0))
-                                                .rounded_full()
-                                                .bg(rgb(THEME.danger)),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("new-workspace")
-                                    .cursor_pointer()
-                                    .hover(|element| element.text_color(rgb(THEME.foreground)))
-                                    .on_click(cx.listener(|this, _, _, cx| this.new_workspace(cx)))
-                                    .child("＋"),
-                            ),
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child("⚙")
+                            .when(history_needs_attention, |element| {
+                                element.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(3.0))
+                                        .right(px(3.0))
+                                        .w(px(5.0))
+                                        .h(px(5.0))
+                                        .rounded_full()
+                                        .bg(rgb(THEME.danger)),
+                                )
+                            }),
                     ),
+            )
+            .child(div().h(px(1.0)).flex_none().bg(rgb(THEME.border)))
+            .child(self.render_workstation_group_header("Pinned", pinned_workspace_count, true, cx))
+            .when(
+                pinned_workspace_count == 0 && self.workstation_groups.pinned,
+                |element| {
+                    element.child(
+                        div()
+                            .px(px(14.0))
+                            .pb(px(6.0))
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child("No pinned workstations"),
+                    )
+                },
             )
             .children(
                 workspaces
                     .into_iter()
                     .enumerate()
                     .map(|(index, workspace)| {
+                        let pinned = workspace.pinned;
+                        let group_expanded = if pinned {
+                            self.workstation_groups.pinned
+                        } else {
+                            self.workstation_groups.ordinary
+                        };
+                        let starts_workstations = !pinned && index == pinned_workspace_count;
                         let active = Some(workspace.id) == self.active_workspace;
                         let workspace_id = workspace.id;
                         let offline = matches!(
@@ -3289,14 +3375,25 @@ impl NahApp {
                         };
                         let active_text = readable_text_color(card_color);
                         div()
-                            .id(("workspace-section", element_key(workspace.id)))
-                            .mx(px(7.0))
-                            .mb(px(3.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
+                            .when(starts_workstations, |element| {
+                                element.child(self.render_workstation_group_header(
+                                    "Workstations",
+                                    workstation_count,
+                                    false,
+                                    cx,
+                                ))
+                            })
+                            .when(group_expanded, |element| {
+                                element.child(
+                                    div()
+                                        .id(("workspace-section", element_key(workspace.id)))
+                                        .mx(px(7.0))
+                                        .mb(px(3.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
                                     .id(("workspace", element_key(workspace.id)))
                                     .h(px(31.0))
                                     .px(px(8.0))
@@ -3651,39 +3748,85 @@ impl NahApp {
                                     }))
                                 }
                             })
+                                )
+                            })
                     }),
+            )
+            .when(workstation_count == 0, |element| {
+                element
+                    .child(self.render_workstation_group_header("Workstations", 0, false, cx))
+                    .when(self.workstation_groups.ordinary, |element| {
+                        element.child(
+                            div()
+                                .px(px(14.0))
+                                .pb(px(6.0))
+                                .font_family(".SystemUIFont")
+                                .text_xs()
+                                .text_color(rgb(THEME.dim))
+                                .child("No workstations yet — use Add workstation above"),
+                        )
+                    })
+            })
+            .child(div().flex_1())
+            .into_any_element()
+    }
+
+    fn render_workstation_group_header(
+        &self,
+        label: &'static str,
+        count: usize,
+        pinned: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let expanded = if pinned {
+            self.workstation_groups.pinned
+        } else {
+            self.workstation_groups.ordinary
+        };
+        div()
+            .id(("workstation-group", usize::from(pinned)))
+            .mx(px(7.0))
+            .mt(px(4.0))
+            .h(px(26.0))
+            .px(px(7.0))
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .hover(|element| element.bg(rgb(THEME.surface)))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_workstation_group(pinned, cx)))
+            .child(
+                div()
+                    .w(px(12.0))
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.muted))
+                    .child(if expanded { "⌄" } else { "›" }),
+            )
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(THEME.muted))
+                    .child(label),
             )
             .child(div().flex_1())
             .child(
                 div()
-                    .id("new-workspace-bottom")
-                    .mx(px(9.0))
-                    .mb(px(8.0))
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
+                    .min_w(px(17.0))
+                    .h(px(17.0))
+                    .px(px(5.0))
+                    .rounded_full()
                     .bg(rgb(THEME.surface))
-                    .border_1()
-                    .border_color(rgb(THEME.border))
-                    .font_family(".SystemUIFont")
-                    .text_sm()
-                    .text_color(rgb(THEME.foreground))
-                    .hover(|element| element.border_color(rgb(THEME.accent)))
+                    .font_family("SF Mono")
+                    .text_size(px(9.5))
+                    .text_color(rgb(THEME.dim))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .on_click(cx.listener(|this, _, _, cx| this.new_workspace(cx)))
-                    .child("＋ New Workstation"),
-            )
-            .child(
-                div()
-                    .px(px(11.0))
-                    .pb(px(9.0))
-                    .font_family("SF Mono")
-                    .text_xs()
-                    .text_color(rgb(THEME.dim))
-                    .child("⌘N new workstation"),
+                    .child(count.to_string()),
             )
             .into_any_element()
     }
@@ -4474,11 +4617,22 @@ impl NahApp {
 
     fn render_tab_menu(&self, menu: TabMenu, cx: &mut Context<Self>) -> AnyElement {
         let pane_id = menu.pane_id;
+        let inline_color_picker = self
+            .color_picker
+            .as_ref()
+            .filter(|picker| picker.target == ColorTarget::Pane(pane_id));
+        let selected_profile = self
+            .pane_metadata(pane_id)
+            .and_then(|pane| pane.profile_override);
         div()
+            .id(("terminal-context-menu", element_key(pane_id)))
             .absolute()
             .left(menu.position.x)
             .top(menu.position.y)
             .w(px(232.0))
+            .h_auto()
+            .max_h(relative(0.72))
+            .overflow_y_scroll()
             .py(px(5.0))
             .rounded(px(7.0))
             .bg(rgb(THEME.elevated))
@@ -4503,7 +4657,7 @@ impl NahApp {
             )
             .child(
                 div()
-                    .mt(px(4.0))
+                    .mt(px(5.0))
                     .mx(px(8.0))
                     .pt(px(7.0))
                     .border_t_1()
@@ -4513,7 +4667,38 @@ impl NahApp {
                     .text_color(rgb(THEME.dim))
                     .child("Terminal identity"),
             )
-            .child(self.render_profile_choices(pane_id, cx))
+            .child(
+                div()
+                    .id(("select-terminal-icon", element_key(pane_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_tab_identity_picker(pane_id, cx)
+                    }))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child("Select icon")
+                    .child(div().flex_1())
+                    .children(selected_profile.map(|profile| {
+                        render_terminal_profile_mark(profile, THEME.foreground, THEME.accent)
+                    }))
+                    .child(if menu.identity_picker_open {
+                        "⌄"
+                    } else {
+                        "›"
+                    }),
+            )
+            .when(menu.identity_picker_open, |element| {
+                element.child(self.render_profile_choices(pane_id, cx))
+            })
             .child(
                 div()
                     .id(("reset-identity-menu", element_key(pane_id)))
@@ -4524,12 +4709,12 @@ impl NahApp {
                     .cursor_pointer()
                     .font_family(".SystemUIFont")
                     .text_sm()
-                    .text_color(rgb(THEME.foreground))
+                    .text_color(rgb(THEME.muted))
                     .hover(|element| element.bg(rgb(THEME.accent_soft)))
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.reset_pane_identity(pane_id, cx)),
                     )
-                    .child("Reset name and identity"),
+                    .child("Reset"),
             )
             .child(
                 div()
@@ -4543,27 +4728,9 @@ impl NahApp {
                     .text_color(rgb(THEME.dim))
                     .child("Terminal color"),
             )
-            .child(self.render_color_choices(ColorTarget::Pane(pane_id), "tab-menu", cx))
             .child(
                 div()
-                    .id(("default-color-menu", element_key(pane_id)))
-                    .mx(px(5.0))
-                    .px(px(9.0))
-                    .py(px(7.0))
-                    .rounded(px(4.0))
-                    .cursor_pointer()
-                    .font_family(".SystemUIFont")
-                    .text_sm()
-                    .text_color(rgb(THEME.foreground))
-                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.apply_color(ColorTarget::Pane(pane_id), None, cx)
-                    }))
-                    .child("Use default"),
-            )
-            .child(
-                div()
-                    .id(("pick-color-menu", element_key(pane_id)))
+                    .id(("pick-terminal-color", element_key(pane_id)))
                     .mx(px(5.0))
                     .px(px(9.0))
                     .py(px(7.0))
@@ -4578,6 +4745,9 @@ impl NahApp {
                     }))
                     .child("Pick color…"),
             )
+            .when_some(inline_color_picker, |element, picker| {
+                element.child(self.render_inline_color_picker(picker, "inline-terminal-color", cx))
+            })
             .child(
                 div()
                     .id(("close-menu", element_key(pane_id)))
@@ -4600,23 +4770,23 @@ impl NahApp {
         let selected = self
             .pane_metadata(pane_id)
             .and_then(|pane| pane.profile_override);
-        let choices = std::iter::once(("Auto".to_owned(), None)).chain(
-            TerminalProfile::ALL
-                .into_iter()
-                .map(|profile| (profile.display_name().to_owned(), Some(profile))),
-        );
+        let choices = std::iter::once(None).chain(TerminalProfile::ALL.into_iter().map(Some));
         div()
             .mx(px(8.0))
             .my(px(6.0))
             .flex()
             .flex_wrap()
-            .gap(px(5.0))
-            .children(choices.enumerate().map(|(index, (label, profile))| {
+            .gap(px(6.0))
+            .children(choices.enumerate().map(|(index, profile)| {
                 let active = selected == profile;
+                let label = profile.map_or_else(
+                    || "Automatic terminal icon".to_owned(),
+                    |profile| profile.display_name().to_owned(),
+                );
                 div()
                     .id(("identity-profile", index))
-                    .px(px(7.0))
-                    .py(px(5.0))
+                    .w(px(30.0))
+                    .h(px(28.0))
                     .rounded(px(5.0))
                     .cursor_pointer()
                     .border_1()
@@ -4632,7 +4802,7 @@ impl NahApp {
                     })
                     .flex()
                     .items_center()
-                    .gap(px(5.0))
+                    .justify_center()
                     .font_family(".SystemUIFont")
                     .text_xs()
                     .text_color(if active {
@@ -4644,6 +4814,12 @@ impl NahApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_pane_profile(pane_id, profile, cx)
                     }))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: label.clone(),
+                        })
+                        .into()
+                    })
                     .children(profile.map(|profile| {
                         render_terminal_profile_mark(
                             profile,
@@ -4655,7 +4831,7 @@ impl NahApp {
                             if active { THEME.accent } else { THEME.muted },
                         )
                     }))
-                    .child(label)
+                    .when(profile.is_none(), |element| element.child("A"))
             }))
             .into_any_element()
     }
@@ -4822,7 +4998,11 @@ impl NahApp {
                     .child("Pick color…"),
             )
             .when_some(inline_color_picker, |element, picker| {
-                element.child(self.render_inline_color_picker(picker, cx))
+                element.child(self.render_inline_color_picker(
+                    picker,
+                    "inline-workstation-color",
+                    cx,
+                ))
             })
             .child(
                 div()
@@ -4887,11 +5067,12 @@ impl NahApp {
             .into_any_element()
     }
 
-    /// The workstation picker stays inside its row's context menu so color
-    /// selection does not interrupt terminal work with a second modal layer.
+    /// Color pickers stay inside their owning context menu so selection does
+    /// not interrupt terminal work with a second modal layer.
     fn render_inline_color_picker(
         &self,
         picker: &ColorPickerState,
+        id_prefix: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let target = picker.target;
@@ -4913,7 +5094,7 @@ impl NahApp {
                     .text_color(rgb(THEME.muted))
                     .child("Recent and Harbor Night colors"),
             )
-            .child(self.render_color_choices(target, "inline-workstation-color", cx))
+            .child(self.render_color_choices(target, id_prefix, cx))
             .child(
                 div()
                     .h(px(32.0))
@@ -5731,6 +5912,8 @@ impl NahApp {
                     )
                     .child(
                         div()
+                            .id("terminal-rename-input")
+                            .track_focus(&self.focus_handle)
                             .h(px(36.0))
                             .px(px(10.0))
                             .rounded(px(6.0))
@@ -5739,6 +5922,13 @@ impl NahApp {
                             .border_color(rgb(THEME.accent))
                             .flex()
                             .items_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.focus_handle.focus(window);
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .font_family(".SystemUIFont")
                             .text_sm()
                             .text_color(rgb(THEME.foreground))
@@ -6802,6 +6992,7 @@ impl NahApp {
             matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. });
         let open_terminal_binding = self.binding_label(AppCommand::NewTab);
         let workspace_color = self.workspace_color(workspace.id).as_rgb();
+        let sidebar_visible = self.sidebar_visible;
         let canonical_layout = workspace.tabs.first().map(|tab| tab.layout.clone());
         let layout = canonical_layout.as_ref().map(|layout| {
             self.zoomed_pane
@@ -6904,34 +7095,36 @@ impl NahApp {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .when(!self.sidebar_visible, |element| {
-                        element.child(
-                            div()
-                                .id("show-workspace-sidebar")
-                                .flex_none()
-                                .w(px(24.0))
-                                .h(px(24.0))
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(rgb(THEME.muted))
-                                .hover(|element| {
-                                    element
-                                        .bg(rgb(THEME.elevated))
-                                        .text_color(rgb(THEME.foreground))
+                    .child(
+                        div()
+                            .id("toggle-workstation-sidebar")
+                            .flex_none()
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(THEME.elevated))
+                                    .text_color(rgb(THEME.foreground))
+                            })
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: if sidebar_visible {
+                                        "Hide workstation sidebar (⌘B)".to_owned()
+                                    } else {
+                                        "Show workstation sidebar (⌘B)".to_owned()
+                                    },
                                 })
-                                .tooltip(|_, cx| {
-                                    cx.new(|_| TooltipView {
-                                        text: "Show workstation sidebar (⌘B)".to_owned(),
-                                    })
-                                    .into()
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-                                .child(render_sidebar_toggle_icon(false)),
-                        )
-                    })
+                                .into()
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+                            .child(render_sidebar_toggle_icon(sidebar_visible)),
+                    )
                     .child(
                         div()
                             .font_family("SF Mono")
@@ -6978,6 +7171,10 @@ impl Render for NahApp {
         // terminal behind the dialog.
         if let Some(dialog) = self.workspace_creation.as_ref() {
             self.workspace_input_focus[dialog.field.index()].focus(window);
+        } else if self.rename_editor.is_some() || self.workspace_rename_editor.is_some() {
+            // Keep a rename modal on the root text-input route. This makes
+            // replacement typing reliable after clearing the selected title.
+            self.focus_handle.focus(window);
         }
 
         div()
@@ -7140,9 +7337,12 @@ impl Render for NahApp {
                 element.child(self.render_appearance_settings(cx))
             })
             .when_some(
-                self.color_picker
-                    .as_ref()
-                    .filter(|picker| !matches!(picker.target, ColorTarget::Workspace(_))),
+                self.color_picker.as_ref().filter(|picker| {
+                    matches!(
+                        picker.target,
+                        ColorTarget::DefaultTerminal | ColorTarget::DefaultWorkspace
+                    )
+                }),
                 |element, picker| element.child(self.render_color_picker(picker, cx)),
             )
     }
@@ -8703,6 +8903,19 @@ fn workstation_banner_header_height(sidebar_content_width: f32) -> f32 {
     sidebar_content_width.max(0.0) / WORKSTATION_BANNER_ASPECT_RATIO
 }
 
+fn append_rename_text(value: &mut String, replace_on_type: &mut bool, text: &str) {
+    if *replace_on_type {
+        value.clear();
+    }
+    let remaining = 80_usize.saturating_sub(value.chars().count());
+    value.extend(
+        text.chars()
+            .filter(|character| !character.is_control())
+            .take(remaining),
+    );
+    *replace_on_type = false;
+}
+
 /// Prefer the copy packaged inside a native macOS bundle. The source-tree path
 /// keeps local non-bundled development builds visually faithful as well.
 fn workstation_banner_path() -> PathBuf {
@@ -9488,6 +9701,20 @@ mod tests {
                 (height * WORKSTATION_BANNER_ASPECT_RATIO - sidebar_content_width).abs() < 0.0001
             );
         }
+    }
+
+    #[test]
+    fn terminal_rename_accepts_replacement_text_after_the_original_is_cleared() {
+        let mut value = "Terminal 1".to_owned();
+        let mut replace_on_type = true;
+
+        append_rename_text(&mut value, &mut replace_on_type, "Build shell");
+
+        assert_eq!(value, "Build shell");
+        assert!(!replace_on_type);
+
+        append_rename_text(&mut value, &mut replace_on_type, "\n");
+        assert_eq!(value, "Build shell");
     }
 
     #[test]
