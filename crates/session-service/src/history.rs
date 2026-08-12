@@ -693,7 +693,7 @@ impl Store {
             Err(error) => {
                 self.corrupt_chunk_seen = true;
                 eprintln!(
-                    "Rust Mux history chunk {} is corrupt: {error:#}",
+                    "Not a Harness history chunk {} is corrupt: {error:#}",
                     path.display()
                 );
                 (Vec::new(), true, true)
@@ -866,7 +866,7 @@ impl Store {
             }) {
                 Ok(manifest) => manifests.push(manifest),
                 Err(error) => eprintln!(
-                    "ignoring invalid Rust Mux history manifest {}: {error:#}",
+                    "ignoring invalid Not a Harness history manifest {}: {error:#}",
                     manifest_path.display()
                 ),
             }
@@ -1324,7 +1324,7 @@ mod tests {
     use super::*;
 
     fn test_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("rust-mux-history-{label}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("not-a-harness-history-{label}-{}", Uuid::new_v4()))
     }
 
     fn open_store(label: &str) -> (PathBuf, Store) {

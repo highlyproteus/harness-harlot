@@ -152,7 +152,7 @@
   "status": "in_progress",
   "block_reason": null,
   "notes": [
-    { "timestamp": "2026-08-11T16:46:38Z", "text": "Security boundary: system OpenSSH owns protocol, authentication, host-key verification, and jump-host behavior; Rust Mux owns only the local PTY, process lifecycle, metadata, and UI projection." },
+    { "timestamp": "2026-08-11T16:46:38Z", "text": "Security boundary: system OpenSSH owns protocol, authentication, host-key verification, and jump-host behavior; Not a Harness owns only the local PTY, process lifecycle, metadata, and UI projection." },
     { "timestamp": "2026-08-11T21:22:24Z", "text": "Integrated the first native system-SSH slice on protocol v5 alongside terminal interaction. The desktop requires destination review and a second explicit confirmation; the daemon validates a conservative host alias and launches only structured argv equivalent to /usr/bin/ssh -- host in a managed PTY. OpenSSH alone resolves config, keys, agents, known hosts, Match, and proxy rules. Runtime metadata distinguishes system SSH, while host intent is removed from owner-only recovery snapshots so daemon restart remains network-silent. Host discovery plus real remote resize, movement, reconnect, and failure-path tests remain, so this task is in progress rather than complete." }
   ],
   "last_updated": "2026-08-11T21:22:24Z"

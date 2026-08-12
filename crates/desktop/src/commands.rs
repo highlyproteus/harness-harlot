@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
 
 use gpui::Keystroke;
 use serde::{Deserialize, Serialize};
 
-pub const ROOT_KEY_CONTEXT: &str = "RustMuxTerminal";
+pub const ROOT_KEY_CONTEXT: &str = "NotAHarnessTerminal";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -210,7 +208,7 @@ impl AppConfig {
     }
 
     pub fn load() -> Result<Self, ConfigError> {
-        let Some(path) = config_path() else {
+        let Some(path) = rust_mux_protocol::config_path() else {
             return Ok(Self::default());
         };
         if !path.exists() {
@@ -298,16 +296,6 @@ fn normalize_sequence(sequence: &str) -> Result<String, ConfigError> {
         })?;
     }
     Ok(sequence)
-}
-
-fn config_path() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("RUST_MUX_CONFIG") {
-        return Some(PathBuf::from(path));
-    }
-    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(path).join("rust-mux/config.json"));
-    }
-    env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/rust-mux/config.json"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

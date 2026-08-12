@@ -6,7 +6,7 @@
   "tasks": [
     {
       "file": "tasks/rust-mux/00-vision.md",
-      "title": "Rust Mux Vision",
+      "title": "Not a Harness Vision",
       "goal": "Define a lightweight, reliability-first native local and SSH terminal workspace whose sessions outlive its desktop UI without becoming an agent harness or runtime.",
       "complete": 9,
       "total": 9,
@@ -38,7 +38,7 @@
           "section": "Requirements"
         },
         {
-          "text": "Treat terminals and agents as ordinary shell workloads; Rust Mux must stay out of their way rather than own or supervise an agent runtime.",
+          "text": "Treat terminals and agents as ordinary shell workloads; Not a Harness must stay out of their way rather than own or supervise an agent runtime.",
           "done": true,
           "section": "Requirements"
         },

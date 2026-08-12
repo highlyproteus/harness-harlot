@@ -153,7 +153,7 @@ impl TerminalModel {
     /// # Panics
     ///
     /// Panics only if the visible line count cannot fit in Alacritty's signed
-    /// line index. Rust Mux caps PTY rows far below that bound.
+    /// line index. Not a Harness caps PTY rows far below that bound.
     pub fn visible_lines(&self) -> Vec<String> {
         (0..self.terminal.screen_lines())
             .map(|line| {

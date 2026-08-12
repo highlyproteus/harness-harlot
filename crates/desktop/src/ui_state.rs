@@ -121,18 +121,7 @@ impl UiStateStore {
 }
 
 fn default_ui_state_path() -> Result<PathBuf> {
-    if let Some(directory) = std::env::var_os("RUST_MUX_STATE_DIR") {
-        return Ok(PathBuf::from(directory).join("ui-state.json"));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let home = PathBuf::from(home);
-    #[cfg(target_os = "macos")]
-    let directory = home.join("Library/Application Support/Rust Mux");
-    #[cfg(not(target_os = "macos"))]
-    let directory = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/state"))
-        .join("rust-mux");
+    let directory = rust_mux_protocol::state_directory().context("HOME is not set")?;
     Ok(directory.join("ui-state.json"))
 }
 
@@ -154,7 +143,8 @@ mod tests {
     use super::*;
 
     fn temp_store(label: &str) -> (PathBuf, UiStateStore) {
-        let root = std::env::temp_dir().join(format!("rust-mux-ui-{label}-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("not-a-harness-ui-{label}-{}", Uuid::new_v4()));
         let store = UiStateStore::new(root.join("ui-state.json"));
         (root, store)
     }

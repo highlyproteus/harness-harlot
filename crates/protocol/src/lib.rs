@@ -7,7 +7,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 11;
-pub const SOCKET_ENV: &str = "RUST_MUX_SOCKET";
+pub const SOCKET_ENV: &str = "NOT_A_HARNESS_SOCKET";
+pub const LEGACY_SOCKET_ENV: &str = "RUST_MUX_SOCKET";
+pub const STATE_DIR_ENV: &str = "NOT_A_HARNESS_STATE_DIR";
+pub const LEGACY_STATE_DIR_ENV: &str = "RUST_MUX_STATE_DIR";
+pub const CONFIG_ENV: &str = "NOT_A_HARNESS_CONFIG";
+pub const LEGACY_CONFIG_ENV: &str = "RUST_MUX_CONFIG";
+pub const PANE_ID_ENV: &str = "NOT_A_HARNESS_PANE_ID";
+pub const LEGACY_PANE_ID_ENV: &str = "RUST_MUX_PANE_ID";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_SSH_HOST_LEN: usize = 253;
 pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;
@@ -842,7 +849,7 @@ pub enum ClientRequest {
 /// Normalizes the single OpenSSH destination accepted from the desktop UI.
 ///
 /// A user may enter a bare `[user@]host` destination or paste the exact command
-/// form `ssh [user@]host`. Rust Mux strips only that known executable token;
+/// form `ssh [user@]host`. Not a Harness strips only that known executable token;
 /// options, extra commands, shell syntax, and other executables remain outside
 /// this boundary. OpenSSH remains responsible for resolving normal config and
 /// agent behavior after the normalized destination is validated.
@@ -877,7 +884,7 @@ pub fn normalize_ssh_input(input: &str) -> Result<String, &'static str> {
 
 /// Validates the normalized OpenSSH destination sent to the session service.
 ///
-/// Rust Mux deliberately accepts only a conservative `[user@]host` or SSH
+/// Not a Harness deliberately accepts only a conservative `[user@]host` or SSH
 /// config `Host` alias subset. Option prefixes, ports, commands, shell syntax,
 /// whitespace, and control characters are not part of this value.
 ///
@@ -982,10 +989,63 @@ pub enum WireError {
 }
 
 pub fn socket_path() -> PathBuf {
-    std::env::var_os(SOCKET_ENV).map_or_else(
-        || std::env::temp_dir().join("rust-mux-session.sock"),
-        PathBuf::from,
-    )
+    environment_path(SOCKET_ENV, LEGACY_SOCKET_ENV).unwrap_or_else(|| {
+        preferred_path(
+            std::env::temp_dir().join("not-a-harness-session.sock"),
+            std::env::temp_dir().join("rust-mux-session.sock"),
+        )
+    })
+}
+
+/// Returns the owner-only state directory, retaining an existing Rust Mux
+/// directory when a Not a Harness directory has not been created yet.
+pub fn state_directory() -> Option<PathBuf> {
+    if let Some(directory) = environment_path(STATE_DIR_ENV, LEGACY_STATE_DIR_ENV) {
+        return Some(directory);
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    #[cfg(target_os = "macos")]
+    let paths = (
+        home.join("Library/Application Support/Not a Harness"),
+        home.join("Library/Application Support/Rust Mux"),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let paths = {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/state"));
+        (base.join("not-a-harness"), base.join("rust-mux"))
+    };
+    Some(preferred_path(paths.0, paths.1))
+}
+
+/// Returns the desktop config file, preferring the new identity while safely
+/// loading an existing Rust Mux config when no new config exists.
+pub fn config_path() -> Option<PathBuf> {
+    if let Some(path) = environment_path(CONFIG_ENV, LEGACY_CONFIG_ENV) {
+        return Some(path);
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(preferred_path(
+        base.join("not-a-harness/config.json"),
+        base.join("rust-mux/config.json"),
+    ))
+}
+
+fn environment_path(current: &str, legacy: &str) -> Option<PathBuf> {
+    std::env::var_os(current)
+        .or_else(|| std::env::var_os(legacy))
+        .map(PathBuf::from)
+}
+
+fn preferred_path(current: PathBuf, legacy: PathBuf) -> PathBuf {
+    if current.exists() || !legacy.exists() {
+        current
+    } else {
+        legacy
+    }
 }
 
 /// Writes one length-prefixed JSON message and flushes it to the peer.
@@ -1035,9 +1095,30 @@ pub fn read_message<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<T,
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn identity_paths_prefer_current_but_reuse_existing_legacy_data() {
+        let root = std::env::temp_dir().join(format!(
+            "not-a-harness-path-compatibility-{}",
+            Uuid::new_v4()
+        ));
+        let current = root.join("not-a-harness");
+        let legacy = root.join("rust-mux");
+
+        fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(preferred_path(current.clone(), legacy.clone()), legacy);
+
+        fs::create_dir_all(&current).unwrap();
+        assert_eq!(
+            preferred_path(current.clone(), root.join("rust-mux")),
+            current
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn messages_round_trip_as_length_prefixed_json() {

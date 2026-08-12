@@ -1,6 +1,6 @@
 # Local terminal history storage
 
-Rust Mux keeps two deliberately separate history layers:
+Not a Harness keeps two deliberately separate history layers:
 
 - **Live memory** is the daemon-owned Alacritty grid plus a 2,000-line scrollback buffer per running pane. It stays bounded and is the authoritative interactive terminal state.
 - **Local history storage** is an optional owner-only archive of raw PTY output from future sessions. It is used only when the desktop requests an older page or an archived search. It does not enlarge the live terminal model or keep a full session in UI memory.
@@ -9,7 +9,7 @@ The archive does not reconstruct output from sessions that predate this feature.
 
 ## Storage and privacy boundary
 
-The session service is the only writer. With the default state directory, archive data lives under `history/` beside `sessions.json`; `RUST_MUX_STATE_DIR` moves both under the selected local state directory. Directories are forced to mode `0700` and metadata/chunks to `0600`. Symbolic-link archive directories and files are rejected or skipped. Rust Mux performs no upload, telemetry, browser storage, secret classification, indexing service, or automatic sharing. Terminal output is stored as local terminal output, without inspecting it for credentials or other secrets.
+The session service is the only writer. With the default state directory, archive data lives under `history/` beside `sessions.json`; `NOT_A_HARNESS_STATE_DIR` moves both under the selected local state directory. `RUST_MUX_STATE_DIR` remains a legacy fallback, and an existing default Rust Mux state directory is reused when the new directory is absent. Directories are forced to mode `0700` and metadata/chunks to `0600`. Symbolic-link archive directories and files are rejected or skipped. Not a Harness performs no upload, telemetry, browser storage, secret classification, indexing service, or automatic sharing. Terminal output is stored as local terminal output, without inspecting it for credentials or other secrets.
 
 Each terminal run receives a distinct archive session ID even when a recovered pane keeps the same pane ID. Output is accumulated on a dedicated writer thread and published as independently checksummed 128 KiB chunks. A chunk is written to an owner-only temporary file, synced, renamed atomically, and followed by a directory sync. Manifests and settings use the same atomic-replace pattern. On restart, unpublished temporary files are removed and an unfinished session is closed with a visible gap marker; already published chunks remain readable. A corrupt, truncated, reordered, or checksum-mismatched chunk becomes a visible archive gap instead of being rendered as trusted output.
 

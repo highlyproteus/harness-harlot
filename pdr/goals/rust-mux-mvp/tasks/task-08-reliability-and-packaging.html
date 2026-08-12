@@ -137,7 +137,7 @@
   "goal_file": "../PDR.html",
   "title": "Harden reliability and package macOS and Linux",
   "description": "Add fault-injection and soak tests for desktop crash/restart, daemon disconnect, slow clients, high-output local and SSH panes, corrupted layout state, macOS Spaces/display changes, Linux compositor/display-session changes, SSH network loss, and host-key failures. Persist layouts atomically, state that daemon crash may end PTYs, package independent daemon and desktop lifecycles, generate license notices, and record future Windows and optional remote-rmuxd paths.",
-  "why": "Rust Mux should only claim reliability after testing the exact local, display, and remote lifecycle transitions its users depend on.",
+  "why": "Not a Harness should only claim reliability after testing the exact local, display, and remote lifecycle transitions its users depend on.",
   "acceptance_criteria": [
     { "text": "macOS passes repeated Spaces, fullscreen, display attach/detach, desktop restart, and SSH reconnect soak scenarios", "met": false },
     { "text": "Linux passes desktop restart, compositor/display changes, PTY reconnect, and SSH reconnect scenarios", "met": false },
