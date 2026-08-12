@@ -663,6 +663,59 @@ struct ResizeDrag {
     axis: SplitAxis,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum SidebarResizeLifecycle {
+    #[default]
+    Idle,
+    Dragging {
+        initial_width: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidebarResizeMove {
+    Ignore,
+    Update,
+    Complete,
+}
+
+impl SidebarResizeLifecycle {
+    fn begin(&mut self, initial_width: f32) {
+        *self = Self::Dragging { initial_width };
+    }
+
+    fn pointer_move(&mut self, pressed_button: Option<MouseButton>) -> SidebarResizeMove {
+        match (*self, pressed_button) {
+            (Self::Idle, _) => SidebarResizeMove::Ignore,
+            (Self::Dragging { .. }, Some(MouseButton::Left)) => SidebarResizeMove::Update,
+            (Self::Dragging { .. }, _) => {
+                *self = Self::Idle;
+                SidebarResizeMove::Complete
+            }
+        }
+    }
+
+    fn finish(&mut self) -> bool {
+        if matches!(self, Self::Idle) {
+            return false;
+        }
+        *self = Self::Idle;
+        true
+    }
+
+    fn cancel(&mut self) -> Option<f32> {
+        let Self::Dragging { initial_width } = *self else {
+            return None;
+        };
+        *self = Self::Idle;
+        Some(initial_width)
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Dragging { .. })
+    }
+}
+
 /// Client-local split identity. The current protocol has no split IDs, so this
 /// wraps its deterministic compatibility key behind one boundary. A future
 /// protocol `SplitId` can replace the field without changing layout controls.
@@ -750,7 +803,7 @@ struct RustMux {
     zoomed_pane: Option<Uuid>,
     command_palette: Option<CommandPaletteState>,
     resizing: Option<ResizeDrag>,
-    resizing_sidebar: bool,
+    sidebar_resize: SidebarResizeLifecycle,
     ui_state_store: Option<UiStateStore>,
     preferred_sidebar_width: f32,
     sidebar_pixels: f32,
@@ -816,7 +869,7 @@ impl RustMux {
             zoomed_pane: None,
             command_palette: None,
             resizing: None,
-            resizing_sidebar: false,
+            sidebar_resize: SidebarResizeLifecycle::default(),
             ui_state_store,
             preferred_sidebar_width,
             sidebar_pixels: DEFAULT_SIDEBAR_WIDTH,
@@ -854,6 +907,13 @@ impl RustMux {
             if this.update_window_geometry(window) {
                 this.sync_pty_sizes();
                 cx.notify();
+            }
+        })
+        .detach();
+
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.cancel_sidebar_resize(window, cx);
             }
         })
         .detach();
@@ -2376,7 +2436,12 @@ impl RustMux {
         }
     }
 
-    fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.sidebar_resize.is_active() {
+            self.cancel_sidebar_resize(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.command_palette.is_some() {
             self.handle_palette_key(event, cx);
             return;
@@ -2676,17 +2741,25 @@ impl RustMux {
     }
 
     fn handle_resize(&mut self, event: &MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
-        if self.resizing_sidebar {
-            let window_width = f32::from(window.bounds().size.width);
-            let next = constrained_sidebar_width(f32::from(event.position.x), window_width);
-            if (self.preferred_sidebar_width - next).abs() > f32::EPSILON {
-                self.preferred_sidebar_width = next;
-                self.update_window_geometry(window);
-                self.last_sizes.clear();
-                self.sync_pty_sizes();
-                cx.notify();
+        match self.sidebar_resize.pointer_move(event.pressed_button) {
+            SidebarResizeMove::Ignore => {}
+            SidebarResizeMove::Update => {
+                let window_width = f32::from(window.bounds().size.width);
+                let next = constrained_sidebar_width(f32::from(event.position.x), window_width);
+                if (self.preferred_sidebar_width - next).abs() > f32::EPSILON {
+                    self.preferred_sidebar_width = next;
+                    self.update_window_geometry(window);
+                    self.last_sizes.clear();
+                    self.sync_pty_sizes();
+                    cx.notify();
+                }
+                return;
             }
-            return;
+            SidebarResizeMove::Complete => {
+                self.persist_sidebar_width();
+                cx.notify();
+                return;
+            }
         }
         let Some(drag) = self.resizing else { return };
         self.update_window_geometry(window);
@@ -2743,14 +2816,29 @@ impl RustMux {
         true
     }
 
-    fn finish_resize(&mut self, cx: &mut Context<Self>) {
-        if self.resizing_sidebar
-            && let Some(store) = &self.ui_state_store
+    fn persist_sidebar_width(&self) {
+        if let Some(store) = &self.ui_state_store
             && let Err(error) = store.save_workspace_sidebar_width(self.preferred_sidebar_width)
         {
             eprintln!("Rust Mux sidebar width was not persisted: {error:#}");
         }
-        self.resizing_sidebar = false;
+    }
+
+    fn cancel_sidebar_resize(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(initial_width) = self.sidebar_resize.cancel() else {
+            return;
+        };
+        self.preferred_sidebar_width = initial_width;
+        self.update_window_geometry(window);
+        self.last_sizes.clear();
+        self.sync_pty_sizes();
+        cx.notify();
+    }
+
+    fn finish_resize(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_resize.finish() {
+            self.persist_sidebar_width();
+        }
         self.resizing = None;
         self.dragging_pane = None;
         self.drag_hover.clear();
@@ -3154,7 +3242,7 @@ impl RustMux {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
                     this.resizing = None;
-                    this.resizing_sidebar = true;
+                    this.sidebar_resize.begin(this.preferred_sidebar_width);
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -6107,9 +6195,9 @@ impl Render for RustMux {
             .min_h(px(460.0))
             .bg(rgb(THEME.window))
             .flex()
-            .on_key_down(
-                cx.listener(|this, event: &KeyDownEvent, _, cx| this.handle_key(event, cx)),
-            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.handle_key(event, window, cx)
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.handle_resize(event, window, cx)
             }))
@@ -6194,6 +6282,15 @@ impl Render for RustMux {
                     .h(px(1.0))
                     .child(TerminalInputElement { input: cx.entity() }),
             )
+            .when(self.sidebar_resize.is_active(), |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .w(px(1.0))
+                        .h(px(1.0))
+                        .child(SidebarResizeCaptureElement { input: cx.entity() }),
+                )
+            })
             .child(self.render_sidebar(cx))
             .child(self.render_sidebar_resize_handle(cx))
             .child(self.render_workspace(cx))
@@ -6681,6 +6778,83 @@ impl Element for TerminalInputElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
+    }
+}
+
+/// Registers window-level listeners while the sidebar divider owns an active
+/// pointer gesture. GPUI's normal element listeners are hover-scoped, while a
+/// resize capture must continue to receive drag and release events outside the
+/// divider (and even outside the window bounds when the platform delivers them).
+struct SidebarResizeCaptureElement {
+    input: Entity<RustMux>,
+}
+
+impl IntoElement for SidebarResizeCaptureElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SidebarResizeCaptureElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(Style::default(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        (): &mut Self::PrepaintState,
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase == DispatchPhase::Capture {
+                input.update(cx, |this, cx| this.handle_resize(event, window, cx));
+                cx.stop_propagation();
+            }
+        });
+
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                input.update(cx, |this, cx| this.finish_resize(cx));
+                cx.stop_propagation();
+            }
+        });
     }
 }
 
@@ -8217,6 +8391,40 @@ mod tests {
         assert!((compact - 320.0).abs() < 0.0001);
         assert!((workspace_pixel_size(640.0, 460.0, compact).0 - 320.0).abs() < 0.0001);
         assert!((constrained_sidebar_width(preferred, 1280.0) - preferred).abs() < 0.0001);
+    }
+
+    #[test]
+    fn sidebar_resize_only_updates_while_the_left_button_is_held() {
+        let mut resize = SidebarResizeLifecycle::default();
+
+        assert_eq!(
+            resize.pointer_move(Some(MouseButton::Left)),
+            SidebarResizeMove::Ignore
+        );
+
+        resize.begin(240.0);
+        assert_eq!(
+            resize.pointer_move(Some(MouseButton::Left)),
+            SidebarResizeMove::Update
+        );
+        assert_eq!(resize.pointer_move(None), SidebarResizeMove::Complete);
+        assert!(!resize.is_active());
+        assert_eq!(resize.pointer_move(None), SidebarResizeMove::Ignore);
+    }
+
+    #[test]
+    fn sidebar_resize_release_and_cancel_end_the_capture() {
+        let mut resize = SidebarResizeLifecycle::default();
+
+        resize.begin(275.0);
+        assert!(resize.finish());
+        assert!(!resize.finish());
+        assert!(!resize.is_active());
+
+        resize.begin(310.0);
+        assert_eq!(resize.cancel(), Some(310.0));
+        assert_eq!(resize.cancel(), None);
+        assert!(!resize.is_active());
     }
 
     #[test]
