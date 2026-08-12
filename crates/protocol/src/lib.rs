@@ -99,6 +99,7 @@ impl SessionSnapshot {
                 color: None,
                 pinned: false,
                 pin_order: 0,
+                order: 1,
                 active_terminal_count: 1,
                 connection: WorkspaceConnection::Local,
                 tabs: vec![tab],
@@ -117,6 +118,9 @@ pub struct Workspace {
     pub pinned: bool,
     #[serde(default)]
     pub pin_order: u32,
+    /// Explicit manual order within the workspace's current pinned group.
+    #[serde(default)]
+    pub order: u32,
     #[serde(default)]
     pub active_terminal_count: u32,
     #[serde(default)]
@@ -778,6 +782,11 @@ pub enum ClientRequest {
     MovePinnedWorkspace {
         workspace_id: Uuid,
         direction: WorkspacePinMove,
+    },
+    ReorderWorkspace {
+        workspace_id: Uuid,
+        target_workspace_id: Uuid,
+        after: bool,
     },
     DisconnectWorkspace {
         workspace_id: Uuid,

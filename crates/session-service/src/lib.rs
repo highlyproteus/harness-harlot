@@ -1463,6 +1463,7 @@ impl SessionRegistry {
             bail!("pane limit of {MAX_PANES} reached");
         }
         let number = state.snapshot.workspaces.len() + 1;
+        let order = next_workspace_order(&state.snapshot.workspaces, false);
         let pane = state.new_pane(pane_id);
         state.snapshot.workspaces.push(Workspace {
             id: workspace_id,
@@ -1470,6 +1471,7 @@ impl SessionRegistry {
             color: None,
             pinned: false,
             pin_order: 0,
+            order,
             active_terminal_count: 1,
             connection: WorkspaceConnection::Local,
             tabs: vec![Tab {
@@ -1533,6 +1535,7 @@ impl SessionRegistry {
             bail!("pane limit of {MAX_PANES} reached");
         }
         let number = state.snapshot.workspaces.len() + 1;
+        let order = next_workspace_order(&state.snapshot.workspaces, false);
         let pane = Pane {
             id: ids.pane,
             title: format!("SSH {destination}"),
@@ -1548,6 +1551,7 @@ impl SessionRegistry {
             color: None,
             pinned: false,
             pin_order: 0,
+            order,
             active_terminal_count: 0,
             connection: WorkspaceConnection::SystemSsh {
                 destination: destination.to_owned(),
@@ -1661,6 +1665,7 @@ impl SessionRegistry {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
+        let unpinned_order = next_workspace_order(&state.snapshot.workspaces, false);
         let workspace = state
             .snapshot
             .workspaces
@@ -1669,7 +1674,10 @@ impl SessionRegistry {
             .with_context(|| format!("workstation {workspace_id} does not exist"))?;
         workspace.pinned = pinned;
         workspace.pin_order = if pinned { next_order } else { 0 };
-        normalize_pin_orders(&mut state.snapshot.workspaces);
+        if !pinned {
+            workspace.order = unpinned_order;
+        }
+        normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         persist_state(&state)
     }
@@ -1683,7 +1691,7 @@ impl SessionRegistry {
             .state
             .write()
             .map_err(|_| anyhow!("session state lock was poisoned"))?;
-        normalize_pin_orders(&mut state.snapshot.workspaces);
+        normalize_workspace_orders(&mut state.snapshot.workspaces);
         let mut pinned = state
             .snapshot
             .workspaces
@@ -1712,6 +1720,67 @@ impl SessionRegistry {
                 workspace.pin_order = first.1;
             }
         }
+        normalize_workspace_orders(&mut state.snapshot.workspaces);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    pub fn reorder_workspace(
+        &self,
+        workspace_id: Uuid,
+        target_workspace_id: Uuid,
+        after: bool,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let source_pinned = state
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?
+            .pinned;
+        let target_pinned = state
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == target_workspace_id)
+            .with_context(|| format!("workstation {target_workspace_id} does not exist"))?
+            .pinned;
+        if source_pinned != target_pinned {
+            bail!("workstations can only be reordered within the same group");
+        }
+        let mut ordered = state
+            .snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.pinned == source_pinned)
+            .map(|workspace| (workspace.id, workspace.order))
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, order)| *order);
+        let source = ordered
+            .iter()
+            .position(|(id, _)| *id == workspace_id)
+            .context("source workstation was not in its pinned group")?;
+        let item = ordered.remove(source);
+        let target = ordered
+            .iter()
+            .position(|(id, _)| *id == target_workspace_id)
+            .context("target workstation was not in its pinned group")?;
+        ordered.insert(target + usize::from(after), item);
+        for (index, (id, _)) in ordered.into_iter().enumerate() {
+            if let Some(workspace) = state
+                .snapshot
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == id)
+            {
+                workspace.order = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            }
+        }
+        normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         persist_state(&state)
     }
@@ -1950,7 +2019,7 @@ impl SessionRegistry {
         for (pane_id, _) in sessions {
             state.panes.remove(&pane_id);
         }
-        normalize_pin_orders(&mut state.snapshot.workspaces);
+        normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         persist_state(&state)
     }
@@ -2436,7 +2505,17 @@ fn normalize_workspace_title(title: Option<&str>) -> Result<Option<String>> {
     Ok(Some(title.to_owned()))
 }
 
-fn normalize_pin_orders(workspaces: &mut [Workspace]) {
+fn next_workspace_order(workspaces: &[Workspace], pinned: bool) -> u32 {
+    workspaces
+        .iter()
+        .filter(|workspace| workspace.pinned == pinned)
+        .map(|workspace| workspace.order)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn normalize_workspace_orders(workspaces: &mut [Workspace]) {
     let mut pinned = workspaces
         .iter()
         .enumerate()
@@ -2449,6 +2528,18 @@ fn normalize_pin_orders(workspaces: &mut [Workspace]) {
     }
     for workspace in workspaces.iter_mut().filter(|workspace| !workspace.pinned) {
         workspace.pin_order = 0;
+    }
+    for pinned in [true, false] {
+        let mut group = workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| workspace.pinned == pinned)
+            .map(|(index, workspace)| (index, workspace.order))
+            .collect::<Vec<_>>();
+        group.sort_by_key(|(index, order)| (*order, *index));
+        for (order, (index, _)) in group.into_iter().enumerate() {
+            workspaces[index].order = u32::try_from(order + 1).unwrap_or(u32::MAX);
+        }
     }
 }
 
@@ -3031,6 +3122,7 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         | ClientRequest::RenameWorkspace { .. }
         | ClientRequest::SetWorkspacePinned { .. }
         | ClientRequest::MovePinnedWorkspace { .. }
+        | ClientRequest::ReorderWorkspace { .. }
         | ClientRequest::DisconnectWorkspace { .. }
         | ClientRequest::ReconnectWorkspace { .. }
         | ClientRequest::DeleteWorkspace { .. }
@@ -3058,6 +3150,7 @@ fn is_layout_request(request: &ClientRequest) -> bool {
             | ClientRequest::RenameWorkspace { .. }
             | ClientRequest::SetWorkspacePinned { .. }
             | ClientRequest::MovePinnedWorkspace { .. }
+            | ClientRequest::ReorderWorkspace { .. }
             | ClientRequest::DisconnectWorkspace { .. }
             | ClientRequest::ReconnectWorkspace { .. }
             | ClientRequest::DeleteWorkspace { .. }
@@ -3111,6 +3204,11 @@ fn handle_layout_request(
             workspace_id,
             direction,
         } => sessions.move_pinned_workspace(workspace_id, direction)?,
+        ClientRequest::ReorderWorkspace {
+            workspace_id,
+            target_workspace_id,
+            after,
+        } => sessions.reorder_workspace(workspace_id, target_workspace_id, after)?,
         ClientRequest::DisconnectWorkspace { workspace_id } => {
             sessions.disconnect_workspace(workspace_id)?;
         }
@@ -3715,6 +3813,35 @@ mod tests {
         );
         assert!(registry.delete_workspace(first).is_ok());
         assert!(registry.delete_workspace(third).is_err());
+    }
+
+    #[test]
+    fn workspace_reorder_stays_in_its_group_and_persists_explicit_order() {
+        let registry = SessionRegistry::new().unwrap();
+        let first = registry.snapshot().unwrap().workspaces[0].id;
+        let (second, _) = registry.create_workspace(Some("Second")).unwrap();
+        let (third, _) = registry.create_workspace(Some("Third")).unwrap();
+
+        registry.reorder_workspace(third, first, false).unwrap();
+        registry.set_workspace_pinned(second, true).unwrap();
+        assert!(registry.reorder_workspace(third, second, false).is_err());
+
+        let snapshot = registry.snapshot().unwrap();
+        let mut regular = snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| !workspace.pinned)
+            .map(|workspace| (workspace.title.as_str(), workspace.order))
+            .collect::<Vec<_>>();
+        regular.sort_by_key(|(_, order)| *order);
+        assert_eq!(regular, vec![("Third", 1), ("Workstation 1", 2)]);
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == second)
+                .is_some_and(|workspace| workspace.pinned)
+        );
     }
 
     #[test]

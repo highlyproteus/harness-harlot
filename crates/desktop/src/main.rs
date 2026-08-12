@@ -123,6 +123,20 @@ struct PaneDrag {
     position: Point<Pixels>,
 }
 
+#[derive(Clone, Debug)]
+struct WorkspaceDrag {
+    workspace_id: Uuid,
+    pinned: bool,
+    title: String,
+    position: Point<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkspaceDropPreview {
+    target_workspace_id: Uuid,
+    after: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TabIdentityPresentation {
     label: String,
@@ -146,6 +160,28 @@ impl Render for PaneDrag {
             .justify_center()
             .font_family("SF Mono")
             .text_xs()
+            .text_color(rgb(THEME.foreground))
+            .child(self.title.clone())
+    }
+}
+
+impl Render for WorkspaceDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .left(self.position.x - px(82.0))
+            .top(self.position.y - px(14.0))
+            .w(px(164.0))
+            .h(px(28.0))
+            .rounded(px(5.0))
+            .bg(rgb(THEME.elevated))
+            .border_1()
+            .border_color(rgb(THEME.accent))
+            .flex()
+            .items_center()
+            .justify_center()
+            .font_family(".SystemUIFont")
+            .text_sm()
             .text_color(rgb(THEME.foreground))
             .child(self.title.clone())
     }
@@ -905,6 +941,9 @@ struct NahApp {
     sidebar_visible: bool,
     sidebar_pixels: f32,
     workstation_tab_scroll: ScrollHandle,
+    dragging_workspace: Option<Uuid>,
+    workspace_drop_preview: Option<WorkspaceDropPreview>,
+    suppress_workspace_click: bool,
     last_sizes: HashMap<Uuid, (u16, u16)>,
     workspace_pixels: (f32, f32),
     connection_error: Option<String>,
@@ -987,6 +1026,9 @@ impl NahApp {
             sidebar_visible: true,
             sidebar_pixels: default_sidebar_width(),
             workstation_tab_scroll: ScrollHandle::new(),
+            dragging_workspace: None,
+            workspace_drop_preview: None,
+            suppress_workspace_click: false,
             last_sizes: HashMap::new(),
             workspace_pixels: (0.0, 0.0),
             connection_error: None,
@@ -1996,6 +2038,24 @@ impl NahApp {
             direction,
         });
         self.workspace_menu = None;
+        cx.notify();
+    }
+
+    fn reorder_workspace(
+        &mut self,
+        workspace_id: Uuid,
+        target_workspace_id: Uuid,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(ClientRequest::ReorderWorkspace {
+            workspace_id,
+            target_workspace_id,
+            after,
+        });
+        self.dragging_workspace = None;
+        self.workspace_drop_preview = None;
+        self.suppress_workspace_click = true;
         cx.notify();
     }
 
@@ -3106,6 +3166,11 @@ impl NahApp {
             }
         }
         let Some(drag) = self.resizing else { return };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.resizing = None;
+            cx.notify();
+            return;
+        }
         self.update_window_geometry(window);
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
@@ -3243,16 +3308,7 @@ impl NahApp {
             .as_ref()
             .map(|snapshot| snapshot.workspaces.clone())
             .unwrap_or_default();
-        workspaces.sort_by_key(|workspace| {
-            (
-                !workspace.pinned,
-                if workspace.pinned {
-                    workspace.pin_order
-                } else {
-                    u32::MAX
-                },
-            )
-        });
+        workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
         let history_needs_attention = self
             .history_status
             .as_ref()
@@ -3439,6 +3495,19 @@ impl NahApp {
                             workspace_color
                         };
                         let active_text = readable_text_color(card_color);
+                        let drop_preview = self.workspace_drop_preview;
+                        let drop_above = drop_preview.is_some_and(|preview| {
+                            preview.target_workspace_id == workspace_id && !preview.after
+                        });
+                        let drop_below = drop_preview.is_some_and(|preview| {
+                            preview.target_workspace_id == workspace_id && preview.after
+                        });
+                        let drag = WorkspaceDrag {
+                            workspace_id,
+                            pinned,
+                            title: workspace_title.clone(),
+                            position: Point::default(),
+                        };
                         div()
                             .when(starts_workstations, |element| {
                                 element.child(self.render_workstation_group_header(
@@ -3463,6 +3532,13 @@ impl NahApp {
                                     .h(px(31.0))
                                     .px(px(8.0))
                                     .rounded(px(6.0))
+                                    .border_t(if drop_above { px(2.0) } else { px(0.0) })
+                                    .border_b(if drop_below { px(2.0) } else { px(0.0) })
+                                    .border_color(rgb(if drop_above || drop_below {
+                                        THEME.accent
+                                    } else {
+                                        THEME.border
+                                    }))
                                     .when(!offline || terminal_count == 0, |element| {
                                         element.cursor_pointer()
                                     })
@@ -3479,6 +3555,11 @@ impl NahApp {
                                     })
                                     .when(!offline || terminal_count == 0, |element| {
                                         element.on_click(cx.listener(move |this, _, _, cx| {
+                                            if this.suppress_workspace_click {
+                                                this.suppress_workspace_click = false;
+                                                cx.notify();
+                                                return;
+                                            }
                                             this.active_workspace = Some(workspace_id);
                                             if let Some(pane_id) = first_pane {
                                                 this.focus_pane_with_snapshot(pane_id);
@@ -3487,6 +3568,37 @@ impl NahApp {
                                             cx.notify();
                                         }))
                                     })
+                                    .on_drag(drag, |info: &WorkspaceDrag, position, _, cx| {
+                                        cx.new(|_| WorkspaceDrag {
+                                            position,
+                                            ..info.clone()
+                                        })
+                                    })
+                                    .on_drag_move::<WorkspaceDrag>(cx.listener(
+                                        move |this, event: &gpui::DragMoveEvent<WorkspaceDrag>, _, cx| {
+                                            let drag = event.drag(cx);
+                                            if drag.workspace_id != workspace_id
+                                                && drag.pinned == pinned
+                                                && event.bounds.contains(&event.event.position)
+                                            {
+                                                this.dragging_workspace = Some(drag.workspace_id);
+                                                this.workspace_drop_preview = Some(WorkspaceDropPreview {
+                                                    target_workspace_id: workspace_id,
+                                                    after: event.event.position.y > event.bounds.center().y,
+                                                });
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }
+                                        },
+                                    ))
+                                    .on_drop(cx.listener(move |this, info: &WorkspaceDrag, _, cx| {
+                                        if info.workspace_id != workspace_id && info.pinned == pinned {
+                                            let after = this.workspace_drop_preview
+                                                .is_some_and(|preview| preview.target_workspace_id == workspace_id && preview.after);
+                                            this.reorder_workspace(info.workspace_id, workspace_id, after, cx);
+                                        }
+                                        cx.stop_propagation();
+                                    }))
                                     .on_mouse_down(
                                         MouseButton::Right,
                                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -3964,6 +4076,13 @@ impl NahApp {
                         cx.stop_propagation();
                         cx.notify();
                     }
+                },
+            ))
+            .on_drag_move::<WorkspaceDrag>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<WorkspaceDrag>, _, cx| {
+                    this.dragging_workspace = Some(event.drag(cx).workspace_id);
+                    this.workspace_drop_preview = None;
+                    cx.notify();
                 },
             ))
             .on_drop(cx.listener(move |this, info: &PaneDrag, _, cx| {
@@ -4907,16 +5026,7 @@ impl NahApp {
             .as_ref()
             .map(|snapshot| snapshot.workspaces.clone())
             .unwrap_or_default();
-        workspaces.sort_by_key(|workspace| {
-            (
-                !workspace.pinned,
-                if workspace.pinned {
-                    workspace.pin_order
-                } else {
-                    u32::MAX
-                },
-            )
-        });
+        workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
         let sidebar_visible = self.sidebar_visible;
         let navigation_hint = format!(
             "{} · {} · ⇧⌘P commands",
@@ -5261,8 +5371,9 @@ impl NahApp {
                         .cursor_pointer()
                         .font_family(".SystemUIFont")
                         .text_sm()
-                        .text_color(rgb(THEME.foreground))
-                        .hover(|item| item.bg(rgb(THEME.accent_soft)))
+                        .bg(rgb(THEME.danger))
+                        .text_color(rgb(0xffffff))
+                        .hover(|item| item.bg(rgb(0xc93c45)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.begin_workspace_disconnect(workspace_id, cx)
                         }))
@@ -5504,18 +5615,18 @@ impl NahApp {
             .map(|snapshot| snapshot.appearance.clone())
             .unwrap_or_default();
         div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
+            .id("settings-workspace-surface")
             .size_full()
-            .bg(rgba(0x090b0f88))
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .p(px(18.0))
+            .bg(rgb(THEME.terminal))
             .flex()
-            .items_center()
             .justify_center()
-            .occlude()
             .child(
                 div()
                     .w(px(680.0))
+                    .h_full()
                     .p(px(18.0))
                     .rounded(px(10.0))
                     .bg(rgb(THEME.elevated))
@@ -7155,8 +7266,10 @@ impl NahApp {
             .bg(rgb(THEME.border))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     this.resizing = Some(ResizeDrag { split_id, axis });
+                    this.focus_handle.focus(window);
+                    cx.stop_propagation();
                     cx.notify();
                 }),
             )
@@ -7383,6 +7496,11 @@ impl NahApp {
                 )
                 .into_any_element()
         };
+        let workspace_content = if self.appearance_settings_open {
+            self.render_appearance_settings(cx)
+        } else {
+            workspace_content
+        };
         div()
             .min_w(px(0.0))
             .min_h(px(0.0))
@@ -7578,9 +7696,6 @@ impl Render for NahApp {
             })
             .when_some(self.workspace_creation.as_ref(), |element, dialog| {
                 element.child(self.render_workspace_creation_dialog(dialog, cx))
-            })
-            .when(self.appearance_settings_open, |element| {
-                element.child(self.render_appearance_settings(cx))
             })
             .when_some(
                 self.color_picker.as_ref().filter(|picker| {
