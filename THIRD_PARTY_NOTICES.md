@@ -25,11 +25,11 @@ The installed Claude product artwork is reproduced unchanged for referential ide
 ## Droid
 
 - File: `droid.svg`
-- Official source: [`docs/favicon.svg`](https://github.com/Factory-AI/factory/blob/1fd9026d72f81668d88f37237cb5a2e89a17e6e2/docs/favicon.svg) in Factory's official Droid repository
-- SHA-256: `4a6e2ad6af6635472cbf4a4e5e25046b2453793bf2be8a9b9f29c3cb88adc0cf`
+- Official source: [`docs/logo/dark.svg`](https://github.com/Factory-AI/factory/blob/1fd9026d72f81668d88f37237cb5a2e89a17e6e2/docs/logo/dark.svg) in Factory's official Droid repository
+- SHA-256: `6da8498b22f6fc9d824ef8ba26f7352b292f8a20e75fcfeb5f6e09c2d821b16c`
 - Product source: [Factory Droid](https://github.com/Factory-AI/factory/tree/1fd9026d72f81668d88f37237cb5a2e89a17e6e2)
 
-Factory's published favicon artwork is reproduced unchanged for referential identification of Droid. Factory and Droid are trademarks of Factory AI. No Factory endorsement is claimed.
+Factory's transparent dark-background wordmark is embedded byte-for-byte. Rust Mux clips its leading official star mark at render time beside the full `Droid` label; the asset is not recolored or rewritten. Factory and Droid are trademarks of Factory AI. No Factory endorsement is claimed.
 
 ## Hermes Agent
 
