@@ -100,8 +100,11 @@ active terminal sessions alone.
 For side-by-side local development inspection, `scripts/build-macos-dev-app.sh`
 creates `target/debug/Not a Harness Dev.app` with bundle identifier
 `com.nah.desktop.dev`, executable `nah-dev`, and the separate monochrome
-development icon. Launch it with isolated `NAH_SOCKET`, `NAH_STATE_DIR`, and
-`NAH_CONFIG` values so it never reads or writes the stable app's local state.
+development icon. The Dev launcher automatically uses a separate socket plus
+durable `Not a Harness Dev` state and `nah-dev` configuration, so saved Dev
+workstations survive a Dev relaunch without reading or writing stable app data.
+Explicit `NAH_SOCKET`, `NAH_STATE_DIR`, and `NAH_CONFIG` values still take
+precedence for disposable test launches.
 
 The technical package, crate, and executable prefix is `nah`. The built
 executables are `nah-service` and `nah`. Set `NAH_SOCKET` in both processes to

@@ -1,5 +1,5 @@
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,11 @@ pub const SOCKET_ENV: &str = "NAH_SOCKET";
 pub const STATE_DIR_ENV: &str = "NAH_STATE_DIR";
 pub const CONFIG_ENV: &str = "NAH_CONFIG";
 pub const PANE_ID_ENV: &str = "NAH_PANE_ID";
+/// Marks the separately packaged development desktop build.
+///
+/// Explicit `NAH_SOCKET`, `NAH_STATE_DIR`, and `NAH_CONFIG` values always
+/// override the corresponding Dev defaults, preserving disposable test runs.
+pub const DEVELOPMENT_BUILD_ENV: &str = "NAH_DEVELOPMENT_BUILD";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_SSH_HOST_LEN: usize = 253;
 pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;
@@ -985,11 +990,17 @@ pub enum WireError {
 }
 
 pub fn socket_path() -> PathBuf {
-    std::env::var_os(SOCKET_ENV).map_or_else(default_socket_path, PathBuf::from)
+    std::env::var_os(SOCKET_ENV)
+        .map_or_else(|| default_socket_path(development_build()), PathBuf::from)
 }
 
-fn default_socket_path() -> PathBuf {
-    std::env::temp_dir().join("nah-session.sock")
+fn default_socket_path(development_build: bool) -> PathBuf {
+    let filename = if development_build {
+        "nah-dev-session.sock"
+    } else {
+        "nah-session.sock"
+    };
+    std::env::temp_dir().join(filename)
 }
 
 /// Returns the owner-only Not a Harness state directory.
@@ -998,16 +1009,35 @@ pub fn state_directory() -> Option<PathBuf> {
         return Some(PathBuf::from(directory));
     }
     let home = PathBuf::from(std::env::var_os("HOME")?);
+    let xdg_state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    Some(default_state_directory(
+        &home,
+        xdg_state_home.as_deref(),
+        development_build(),
+    ))
+}
+
+fn default_state_directory(
+    home: &Path,
+    xdg_state_home: Option<&Path>,
+    development_build: bool,
+) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        Some(home.join("Library/Application Support/Not a Harness"))
+        let _ = xdg_state_home;
+        let product_directory = if development_build {
+            "Not a Harness Dev"
+        } else {
+            "Not a Harness"
+        };
+        home.join("Library/Application Support")
+            .join(product_directory)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let base = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/state"));
-        Some(base.join("nah"))
+        let fallback = home.join(".local/state");
+        let base = xdg_state_home.unwrap_or(&fallback);
+        base.join(if development_build { "nah-dev" } else { "nah" })
     }
 }
 
@@ -1019,7 +1049,16 @@ pub fn config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("nah/config.json"))
+    Some(default_config_path(&base, development_build()))
+}
+
+fn default_config_path(base: &Path, development_build: bool) -> PathBuf {
+    let product_directory = if development_build { "nah-dev" } else { "nah" };
+    base.join(product_directory).join("config.json")
+}
+
+fn development_build() -> bool {
+    std::env::var(DEVELOPMENT_BUILD_ENV).as_deref() == Ok("1")
 }
 
 /// Child terminals receive this stable pane identifier.
@@ -1083,8 +1122,26 @@ mod tests {
         assert_eq!(SOCKET_ENV, "NAH_SOCKET");
         assert_eq!(STATE_DIR_ENV, "NAH_STATE_DIR");
         assert_eq!(CONFIG_ENV, "NAH_CONFIG");
+        assert_eq!(DEVELOPMENT_BUILD_ENV, "NAH_DEVELOPMENT_BUILD");
         assert_eq!(pane_id_env(), "NAH_PANE_ID");
-        assert!(default_socket_path().ends_with("nah-session.sock"));
+        assert!(default_socket_path(false).ends_with("nah-session.sock"));
+    }
+
+    #[test]
+    fn development_build_defaults_are_isolated_from_stable() {
+        assert!(default_socket_path(true).ends_with("nah-dev-session.sock"));
+        assert_ne!(default_socket_path(false), default_socket_path(true));
+
+        let home = PathBuf::from("/Users/example");
+        assert_ne!(
+            default_state_directory(&home, None, false),
+            default_state_directory(&home, None, true)
+        );
+        let config_home = home.join(".config");
+        assert_ne!(
+            default_config_path(&config_home, false),
+            default_config_path(&config_home, true)
+        );
     }
 
     #[test]

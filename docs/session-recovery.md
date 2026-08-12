@@ -11,7 +11,7 @@ Natural child exits remain in the layout with their final terminal grid and an `
 
 ## Storage safety
 
-Fresh installs write `sessions.json` under `~/Library/Application Support/Not a Harness` on macOS and `$XDG_STATE_HOME/nah` (or `~/.local/state/nah`) on Linux. `NAH_STATE_DIR` is available for isolated tests and packaging. The directory is mode `0700` and snapshots are mode `0600`.
+Fresh stable installs write `sessions.json` under `~/Library/Application Support/Not a Harness` on macOS and `$XDG_STATE_HOME/nah` (or `~/.local/state/nah`) on Linux. Development builds use the separate durable `Not a Harness Dev` or `nah-dev` state directory by default. `NAH_STATE_DIR` remains available for disposable isolated tests and packaging. The directory is mode `0700` and snapshots are mode `0600`.
 
 Snapshots use a versioned, deny-unknown-fields schema with byte, workspace, tab, pane, nesting-depth, ID uniqueness, title, path, and split-ratio limits. Writes use a same-directory mode-`0600` temporary file, file sync, atomic replace, and directory sync. A malformed, oversized, unsupported, symlinked, or structurally invalid snapshot is moved to a restricted `sessions.corrupt-*.json` quarantine file and the service starts from a safe seeded workspace.
 
