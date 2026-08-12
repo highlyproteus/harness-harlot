@@ -1242,7 +1242,9 @@ impl NahApp {
             invalid: false,
         });
         self.tab_menu = None;
-        self.workspace_menu = None;
+        if !matches!(target, ColorTarget::Workspace(_)) {
+            self.workspace_menu = None;
+        }
         cx.notify();
     }
 
@@ -3012,7 +3014,7 @@ impl NahApp {
                             })
                             .tooltip(|_, cx| {
                                 cx.new(|_| TooltipView {
-                                    text: "Hide workspace sidebar (⌘B)".to_owned(),
+                                    text: "Hide workstation sidebar (⌘B)".to_owned(),
                                 })
                                 .into()
                             })
@@ -3070,7 +3072,7 @@ impl NahApp {
                             .text_sm()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(THEME.foreground))
-                            .child("Workspaces"),
+                            .child("Workstations"),
                     ),
             )
             .children(
@@ -3094,7 +3096,6 @@ impl NahApp {
                                 ..
                             }
                         );
-                        let pinned = workspace.pinned;
                         let workspace_title = workspace.title.clone();
                         let terminal_tabs = workspace_terminal_tabs(&workspace)
                             .into_iter()
@@ -3200,9 +3201,9 @@ impl NahApp {
                                             .tooltip(move |_, cx| {
                                                 cx.new(|_| TooltipView {
                                                     text: if expanded {
-                                                        "Collapse terminal tabs".to_owned()
+                                                        "Collapse workstation terminals".to_owned()
                                                     } else {
-                                                        "Expand terminal tabs".to_owned()
+                                                        "Expand workstation terminals".to_owned()
                                                     },
                                                 })
                                                 .into()
@@ -3255,40 +3256,6 @@ impl NahApp {
                                                 .into()
                                             })
                                             .child(terminal_count.to_string()),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(("pin-workspace", element_key(workspace_id)))
-                                            .cursor_pointer()
-                                            .font_family("SF Mono")
-                                            .text_xs()
-                                            .text_color(rgb(if pinned {
-                                                THEME.ansi[3]
-                                            } else {
-                                                THEME.muted
-                                            }))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.set_workspace_pinned(
-                                                    workspace_id,
-                                                    !pinned,
-                                                    cx,
-                                                );
-                                                cx.stop_propagation();
-                                            }))
-                                            .child(if pinned { "◆" } else { "◇" }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(("delete-workspace", element_key(workspace_id)))
-                                            .cursor_pointer()
-                                            .font_family("SF Mono")
-                                            .text_xs()
-                                            .text_color(rgb(THEME.danger))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.begin_workspace_delete(workspace_id, cx);
-                                                cx.stop_propagation();
-                                            }))
-                                            .child("×"),
                                     ),
                             )
                             .when_some(connection_status, |element, status| {
@@ -3459,7 +3426,7 @@ impl NahApp {
                     .items_center()
                     .justify_center()
                     .on_click(cx.listener(|this, _, _, cx| this.new_workspace(cx)))
-                    .child("＋ New Workspace"),
+                    .child("＋ New Workstation"),
             )
             .child(
                 div()
@@ -3468,7 +3435,7 @@ impl NahApp {
                     .font_family("SF Mono")
                     .text_xs()
                     .text_color(rgb(THEME.dim))
-                    .child("⌘N new workspace"),
+                    .child("⌘N new workstation"),
             )
             .into_any_element()
     }
@@ -4452,6 +4419,10 @@ impl NahApp {
         });
         let pinned = workspace.is_some_and(|workspace| workspace.pinned);
         let connection = workspace.map(|workspace| workspace.connection.clone());
+        let inline_color_picker = self
+            .color_picker
+            .as_ref()
+            .filter(|picker| picker.target == ColorTarget::Workspace(workspace_id));
         div()
             .absolute()
             .left(menu.position.x)
@@ -4479,7 +4450,7 @@ impl NahApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.begin_workspace_rename(workspace_id, cx)
                     }))
-                    .child("Rename workspace…"),
+                    .child("Rename workstation…"),
             )
             .child(
                 div()
@@ -4497,9 +4468,9 @@ impl NahApp {
                         this.set_workspace_pinned(workspace_id, !pinned, cx)
                     }))
                     .child(if pinned {
-                        "Unpin workspace"
+                        "Unpin workstation"
                     } else {
-                        "Pin workspace"
+                        "Pin workstation"
                     }),
             )
             .when(pinned, |element| {
@@ -4519,7 +4490,7 @@ impl NahApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.move_pinned_workspace(workspace_id, WorkspacePinMove::Up, cx)
                             }))
-                            .child("Move pinned workspace up"),
+                            .child("Move pinned workstation up"),
                     )
                     .child(
                         div()
@@ -4536,7 +4507,7 @@ impl NahApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.move_pinned_workspace(workspace_id, WorkspacePinMove::Down, cx)
                             }))
-                            .child("Move pinned workspace down"),
+                            .child("Move pinned workstation down"),
                     )
             })
             .when_some(connection, |element, connection| match connection {
@@ -4559,7 +4530,7 @@ impl NahApp {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.disconnect_workspace(workspace_id, cx)
                         }))
-                        .child("Disconnect and keep workspace"),
+                        .child("Disconnect and keep workstation"),
                 ),
                 WorkspaceConnection::SystemSsh {
                     status: WorkspaceConnectionStatus::Offline,
@@ -4584,37 +4555,6 @@ impl NahApp {
             })
             .child(
                 div()
-                    .mx(px(9.0))
-                    .py(px(5.0))
-                    .font_family(".SystemUIFont")
-                    .text_xs()
-                    .text_color(rgb(THEME.dim))
-                    .child("Workspace color"),
-            )
-            .child(self.render_color_choices(
-                ColorTarget::Workspace(workspace_id),
-                "workspace-menu",
-                cx,
-            ))
-            .child(
-                div()
-                    .id(("workspace-default-color", element_key(workspace_id)))
-                    .mx(px(5.0))
-                    .px(px(9.0))
-                    .py(px(7.0))
-                    .rounded(px(4.0))
-                    .cursor_pointer()
-                    .font_family(".SystemUIFont")
-                    .text_sm()
-                    .text_color(rgb(THEME.foreground))
-                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.apply_color(ColorTarget::Workspace(workspace_id), None, cx)
-                    }))
-                    .child("Use default"),
-            )
-            .child(
-                div()
                     .id(("workspace-pick-color", element_key(workspace_id)))
                     .mx(px(5.0))
                     .px(px(9.0))
@@ -4630,6 +4570,9 @@ impl NahApp {
                     }))
                     .child("Pick color…"),
             )
+            .when_some(inline_color_picker, |element, picker| {
+                element.child(self.render_inline_color_picker(picker, cx))
+            })
             .child(
                 div()
                     .id(("delete-workspace-menu", element_key(workspace_id)))
@@ -4646,7 +4589,7 @@ impl NahApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.begin_workspace_delete(workspace_id, cx)
                     }))
-                    .child("Delete workspace…"),
+                    .child("Delete workstation…"),
             )
             .into_any_element()
     }
@@ -4689,6 +4632,126 @@ impl NahApp {
                                 this.apply_color(target, Some(color), cx)
                             }))
                     }),
+            )
+            .into_any_element()
+    }
+
+    /// The workstation picker stays inside its row's context menu so color
+    /// selection does not interrupt terminal work with a second modal layer.
+    fn render_inline_color_picker(
+        &self,
+        picker: &ColorPickerState,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let target = picker.target;
+        div()
+            .mx(px(5.0))
+            .mb(px(5.0))
+            .p(px(8.0))
+            .rounded(px(5.0))
+            .bg(rgb(THEME.surface))
+            .border_1()
+            .border_color(rgb(THEME.border))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.muted))
+                    .child("Recent and Harbor Night colors"),
+            )
+            .child(self.render_color_choices(target, "inline-workstation-color", cx))
+            .child(
+                div()
+                    .h(px(32.0))
+                    .px(px(8.0))
+                    .rounded(px(5.0))
+                    .bg(rgb(THEME.terminal))
+                    .border_1()
+                    .border_color(if picker.invalid {
+                        rgb(THEME.danger)
+                    } else {
+                        rgb(THEME.border_strong)
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .font_family("SF Mono")
+                    .text_xs()
+                    .text_color(rgb(THEME.foreground))
+                    .child("#")
+                    .child(
+                        div()
+                            .when(picker.replace_on_type, |element| {
+                                element.bg(rgb(THEME.selection))
+                            })
+                            .child(picker.hex.clone()),
+                    )
+                    .when(picker.invalid, |element| {
+                        element.child(
+                            div()
+                                .ml(px(4.0))
+                                .font_family(".SystemUIFont")
+                                .text_xs()
+                                .text_color(rgb(THEME.danger))
+                                .child("Six hex digits"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .id("inline-workstation-color-default")
+                            .px(px(7.0))
+                            .py(px(5.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(THEME.foreground))
+                            .hover(|element| element.bg(rgb(THEME.elevated)))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.apply_color(target, None, cx)
+                                }),
+                            )
+                            .child("Use default"),
+                    )
+                    .child(
+                        div()
+                            .id("cancel-inline-workstation-color")
+                            .px(px(7.0))
+                            .py(px(5.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| element.bg(rgb(THEME.elevated)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.color_picker = None;
+                                cx.notify();
+                            }))
+                            .child("Cancel"),
+                    )
+                    .child(
+                        div()
+                            .id("apply-inline-workstation-color")
+                            .px(px(7.0))
+                            .py(px(5.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .bg(rgb(THEME.accent_soft))
+                            .text_xs()
+                            .text_color(rgb(THEME.foreground))
+                            .hover(|element| element.bg(rgb(THEME.selection)))
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_color_picker(cx)))
+                            .child("Apply"),
+                    ),
             )
             .into_any_element()
     }
@@ -4769,7 +4832,7 @@ impl NahApp {
                             .font_family(".SystemUIFont")
                             .text_sm()
                             .text_color(rgb(THEME.muted))
-                            .child("Global defaults stay independent. Terminal accents never recolor workspaces, and workspace colors never recolor terminals."),
+                            .child("Global defaults stay independent. Terminal accents never recolor workstations, and workstation colors never recolor terminals."),
                     )
                     .child(self.render_appearance_row(
                         "Default terminal accent",
@@ -4779,8 +4842,8 @@ impl NahApp {
                         cx,
                     ))
                     .child(self.render_appearance_row(
-                        "Default workspace color",
-                        "Selected workspace and workspace marker in the left rail",
+                        "Default workstation color",
+                        "Selected workstation and workstation marker in the left rail",
                         ColorTarget::DefaultWorkspace,
                         appearance.default_workspace_color,
                         cx,
@@ -5056,7 +5119,7 @@ impl NahApp {
                     })
                     .when_some(active_workspace, |element, workspace_id| {
                         element.child(self.render_clear_history_button(
-                            "Workspace",
+                            "Workstation",
                             HistoryClearScope::Workspace { workspace_id },
                             cx,
                         ))
@@ -5247,9 +5310,9 @@ impl NahApp {
         let target = picker.target;
         let (title, can_reset) = match target {
             ColorTarget::DefaultTerminal => ("Pick default terminal accent", false),
-            ColorTarget::DefaultWorkspace => ("Pick default workspace color", false),
+            ColorTarget::DefaultWorkspace => ("Pick default workstation color", false),
             ColorTarget::Pane(_) => ("Pick terminal color", true),
-            ColorTarget::Workspace(_) => ("Pick workspace color", true),
+            ColorTarget::Workspace(_) => ("Pick workstation color", true),
         };
         div()
             .absolute()
@@ -5499,7 +5562,7 @@ impl NahApp {
                         .font_family(".SystemUIFont")
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(rgb(THEME.foreground))
-                        .child("New Workspace"),
+                        .child("New Workstation"),
                 )
                 .child(
                     div()
@@ -5571,7 +5634,7 @@ impl NahApp {
                         .font_family(".SystemUIFont")
                         .text_xs()
                         .text_color(rgb(THEME.dim))
-                        .child("Workspace name (optional)"),
+                        .child("Workstation name (optional)"),
                 )
                 .child(
                     div()
@@ -5605,7 +5668,7 @@ impl NahApp {
                         .child(WorkspaceTextInputElement {
                             input: cx.entity(),
                             field: WorkspaceCreationField::Name,
-                            placeholder: "Workspace name",
+                            placeholder: "Workstation name",
                         }),
                 )
                 .when(kind == WorkspaceCreationKind::SystemSsh, |element| {
@@ -5662,7 +5725,7 @@ impl NahApp {
                         .text_sm()
                         .text_color(rgb(THEME.muted))
                         .child(
-                            "The workspace connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Not a Harness stores no credentials or SSH config contents.",
+                            "The workstation connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Not a Harness stores no credentials or SSH config contents.",
                         ),
                     )
                 })
@@ -5711,7 +5774,7 @@ impl NahApp {
                                 .child(if kind == WorkspaceCreationKind::SystemSsh {
                                     "Review connection"
                                 } else {
-                                    "Create workspace"
+                                    "Create workstation"
                                 }),
                         ),
                 )
@@ -5733,7 +5796,7 @@ impl NahApp {
                         .text_sm()
                         .text_color(rgb(THEME.muted))
                         .child(
-                            "This starts the installed OpenSSH client now and saves safe workspace metadata locally for later reconnect. Not a Harness adds no SSH options, stores no credentials, and does not change your config, agent, forwarding, or host-key policy.",
+                            "This starts the installed OpenSSH client now and saves safe workstation metadata locally for later reconnect. Not a Harness adds no SSH options, stores no credentials, and does not change your config, agent, forwarding, or host-key policy.",
                         ),
                 )
                 .when_some(error, |element, message| {
@@ -5843,7 +5906,7 @@ impl NahApp {
                             .font_family(".SystemUIFont")
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(THEME.foreground))
-                            .child("Rename workspace"),
+                            .child("Rename workstation"),
                     )
                     .child(
                         div()
@@ -5906,10 +5969,10 @@ impl NahApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let message = if confirmation.active_terminal_count == 0 {
-            "This removes the saved workspace metadata from this machine. No active terminal process will be ended.".to_owned()
+            "This removes the saved workstation metadata from this machine. No active terminal process will be ended.".to_owned()
         } else {
             format!(
-                "This permanently removes the workspace and ends {} active terminal process{}. Disconnecting is the non-destructive choice for a saved SSH workspace.",
+                "This permanently removes the workstation and ends {} active terminal process{}. Disconnecting is the non-destructive choice for a saved SSH workstation.",
                 confirmation.active_terminal_count,
                 if confirmation.active_terminal_count == 1 {
                     ""
@@ -5944,7 +6007,7 @@ impl NahApp {
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(THEME.foreground))
-                            .child(format!("Delete {}?", confirmation.title)),
+                            .child(format!("Delete workstation {}?", confirmation.title)),
                     )
                     .child(div().text_sm().text_color(rgb(THEME.muted)).child(message))
                     .child(
@@ -5980,7 +6043,7 @@ impl NahApp {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.confirm_workspace_delete(cx)
                                     }))
-                                    .child("Delete workspace"),
+                                    .child("Delete workstation"),
                             ),
                     ),
             )
@@ -6027,7 +6090,7 @@ impl NahApp {
                             .text_sm()
                             .text_color(rgb(THEME.muted))
                             .child(if confirmation.leaves_workspace_empty {
-                                "This will terminate the last terminal and leave the saved workspace empty. You can open a new terminal from its empty state."
+                                "This will terminate the last terminal and leave the saved workstation empty. You can open a new terminal from its empty state."
                             } else {
                                 "This will terminate this terminal and its running shell process. Other terminal tabs stay open."
                             }),
@@ -6347,9 +6410,9 @@ impl NahApp {
                                 .text_color(rgb(THEME.muted))
                                 .text_center()
                                 .child(if empty_workspace_uses_ssh {
-                                    "Open a fresh remote terminal with this workspace's saved system OpenSSH destination."
+                                    "Open a fresh remote terminal with this workstation's saved system OpenSSH destination."
                                 } else {
-                                    "This workspace is saved and ready when you want another local shell."
+                                    "This workstation is saved and ready when you want another local shell."
                                 }),
                         )
                         .child(
@@ -6421,7 +6484,7 @@ impl NahApp {
                                 })
                                 .tooltip(|_, cx| {
                                     cx.new(|_| TooltipView {
-                                        text: "Show workspace sidebar (⌘B)".to_owned(),
+                                        text: "Show workstation sidebar (⌘B)".to_owned(),
                                     })
                                     .into()
                                 })
@@ -6626,9 +6689,12 @@ impl Render for NahApp {
             .when(self.appearance_settings_open, |element| {
                 element.child(self.render_appearance_settings(cx))
             })
-            .when_some(self.color_picker.as_ref(), |element, picker| {
-                element.child(self.render_color_picker(picker, cx))
-            })
+            .when_some(
+                self.color_picker
+                    .as_ref()
+                    .filter(|picker| !matches!(picker.target, ColorTarget::Workspace(_))),
+                |element, picker| element.child(self.render_color_picker(picker, cx)),
+            )
     }
 }
 
@@ -7615,7 +7681,7 @@ fn workspace_terminal_tabs(workspace: &Workspace) -> Vec<&Pane> {
 }
 
 fn terminal_tab_count_label(count: usize) -> String {
-    format!("{count} terminal tab{}", if count == 1 { "" } else { "s" })
+    format!("{count} terminal{}", if count == 1 { "" } else { "s" })
 }
 
 fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
@@ -8362,7 +8428,7 @@ mod tests {
                 TerminalProfile::Terminal
             ]
         );
-        assert_eq!(terminal_tab_count_label(tabs.len()), "3 terminal tabs");
+        assert_eq!(terminal_tab_count_label(tabs.len()), "3 terminals");
     }
 
     #[test]
@@ -8371,8 +8437,20 @@ mod tests {
         workspace.tabs.clear();
 
         assert!(workspace_terminal_tabs(&workspace).is_empty());
-        assert_eq!(terminal_tab_count_label(0), "0 terminal tabs");
-        assert_eq!(terminal_tab_count_label(1), "1 terminal tab");
+        assert_eq!(terminal_tab_count_label(0), "0 terminals");
+        assert_eq!(terminal_tab_count_label(1), "1 terminal");
+    }
+
+    #[test]
+    fn workstation_rows_start_collapsed_while_the_header_keeps_its_terminal_count() {
+        let workstation = SessionSnapshot::seeded().workspaces.remove(0);
+        let expanded_workstations: HashSet<Uuid> = HashSet::new();
+
+        assert!(!expanded_workstations.contains(&workstation.id));
+        assert_eq!(
+            terminal_tab_count_label(workspace_terminal_tabs(&workstation).len()),
+            "1 terminal"
+        );
     }
 
     #[test]

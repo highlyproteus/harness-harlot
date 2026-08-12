@@ -767,7 +767,7 @@ impl SessionRegistry {
                     .iter()
                     .any(|workspace| workspace.id == workspace_id)
                 {
-                    bail!("workspace {workspace_id} does not exist");
+                    bail!("workstation {workspace_id} does not exist");
                 }
             }
             HistoryClearScope::All => {}
@@ -888,9 +888,9 @@ impl SessionRegistry {
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
-                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
             if !workspace.tabs.is_empty() {
-                bail!("workspace {workspace_id} already has a terminal layout");
+                bail!("workstation {workspace_id} already has a terminal layout");
             }
             workspace.connection.clone()
         };
@@ -929,9 +929,9 @@ impl SessionRegistry {
                 .workspaces
                 .iter_mut()
                 .find(|workspace| workspace.id == workspace_id)
-                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
             if !workspace.tabs.is_empty() {
-                bail!("workspace {workspace_id} already has a terminal layout");
+                bail!("workstation {workspace_id} already has a terminal layout");
             }
             let pane = Pane {
                 id: pane_id,
@@ -1093,7 +1093,7 @@ impl SessionRegistry {
             }
         }
         if !did_swap {
-            bail!("panes can only be rearranged inside the same workspace layout");
+            bail!("panes can only be rearranged inside the same workstation layout");
         }
         state.snapshot.revision += 1;
         persist_state(&state)?;
@@ -1119,7 +1119,7 @@ impl SessionRegistry {
             })
         });
         if !did_move {
-            bail!("source and target terminals must exist in the same workspace layout");
+            bail!("source and target terminals must exist in the same workstation layout");
         }
         state.snapshot.revision += 1;
         persist_state(&state)?;
@@ -1197,7 +1197,7 @@ impl SessionRegistry {
                 .any(|tab| move_existing_pane_to_tab(&mut tab.layout, source_pane, target_pane))
         });
         if !did_move {
-            bail!("source and target terminals must exist in the same workspace layout");
+            bail!("source and target terminals must exist in the same workstation layout");
         }
         state.snapshot.revision += 1;
         persist_state(&state)?;
@@ -1394,7 +1394,7 @@ impl SessionRegistry {
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.id == workspace_id)
-            .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
         workspace.color = color;
         if let Some(color) = color {
             remember_recent_color(&mut state.snapshot, color);
@@ -1411,7 +1411,7 @@ impl SessionRegistry {
                 .read()
                 .map_err(|_| anyhow!("session state lock was poisoned"))?;
             if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
-                bail!("workspace limit of {MAX_WORKSPACES} reached");
+                bail!("workstation limit of {MAX_WORKSPACES} reached");
             }
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
@@ -1428,7 +1428,7 @@ impl SessionRegistry {
             .map_err(|_| anyhow!("session state lock was poisoned"))?;
         if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
             let _ = session.terminate_and_wait();
-            bail!("workspace limit of {MAX_WORKSPACES} reached");
+            bail!("workstation limit of {MAX_WORKSPACES} reached");
         }
         if state.panes.len() >= MAX_PANES {
             let _ = session.terminate_and_wait();
@@ -1438,7 +1438,7 @@ impl SessionRegistry {
         let pane = state.new_pane(pane_id);
         state.snapshot.workspaces.push(Workspace {
             id: workspace_id,
-            title: title.unwrap_or_else(|| format!("Workspace {number}")),
+            title: title.unwrap_or_else(|| format!("Workstation {number}")),
             color: None,
             pinned: false,
             pin_order: 0,
@@ -1479,7 +1479,7 @@ impl SessionRegistry {
                 .read()
                 .map_err(|_| anyhow!("session state lock was poisoned"))?;
             if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
-                bail!("workspace limit of {MAX_WORKSPACES} reached");
+                bail!("workstation limit of {MAX_WORKSPACES} reached");
             }
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
@@ -1497,7 +1497,7 @@ impl SessionRegistry {
                 .write()
                 .map_err(|_| anyhow!("session state lock was poisoned"))?;
             if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
-                bail!("workspace limit of {MAX_WORKSPACES} reached");
+                bail!("workstation limit of {MAX_WORKSPACES} reached");
             }
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
@@ -1514,7 +1514,7 @@ impl SessionRegistry {
             };
             state.snapshot.workspaces.push(Workspace {
                 id: workspace_id,
-                title: title.unwrap_or_else(|| format!("SSH Workspace {number}")),
+                title: title.unwrap_or_else(|| format!("SSH Workstation {number}")),
                 color: None,
                 pinned: false,
                 pin_order: 0,
@@ -1554,7 +1554,7 @@ impl SessionRegistry {
 
     pub fn rename_workspace(&self, workspace_id: Uuid, title: &str) -> Result<()> {
         let title =
-            normalize_workspace_title(Some(title))?.context("workspace name cannot be empty")?;
+            normalize_workspace_title(Some(title))?.context("workstation name cannot be empty")?;
         let mut state = self
             .state
             .write()
@@ -1564,7 +1564,7 @@ impl SessionRegistry {
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.id == workspace_id)
-            .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
         workspace.title = title;
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         persist_state(&state)
@@ -1589,7 +1589,7 @@ impl SessionRegistry {
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.id == workspace_id)
-            .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
         workspace.pinned = pinned;
         workspace.pin_order = if pinned { next_order } else { 0 };
         normalize_pin_orders(&mut state.snapshot.workspaces);
@@ -1618,7 +1618,7 @@ impl SessionRegistry {
         let index = pinned
             .iter()
             .position(|(id, _)| *id == workspace_id)
-            .with_context(|| format!("workspace {workspace_id} is not pinned"))?;
+            .with_context(|| format!("workstation {workspace_id} is not pinned"))?;
         let other = match direction {
             WorkspacePinMove::Up => index.checked_sub(1),
             WorkspacePinMove::Down => (index + 1 < pinned.len()).then_some(index + 1),
@@ -1650,9 +1650,9 @@ impl SessionRegistry {
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
-                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
             if !matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. }) {
-                bail!("only a system-SSH workspace can be disconnected");
+                bail!("only a system-SSH workstation can be disconnected");
             }
             pane_ids_for_workspace(workspace)
                 .into_iter()
@@ -1677,9 +1677,11 @@ impl SessionRegistry {
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.id == workspace_id)
-            .with_context(|| format!("workspace {workspace_id} disappeared while disconnecting"))?;
+            .with_context(|| {
+                format!("workstation {workspace_id} disappeared while disconnecting")
+            })?;
         let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection else {
-            bail!("only a system-SSH workspace can be disconnected");
+            bail!("only a system-SSH workstation can be disconnected");
         };
         *status = WorkspaceConnectionStatus::Offline;
         workspace.active_terminal_count = workspace
@@ -1713,16 +1715,16 @@ impl SessionRegistry {
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
-                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
             let WorkspaceConnection::SystemSsh {
                 destination,
                 status,
             } = &workspace.connection
             else {
-                bail!("only a system-SSH workspace can be reconnected");
+                bail!("only a system-SSH workstation can be reconnected");
             };
             if *status == WorkspaceConnectionStatus::Connected {
-                bail!("workspace is already connected");
+                bail!("workstation is already connected");
             }
             let pane_ids = pane_ids_for_workspace(workspace)
                 .into_iter()
@@ -1763,10 +1765,10 @@ impl SessionRegistry {
                 .iter_mut()
                 .find(|workspace| workspace.id == workspace_id)
                 .with_context(|| {
-                    format!("workspace {workspace_id} disappeared while reconnecting")
+                    format!("workstation {workspace_id} disappeared while reconnecting")
                 })?;
             let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection else {
-                bail!("only a system-SSH workspace can be reconnected");
+                bail!("only a system-SSH workstation can be reconnected");
             };
             if created_layout {
                 let pane_id = pane_ids[0];
@@ -1835,14 +1837,14 @@ impl SessionRegistry {
                 .read()
                 .map_err(|_| anyhow!("session state lock was poisoned"))?;
             if state.snapshot.workspaces.len() <= 1 {
-                bail!("the last workspace cannot be deleted");
+                bail!("the last workstation cannot be deleted");
             }
             let workspace = state
                 .snapshot
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
-                .with_context(|| format!("workspace {workspace_id} does not exist"))?;
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
             pane_ids_for_workspace(workspace)
                 .into_iter()
                 .filter_map(|pane_id| {
@@ -1866,7 +1868,7 @@ impl SessionRegistry {
             .workspaces
             .retain(|workspace| workspace.id != workspace_id);
         if state.snapshot.workspaces.len() == before {
-            bail!("workspace {workspace_id} disappeared while deleting");
+            bail!("workstation {workspace_id} disappeared while deleting");
         }
         for (pane_id, _) in sessions {
             state.panes.remove(&pane_id);
@@ -2317,10 +2319,10 @@ fn normalize_workspace_title(title: Option<&str>) -> Result<Option<String>> {
         return Ok(None);
     }
     if title.chars().count() > MAX_WORKSPACE_TITLE_CHARS {
-        bail!("workspace name may contain at most {MAX_WORKSPACE_TITLE_CHARS} characters");
+        bail!("workstation name may contain at most {MAX_WORKSPACE_TITLE_CHARS} characters");
     }
     if title.chars().any(char::is_control) {
-        bail!("workspace name may not contain control characters");
+        bail!("workstation name may not contain control characters");
     }
     Ok(Some(title.to_owned()))
 }

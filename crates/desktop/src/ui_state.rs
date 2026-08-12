@@ -67,14 +67,14 @@ impl UiStateStore {
             bail!("unsupported UI state schema {}", state.schema_version);
         }
         if !state.workspace_sidebar_width.is_finite() || state.workspace_sidebar_width <= 0.0 {
-            bail!("workspace sidebar width must be finite and positive");
+            bail!("workstation sidebar width must be finite and positive");
         }
         Ok(Some(state.workspace_sidebar_width))
     }
 
     pub(crate) fn save_workspace_sidebar_width(&self, width: f32) -> Result<()> {
         if !width.is_finite() || width <= 0.0 {
-            bail!("workspace sidebar width must be finite and positive");
+            bail!("workstation sidebar width must be finite and positive");
         }
         let state = PersistedUiState {
             schema_version: SCHEMA_VERSION,

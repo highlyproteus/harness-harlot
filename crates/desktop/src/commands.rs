@@ -43,15 +43,15 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
     CommandDescriptor {
         command: AppCommand::NewWorkspace,
         id: "workspace.new",
-        title: "New Workspace",
-        category: "Workspace",
+        title: "New Workstation",
+        category: "Workstation",
         default_bindings: &["cmd-n"],
     },
     CommandDescriptor {
         command: AppCommand::ToggleSidebar,
         id: "workspace.toggle-sidebar",
-        title: "Toggle Workspace Sidebar",
-        category: "Workspace",
+        title: "Toggle Workstation Sidebar",
+        category: "Workstation",
         default_bindings: &["cmd-b"],
     },
     CommandDescriptor {
