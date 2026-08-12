@@ -77,7 +77,7 @@ const DEFAULT_SIDEBAR_WIDTH: f32 = 190.0;
 const MIN_SIDEBAR_WIDTH: f32 = 150.0;
 const MAX_SIDEBAR_WIDTH: f32 = 420.0;
 const MIN_TERMINAL_AREA_WIDTH: f32 = 320.0;
-const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.0;
+const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 12.0;
 const TITLEBAR_HEIGHT: f32 = 38.0;
 const PANE_HEADER_HEIGHT: f32 = 29.0;
 const SPLIT_DIVIDER_SIZE: f32 = 4.0;
@@ -831,6 +831,7 @@ struct RustMux {
     drag_hover: DragHoverState,
     selection_drag: Option<SelectionDrag>,
     ime_preedit: String,
+    workspace_input_focus: [FocusHandle; 2],
     workspace_input_layouts: [Option<ShapedLine>; 2],
     workspace_input_bounds: [Option<Bounds<Pixels>>; 2],
 }
@@ -839,6 +840,7 @@ impl RustMux {
     fn new(window: &mut Window, keymap: ResolvedKeymap, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
+        let workspace_input_focus = [cx.focus_handle(), cx.focus_handle()];
         let terminal_font = TerminalFontProfile::resolve(cx.text_system());
         let ui_state_store = match UiStateStore::from_default_path() {
             Ok(store) => Some(store),
@@ -899,6 +901,7 @@ impl RustMux {
             drag_hover: DragHoverState::default(),
             selection_drag: None,
             ime_preedit: String::new(),
+            workspace_input_focus,
             workspace_input_layouts: [None, None],
             workspace_input_bounds: [None, None],
         };
@@ -2635,6 +2638,25 @@ impl RustMux {
                         cx.notify();
                     }
                 }
+                _ if step == Some(WorkspaceCreationStep::Details)
+                    && !keystroke.modifiers.platform
+                    && !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt =>
+                {
+                    // Most text arrives through EntityInputHandler, including
+                    // IME composition. Some native key paths, however, only
+                    // provide `key_char`; accept that ordinary text here so a
+                    // modal never looks focused while silently rejecting the
+                    // user's keyboard. This remains modal and cannot reach a
+                    // terminal behind the dialog.
+                    if let Some(text) = &keystroke.key_char
+                        && !text.chars().any(char::is_control)
+                        && let Some(dialog) = self.workspace_creation.as_mut()
+                    {
+                        dialog.replace_text(None, text, false, None);
+                        cx.notify();
+                    }
+                }
                 _ => {}
             }
             cx.stop_propagation();
@@ -3458,7 +3480,7 @@ impl RustMux {
             .flex()
             .justify_center()
             .bg(rgba(0x00000000))
-            .hover(|element| element.bg(rgba(0xffffff0c)))
+            .hover(|element| element.bg(rgba(0xffffff10)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -3468,7 +3490,13 @@ impl RustMux {
                     cx.notify();
                 }),
             )
-            .child(div().w(px(1.0)).h_full().bg(rgb(THEME.border_strong)))
+            .child(
+                div()
+                    .w(px(2.0))
+                    .h(px(38.0))
+                    .rounded_full()
+                    .bg(rgb(THEME.border_strong)),
+            )
             .into_any_element()
     }
 
@@ -5453,6 +5481,10 @@ impl RustMux {
         let field = dialog.field;
         let destination = dialog.destination.text.clone();
         let error = dialog.error.clone();
+        let name_input_focus =
+            self.workspace_input_focus[WorkspaceCreationField::Name.index()].clone();
+        let destination_input_focus =
+            self.workspace_input_focus[WorkspaceCreationField::Destination.index()].clone();
         let content = match dialog.step {
             WorkspaceCreationStep::Details => div()
                 .flex()
@@ -5540,6 +5572,7 @@ impl RustMux {
                 .child(
                     div()
                         .id("workspace-name-input")
+                        .track_focus(&name_input_focus)
                         .h(px(36.0))
                         .px(px(10.0))
                         .rounded(px(6.0))
@@ -5583,6 +5616,7 @@ impl RustMux {
                         .child(
                             div()
                                 .id("workspace-ssh-input")
+                                .track_focus(&destination_input_focus)
                                 .h(px(36.0))
                                 .px(px(10.0))
                                 .rounded(px(6.0))
@@ -6432,6 +6466,13 @@ impl Render for RustMux {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_window_geometry(window);
 
+        // The workspace dialog has its own focus targets. A pointer click on
+        // the sidebar button must not leave native text input attached to the
+        // terminal behind the dialog.
+        if let Some(dialog) = self.workspace_creation.as_ref() {
+            self.workspace_input_focus[dialog.field.index()].focus(window);
+        }
+
         div()
             .key_context(if self.command_palette.is_some() {
                 "RustMuxPalette"
@@ -6945,7 +6986,8 @@ impl Element for WorkspaceTextInputElement {
         cx: &mut App,
     ) {
         if state.active {
-            let focus_handle = self.input.read(cx).focus_handle.clone();
+            let focus_handle =
+                self.input.read(cx).workspace_input_focus[self.field.index()].clone();
             window.handle_input(
                 &focus_handle,
                 ElementInputHandler::new(bounds, self.input.clone()),
@@ -7029,12 +7071,14 @@ impl Element for TerminalInputElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.input.read(cx).focus_handle.clone();
-        window.handle_input(
-            &focus_handle,
-            ElementInputHandler::new(bounds, self.input.clone()),
-            cx,
-        );
+        let app = self.input.read(cx);
+        if app.workspace_creation.is_none() {
+            window.handle_input(
+                &app.focus_handle,
+                ElementInputHandler::new(bounds, self.input.clone()),
+                cx,
+            );
+        }
     }
 }
 
