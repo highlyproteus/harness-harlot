@@ -22,10 +22,10 @@ persistent session service
 
 The Rust workspace keeps those responsibilities explicit:
 
-- `rust-mux-desktop`: restartable GPUI client with the compact workspace rail, pane-local human-named tabs, real themed terminal surfaces, keyboard focus/input, pane-targeted controls, divider resize, and drag-to-split movement.
-- `rust-mux-session-service`: long-lived local authority for PTYs, configured-shell processes, terminal state, and live layouts.
-- `rust-mux-protocol`: versioned transport messages and shared layout types.
-- `rust-mux-terminal-model`: a narrow adapter around Alacritty's established terminal engine. Not a Harness will not implement VT parsing from scratch.
+- `nah-desktop`: restartable GPUI client with the compact workspace rail, pane-local human-named tabs, real themed terminal surfaces, keyboard focus/input, pane-targeted controls, divider resize, and drag-to-split movement.
+- `nah-session-service`: long-lived local authority for PTYs, configured-shell processes, terminal state, and live layouts.
+- `nah-protocol`: versioned transport messages and shared layout types.
+- `nah-terminal-model`: a narrow adapter around Alacritty's established terminal engine. Not a Harness will not implement VT parsing from scratch.
 
 The client is only a projection of daemon state. Closing it does not stop the service or its PTYs; a new client fetches current layout metadata and revision-aware pane updates from the owner-only Unix socket. A daemon restart recreates fresh local shells from a restricted owner-only snapshot; it does not claim to preserve live processes.
 
@@ -76,36 +76,34 @@ Explicitly deferred: embedded web browsing, mobile access, generic remote-contro
 Requirements: Rust 1.96 or newer.
 
 ```bash
-cargo run -p rust-mux-session-service
+cargo run -p nah-session-service
 ```
 
 In another terminal:
 
 ```bash
-cargo run -p rust-mux-desktop
+cargo run -p nah-desktop
 ```
 
 On macOS, `scripts/build-macos-app.sh` creates the debug
 `target/debug/Not a Harness.app`; pass `release` for a release bundle. Its
 display name, executable, and bundle identifier are `Not a Harness`,
-`not-a-harness`, and `com.notaharness.desktop`.
+`nah`, and `com.nah.desktop`.
 
-The Cargo package and Rust crate names remain `rust-mux-*` as stable internal
-identifiers, while the built executables are `not-a-harness-service` and
-`not-a-harness`. Set `NOT_A_HARNESS_SOCKET` in both processes to override the
-default socket path. The legacy `RUST_MUX_SOCKET` name remains accepted when
-the new variable is unset. The service is intentionally foreground-only for
+The technical package, crate, and executable prefix is `nah`. The built
+executables are `nah-service` and `nah`. Set `NAH_SOCKET` in both processes to
+override the default socket path. The default is `nah-session.sock` in the
+system temporary directory. The service is intentionally foreground-only for
 now so lifecycle behavior is visible during development.
 
 ### Command bindings
 
-Not a Harness loads optional JSON configuration from `NOT_A_HARNESS_CONFIG`,
-then `$XDG_CONFIG_HOME/not-a-harness/config.json`, then
-`$HOME/.config/not-a-harness/config.json`. The legacy `RUST_MUX_CONFIG` variable
-and `rust-mux/config.json` path are fallback sources when the new equivalent is
-unset or absent. Key sequences use GPUI syntax; multiple space-separated
-strokes form a chord. A configured action replaces its defaults, and an empty
-list unbinds it while keeping it in the command palette.
+Not a Harness loads optional JSON configuration from `NAH_CONFIG`, then
+`$XDG_CONFIG_HOME/nah/config.json`, then `$HOME/.config/nah/config.json`.
+`NAH_STATE_DIR` selects an alternate owner-only state directory, and child
+terminals receive `NAH_PANE_ID`. Key sequences use GPUI syntax; multiple
+space-separated strokes form a chord. A configured action replaces its defaults,
+and an empty list unbinds it while keeping it in the command palette.
 
 ```json
 {
@@ -130,8 +128,8 @@ cargo test --workspace
 
 See [the project plan](index.html), the [identity migration notes](docs/identity-migration.md),
 and [`tasks/rust-mux`](tasks/rust-mux) for phased implementation details. The
-task/PDR paths retain their original goal IDs so historical links and ledgers do
-not break.
+task/PDR paths retain their original historical IDs so established records and
+links do not break.
 
 ## Roadmap
 

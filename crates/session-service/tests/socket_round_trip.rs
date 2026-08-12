@@ -1,7 +1,5 @@
-use rust_mux_protocol::{
-    ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, ServiceResponse, WireError,
-};
-use rust_mux_session_service::{SessionRegistry, serve_connection};
+use nah_protocol::{ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, ServiceResponse, WireError};
+use nah_session_service::{SessionRegistry, serve_connection};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,7 +37,7 @@ async fn client_can_handshake_and_fetch_snapshot() {
         ServiceResponse::Snapshot { snapshot } => {
             assert_eq!(snapshot.workspaces.len(), 1);
             let target_pane = match &snapshot.workspaces[0].tabs[0].layout {
-                rust_mux_protocol::PaneLayout::Leaf { pane } => pane.id,
+                nah_protocol::PaneLayout::Leaf { pane } => pane.id,
                 other => panic!("unexpected initial layout: {other:?}"),
             };
             write_message(

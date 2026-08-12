@@ -9,7 +9,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Osc52, TermMode, point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::{self, Color, NamedColor};
-use rust_mux_protocol::{
+use nah_protocol::{
     TerminalAttributes, TerminalColor, TerminalCursor, TerminalLine, TerminalModifiers,
     TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalRun, TerminalSelection,
     TerminalSelectionKind,

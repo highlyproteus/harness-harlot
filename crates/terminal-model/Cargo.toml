@@ -1,5 +1,5 @@
 [package]
-name = "rust-mux-terminal-model"
+name = "nah-terminal-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ description = "Terminal model adapter for Not a Harness"
 
 [dependencies]
 alacritty_terminal.workspace = true
-rust-mux-protocol = { path = "../protocol" }
+nah-protocol = { path = "../protocol" }
 
 [lints]
 workspace = true

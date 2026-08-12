@@ -3235,6 +3235,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "nah-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "nah-protocol",
+ "nah-terminal-model",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "nah-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "nah-session-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "nah-protocol",
+ "nah-terminal-model",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nah-terminal-model"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "nah-protocol",
+]
+
+[[package]]
 name = "nanorand"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4451,55 +4500,6 @@ dependencies = [
  "globset",
  "sha2 0.11.0",
  "walkdir",
-]
-
-[[package]]
-name = "rust-mux-desktop"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gpui",
- "rust-mux-protocol",
- "rust-mux-terminal-model",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "unicode-width",
- "uuid",
-]
-
-[[package]]
-name = "rust-mux-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "rust-mux-session-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "portable-pty",
- "rust-mux-protocol",
- "rust-mux-terminal-model",
- "serde",
- "serde_json",
- "sysinfo",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "rust-mux-terminal-model"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "rust-mux-protocol",
 ]
 
 [[package]]

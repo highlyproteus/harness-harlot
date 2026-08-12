@@ -31,7 +31,7 @@ The diagnostics contain no terminal cells or text, keyboard input, clipboard dat
 Run the focused activity-matrix smoke test with diagnostics visible:
 
 ```sh
-cargo test -p rust-mux-session-service --test pane_streaming local_activity_matrix_smoke_reports_bounded_change_only_delivery -- --nocapture
+cargo test -p nah-session-service --test pane_streaming local_activity_matrix_smoke_reports_bounded_change_only_delivery -- --nocapture
 ```
 
 The pass conditions are exact zero screen bytes for unchanged and cold subscriptions, one changed screen for the active burst, a current targeted refocus screen in under 500 ms on the local owner-only socket path, and a nonzero bounded daemon resident-memory measurement. The complete suite also covers changed-pane isolation, cold draining through a high-output burst, final-output visibility, refocus, cursor catch-up, and cursorless receiver reconnect.

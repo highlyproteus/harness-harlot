@@ -1,9 +1,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rust_mux_protocol::{PaneLayout, PaneRevisionCursor, SplitAxis, TerminalScreen};
-use rust_mux_session_service::SessionRegistry;
-use rust_mux_terminal_model::SCROLLBACK_HISTORY_LIMIT;
+use nah_protocol::{PaneLayout, PaneRevisionCursor, SplitAxis, TerminalScreen};
+use nah_session_service::SessionRegistry;
+use nah_terminal_model::SCROLLBACK_HISTORY_LIMIT;
 use uuid::Uuid;
 
 #[test]

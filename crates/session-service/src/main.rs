@@ -4,8 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rust_mux_protocol::socket_path;
-use rust_mux_session_service::{SessionRegistry, serve_connection};
+use nah_protocol::socket_path;
+use nah_session_service::{SessionRegistry, serve_connection};
 use tokio::net::{UnixListener, UnixStream};
 
 #[derive(Debug)]

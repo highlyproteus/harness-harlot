@@ -121,7 +121,7 @@ impl UiStateStore {
 }
 
 fn default_ui_state_path() -> Result<PathBuf> {
-    let directory = rust_mux_protocol::state_directory().context("HOME is not set")?;
+    let directory = nah_protocol::state_directory().context("HOME is not set")?;
     Ok(directory.join("ui-state.json"))
 }
 
@@ -143,8 +143,7 @@ mod tests {
     use super::*;
 
     fn temp_store(label: &str) -> (PathBuf, UiStateStore) {
-        let root =
-            std::env::temp_dir().join(format!("not-a-harness-ui-{label}-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("nah-ui-{label}-{}", Uuid::new_v4()));
         let store = UiStateStore::new(root.join("ui-state.json"));
         (root, store)
     }
