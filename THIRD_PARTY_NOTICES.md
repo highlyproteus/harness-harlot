@@ -15,12 +15,21 @@ The supplied Codex artwork is reproduced unchanged for referential identificatio
 
 ## Claude Code
 
-- File: `claude-code.svg`
-- Official source: Anthropic Claude desktop product resource `/Applications/Claude.app/Contents/Resources/ion-dist/images/install-hub/claude_code_terminal-icon-dark.svg`, app version/build `1.26832.0`
-- SHA-256: `7651073e8c8e830f99876fa335b3c988cd5ad821378a8994ed6db9a5c2c36345`
+- File: `claude-code.png`
+- Official source: Anthropic Claude desktop product resource `/Applications/Claude.app/Contents/Resources/ion-dist/images/claude_app_icon.png`, app version/build `1.26832.0`
+- SHA-256: `c7b5642f810adfba78781592d9dec18d7eb376c7ebf403c4d882fb9d39f65408`
 - Product source: [anthropics/claude-code](https://github.com/anthropics/claude-code/tree/681a8be245e7759a405e276b16ae69ea6b75076f)
 
-The installed product artwork is reproduced unchanged for referential identification of Claude Code. Anthropic and Claude are trademarks of Anthropic. No Anthropic endorsement is claimed.
+The installed Claude product artwork is reproduced unchanged for referential identification of Claude Code. Anthropic and Claude are trademarks of Anthropic. No Anthropic endorsement is claimed.
+
+## Droid
+
+- File: `droid.svg`
+- Official source: [`docs/favicon.svg`](https://github.com/Factory-AI/factory/blob/1fd9026d72f81668d88f37237cb5a2e89a17e6e2/docs/favicon.svg) in Factory's official Droid repository
+- SHA-256: `4a6e2ad6af6635472cbf4a4e5e25046b2453793bf2be8a9b9f29c3cb88adc0cf`
+- Product source: [Factory Droid](https://github.com/Factory-AI/factory/tree/1fd9026d72f81668d88f37237cb5a2e89a17e6e2)
+
+Factory's published favicon artwork is reproduced unchanged for referential identification of Droid. Factory and Droid are trademarks of Factory AI. No Factory endorsement is claimed.
 
 ## Hermes Agent
 

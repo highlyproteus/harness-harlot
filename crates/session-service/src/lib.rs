@@ -23,7 +23,7 @@ use rust_mux_protocol::{
     TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
     TerminalProfile, TerminalScreen, TerminalSelectionKind, Workspace, WorkspaceConnection,
     WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
-    terminal_profile_for_title, validate_ssh_host,
+    terminal_profile_for_executable, terminal_profile_for_title, validate_ssh_host,
 };
 use rust_mux_terminal_model::TerminalModel;
 use serde::Serialize;
@@ -2156,7 +2156,10 @@ fn refresh_command_profiles(state: &mut RegistryState) {
     }
 
     let mut system = System::new();
-    system.refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        ProcessRefreshKind::new().with_exe(UpdateKind::Always),
+    );
     if system.processes().len() > MAX_DISCOVERY_PROCESSES {
         return;
     }
@@ -2192,8 +2195,11 @@ fn discover_descendant_profile(system: &System, root: Pid) -> Option<TerminalPro
                 return None;
             }
             if let Some(process) = system.process(*child)
-                && let Some(name) = process.name().to_str()
-                && let Some(profile) = terminal_profile_for_command(name)
+                && let Some(profile) = process
+                    .name()
+                    .to_str()
+                    .and_then(terminal_profile_for_command)
+                    .or_else(|| process.exe().and_then(terminal_profile_for_executable))
             {
                 return Some(profile);
             }

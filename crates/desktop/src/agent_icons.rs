@@ -42,7 +42,7 @@ const fn png(path: &'static str, sha256: &'static str) -> AgentIconAsset {
 
 /// Desktop-only icon registry. Assets are compiled into the executable and
 /// are never fetched or resolved from the user's environment at runtime.
-pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 10] = [
+pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 11] = [
     AgentIconDefinition {
         profile: TerminalProfile::Terminal,
         accessible_name: "Terminal",
@@ -70,11 +70,20 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 10] = [
     AgentIconDefinition {
         profile: TerminalProfile::Claude,
         accessible_name: "Claude Code",
-        asset: Some(svg(
-            "agent-icons/claude-code.svg",
-            "7651073e8c8e830f99876fa335b3c988cd5ad821378a8994ed6db9a5c2c36345",
+        asset: Some(png(
+            "agent-icons/claude-code.png",
+            "c7b5642f810adfba78781592d9dec18d7eb376c7ebf403c4d882fb9d39f65408",
         )),
         notice_key: "claude-code",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::Droid,
+        accessible_name: "Droid",
+        asset: Some(svg(
+            "agent-icons/droid.svg",
+            "4a6e2ad6af6635472cbf4a4e5e25046b2453793bf2be8a9b9f29c3cb88adc0cf",
+        )),
+        notice_key: "factory-droid",
     },
     AgentIconDefinition {
         profile: TerminalProfile::KiloCode,
@@ -139,7 +148,7 @@ pub fn agent_icon_definition(profile: TerminalProfile) -> &'static AgentIconDefi
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgentIconAssets;
 
-const EMBEDDED_ASSETS: [(&str, &[u8]); 8] = [
+const EMBEDDED_ASSETS: [(&str, &[u8]); 9] = [
     (
         "agent-icons/hermes-agent.png",
         include_bytes!("../assets/agent-icons/hermes-agent.png"),
@@ -149,8 +158,12 @@ const EMBEDDED_ASSETS: [(&str, &[u8]); 8] = [
         include_bytes!("../assets/agent-icons/codex-cli.png"),
     ),
     (
-        "agent-icons/claude-code.svg",
-        include_bytes!("../assets/agent-icons/claude-code.svg"),
+        "agent-icons/claude-code.png",
+        include_bytes!("../assets/agent-icons/claude-code.png"),
+    ),
+    (
+        "agent-icons/droid.svg",
+        include_bytes!("../assets/agent-icons/droid.svg"),
     ),
     (
         "agent-icons/kilo-code.svg",

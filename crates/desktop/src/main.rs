@@ -7664,6 +7664,7 @@ mod tests {
             (TerminalProfile::Hermes, true),
             (TerminalProfile::Codex, true),
             (TerminalProfile::Claude, true),
+            (TerminalProfile::Droid, true),
             (TerminalProfile::KiloCode, true),
             (TerminalProfile::Cursor, true),
             (TerminalProfile::OpenCode, true),
