@@ -10,19 +10,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
     DispatchPhase, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, KeyBinding,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ScrollWheelEvent, ShapedLine, StrikethroughStyle, Style, StyledText, TextRun,
-    TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions,
-    div, fill, img, point, prelude::*, px, relative, rgb, rgba, size, svg,
+    FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, Image, ImageFormat, InspectorElementId,
+    KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine, StrikethroughStyle,
+    Style, StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window,
+    WindowBounds, WindowOptions, actions, div, fill, img, point, prelude::*, px, relative, rgb,
+    rgba, size, svg,
 };
 use nah_desktop::request;
 use nah_protocol::{
@@ -84,6 +87,8 @@ const MIN_TERMINAL_AREA_WIDTH: f32 = 320.0;
 const SIDEBAR_RESIZE_HIT_WIDTH: f32 = 8.0;
 const SIDEBAR_RESIZE_VISUAL_WIDTH: f32 = 2.0;
 const TITLEBAR_HEIGHT: f32 = 38.0;
+const APP_CHROME_HEIGHT: f32 = TITLEBAR_HEIGHT;
+const MACOS_TRAFFIC_LIGHT_SAFE_INSET: f32 = 78.0;
 const WORKSTATION_BANNER_ASPECT_RATIO: f32 = 3.0;
 const PANE_HEADER_HEIGHT: f32 = 29.0;
 const SPLIT_DIVIDER_SIZE: f32 = 4.0;
@@ -899,6 +904,7 @@ struct NahApp {
     preferred_sidebar_width: f32,
     sidebar_visible: bool,
     sidebar_pixels: f32,
+    workstation_tab_scroll: ScrollHandle,
     last_sizes: HashMap<Uuid, (u16, u16)>,
     workspace_pixels: (f32, f32),
     connection_error: Option<String>,
@@ -980,6 +986,7 @@ impl NahApp {
             preferred_sidebar_width,
             sidebar_visible: true,
             sidebar_pixels: default_sidebar_width(),
+            workstation_tab_scroll: ScrollHandle::new(),
             last_sizes: HashMap::new(),
             workspace_pixels: (0.0, 0.0),
             connection_error: None,
@@ -1545,6 +1552,47 @@ impl NahApp {
             self.expanded_workspaces.insert(workspace_id);
         }
         cx.notify();
+    }
+
+    fn select_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        self.active_workspace = Some(workspace_id);
+        let first_pane = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .and_then(|workspace| workspace.tabs.first())
+                .and_then(|tab| visible_panes(&tab.layout).first().copied())
+        });
+        if let Some(pane_id) = first_pane {
+            self.focus_pane_with_snapshot(pane_id);
+        }
+        self.last_sizes.clear();
+        cx.notify();
+    }
+
+    fn select_workspace_by_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let mut workspace_ids = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.workspaces.clone())
+            .unwrap_or_default();
+        workspace_ids.sort_by_key(|workspace| {
+            (
+                !workspace.pinned,
+                if workspace.pinned {
+                    workspace.pin_order
+                } else {
+                    u32::MAX
+                },
+            )
+        });
+        let Some(workspace_id) = workspace_ids.get(index).map(|workspace| workspace.id) else {
+            return false;
+        };
+        self.select_workspace(workspace_id, cx);
+        self.workstation_tab_scroll.scroll_to_item(index);
+        true
     }
 
     fn toggle_workstation_group(&mut self, pinned: bool, cx: &mut Context<Self>) {
@@ -2663,6 +2711,25 @@ impl NahApp {
             return;
         }
         let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform && !keystroke.modifiers.control && !keystroke.modifiers.alt
+        {
+            let workspace_shortcut = match keystroke.key.as_str() {
+                "1" => Some(0),
+                "2" => Some(1),
+                "3" => Some(2),
+                "4" => Some(3),
+                "5" => Some(4),
+                "6" => Some(5),
+                "7" => Some(6),
+                "8" => Some(7),
+                "9" => Some(8),
+                _ => None,
+            };
+            if workspace_shortcut.is_some_and(|index| self.select_workspace_by_index(index, cx)) {
+                cx.stop_propagation();
+                return;
+            }
+        }
         if let Some(picker) = self.color_picker.as_mut() {
             match keystroke.key.as_str() {
                 "enter" => self.submit_color_picker(cx),
@@ -3060,7 +3127,7 @@ impl NahApp {
             return;
         };
         let workspace_x = f32::from(event.position.x) - self.sidebar_pixels;
-        let workspace_y = f32::from(event.position.y) - TITLEBAR_HEIGHT;
+        let workspace_y = f32::from(event.position.y) - APP_CHROME_HEIGHT;
         let ratio = match drag.axis {
             SplitAxis::Horizontal => (workspace_x - split.x) / split.width.max(1.0),
             SplitAxis::Vertical => (workspace_y - split.y) / split.height.max(1.0),
@@ -3221,12 +3288,10 @@ impl NahApp {
                     .overflow_hidden()
                     .bg(rgb(THEME.terminal))
                     .child(
-                        img(workstation_banner_path())
+                        img(workstation_banner_image())
                             .id("workstation-banner-image")
-                            .absolute()
-                            .top(px(0.0))
-                            .left(px(0.0))
-                            .size_full()
+                            .w_full()
+                            .h_full()
                             .object_fit(gpui::ObjectFit::Contain),
                     ),
             )
@@ -4833,6 +4898,250 @@ impl NahApp {
                     }))
                     .when(profile.is_none(), |element| element.child("A"))
             }))
+            .into_any_element()
+    }
+
+    fn render_global_navigation(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut workspaces = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.workspaces.clone())
+            .unwrap_or_default();
+        workspaces.sort_by_key(|workspace| {
+            (
+                !workspace.pinned,
+                if workspace.pinned {
+                    workspace.pin_order
+                } else {
+                    u32::MAX
+                },
+            )
+        });
+        let sidebar_visible = self.sidebar_visible;
+        let navigation_hint = format!(
+            "{} · {} · ⇧⌘P commands",
+            THEME.name, self.terminal_font.family
+        );
+        let tab_scroll_to_start = self.workstation_tab_scroll.clone();
+        let tab_scroll_to_end = self.workstation_tab_scroll.clone();
+        let last_workspace_index = workspaces.len().saturating_sub(1);
+
+        div()
+            .id("global-workstation-navigation")
+            .h(px(TITLEBAR_HEIGHT))
+            .flex_none()
+            // This is the actual macOS titlebar row. Keep controls clear of
+            // the traffic lights while sharing their vertical alignment.
+            .pl(px(MACOS_TRAFFIC_LIGHT_SAFE_INSET))
+            .pr(px(10.0))
+            .bg(rgb(THEME.window))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id("toggle-workstation-sidebar")
+                    .flex_none()
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .focusable()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(THEME.muted))
+                    .hover(|element| {
+                        element
+                            .bg(rgb(THEME.elevated))
+                            .text_color(rgb(THEME.foreground))
+                    })
+                    .in_focus(|style| style.bg(rgb(THEME.elevated)))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: if sidebar_visible {
+                                "Hide workstation sidebar (⌘B)".to_owned()
+                            } else {
+                                "Show workstation sidebar (⌘B)".to_owned()
+                            },
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+                    .child(render_sidebar_toggle_icon(sidebar_visible)),
+            )
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(18.0))
+                    .flex_none()
+                    .bg(rgb(THEME.border)),
+            )
+            .child(
+                div()
+                    .id("scroll-workstation-tabs-left")
+                    .flex_none()
+                    .w(px(20.0))
+                    .h(px(24.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .focusable()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(THEME.muted))
+                    .hover(|element| {
+                        element
+                            .bg(rgb(THEME.elevated))
+                            .text_color(rgb(THEME.foreground))
+                    })
+                    .tooltip(|_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: "Show first workstation tabs".to_owned(),
+                        })
+                        .into()
+                    })
+                    .on_click(move |_, _, cx| {
+                        tab_scroll_to_start.scroll_to_item(0);
+                        cx.refresh_windows();
+                    })
+                    .child("‹"),
+            )
+            .child(
+                div()
+                    .id("global-workstation-tabs")
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex_1()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.workstation_tab_scroll)
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .children(
+                        workspaces
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, workspace)| {
+                                let workspace_id = workspace.id;
+                                let active = Some(workspace_id) == self.active_workspace;
+                                let title = workspace.title.clone();
+                                let color = self.workspace_color(workspace_id).as_rgb();
+                                let tooltip_title = title.clone();
+                                let shortcut = (index < 9).then(|| format!(" (⌘{})", index + 1));
+                                div()
+                                    .id(("global-workstation-tab", element_key(workspace_id)))
+                                    .flex_none()
+                                    .max_w(px(220.0))
+                                    .h(px(26.0))
+                                    .px(px(9.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .focusable()
+                                    .when(active, |element| {
+                                        element
+                                            .bg(rgb(THEME.elevated))
+                                            .border_1()
+                                            .border_color(rgb(color))
+                                    })
+                                    .when(!active, |element| {
+                                        element
+                                            .border_1()
+                                            .border_color(rgb(THEME.border))
+                                            .hover(|element| element.bg(rgb(THEME.elevated)))
+                                    })
+                                    .in_focus(|style| style.border_color(rgb(THEME.accent)))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: format!(
+                                                "Switch to {tooltip_title}{}",
+                                                shortcut.as_deref().unwrap_or_default()
+                                            ),
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_workspace(workspace_id, cx)
+                                    }))
+                                    .on_key_down(cx.listener(
+                                        move |this, event: &KeyDownEvent, _, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                this.select_workspace(workspace_id, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .w(px(7.0))
+                                            .h(px(7.0))
+                                            .flex_none()
+                                            .rounded_full()
+                                            .bg(rgb(color)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .truncate()
+                                            .whitespace_nowrap()
+                                            .text_sm()
+                                            .font_weight(if active {
+                                                gpui::FontWeight::SEMIBOLD
+                                            } else {
+                                                gpui::FontWeight::NORMAL
+                                            })
+                                            .text_color(rgb(if active {
+                                                THEME.foreground
+                                            } else {
+                                                THEME.muted
+                                            }))
+                                            .child(title),
+                                    )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("scroll-workstation-tabs-right")
+                    .flex_none()
+                    .w(px(20.0))
+                    .h(px(24.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .focusable()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(THEME.muted))
+                    .hover(|element| {
+                        element
+                            .bg(rgb(THEME.elevated))
+                            .text_color(rgb(THEME.foreground))
+                    })
+                    .tooltip(|_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: "Show more workstation tabs".to_owned(),
+                        })
+                        .into()
+                    })
+                    .on_click(move |_, _, cx| {
+                        tab_scroll_to_end.scroll_to_item(last_workspace_index);
+                        cx.refresh_windows();
+                    })
+                    .child("›"),
+            )
+            .tooltip(move |_, cx| {
+                cx.new(|_| TooltipView {
+                    text: navigation_hint.clone(),
+                })
+                .into()
+            })
             .into_any_element()
     }
 
@@ -6991,8 +7300,6 @@ impl NahApp {
         let empty_workspace_uses_ssh =
             matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. });
         let open_terminal_binding = self.binding_label(AppCommand::NewTab);
-        let workspace_color = self.workspace_color(workspace.id).as_rgb();
-        let sidebar_visible = self.sidebar_visible;
         let canonical_layout = workspace.tabs.first().map(|tab| tab.layout.clone());
         let layout = canonical_layout.as_ref().map(|layout| {
             self.zoomed_pane
@@ -7078,85 +7385,12 @@ impl NahApp {
         };
         div()
             .min_w(px(0.0))
+            .min_h(px(0.0))
             .h_full()
             .flex_1()
             .bg(rgb(THEME.terminal))
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .h(px(TITLEBAR_HEIGHT))
-                    .flex_none()
-                    .pl(px(if self.sidebar_visible { 11.0 } else { 79.0 }))
-                    .pr(px(11.0))
-                    .bg(rgb(THEME.surface))
-                    .border_b_1()
-                    .border_color(rgb(THEME.border))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .id("toggle-workstation-sidebar")
-                            .flex_none()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(rgb(THEME.muted))
-                            .hover(|element| {
-                                element
-                                    .bg(rgb(THEME.elevated))
-                                    .text_color(rgb(THEME.foreground))
-                            })
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: if sidebar_visible {
-                                        "Hide workstation sidebar (⌘B)".to_owned()
-                                    } else {
-                                        "Show workstation sidebar (⌘B)".to_owned()
-                                    },
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-                            .child(render_sidebar_toggle_icon(sidebar_visible)),
-                    )
-                    .child(
-                        div()
-                            .font_family("SF Mono")
-                            .text_xs()
-                            .text_color(rgb(workspace_color))
-                            .child("▰"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child(workspace.title.clone()),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .font_family("SF Mono")
-                            .text_xs()
-                            .text_color(rgb(THEME.dim))
-                            .child(format!(
-                                "{} · {}{}  ·  ⇧⌘P commands",
-                                THEME.name,
-                                self.terminal_font.family,
-                                if self.zoomed_pane.is_some() {
-                                    " · ZOOMED"
-                                } else {
-                                    ""
-                                }
-                            )),
-                    ),
-            )
             .child(div().min_h(px(0.0)).flex_1().child(workspace_content))
             .into_any_element()
     }
@@ -7190,6 +7424,7 @@ impl Render for NahApp {
             .min_h(px(460.0))
             .bg(rgb(THEME.window))
             .flex()
+            .flex_col()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx)
             }))
@@ -7291,12 +7526,23 @@ impl Render for NahApp {
                         .child(SidebarResizeCaptureElement { input: cx.entity() }),
                 )
             })
-            .when(self.sidebar_visible, |element| {
-                element
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_sidebar_resize_handle(cx))
-            })
-            .child(self.render_workspace(cx))
+            // The global navigation shares the macOS titlebar row. The rail
+            // begins directly beneath it instead of rendering under traffic
+            // lights or under a redundant second bar.
+            .child(self.render_global_navigation(cx))
+            .child(
+                div()
+                    .relative()
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .when(self.sidebar_visible, |element| {
+                        element
+                            .child(self.render_sidebar(cx))
+                            .child(self.render_sidebar_resize_handle(cx))
+                    })
+                    .child(self.render_workspace(cx)),
+            )
             .when_some(self.tab_menu, |element, menu| {
                 element.child(self.render_tab_menu(menu, cx))
             })
@@ -8596,7 +8842,7 @@ fn sidebar_width_for_visibility(preferred_width: f32, window_width: f32, visible
 fn workspace_pixel_size(window_width: f32, window_height: f32, sidebar_width: f32) -> (f32, f32) {
     (
         (window_width - sidebar_width).max(1.0),
-        (window_height - TITLEBAR_HEIGHT).max(1.0),
+        (window_height - APP_CHROME_HEIGHT).max(1.0),
     )
 }
 
@@ -8918,6 +9164,7 @@ fn append_rename_text(value: &mut String, replace_on_type: &mut bool, text: &str
 
 /// Prefer the copy packaged inside a native macOS bundle. The source-tree path
 /// keeps local non-bundled development builds visually faithful as well.
+#[cfg(test)]
 fn workstation_banner_path() -> PathBuf {
     let bundled = std::env::current_exe().ok().and_then(|executable| {
         executable
@@ -8934,6 +9181,22 @@ fn workstation_banner_path() -> PathBuf {
             .join("assets")
             .join("notaharness-banner.png")
     })
+}
+
+/// Keep the banner available to the native renderer even while a Dev bundle is
+/// rebuilt in place. The same user-owned artwork remains packaged as a bundle
+/// resource; this stable in-process source prevents an asynchronous file-load
+/// miss from leaving the rail header blank after a relaunch.
+fn workstation_banner_image() -> Arc<Image> {
+    static BANNER: OnceLock<Arc<Image>> = OnceLock::new();
+    BANNER
+        .get_or_init(|| {
+            Arc::new(Image::from_bytes(
+                ImageFormat::Png,
+                include_bytes!("../assets/notaharness-banner.png").to_vec(),
+            ))
+        })
+        .clone()
 }
 
 /// Sets the live Dock icon explicitly. `AppKit` otherwise retains the generic
