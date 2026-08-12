@@ -391,7 +391,7 @@ struct SshWorkspaceIds {
     pane: Uuid,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimePaneKind {
     Local,
     SystemSsh { host: String },
@@ -407,6 +407,15 @@ impl RuntimePaneKind {
             Self::Local => shell_title(),
             Self::SystemSsh { host } => format!("ssh {host}"),
         }
+    }
+}
+
+fn runtime_kind_for_workspace(connection: &WorkspaceConnection) -> RuntimePaneKind {
+    match connection {
+        WorkspaceConnection::Local => RuntimePaneKind::Local,
+        WorkspaceConnection::SystemSsh { destination, .. } => RuntimePaneKind::SystemSsh {
+            host: destination.clone(),
+        },
     }
 }
 
@@ -812,7 +821,7 @@ impl SessionRegistry {
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
-        let session = PtySession::spawn_local(new_id, workspace_id, &cwd, &self.history)?;
+        let (session, kind) = self.spawn_pane_for_workspace(new_id, workspace_id, &cwd)?;
         let mut state = self
             .state
             .write()
@@ -820,7 +829,10 @@ impl SessionRegistry {
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
-        let new_pane = state.new_pane(new_id);
+        let mut new_pane = state.new_pane(new_id);
+        if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
+            "ssh".clone_into(&mut new_pane.shell);
+        }
         let did_split = state.snapshot.workspaces.iter_mut().any(|workspace| {
             workspace
                 .tabs
@@ -835,7 +847,7 @@ impl SessionRegistry {
             RuntimePane {
                 session,
                 last_valid_cwd: cwd,
-                kind: RuntimePaneKind::Local,
+                kind,
                 recovered: false,
                 exit_status: None,
                 detected_command_profile: None,
@@ -850,7 +862,7 @@ impl SessionRegistry {
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
-        let session = PtySession::spawn_local(new_id, workspace_id, &cwd, &self.history)?;
+        let (session, kind) = self.spawn_pane_for_workspace(new_id, workspace_id, &cwd)?;
         let mut state = self
             .state
             .write()
@@ -858,7 +870,10 @@ impl SessionRegistry {
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
-        let pane = state.new_pane(new_id);
+        let mut pane = state.new_pane(new_id);
+        if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
+            "ssh".clone_into(&mut pane.shell);
+        }
         let did_add = state.snapshot.workspaces.iter_mut().any(|workspace| {
             workspace
                 .tabs
@@ -873,7 +888,7 @@ impl SessionRegistry {
             RuntimePane {
                 session,
                 last_valid_cwd: cwd,
-                kind: RuntimePaneKind::Local,
+                kind,
                 recovered: false,
                 exit_status: None,
                 detected_command_profile: None,
@@ -2026,6 +2041,38 @@ impl SessionRegistry {
             .map_err(|_| anyhow!("session state lock was poisoned"))?;
         workspace_id_for_pane(&state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} has no workspace"))
+    }
+
+    fn workspace_connection(&self, workspace_id: Uuid) -> Result<WorkspaceConnection> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        state
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.connection.clone())
+            .with_context(|| format!("workstation {workspace_id} does not exist"))
+    }
+
+    fn spawn_pane_for_workspace(
+        &self,
+        pane_id: Uuid,
+        workspace_id: Uuid,
+        cwd: &Path,
+    ) -> Result<(Arc<PtySession>, RuntimePaneKind)> {
+        let kind = runtime_kind_for_workspace(&self.workspace_connection(workspace_id)?);
+        let session = match &kind {
+            RuntimePaneKind::Local => {
+                PtySession::spawn_local(pane_id, workspace_id, cwd, &self.history)?
+            }
+            RuntimePaneKind::SystemSsh { host } => {
+                PtySession::spawn_ssh(pane_id, workspace_id, host, &self.history)?
+            }
+        };
+        Ok((session, kind))
     }
 }
 
@@ -3373,6 +3420,25 @@ mod tests {
                 "host: {host:?}"
             );
         }
+    }
+
+    #[test]
+    fn extra_panes_in_saved_ssh_workstations_retain_the_saved_destination() {
+        let destination = "admin@build-node";
+        let ssh = WorkspaceConnection::SystemSsh {
+            destination: destination.to_owned(),
+            status: WorkspaceConnectionStatus::Connected,
+        };
+        assert_eq!(
+            runtime_kind_for_workspace(&ssh),
+            RuntimePaneKind::SystemSsh {
+                host: destination.to_owned(),
+            }
+        );
+        assert_eq!(
+            runtime_kind_for_workspace(&WorkspaceConnection::Local),
+            RuntimePaneKind::Local
+        );
     }
 
     #[test]
