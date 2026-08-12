@@ -27,6 +27,8 @@ mkdir -p "$contents_directory/MacOS" "$contents_directory/Resources"
 cp "$repository_root/packaging/macos/Info.plist" "$contents_directory/Info.plist"
 cp "$repository_root/packaging/macos/Not-a-Harness.icns" \
   "$contents_directory/Resources/Not-a-Harness.icns"
+cp "$repository_root/crates/desktop/assets/notaharness-banner.png" \
+  "$contents_directory/Resources/notaharness-banner.png"
 cp "$repository_root/target/$profile/nah" \
   "$contents_directory/MacOS/nah"
 cp "$repository_root/target/$profile/nah-service" \

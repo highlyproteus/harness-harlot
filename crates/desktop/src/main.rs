@@ -10,18 +10,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Application, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase,
-    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, KeyBinding, KeyDownEvent,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ScrollWheelEvent, ShapedLine, StrikethroughStyle, Style, StyledText, TextRun, TitlebarOptions,
-    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, fill, img,
-    point, prelude::*, px, relative, rgb, rgba, size, svg,
+    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
+    DispatchPhase, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, KeyBinding,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, ScrollWheelEvent, ShapedLine, StrikethroughStyle, Style, StyledText, TextRun,
+    TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions,
+    div, fill, img, point, prelude::*, px, relative, rgb, rgba, size, svg,
 };
 use nah_desktop::request;
 use nah_protocol::{
@@ -75,10 +76,10 @@ actions!(
     ]
 );
 
-const DEFAULT_SIDEBAR_WIDTH: f32 = 190.0;
-const MIN_SIDEBAR_WIDTH: f32 = 150.0;
+const DEFAULT_SIDEBAR_WIDTH: f32 = 144.0;
+const MIN_SIDEBAR_WIDTH: f32 = 120.0;
 const MAX_SIDEBAR_WIDTH: f32 = 420.0;
-const DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH: f32 = 300.0;
+const DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH: f32 = 225.0;
 const MIN_TERMINAL_AREA_WIDTH: f32 = 320.0;
 const SIDEBAR_RESIZE_HIT_WIDTH: f32 = 8.0;
 const SIDEBAR_RESIZE_VISUAL_WIDTH: f32 = 2.0;
@@ -262,6 +263,19 @@ struct WorkspaceDeleteConfirmation {
     workspace_id: Uuid,
     title: String,
     active_terminal_count: u32,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceConnectionInfo {
+    workspace_id: Uuid,
+    position: Point<Pixels>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceDisconnectConfirmation {
+    workspace_id: Uuid,
+    title: String,
+    destination: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -883,6 +897,8 @@ struct NahApp {
     search_editor: Option<SearchEditor>,
     close_confirmation: Option<CloseConfirmation>,
     workspace_delete_confirmation: Option<WorkspaceDeleteConfirmation>,
+    workspace_connection_info: Option<WorkspaceConnectionInfo>,
+    workspace_disconnect_confirmation: Option<WorkspaceDisconnectConfirmation>,
     workspace_creation: Option<WorkspaceCreationDialog>,
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
@@ -961,6 +977,8 @@ impl NahApp {
             search_editor: None,
             close_confirmation: None,
             workspace_delete_confirmation: None,
+            workspace_connection_info: None,
+            workspace_disconnect_confirmation: None,
             workspace_creation: None,
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
@@ -1675,6 +1693,7 @@ impl NahApp {
             position,
         });
         self.tab_menu = None;
+        self.workspace_connection_info = None;
         self.last_sizes.clear();
         cx.notify();
     }
@@ -1895,6 +1914,57 @@ impl NahApp {
         }
         self.refresh_state();
         cx.notify();
+    }
+
+    fn open_workspace_connection_info(
+        &mut self,
+        workspace_id: Uuid,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_connection_info = Some(WorkspaceConnectionInfo {
+            workspace_id,
+            position,
+        });
+        self.workspace_menu = None;
+        self.tab_menu = None;
+        cx.notify();
+    }
+
+    fn begin_workspace_disconnect(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        let workspace = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+        });
+        let Some(Workspace {
+            title,
+            connection:
+                WorkspaceConnection::SystemSsh {
+                    destination,
+                    status: WorkspaceConnectionStatus::Connected,
+                },
+            ..
+        }) = workspace
+        else {
+            return;
+        };
+        self.workspace_disconnect_confirmation = Some(WorkspaceDisconnectConfirmation {
+            workspace_id,
+            title: title.clone(),
+            destination: destination.clone(),
+        });
+        self.workspace_connection_info = None;
+        self.workspace_menu = None;
+        cx.notify();
+    }
+
+    fn confirm_workspace_disconnect(&mut self, cx: &mut Context<Self>) {
+        let Some(confirmation) = self.workspace_disconnect_confirmation.take() else {
+            return;
+        };
+        self.disconnect_workspace(confirmation.workspace_id, cx);
     }
 
     fn reconnect_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
@@ -2829,6 +2899,18 @@ impl NahApp {
             cx.stop_propagation();
             return;
         }
+        if self.workspace_disconnect_confirmation.is_some() {
+            match keystroke.key.as_str() {
+                "enter" => self.confirm_workspace_disconnect(cx),
+                "escape" => {
+                    self.workspace_disconnect_confirmation = None;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.close_confirmation.is_some() {
             match keystroke.key.as_str() {
                 "enter" => self.confirm_close(cx),
@@ -2849,6 +2931,12 @@ impl NahApp {
         }
         if self.workspace_menu.is_some() && keystroke.key == "escape" {
             self.workspace_menu = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.workspace_connection_info.is_some() && keystroke.key == "escape" {
+            self.workspace_connection_info = None;
             cx.stop_propagation();
             cx.notify();
             return;
@@ -3133,18 +3221,23 @@ impl NahApp {
             )
             .child(
                 div()
-                    .px(px(10.0))
-                    .pt(px(10.0))
-                    .pb(px(6.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
+                    .id("workstation-banner")
+                    .relative()
+                    .w_full()
+                    .h(px((self.sidebar_pixels - SIDEBAR_RESIZE_HIT_WIDTH)
+                        .clamp(120.0, 240.0)
+                        / 3.0))
+                    .flex_none()
+                    .overflow_hidden()
+                    .bg(rgb(THEME.terminal))
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child("Workstations"),
+                        img(workstation_banner_path())
+                            .id("workstation-banner-image")
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(0.0))
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Cover),
                     ),
             )
             .children(
@@ -3188,17 +3281,6 @@ impl NahApp {
                             workspace_color
                         };
                         let active_text = readable_text_color(card_color);
-                        let connection_status = match &workspace.connection {
-                            WorkspaceConnection::Local => None,
-                            WorkspaceConnection::SystemSsh {
-                                destination,
-                                status: WorkspaceConnectionStatus::Connected,
-                            } => Some(format!("Connected · {destination}")),
-                            WorkspaceConnection::SystemSsh {
-                                destination,
-                                status: WorkspaceConnectionStatus::Offline,
-                            } => Some(format!("Offline · {destination}")),
-                        };
                         div()
                             .id(("workspace-section", element_key(workspace.id)))
                             .mx(px(7.0))
@@ -3288,7 +3370,9 @@ impl NahApp {
                                     )
                                     .child(
                                         div()
+                                            .min_w(px(0.0))
                                             .flex_1()
+                                            .truncate()
                                             .text_sm()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(if active || connected || offline {
@@ -3328,61 +3412,133 @@ impl NahApp {
                                                 .into()
                                             })
                                             .child(terminal_count.to_string()),
-                                    ),
-                            )
-                            .when_some(connection_status, |element, status| {
-                                element.child(
-                                    div()
-                                        .ml(px(21.0))
-                                        .mr(px(4.0))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .text_sm()
-                                                .font_family("SF Mono")
-                                                .text_xs()
-                                                .text_color(rgb(THEME.dim))
-                                                .child(status),
-                                        )
-                                        .when(connected, |element| {
-                                            element.child(
+                                    )
+                                    .when(connected, |element| {
+                                        element
+                                            .child(
                                                 div()
                                                     .id((
-                                                        "disconnect-workspace",
+                                                        "workspace-connection-info",
                                                         element_key(workspace_id),
                                                     ))
+                                                    .flex_none()
+                                                    .w(px(16.0))
+                                                    .h(px(16.0))
+                                                    .rounded_full()
                                                     .cursor_pointer()
+                                                    .font_family(".SystemUIFont")
                                                     .text_xs()
-                                                    .text_color(rgb(THEME.foreground))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.disconnect_workspace(workspace_id, cx);
-                                                        cx.stop_propagation();
-                                                    }))
-                                                    .child("Disconnect"),
+                                                    .text_color(rgb(active_text))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .hover(|element| element.bg(rgba(0xffffff20)))
+                                                    .tooltip(|_, cx| {
+                                                        cx.new(|_| TooltipView {
+                                                            text: "Connection details".to_owned(),
+                                                        })
+                                                        .into()
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |this, event: &ClickEvent, _, cx| {
+                                                            this.open_workspace_connection_info(
+                                                                workspace_id,
+                                                                event.position(),
+                                                                cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        },
+                                                    ))
+                                                    .child("ⓘ"),
                                             )
-                                        })
-                                        .when(offline, |element| {
-                                            element.child(
+                                            .child(
+                                                div()
+                                                    .id((
+                                                        "workspace-connected-indicator",
+                                                        element_key(workspace_id),
+                                                    ))
+                                                    .flex_none()
+                                                    .w(px(8.0))
+                                                    .h(px(8.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(THEME.ansi[2]))
+                                                    .tooltip(|_, cx| {
+                                                        cx.new(|_| TooltipView {
+                                                            text: "Connected".to_owned(),
+                                                        })
+                                                        .into()
+                                                    }),
+                                            )
+                                    })
+                                    .when(offline, |element| {
+                                        element
+                                            .child(
                                                 div()
                                                     .id((
                                                         "reconnect-workspace",
                                                         element_key(workspace_id),
                                                     ))
+                                                    .flex_none()
+                                                    .w(px(18.0))
+                                                    .h(px(18.0))
+                                                    .rounded(px(4.0))
                                                     .cursor_pointer()
-                                                    .text_xs()
+                                                    .font_family(".SystemUIFont")
+                                                    .text_sm()
                                                     .text_color(rgb(THEME.ansi[2]))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .hover(|element| element.bg(rgba(0xffffff20)))
+                                                    .tooltip(|_, cx| {
+                                                        cx.new(|_| TooltipView {
+                                                            text: "Reconnect with system OpenSSH"
+                                                                .to_owned(),
+                                                        })
+                                                        .into()
+                                                    })
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.reconnect_workspace(workspace_id, cx);
                                                         cx.stop_propagation();
                                                     }))
-                                                    .child("Reconnect"),
+                                                    .child("↻"),
                                             )
-                                        }),
-                                )
-                            })
+                                            .child(
+                                                div()
+                                                    .id((
+                                                        "delete-offline-workspace",
+                                                        element_key(workspace_id),
+                                                    ))
+                                                    .flex_none()
+                                                    .w(px(18.0))
+                                                    .h(px(18.0))
+                                                    .rounded(px(4.0))
+                                                    .cursor_pointer()
+                                                    .font_family(".SystemUIFont")
+                                                    .text_xs()
+                                                    .text_color(rgb(THEME.danger))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .hover(|element| element.bg(rgba(0xffffff20)))
+                                                    .tooltip(|_, cx| {
+                                                        cx.new(|_| TooltipView {
+                                                            text: "Delete saved workstation…"
+                                                                .to_owned(),
+                                                        })
+                                                        .into()
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.begin_workspace_delete(
+                                                            workspace_id,
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    }))
+                                                    .child("⌫"),
+                                            )
+                                    }),
+                            )
                             .when(expanded, |element| {
                                 if terminal_tabs.is_empty() {
                                     element.child(
@@ -3431,6 +3587,19 @@ impl NahApp {
                                                 );
                                                 cx.stop_propagation();
                                             }))
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.open_tab_menu(
+                                                            pane_id,
+                                                            event.position,
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    },
+                                                ),
+                                            )
                                             .child(
                                                 div()
                                                     .flex_none()
@@ -4603,7 +4772,7 @@ impl NahApp {
                         .text_color(rgb(THEME.foreground))
                         .hover(|item| item.bg(rgb(THEME.accent_soft)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.disconnect_workspace(workspace_id, cx)
+                            this.begin_workspace_disconnect(workspace_id, cx)
                         }))
                         .child("Disconnect and keep workstation"),
                 ),
@@ -6135,6 +6304,185 @@ impl NahApp {
             .into_any_element()
     }
 
+    fn render_workspace_connection_info(
+        &self,
+        info: &WorkspaceConnectionInfo,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let connection = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == info.workspace_id)
+                .and_then(|workspace| match &workspace.connection {
+                    WorkspaceConnection::SystemSsh {
+                        destination,
+                        status: WorkspaceConnectionStatus::Connected,
+                    } => Some((workspace.title.clone(), destination.clone())),
+                    WorkspaceConnection::Local
+                    | WorkspaceConnection::SystemSsh {
+                        status: WorkspaceConnectionStatus::Offline,
+                        ..
+                    } => None,
+                })
+        });
+        let Some((title, destination)) = connection else {
+            return div().into_any_element();
+        };
+        let workspace_id = info.workspace_id;
+        div()
+            .absolute()
+            .left(info.position.x)
+            .top(info.position.y)
+            .w(px(260.0))
+            .p(px(12.0))
+            .rounded(px(7.0))
+            .bg(rgb(THEME.elevated))
+            .border_1()
+            .border_color(rgb(THEME.border_strong))
+            .shadow_lg()
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.muted))
+                    .child("Connected with system OpenSSH"),
+            )
+            .child(
+                div()
+                    .p(px(8.0))
+                    .rounded(px(5.0))
+                    .bg(rgb(THEME.terminal))
+                    .font_family("SF Mono")
+                    .text_xs()
+                    .text_color(rgb(THEME.foreground))
+                    .child(destination),
+            )
+            .child(
+                div()
+                    .id(("disconnect-workspace-from-info", element_key(workspace_id)))
+                    .px(px(9.0))
+                    .py(px(6.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .bg(rgb(THEME.surface))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.border_color(rgb(THEME.accent)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.begin_workspace_disconnect(workspace_id, cx)
+                    }))
+                    .child("Disconnect…"),
+            )
+            .into_any_element()
+    }
+
+    fn render_workspace_disconnect_dialog(
+        &self,
+        confirmation: &WorkspaceDisconnectConfirmation,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(rgba(0x090b0f88))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(420.0))
+                    .p(px(18.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(THEME.elevated))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child(format!("Disconnect {}?", confirmation.title)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(THEME.muted))
+                            .child(
+                                "This closes the active system OpenSSH terminal. The saved workstation stays available for reconnect.",
+                            ),
+                    )
+                    .child(
+                        div()
+                            .p(px(8.0))
+                            .rounded(px(5.0))
+                            .bg(rgb(THEME.terminal))
+                            .font_family("SF Mono")
+                            .text_xs()
+                            .text_color(rgb(THEME.foreground))
+                            .child(confirmation.destination.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("cancel-workspace-disconnect")
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(THEME.muted))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.workspace_disconnect_confirmation = None;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-workspace-disconnect")
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .bg(rgb(THEME.accent))
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_workspace_disconnect(cx)
+                                    }))
+                                    .child("Disconnect"),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_close_dialog(
         &self,
         confirmation: &CloseConfirmation,
@@ -6660,7 +7008,8 @@ impl Render for NahApp {
                 cx.listener(|this, _, _, cx| {
                     let dismissed_tab = this.tab_menu.take().is_some();
                     let dismissed_workspace = this.workspace_menu.take().is_some();
-                    if dismissed_tab || dismissed_workspace {
+                    let dismissed_connection = this.workspace_connection_info.take().is_some();
+                    if dismissed_tab || dismissed_workspace || dismissed_connection {
                         cx.notify();
                     }
                 }),
@@ -6750,6 +7099,9 @@ impl Render for NahApp {
             .when_some(self.workspace_menu, |element, menu| {
                 element.child(self.render_workspace_menu(menu, cx))
             })
+            .when_some(self.workspace_connection_info.as_ref(), |element, info| {
+                element.child(self.render_workspace_connection_info(info, cx))
+            })
             .when_some(self.rename_editor.as_ref(), |element, editor| {
                 element.child(self.render_rename_dialog(editor, cx))
             })
@@ -6763,6 +7115,12 @@ impl Render for NahApp {
                 self.workspace_delete_confirmation.as_ref(),
                 |element, confirmation| {
                     element.child(self.render_workspace_delete_dialog(confirmation, cx))
+                },
+            )
+            .when_some(
+                self.workspace_disconnect_confirmation.as_ref(),
+                |element, confirmation| {
+                    element.child(self.render_workspace_disconnect_dialog(confirmation, cx))
                 },
             )
             .when_some(self.command_palette.as_ref(), |element, palette| {
@@ -8334,6 +8692,26 @@ fn product_name(development_build: bool) -> &'static str {
     }
 }
 
+/// Prefer the copy packaged inside a native macOS bundle. The source-tree path
+/// keeps local non-bundled development builds visually faithful as well.
+fn workstation_banner_path() -> PathBuf {
+    let bundled = std::env::current_exe().ok().and_then(|executable| {
+        executable
+            .parent()
+            .and_then(|macos_directory| macos_directory.parent())
+            .map(|contents_directory| {
+                contents_directory
+                    .join("Resources")
+                    .join("notaharness-banner.png")
+            })
+    });
+    bundled.filter(|path| path.is_file()).unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("notaharness-banner.png")
+    })
+}
+
 /// Sets the live Dock icon explicitly. `AppKit` otherwise retains the generic
 /// placeholder selected while a development bundle is being rebuilt in place.
 #[cfg(target_os = "macos")]
@@ -9042,9 +9420,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(dimensions[0], (Uuid::from_u128(10), 63, 20));
-        assert_eq!(dimensions[1], (Uuid::from_u128(10), 133, 39));
-        assert_eq!(dimensions[2], (Uuid::from_u128(10), 198, 48));
+        assert_eq!(dimensions[0], (Uuid::from_u128(10), 69, 20));
+        assert_eq!(dimensions[1], (Uuid::from_u128(10), 139, 39));
+        assert_eq!(dimensions[2], (Uuid::from_u128(10), 204, 48));
         assert!(
             dimensions
                 .windows(2)
@@ -9054,7 +9432,7 @@ mod tests {
 
     #[test]
     fn sidebar_width_is_bounded_without_forgetting_a_wider_preference() {
-        assert!((constrained_sidebar_width(80.0, 1280.0) - 150.0).abs() < 0.0001);
+        assert!((constrained_sidebar_width(80.0, 1280.0) - MIN_SIDEBAR_WIDTH).abs() < 0.0001);
         assert!((constrained_sidebar_width(900.0, 1280.0) - 420.0).abs() < 0.0001);
 
         let preferred = 390.0;
@@ -9078,6 +9456,16 @@ mod tests {
         assert!((migrated_sidebar_width_for(Some(356.0), true) - 356.0).abs() < f32::EPSILON);
         assert!(
             (migrated_sidebar_width_for(None, false) - DEFAULT_SIDEBAR_WIDTH).abs() < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn workstation_banner_resolves_to_a_local_packaged_resource() {
+        let banner = workstation_banner_path();
+        assert!(banner.is_file(), "banner is missing: {}", banner.display());
+        assert_eq!(
+            banner.file_name().and_then(|name| name.to_str()),
+            Some("notaharness-banner.png")
         );
     }
 
@@ -9188,9 +9576,9 @@ mod tests {
 
         assert_eq!(
             sizes,
-            vec![(first.id, 65, 39), (Uuid::from_u128(22), 65, 39)]
+            vec![(first.id, 68, 39), (Uuid::from_u128(22), 68, 39)]
         );
-        let used_pixel_width = 545.0 + SPLIT_DIVIDER_SIZE + 541.0;
+        let used_pixel_width = 568.0 + SPLIT_DIVIDER_SIZE + 564.0;
         assert!((used_pixel_width - workspace.0).abs() < 0.0001);
     }
 
