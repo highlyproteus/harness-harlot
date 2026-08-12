@@ -1,10 +1,10 @@
-# Rust Mux Vision
+# Not a Harness Vision
 
 ## Goal
 Define a lightweight, reliability-first native local and SSH terminal workspace whose sessions outlive its desktop UI without becoming an agent harness or runtime.
 
 ## Context
-Rust Mux preserves the useful workspace and movable-pane model of cmux while avoiding a UI process that owns every terminal session. Reliability on macOS Spaces and screen changes is the reason for the architecture, not a later optimization.
+Not a Harness preserves the useful workspace and movable-pane model of cmux while avoiding a UI process that owns every terminal session. Reliability on macOS Spaces and screen changes is the reason for the architecture, not a later optimization.
 
 ## Requirements
 - [x] Keep PTYs, child processes, session state, and layouts in a separate Rust service.
@@ -12,7 +12,7 @@ Rust Mux preserves the useful workspace and movable-pane model of cmux while avo
 - [x] Preserve workspaces, sidebar, tabs, split panes, drag-to-rearrange panes, and configured-host SSH workspaces in the product direction.
 - [x] Reuse an established terminal engine rather than implementing VT behavior.
 - [x] Defer browser, mobile, generic remote-control UI, worktree/diff, AI integrations, and optional remote-rmuxd reattachment.
-- [x] Treat terminals and agents as ordinary shell workloads; Rust Mux must stay out of their way rather than own or supervise an agent runtime.
+- [x] Treat terminals and agents as ordinary shell workloads; Not a Harness must stay out of their way rather than own or supervise an agent runtime.
 - [x] Make bounded history, change-only updates, off-UI-thread work, and content-safe performance diagnostics part of the product contract.
 
 ## Technical Notes

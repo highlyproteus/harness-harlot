@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Persistent local session service for Not a Harness"
+
+[[bin]]
+name = "not-a-harness-service"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true

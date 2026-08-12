@@ -1,6 +1,6 @@
-# Contributing to Rust Mux
+# Contributing to Not a Harness
 
-Rust Mux is early-stage. Start by reading the README and the task plan, and discuss changes that alter the service/UI boundary before implementation.
+Not a Harness is early-stage. Start by reading the README and the task plan, and discuss changes that alter the service/UI boundary before implementation.
 
 ## Local checks
 

@@ -69,7 +69,7 @@ impl SnapshotStore {
                     format!("snapshot was invalid ({error:#}) and could not be quarantined")
                 })?;
                 eprintln!(
-                    "quarantined invalid Rust Mux recovery snapshot at {}: {error:#}",
+                    "quarantined invalid Not a Harness recovery snapshot at {}: {error:#}",
                     quarantined.display()
                 );
                 Ok(None)
@@ -209,18 +209,7 @@ impl SnapshotStore {
 }
 
 pub(crate) fn default_snapshot_path() -> Result<PathBuf> {
-    if let Some(directory) = std::env::var_os("RUST_MUX_STATE_DIR") {
-        return Ok(PathBuf::from(directory).join("sessions.json"));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let home = PathBuf::from(home);
-    #[cfg(target_os = "macos")]
-    let directory = home.join("Library/Application Support/Rust Mux");
-    #[cfg(not(target_os = "macos"))]
-    let directory = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/state"))
-        .join("rust-mux");
+    let directory = rust_mux_protocol::state_directory().context("HOME is not set")?;
     Ok(directory.join("sessions.json"))
 }
 
@@ -650,7 +639,7 @@ mod tests {
     use super::*;
 
     fn test_directory(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("rust-mux-{label}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("not-a-harness-{label}-{}", Uuid::new_v4()))
     }
 
     fn cwd_map(snapshot: &SessionSnapshot) -> HashMap<Uuid, PathBuf> {

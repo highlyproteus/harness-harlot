@@ -1,8 +1,8 @@
 # Third-party notices
 
-Rust Mux uses the following official product artwork only as a small secondary identifier beside the full product name. Inclusion does not imply affiliation, sponsorship, or endorsement. Product names, logos, and trademarks remain the property of their respective owners.
+Not a Harness uses the following official product artwork only as a small secondary identifier beside the full product name. Inclusion does not imply affiliation, sponsorship, or endorsement. Product names, logos, and trademarks remain the property of their respective owners.
 
-The files under `crates/desktop/assets/agent-icons/` are embedded into the desktop binary. Rust Mux does not fetch icons at runtime. Hashes below are SHA-256 and allow byte-for-byte provenance checks.
+The files under `crates/desktop/assets/agent-icons/` are embedded into the desktop binary. Not a Harness does not fetch icons at runtime. Hashes below are SHA-256 and allow byte-for-byte provenance checks.
 
 ## Codex CLI
 
@@ -30,7 +30,7 @@ The installed Claude product artwork is reproduced unchanged for referential ide
 - Embedded PNG SHA-256: `4a4c7d641f83920af6844367cecb65fea9bd79620e64af6d2ee626ffbd0a6a44`
 - Product source: [Factory Droid](https://github.com/Factory-AI/factory/tree/1fd9026d72f81668d88f37237cb5a2e89a17e6e2)
 
-The 48x48 PNG resource is extracted byte-for-byte from Factory's official ICO and rendered unchanged beside the full `Droid` label. Rust Mux does not add a backing, frame, crop, recolor, or rewrite the asset. Factory and Droid are trademarks of Factory AI. No Factory endorsement is claimed.
+The 48x48 PNG resource is extracted byte-for-byte from Factory's official ICO and rendered unchanged beside the full `Droid` label. Not a Harness does not add a backing, frame, crop, recolor, or rewrite the asset. Factory and Droid are trademarks of Factory AI. No Factory endorsement is claimed.
 
 ## Hermes Agent
 
@@ -89,4 +89,4 @@ The official Gemini CLI companion artwork is reproduced unchanged from Google's 
 
 ## GitHub Copilot CLI neutral fallback
 
-No GitHub or Copilot artwork is distributed. The official [GitHub Copilot CLI repository](https://github.com/github/copilot-cli/tree/ef627e1baad937d3c8da45f8a5541c6fc3c97b6a) and official npm package `@github/copilot@1.0.79` expose no standalone icon asset. Rust Mux therefore uses its built-in neutral terminal glyph beside the complete `GitHub Copilot CLI` label.
+No GitHub or Copilot artwork is distributed. The official [GitHub Copilot CLI repository](https://github.com/github/copilot-cli/tree/ef627e1baad937d3c8da45f8a5541c6fc3c97b6a) and official npm package `@github/copilot@1.0.79` expose no standalone icon asset. Not a Harness therefore uses its built-in neutral terminal glyph beside the complete `GitHub Copilot CLI` label.

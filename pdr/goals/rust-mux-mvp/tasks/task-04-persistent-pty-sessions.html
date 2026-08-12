@@ -137,7 +137,7 @@
   "goal_file": "../PDR.html",
   "title": "Implement persistent local Unix PTY sessions",
   "description": "Add service-owned shell sessions through a narrow portable-pty abstraction on macOS and Linux. Implement create, input, output, resize, exit, and explicit terminate commands; define shell selection and environment behavior; and keep child and PTY handles exclusively in the service. Record output sequence numbers and a bounded replay window so clients can reconnect. Keep the adapter compatible with a future Windows ConPTY implementation.",
-  "why": "Preserving the same live shell PID and PTY across desktop restarts is the primary behavior that differentiates Rust Mux from snapshot-only restoration.",
+  "why": "Preserving the same live shell PID and PTY across desktop restarts is the primary behavior that differentiates Not a Harness from snapshot-only restoration.",
   "acceptance_criteria": [
     { "text": "macOS tests exercise a Unix PTY shell create, input, output, resize, and exit lifecycle", "met": true },
     { "text": "Linux tests exercise the equivalent Unix PTY lifecycle", "met": false },

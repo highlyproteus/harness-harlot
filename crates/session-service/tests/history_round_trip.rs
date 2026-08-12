@@ -101,5 +101,8 @@ fn pane(layout: &PaneLayout) -> &rust_mux_protocol::Pane {
 }
 
 fn test_directory(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("rust-mux-integration-{label}-{}", Uuid::new_v4()))
+    std::env::temp_dir().join(format!(
+        "not-a-harness-integration-{label}-{}",
+        Uuid::new_v4()
+    ))
 }

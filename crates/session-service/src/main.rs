@@ -27,7 +27,7 @@ async fn prepare_socket(path: &Path) -> Result<()> {
     }
     if UnixStream::connect(path).await.is_ok() {
         bail!(
-            "a Rust Mux session service is already listening at {}",
+            "a Not a Harness session service is already listening at {}",
             path.display()
         );
     }
@@ -48,7 +48,10 @@ async fn main() -> Result<()> {
     let mut persistence_tick = tokio::time::interval(std::time::Duration::from_secs(2));
     persistence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    println!("Rust Mux session service listening at {}", path.display());
+    println!(
+        "Not a Harness session service listening at {}",
+        path.display()
+    );
     loop {
         tokio::select! {
             connection = listener.accept() => {

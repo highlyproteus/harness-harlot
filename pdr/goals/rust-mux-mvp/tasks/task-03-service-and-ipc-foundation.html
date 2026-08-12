@@ -137,7 +137,7 @@
   "goal_file": "../PDR.html",
   "title": "Build the Tokio service and local IPC foundation",
   "description": "Turn the scaffold into an asynchronous Tokio service using a thin length-delimited request/response and event protocol over a per-user Unix-domain socket. Add a versioned capability handshake, frame limits, request IDs, stable entity IDs, monotonic revisions, revision-aware delta events, bounded attention-aware subscriptions, and snapshot/reconnect semantics. Focused and recent panes receive responsive deltas. After about 60 seconds without attention, stop serializing and pushing their live screens while the daemon continues draining and parsing every PTY into bounded history; focus requests one fresh snapshot before rendering and then resumes deltas. Keep transport DTOs separate from service commands so a later opt-in Axum HTTP/WebSocket adapter or remote rmuxd can reuse the command layer.",
-  "why": "UI restart isolation is Rust Mux's defining guarantee. A thin framed protocol directly models ordered terminal events and backpressure without opening a TCP port or assuming a cloud backend.",
+  "why": "UI restart isolation is Not a Harness's defining guarantee. A thin framed protocol directly models ordered terminal events and backpressure without opening a TCP port or assuming a cloud backend.",
   "acceptance_criteria": [
     { "text": "Protocol and state-model crates compile without OS-specific APIs", "met": true },
     { "text": "Service and client handshake/snapshot integration tests pass on macOS and Linux CI", "met": false },

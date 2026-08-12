@@ -4,7 +4,7 @@
 Render interactive terminal panes in the native desktop without duplicating terminal-emulation logic.
 
 ## Context
-Alacritty's engine should own VT parsing and terminal cell state while Rust Mux owns UI composition and transport.
+Alacritty's engine should own VT parsing and terminal cell state while Not a Harness owns UI composition and transport.
 
 ## Requirements
 - [x] Expand the `alacritty_terminal` adapter around parsing, resize, and visible-grid snapshots.

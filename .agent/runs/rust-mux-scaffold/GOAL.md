@@ -1,4 +1,4 @@
-# Rust Mux scaffold and source-informed PDR
+# Not a Harness scaffold and source-informed PDR
 
 Goal ID: `rust-mux-scaffold`
 Started: 2026-08-11T16:56:29Z
@@ -10,7 +10,7 @@ Tasks: `tasks/rust-mux`
 
 ## Objective
 
-Create and validate the Rust Mux open-source scaffold plus a cmux-informed macOS/Linux local-and-SSH MVP plan
+Create and validate the Not a Harness open-source scaffold plus a cmux-informed macOS/Linux local-and-SSH MVP plan
 
 ## Goal Mode Coupling
 

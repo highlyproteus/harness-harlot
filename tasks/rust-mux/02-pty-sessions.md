@@ -17,7 +17,7 @@ This is the core reliability promise: desktop restarts must not terminate or orp
 - [ ] Prove that desktop reconnect and pane movement preserve the OpenSSH PID and remote session identity.
 
 ## Technical Notes
-The service is the only layer allowed to own PTY or child-process handles. OpenSSH, not Rust Mux, owns SSH protocol/authentication. Avoid unbounded per-client output buffering. An idle desktop subscription may suppress or coalesce screen delivery, but it must never pause the underlying PTY reader or lose bounded replay history.
+The service is the only layer allowed to own PTY or child-process handles. OpenSSH, not Not a Harness, owns SSH protocol/authentication. Avoid unbounded per-client output buffering. An idle desktop subscription may suppress or coalesce screen delivery, but it must never pause the underlying PTY reader or lose bounded replay history.
 
 ## Acceptance Criteria
 - [x] Integration tests cover create/input/output/resize/exit.

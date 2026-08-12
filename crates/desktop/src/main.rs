@@ -51,7 +51,7 @@ use typography::TerminalFontProfile;
 use ui_state::UiStateStore;
 
 actions!(
-    rust_mux,
+    not_a_harness,
     [
         NewWorkspace,
         ToggleSidebar,
@@ -789,7 +789,7 @@ impl DragHoverState {
 }
 
 #[derive(Debug)]
-struct RustMux {
+struct NotAHarness {
     focus_handle: FocusHandle,
     terminal_font: TerminalFontProfile,
     keymap: ResolvedKeymap,
@@ -836,7 +836,7 @@ struct RustMux {
     workspace_input_bounds: [Option<Bounds<Pixels>>; 2],
 }
 
-impl RustMux {
+impl NotAHarness {
     fn new(window: &mut Window, keymap: ResolvedKeymap, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
@@ -845,7 +845,7 @@ impl RustMux {
         let ui_state_store = match UiStateStore::from_default_path() {
             Ok(store) => Some(store),
             Err(error) => {
-                eprintln!("Rust Mux UI state unavailable: {error:#}");
+                eprintln!("Not a Harness UI state unavailable: {error:#}");
                 None
             }
         };
@@ -854,7 +854,7 @@ impl RustMux {
             .and_then(|store| match store.load_workspace_sidebar_width() {
                 Ok(width) => width,
                 Err(error) => {
-                    eprintln!("Rust Mux UI state ignored: {error:#}");
+                    eprintln!("Not a Harness UI state ignored: {error:#}");
                     None
                 }
             })
@@ -2882,7 +2882,7 @@ impl RustMux {
         if let Some(store) = &self.ui_state_store
             && let Err(error) = store.save_workspace_sidebar_width(self.preferred_sidebar_width)
         {
-            eprintln!("Rust Mux sidebar width was not persisted: {error:#}");
+            eprintln!("Not a Harness sidebar width was not persisted: {error:#}");
         }
     }
 
@@ -3699,7 +3699,7 @@ impl RustMux {
                 PaneControlIcon::Add,
                 "New terminal tab (⌘T)",
                 cx,
-                RustMux::new_tab_at,
+                NotAHarness::new_tab_at,
             ))
             .child(self.pane_control(
                 active,
@@ -5658,7 +5658,7 @@ impl RustMux {
                         .text_sm()
                         .text_color(rgb(THEME.muted))
                         .child(
-                            "The workspace connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Rust Mux stores no credentials or SSH config contents.",
+                            "The workspace connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Not a Harness stores no credentials or SSH config contents.",
                         ),
                     )
                 })
@@ -5729,7 +5729,7 @@ impl RustMux {
                         .text_sm()
                         .text_color(rgb(THEME.muted))
                         .child(
-                            "This starts the installed OpenSSH client now and saves safe workspace metadata locally for later reconnect. Rust Mux adds no SSH options, stores no credentials, and does not change your config, agent, forwarding, or host-key policy.",
+                            "This starts the installed OpenSSH client now and saves safe workspace metadata locally for later reconnect. Not a Harness adds no SSH options, stores no credentials, and does not change your config, agent, forwarding, or host-key policy.",
                         ),
                 )
                 .when_some(error, |element, message| {
@@ -6462,7 +6462,7 @@ impl RustMux {
     }
 }
 
-impl Render for RustMux {
+impl Render for NotAHarness {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_window_geometry(window);
 
@@ -6475,7 +6475,7 @@ impl Render for RustMux {
 
         div()
             .key_context(if self.command_palette.is_some() {
-                "RustMuxPalette"
+                "NotAHarnessPalette"
             } else {
                 ROOT_KEY_CONTEXT
             })
@@ -6562,14 +6562,14 @@ impl Render for RustMux {
                 cx.stop_propagation();
             }))
             .on_action(
-                cx.listener(|_: &mut RustMux, _: &ConsumeChordPrefix, _, cx| {
+                cx.listener(|_: &mut NotAHarness, _: &ConsumeChordPrefix, _, cx| {
                     cx.stop_propagation();
                 }),
             )
-            .on_action(cx.listener(RustMux::copy_terminal))
-            .on_action(cx.listener(RustMux::paste_terminal))
-            .on_action(cx.listener(RustMux::find_terminal))
-            .on_action(cx.listener(RustMux::find_next_terminal))
+            .on_action(cx.listener(NotAHarness::copy_terminal))
+            .on_action(cx.listener(NotAHarness::paste_terminal))
+            .on_action(cx.listener(NotAHarness::find_terminal))
+            .on_action(cx.listener(NotAHarness::find_next_terminal))
             .child(
                 div()
                     .absolute()
@@ -6628,7 +6628,7 @@ impl Render for RustMux {
     }
 }
 
-impl EntityInputHandler for RustMux {
+impl EntityInputHandler for NotAHarness {
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -6807,7 +6807,7 @@ impl EntityInputHandler for RustMux {
 }
 
 struct WorkspaceTextInputElement {
-    input: Entity<RustMux>,
+    input: Entity<NotAHarness>,
     field: WorkspaceCreationField,
     placeholder: &'static str,
 }
@@ -7014,7 +7014,7 @@ impl Element for WorkspaceTextInputElement {
 }
 
 struct TerminalInputElement {
-    input: Entity<RustMux>,
+    input: Entity<NotAHarness>,
 }
 
 impl IntoElement for TerminalInputElement {
@@ -7087,7 +7087,7 @@ impl Element for TerminalInputElement {
 /// resize capture must continue to receive drag and release events outside the
 /// divider (and even outside the window bounds when the platform delivers them).
 struct SidebarResizeCaptureElement {
-    input: Entity<RustMux>,
+    input: Entity<NotAHarness>,
 }
 
 impl IntoElement for SidebarResizeCaptureElement {
@@ -7162,7 +7162,7 @@ impl Element for SidebarResizeCaptureElement {
 /// One hit surface per terminal row keeps pointer semantics exact without
 /// forcing GPUI/Taffy to lay out an element for every visible grid cell.
 struct TerminalPointerElement {
-    input: Entity<RustMux>,
+    input: Entity<NotAHarness>,
     pane_id: Uuid,
     row: u16,
     columns: u16,
@@ -7630,9 +7630,9 @@ fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
     let asset_detail = if definition.asset.is_some() {
         "Bundled official artwork is shown unchanged for referential identification only; no affiliation or endorsement is implied"
     } else if pane.identity.profile == TerminalProfile::GitHubCopilot {
-        "The official CLI package exposes no standalone icon asset, so Rust Mux uses the neutral terminal glyph"
+        "The official CLI package exposes no standalone icon asset, so Not a Harness uses the neutral terminal glyph"
     } else {
-        "Rust Mux uses the neutral terminal glyph"
+        "Not a Harness uses the neutral terminal glyph"
     };
     TabIdentityPresentation {
         label: pane.title.clone(),
@@ -8113,7 +8113,7 @@ fn main() {
             let keymap = match AppConfig::load().and_then(|config| config.resolve_keymap()) {
                 Ok(keymap) => keymap,
                 Err(error) => {
-                    eprintln!("Rust Mux config ignored: {error}");
+                    eprintln!("Not a Harness config ignored: {error}");
                     AppConfig::default()
                         .resolve_keymap()
                         .expect("built-in keymap must be valid")
@@ -8139,7 +8139,7 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Rust Mux".into()),
+                        title: Some("Not a Harness".into()),
                         appears_transparent: true,
                         traffic_light_position: Some(point(px(13.0), px(13.0))),
                     }),
@@ -8147,9 +8147,9 @@ fn main() {
                     window_min_size: Some(size(px(720.0), px(460.0))),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| RustMux::new(window, keymap.clone(), cx)),
+                |window, cx| cx.new(|cx| NotAHarness::new(window, keymap.clone(), cx)),
             )
-            .expect("open Rust Mux window");
+            .expect("open Not a Harness window");
             cx.activate(true);
         });
 }
@@ -8392,23 +8392,23 @@ mod tests {
 
     #[test]
     fn workspace_dialog_editor_inserts_and_deletes_at_the_visible_caret() {
-        let mut editor = DialogTextEditor::with_text("Rust Mux");
+        let mut editor = DialogTextEditor::with_text("Terminal App");
         editor.move_home(false);
-        for _ in 0..4 {
+        for _ in 0..8 {
             editor.move_right(false);
         }
 
         editor.replace(None, "-", 80, false, false, None);
-        assert_eq!(editor.text, "Rust- Mux");
-        assert_eq!(editor.selected_range, 5..5);
+        assert_eq!(editor.text, "Terminal- App");
+        assert_eq!(editor.selected_range, 9..9);
 
         editor.delete_backward();
-        assert_eq!(editor.text, "Rust Mux");
-        assert_eq!(editor.selected_range, 4..4);
+        assert_eq!(editor.text, "Terminal App");
+        assert_eq!(editor.selected_range, 8..8);
 
         editor.delete_forward();
-        assert_eq!(editor.text, "RustMux");
-        assert_eq!(editor.selected_range, 4..4);
+        assert_eq!(editor.text, "TerminalApp");
+        assert_eq!(editor.selected_range, 8..8);
     }
 
     #[test]

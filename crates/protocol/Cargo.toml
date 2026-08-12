@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Local protocol types for Not a Harness"
 
 [dependencies]
 serde.workspace = true

@@ -2400,7 +2400,9 @@ fn command_with_terminal_env(
     let mut command = CommandBuilder::from_argv(argv.into_iter().collect());
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
-    command.env("RUST_MUX_PANE_ID", pane_id.to_string());
+    let pane_id = pane_id.to_string();
+    command.env(rust_mux_protocol::PANE_ID_ENV, &pane_id);
+    command.env(rust_mux_protocol::LEGACY_PANE_ID_ENV, pane_id);
     if let Some(home) = std::env::var_os("HOME") {
         command.cwd(home);
     }
