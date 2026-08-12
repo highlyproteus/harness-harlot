@@ -403,7 +403,7 @@ impl DesiredState {
             bail!("appearance recent colors exceed {MAX_RECENT_COLORS}");
         }
         if self.workspaces.is_empty() || self.workspaces.len() > MAX_WORKSPACES {
-            bail!("snapshot must contain 1 to {MAX_WORKSPACES} workspaces");
+            bail!("snapshot must contain 1 to {MAX_WORKSPACES} workstations");
         }
         let mut ids = HashSet::new();
         let mut panes = 0;
@@ -417,7 +417,7 @@ impl DesiredState {
                 WorkspaceConnection::Local => {}
             }
             if workspace.tabs.len() > MAX_TABS_PER_WORKSPACE {
-                bail!("workspace must contain at most {MAX_TABS_PER_WORKSPACE} tabs");
+                bail!("workstation must contain at most {MAX_TABS_PER_WORKSPACE} tabs");
             }
             for tab in &workspace.tabs {
                 validate_id(tab.id, &mut ids)?;

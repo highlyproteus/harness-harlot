@@ -90,7 +90,7 @@ impl SessionSnapshot {
             appearance: AppearanceSettings::default(),
             workspaces: vec![Workspace {
                 id: Uuid::new_v4(),
-                title: "Workspace 1".to_owned(),
+                title: "Workstation 1".to_owned(),
                 color: None,
                 pinned: false,
                 pin_order: 0,
@@ -1104,6 +1104,7 @@ mod tests {
     fn seeded_snapshot_has_a_visible_pane() {
         let snapshot = SessionSnapshot::seeded();
         assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].title, "Workstation 1");
         assert_eq!(snapshot.workspaces[0].tabs.len(), 1);
         assert!(matches!(
             snapshot.workspaces[0].tabs[0].layout,
