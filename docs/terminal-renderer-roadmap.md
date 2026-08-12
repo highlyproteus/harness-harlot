@@ -6,9 +6,9 @@ Rust Mux will remain an all-Rust application. The daemon continues to own PTYs a
 
 This is an architecture boundary, not a judgment about Ghostty's quality. Embedding libghostty would add a Zig/C ABI build and lifecycle boundary, couple the GPUI surface to an evolving library API, and split terminal behavior across two engines while the daemon still needs a serializable canonical grid. That change is too large for a typography fix and would weaken the current Rust ownership and restart-isolation model.
 
-## Pre-R1 diagnosis
+## Historical pre-R1 diagnosis
 
-The PTY and terminal model are not the likely source of the visible text problem. The service already parses real output with `alacritty_terminal` and transmits styled visible runs. The weak link is the first-pass GPUI projection:
+At the start of R1, the PTY and terminal model were not the likely source of the visible text problem. The service already parsed real output with `alacritty_terminal` and transmitted styled visible runs. The weak link was the first-pass GPUI projection:
 
 - it hard-codes `SF Mono`, a `13 px` size, `18 px` line height, and a `7.83 px` cell width;
 - it renders each row as ordinary `StyledText`, then positions the cursor with the hard-coded width;
@@ -26,7 +26,7 @@ Terminal rows use explicit no-wrap shaping. This is required because ordinary UI
 
 The responsive follow-up now derives each pane's PTY grid from its live pixel allocation after sidebar width, workspace header, pane header, terminal padding, focus border, split dividers, and the effective local split ratio. GPUI window-bound observation pushes size changes immediately, the daemon applies the exact requested rows and columns without a second hidden clamp, and tab/control chrome shrinks independently of terminal content. Native macOS validation exercised one-pane and two-pane layouts at 720×460, 1280×820, and 1600×900. Shell-reported sizes changed from 20×62 to 39×131 to 43×171 for one pane and from 20×29/30 to 39×64/64 to 43×84/83 for two panes. Fresh directory listings selected natural one-, two-, three-, or four-column layouts for the available grid with complete filenames; real ANSI color, underline, 256-color background, and truecolor remained aligned.
 
-This checkpoint does not claim the rest of R1/R2: user font overrides, Linux runtime screenshots, scale-factor coverage beyond the current Retina run, comprehensive fallback glyph fixtures, selection, scrollback/search, IME, mouse, and clipboard remain open.
+This checkpoint did not claim the rest of R1/R2. Subsequent terminal-interaction work integrated selection, guarded clipboard paste, bounded scrollback and literal search, mouse reporting, and foundational IME handling. User font overrides, Linux runtime screenshots, broader scale-factor coverage, comprehensive fallback-glyph fixtures, grapheme shaping, remaining wide-cell cases, richer search, and accessibility remain open.
 
 ## Crate and subsystem choices
 
@@ -59,14 +59,14 @@ This is the first incremental implementation to authorize. It should visibly imp
 - Force terminal-cell advances where required and test wide characters, combining marks, emoji, fallback fonts, box drawing, powerline glyphs, bold/italic synthesis, and resize reflow.
 - Benchmark sustained output and atlas churn across many panes before enabling optional ligatures.
 
-### Phase R3: interaction fidelity
+### Phase R3: interaction fidelity (foundational slice integrated)
 
 - Add block, beam, and underline cursors with blink and unfocused states.
 - Add drag selection, word/line selection, copy, paste guards, and a visible selection palette.
 - Map mouse coordinates through measured cell metrics and implement terminal mouse reporting without breaking selection modifiers.
 - Implement IME composition through GPUI input handling, with pre-edit text positioned at the active cell.
 
-### Phase R4: history and navigation
+### Phase R4: history and navigation (bounded slice integrated)
 
 - Bounded Alacritty scrollback, wheel/trackpad scrolling, and literal search are integrated without copying an unbounded client buffer.
 - The daemon now records future PTY output into optional owner-only atomic/checksummed chunks through a bounded non-blocking queue. Reaching the top of live scrollback or missing a live search lazily loads one clearly labeled local-history page; the UI never retains a full archived session.

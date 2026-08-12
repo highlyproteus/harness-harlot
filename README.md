@@ -121,7 +121,7 @@ See [the project plan](index.html) and [`tasks/rust-mux`](tasks/rust-mux) for ph
 ## Roadmap
 
 1. Harden terminal interaction beyond the current selection, clipboard, bounded scrollback, literal-search, mouse-reporting, and foundational IME checkpoint: grapheme shaping, wide-cell edge cases, richer search, and accessibility.
-2. Continue hardening protocol-v9 revision-aware pane delivery with request IDs, longer slow-client/high-output soaks, and macOS/Linux release-profile measurements for update volume, focus-resume latency, UI-thread time, CPU, and memory.
+2. Continue hardening protocol-v11 revision-aware pane delivery with request IDs, longer slow-client/high-output soaks, and macOS/Linux release-profile measurements for update volume, focus-resume latency, UI-thread time, CPU, and memory.
 3. Harden the current CWD inheritance, exit/close semantics, and atomic desired-state recovery with crash fault injection and longer lifecycle soak.
 4. Add conservative, side-effect-free configured-host suggestions and harden SSH child-exit presentation without changing the system-OpenSSH authority boundary.
 5. Validate GPUI on real Linux Wayland/X11 GPU sessions and retain Iced/wgpu as the portability fallback.
