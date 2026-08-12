@@ -24,12 +24,13 @@ The installed Claude product artwork is reproduced unchanged for referential ide
 
 ## Droid
 
-- File: `droid.svg`
-- Official source: [`docs/logo/dark.svg`](https://github.com/Factory-AI/factory/blob/1fd9026d72f81668d88f37237cb5a2e89a17e6e2/docs/logo/dark.svg) in Factory's official Droid repository
-- SHA-256: `6da8498b22f6fc9d824ef8ba26f7352b292f8a20e75fcfeb5f6e09c2d821b16c`
+- File: `droid.png`
+- Official source: 48x48 PNG resource embedded in [Factory's live product favicon](https://factory.ai/favicon.ico)
+- Official source ICO SHA-256: `599c2730e6eca221b287c3b5d30e7f81bdc0c6800e39dabfff84e2b2ed15f652`
+- Embedded PNG SHA-256: `4a4c7d641f83920af6844367cecb65fea9bd79620e64af6d2ee626ffbd0a6a44`
 - Product source: [Factory Droid](https://github.com/Factory-AI/factory/tree/1fd9026d72f81668d88f37237cb5a2e89a17e6e2)
 
-Factory's transparent dark-background wordmark is embedded byte-for-byte. Rust Mux clips its leading official star mark at render time beside the full `Droid` label; the asset is not recolored or rewritten. Factory and Droid are trademarks of Factory AI. No Factory endorsement is claimed.
+The 48x48 PNG resource is extracted byte-for-byte from Factory's official ICO and rendered unchanged beside the full `Droid` label. Rust Mux does not add a backing, frame, crop, recolor, or rewrite the asset. Factory and Droid are trademarks of Factory AI. No Factory endorsement is claimed.
 
 ## Hermes Agent
 
