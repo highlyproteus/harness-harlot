@@ -10,10 +10,20 @@ pub enum AgentIconFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentIconPresentation {
+    Contain,
+    CropLeadingMark {
+        rendered_width_at_20px: u16,
+        crop_width_at_20px: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentIconAsset {
     pub path: &'static str,
     pub format: AgentIconFormat,
     pub sha256: &'static str,
+    pub presentation: AgentIconPresentation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +39,7 @@ const fn svg(path: &'static str, sha256: &'static str) -> AgentIconAsset {
         path,
         format: AgentIconFormat::Svg,
         sha256,
+        presentation: AgentIconPresentation::Contain,
     }
 }
 
@@ -37,6 +48,24 @@ const fn png(path: &'static str, sha256: &'static str) -> AgentIconAsset {
         path,
         format: AgentIconFormat::Png,
         sha256,
+        presentation: AgentIconPresentation::Contain,
+    }
+}
+
+const fn cropped_svg(
+    path: &'static str,
+    sha256: &'static str,
+    rendered_width_at_20px: u16,
+    crop_width_at_20px: u16,
+) -> AgentIconAsset {
+    AgentIconAsset {
+        path,
+        format: AgentIconFormat::Svg,
+        sha256,
+        presentation: AgentIconPresentation::CropLeadingMark {
+            rendered_width_at_20px,
+            crop_width_at_20px,
+        },
     }
 }
 
@@ -79,9 +108,11 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 11] = [
     AgentIconDefinition {
         profile: TerminalProfile::Droid,
         accessible_name: "Droid",
-        asset: Some(svg(
+        asset: Some(cropped_svg(
             "agent-icons/droid.svg",
-            "4a6e2ad6af6635472cbf4a4e5e25046b2453793bf2be8a9b9f29c3cb88adc0cf",
+            "6da8498b22f6fc9d824ef8ba26f7352b292f8a20e75fcfeb5f6e09c2d821b16c",
+            71,
+            18,
         )),
         notice_key: "factory-droid",
     },
@@ -254,5 +285,30 @@ mod tests {
             agent_icon_definition(TerminalProfile::GitHubCopilot).asset,
             None
         );
+    }
+
+    #[test]
+    fn droid_uses_the_transparent_official_wordmark_leading_icon_crop() {
+        let asset = agent_icon_definition(TerminalProfile::Droid)
+            .asset
+            .expect("Droid official asset");
+        assert_eq!(asset.format, AgentIconFormat::Svg);
+        assert_eq!(
+            asset.presentation,
+            AgentIconPresentation::CropLeadingMark {
+                rendered_width_at_20px: 71,
+                crop_width_at_20px: 18,
+            }
+        );
+        let bytes = AgentIconAssets
+            .load(asset.path)
+            .expect("embedded asset lookup")
+            .expect("Droid asset bytes");
+        let svg = std::str::from_utf8(bytes.as_ref()).expect("Droid SVG text");
+        assert!(
+            !svg.contains("<rect"),
+            "Droid asset must remain transparent"
+        );
+        assert!(svg.contains("fill=\"white\""));
     }
 }

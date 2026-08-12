@@ -41,7 +41,7 @@ mod theme;
 mod typography;
 mod ui_state;
 
-use agent_icons::{AgentIconAssets, AgentIconFormat, agent_icon_definition};
+use agent_icons::{AgentIconAssets, AgentIconFormat, AgentIconPresentation, agent_icon_definition};
 use commands::{
     AppCommand, AppConfig, ROOT_KEY_CONTEXT, ResolvedBinding, ResolvedKeymap, descriptor,
     palette_matches,
@@ -7194,12 +7194,52 @@ fn render_terminal_profile_icon(
 ) -> AnyElement {
     let definition = agent_icon_definition(profile);
     let icon = match definition.asset {
-        Some(asset) if asset.format == AgentIconFormat::Svg => svg()
-            .path(asset.path)
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(rgb(fallback_color))
-            .into_any_element(),
+        Some(asset)
+            if asset.format == AgentIconFormat::Svg
+                && matches!(asset.presentation, AgentIconPresentation::Contain) =>
+        {
+            svg()
+                .path(asset.path)
+                .w(px(icon_size))
+                .h(px(icon_size))
+                .text_color(rgb(fallback_color))
+                .into_any_element()
+        }
+        Some(asset) if asset.format == AgentIconFormat::Svg => {
+            let AgentIconPresentation::CropLeadingMark {
+                rendered_width_at_20px,
+                crop_width_at_20px,
+            } = asset.presentation
+            else {
+                unreachable!("non-contained SVG must define its crop")
+            };
+            let scale = icon_size / OFFICIAL_IDENTITY_ICON_SIZE;
+            let rendered_width = f32::from(rendered_width_at_20px) * scale;
+            let crop_width = f32::from(crop_width_at_20px) * scale;
+            div()
+                .w(px(icon_size))
+                .h(px(icon_size))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .relative()
+                        .w(px(crop_width))
+                        .h(px(icon_size))
+                        .overflow_hidden()
+                        .child(
+                            svg()
+                                .path(asset.path)
+                                .absolute()
+                                .left(px(0.0))
+                                .top(px(0.0))
+                                .w(px(rendered_width))
+                                .h(px(icon_size)),
+                        ),
+                )
+                .into_any_element()
+        }
         Some(asset) => img(asset.path)
             .w(px(icon_size))
             .h(px(icon_size))
