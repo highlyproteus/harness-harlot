@@ -78,6 +78,9 @@ actions!(
 const DEFAULT_SIDEBAR_WIDTH: f32 = 190.0;
 const MIN_SIDEBAR_WIDTH: f32 = 150.0;
 const MAX_SIDEBAR_WIDTH: f32 = 420.0;
+const DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH: f32 = 104.0;
+const DEVELOPMENT_MIN_SIDEBAR_WIDTH: f32 = 96.0;
+const DEVELOPMENT_MAX_SIDEBAR_WIDTH: f32 = 300.0;
 const MIN_TERMINAL_AREA_WIDTH: f32 = 320.0;
 const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 12.0;
 const TITLEBAR_HEIGHT: f32 = 38.0;
@@ -904,16 +907,24 @@ impl NahApp {
                 None
             }
         };
-        let preferred_sidebar_width = ui_state_store
-            .as_ref()
-            .and_then(|store| match store.load_workspace_sidebar_width() {
-                Ok(width) => width,
-                Err(error) => {
-                    eprintln!("Not a Harness UI state ignored: {error:#}");
-                    None
-                }
-            })
-            .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
+        let stored_sidebar_width =
+            ui_state_store
+                .as_ref()
+                .and_then(|store| match store.load_workspace_sidebar_width() {
+                    Ok(width) => width,
+                    Err(error) => {
+                        eprintln!("Not a Harness UI state ignored: {error:#}");
+                        None
+                    }
+                });
+        let preferred_sidebar_width = migrated_sidebar_width(stored_sidebar_width);
+        if development_build()
+            && stored_sidebar_width != Some(preferred_sidebar_width)
+            && let Some(store) = &ui_state_store
+            && let Err(error) = store.save_workspace_sidebar_width(preferred_sidebar_width)
+        {
+            eprintln!("Not a Harness sidebar default migration was not persisted: {error:#}");
+        }
         let mut app = Self {
             focus_handle,
             terminal_font,
@@ -934,7 +945,7 @@ impl NahApp {
             ui_state_store,
             preferred_sidebar_width,
             sidebar_visible: true,
-            sidebar_pixels: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_pixels: default_sidebar_width(),
             last_sizes: HashMap::new(),
             workspace_pixels: (0.0, 0.0),
             connection_error: None,
@@ -3018,6 +3029,7 @@ impl NahApp {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let compact_sidebar = self.sidebar_pixels <= 128.0;
         let mut workspaces = self
             .snapshot
             .as_ref()
@@ -3052,66 +3064,70 @@ impl NahApp {
                 div()
                     .h(px(TITLEBAR_HEIGHT))
                     .flex_none()
-                    .pl(px(79.0))
+                    .pl(px(if compact_sidebar { 8.0 } else { 79.0 }))
                     .pr(px(8.0))
                     .flex()
                     .items_center()
-                    .gap(px(10.0))
+                    .gap(px(if compact_sidebar { 6.0 } else { 10.0 }))
                     .text_sm()
                     .text_color(rgb(THEME.muted))
-                    .child(
-                        div()
-                            .id("hide-workspace-sidebar")
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|element| {
-                                element
-                                    .bg(rgb(THEME.elevated))
-                                    .text_color(rgb(THEME.foreground))
-                            })
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "Hide workstation sidebar (⌘B)".to_owned(),
+                    .when(!compact_sidebar, |element| {
+                        element.child(
+                            div()
+                                .id("hide-workspace-sidebar")
+                                .w(px(20.0))
+                                .h(px(20.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .hover(|element| {
+                                    element
+                                        .bg(rgb(THEME.elevated))
+                                        .text_color(rgb(THEME.foreground))
                                 })
-                                .into()
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-                            .child(render_sidebar_toggle_icon(true)),
-                    )
-                    .child(
-                        div()
-                            .id("appearance-settings")
-                            .relative()
-                            .cursor_pointer()
-                            .hover(|element| element.text_color(rgb(THEME.foreground)))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "Settings".to_owned(),
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| TooltipView {
+                                        text: "Hide workstation sidebar (⌘B)".to_owned(),
+                                    })
+                                    .into()
                                 })
-                                .into()
-                            })
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.open_appearance_settings(cx)),
-                            )
-                            .child("⚙")
-                            .when(history_needs_attention, |element| {
-                                element.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(-2.0))
-                                        .right(px(-4.0))
-                                        .w(px(5.0))
-                                        .h(px(5.0))
-                                        .rounded_full()
-                                        .bg(rgb(THEME.danger)),
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+                                .child(render_sidebar_toggle_icon(true)),
+                        )
+                    })
+                    .when(!compact_sidebar, |element| {
+                        element.child(
+                            div()
+                                .id("appearance-settings")
+                                .relative()
+                                .cursor_pointer()
+                                .hover(|element| element.text_color(rgb(THEME.foreground)))
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| TooltipView {
+                                        text: "Settings".to_owned(),
+                                    })
+                                    .into()
+                                })
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.open_appearance_settings(cx)),
                                 )
-                            }),
-                    )
+                                .child("⚙")
+                                .when(history_needs_attention, |element| {
+                                    element.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(-2.0))
+                                            .right(px(-4.0))
+                                            .w(px(5.0))
+                                            .h(px(5.0))
+                                            .rounded_full()
+                                            .bg(rgb(THEME.danger)),
+                                    )
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .id("new-workspace")
@@ -3123,7 +3139,7 @@ impl NahApp {
             )
             .child(
                 div()
-                    .px(px(10.0))
+                    .px(px(if compact_sidebar { 6.0 } else { 10.0 }))
                     .pt(px(10.0))
                     .pb(px(6.0))
                     .flex()
@@ -3131,10 +3147,16 @@ impl NahApp {
                     .gap(px(2.0))
                     .child(
                         div()
+                            .w_full()
+                            .truncate()
                             .text_sm()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(THEME.foreground))
-                            .child("Workstations"),
+                            .child(if compact_sidebar {
+                                "Stations"
+                            } else {
+                                "Workstations"
+                            }),
                     ),
             )
             .children(
@@ -3159,6 +3181,7 @@ impl NahApp {
                             }
                         );
                         let workspace_title = workspace.title.clone();
+                        let workspace_title_tooltip = workspace_title.clone();
                         let terminal_tabs = workspace_terminal_tabs(&workspace)
                             .into_iter()
                             .cloned()
@@ -3191,7 +3214,7 @@ impl NahApp {
                         };
                         div()
                             .id(("workspace-section", element_key(workspace.id)))
-                            .mx(px(7.0))
+                            .mx(px(if compact_sidebar { 4.0 } else { 7.0 }))
                             .mb(px(3.0))
                             .flex()
                             .flex_col()
@@ -3200,10 +3223,16 @@ impl NahApp {
                                 div()
                                     .id(("workspace", element_key(workspace.id)))
                                     .h(px(31.0))
-                                    .px(px(8.0))
+                                    .px(px(if compact_sidebar { 5.0 } else { 8.0 }))
                                     .rounded(px(6.0))
                                     .when(!offline || terminal_count == 0, |element| {
                                         element.cursor_pointer()
+                                    })
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: workspace_title_tooltip.clone(),
+                                        })
+                                        .into()
                                     })
                                     .when(offline, |element| element.bg(rgb(card_color)))
                                     .when(active || connected, |element| {
@@ -3278,7 +3307,9 @@ impl NahApp {
                                     )
                                     .child(
                                         div()
+                                            .min_w(px(0.0))
                                             .flex_1()
+                                            .truncate()
                                             .text_sm()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .text_color(if active || connected || offline {
@@ -3471,9 +3502,9 @@ impl NahApp {
             .child(
                 div()
                     .id("new-workspace-bottom")
-                    .mx(px(9.0))
+                    .mx(px(if compact_sidebar { 5.0 } else { 9.0 }))
                     .mb(px(8.0))
-                    .px(px(10.0))
+                    .px(px(if compact_sidebar { 5.0 } else { 10.0 }))
                     .py(px(8.0))
                     .rounded(px(6.0))
                     .cursor_pointer()
@@ -3488,16 +3519,24 @@ impl NahApp {
                     .items_center()
                     .justify_center()
                     .on_click(cx.listener(|this, _, _, cx| this.new_workspace(cx)))
-                    .child("＋ New Workstation"),
+                    .child(if compact_sidebar {
+                        "＋ New"
+                    } else {
+                        "＋ New Workstation"
+                    }),
             )
             .child(
                 div()
-                    .px(px(11.0))
+                    .px(px(if compact_sidebar { 6.0 } else { 11.0 }))
                     .pb(px(9.0))
                     .font_family("SF Mono")
                     .text_xs()
                     .text_color(rgb(THEME.dim))
-                    .child("⌘N new workstation"),
+                    .child(if compact_sidebar {
+                        "⌘N"
+                    } else {
+                        "⌘N new workstation"
+                    }),
             )
             .into_any_element()
     }
@@ -7970,15 +8009,56 @@ fn apply_layout_control_mutation(
     }
 }
 
+fn default_sidebar_width() -> f32 {
+    default_sidebar_width_for(development_build())
+}
+
+const fn default_sidebar_width_for(development: bool) -> f32 {
+    if development {
+        DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH
+    } else {
+        DEFAULT_SIDEBAR_WIDTH
+    }
+}
+
+fn sidebar_width_bounds() -> (f32, f32) {
+    sidebar_width_bounds_for(development_build())
+}
+
+const fn sidebar_width_bounds_for(development: bool) -> (f32, f32) {
+    if development {
+        (DEVELOPMENT_MIN_SIDEBAR_WIDTH, DEVELOPMENT_MAX_SIDEBAR_WIDTH)
+    } else {
+        (MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+    }
+}
+
+/// A persisted 190 px Dev width was the old untouched default. Migrate only
+/// that exact value so a user-selected narrow or wide rail remains theirs.
+fn migrated_sidebar_width(stored_width: Option<f32>) -> f32 {
+    migrated_sidebar_width_for(stored_width, development_build())
+}
+
+fn migrated_sidebar_width_for(stored_width: Option<f32>, development: bool) -> f32 {
+    if development
+        && stored_width.is_some_and(|width| (width - DEFAULT_SIDEBAR_WIDTH).abs() < f32::EPSILON)
+    {
+        DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH
+    } else {
+        stored_width.unwrap_or_else(|| default_sidebar_width_for(development))
+    }
+}
+
 fn constrained_sidebar_width(preferred_width: f32, window_width: f32) -> f32 {
     let preferred_width = if preferred_width.is_finite() {
         preferred_width
     } else {
-        DEFAULT_SIDEBAR_WIDTH
+        default_sidebar_width()
     };
-    let maximum_for_window =
-        (window_width - MIN_TERMINAL_AREA_WIDTH).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-    preferred_width.clamp(MIN_SIDEBAR_WIDTH, maximum_for_window)
+    let (minimum_sidebar_width, maximum_sidebar_width) = sidebar_width_bounds();
+    let maximum_for_window = (window_width - MIN_TERMINAL_AREA_WIDTH)
+        .clamp(minimum_sidebar_width, maximum_sidebar_width);
+    preferred_width.clamp(minimum_sidebar_width, maximum_for_window)
 }
 
 fn sidebar_width_for_visibility(preferred_width: f32, window_width: f32, visible: bool) -> f32 {
@@ -9023,6 +9103,31 @@ mod tests {
         assert!((compact - 320.0).abs() < 0.0001);
         assert!((workspace_pixel_size(640.0, 460.0, compact).0 - 320.0).abs() < 0.0001);
         assert!((constrained_sidebar_width(preferred, 1280.0) - preferred).abs() < 0.0001);
+    }
+
+    #[test]
+    fn development_sidebar_halves_the_untouched_legacy_default_only() {
+        assert!((default_sidebar_width_for(true) - 104.0).abs() < f32::EPSILON);
+        let (minimum, maximum) = sidebar_width_bounds_for(true);
+        assert!((minimum - 96.0).abs() < f32::EPSILON);
+        assert!((maximum - 300.0).abs() < f32::EPSILON);
+        assert!(
+            (migrated_sidebar_width_for(Some(DEFAULT_SIDEBAR_WIDTH), true)
+                - DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!((migrated_sidebar_width_for(Some(264.0), true) - 264.0).abs() < f32::EPSILON);
+        assert!(
+            (migrated_sidebar_width_for(None, true) - DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (migrated_sidebar_width_for(Some(DEFAULT_SIDEBAR_WIDTH), false)
+                - DEFAULT_SIDEBAR_WIDTH)
+                .abs()
+                < f32::EPSILON
+        );
     }
 
     #[test]
