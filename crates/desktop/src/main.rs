@@ -8143,11 +8143,22 @@ fn ensure_bundled_session_service() {
     eprintln!("Not a Harness session service did not become ready within one second");
 }
 
+/// Sets the live Dock icon explicitly. `AppKit` otherwise retains the generic
+/// placeholder selected while a development bundle is being rebuilt in place.
+#[cfg(target_os = "macos")]
+fn install_macos_dock_icon() {
+    nah_macos_icon::install_dock_icon();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_macos_dock_icon() {}
+
 fn main() {
     ensure_bundled_session_service();
     Application::new()
         .with_assets(AgentIconAssets)
         .run(|cx: &mut App| {
+            install_macos_dock_icon();
             let keymap = match AppConfig::load().and_then(|config| config.resolve_keymap()) {
                 Ok(keymap) => keymap,
                 Err(error) => {

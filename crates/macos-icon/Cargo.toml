@@ -1,0 +1,12 @@
+[package]
+name = "nah-macos-icon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal macOS Dock icon bridge for Not a Harness"
+
+[dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSString"] }
