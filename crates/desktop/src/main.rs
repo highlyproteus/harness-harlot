@@ -1747,6 +1747,7 @@ impl NahApp {
                 pane_id,
             }) => {
                 self.active_workspace = Some(workspace_id);
+                self.expanded_workspaces.insert(workspace_id);
                 self.focus_pane_with_snapshot(pane_id);
                 self.workspace_creation = None;
                 self.refresh_state();
@@ -8442,15 +8443,18 @@ mod tests {
     }
 
     #[test]
-    fn workstation_rows_start_collapsed_while_the_header_keeps_its_terminal_count() {
+    fn workstation_rows_start_collapsed_but_can_expand_after_creation() {
         let workstation = SessionSnapshot::seeded().workspaces.remove(0);
-        let expanded_workstations: HashSet<Uuid> = HashSet::new();
+        let mut expanded_workstations: HashSet<Uuid> = HashSet::new();
 
         assert!(!expanded_workstations.contains(&workstation.id));
         assert_eq!(
             terminal_tab_count_label(workspace_terminal_tabs(&workstation).len()),
             "1 terminal"
         );
+
+        assert!(expanded_workstations.insert(workstation.id));
+        assert!(expanded_workstations.contains(&workstation.id));
     }
 
     #[test]
