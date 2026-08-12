@@ -1,5 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use alacritty_terminal::Term;
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -14,6 +16,32 @@ use rust_mux_protocol::{
 };
 
 pub const SCROLLBACK_HISTORY_LIMIT: usize = 2_000;
+const MAX_SAFE_TITLE_CHARS: usize = 80;
+
+#[derive(Clone, Debug, Default)]
+struct TitleListener {
+    title: Arc<Mutex<Option<String>>>,
+}
+
+impl EventListener for TitleListener {
+    fn send_event(&self, event: Event) {
+        let next = match event {
+            Event::Title(title)
+                if title.chars().count() <= MAX_SAFE_TITLE_CHARS
+                    && !title.chars().any(char::is_control) =>
+            {
+                Some(Some(title))
+            }
+            Event::Title(_) | Event::ResetTitle => Some(None),
+            _ => None,
+        };
+        if let Some(next) = next
+            && let Ok(mut title) = self.title.lock()
+        {
+            *title = next;
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct TerminalSize {
@@ -38,7 +66,8 @@ impl Dimensions for TerminalSize {
 /// Owns terminal parsing and screen state without tying it to a UI toolkit.
 pub struct TerminalModel {
     parser: ansi::Processor,
-    terminal: Term<VoidListener>,
+    terminal: Term<TitleListener>,
+    title: Arc<Mutex<Option<String>>>,
     last_search: Option<(String, Point, Point)>,
 }
 
@@ -66,6 +95,8 @@ impl TerminalModel {
             columns,
             screen_lines,
         };
+        let listener = TitleListener::default();
+        let title = Arc::clone(&listener.title);
         Self {
             parser: ansi::Processor::new(),
             terminal: Term::new(
@@ -75,8 +106,9 @@ impl TerminalModel {
                     ..Config::default()
                 },
                 &size,
-                VoidListener,
+                listener,
             ),
+            title,
             last_search: None,
         }
     }
@@ -104,8 +136,15 @@ impl TerminalModel {
         (self.terminal.columns(), self.terminal.screen_lines())
     }
 
-    pub fn terminal(&self) -> &Term<VoidListener> {
+    #[cfg(test)]
+    fn terminal(&self) -> &Term<TitleListener> {
         &self.terminal
+    }
+
+    /// Returns the latest bounded OSC window-title signal. The title is never
+    /// derived from grid text and callers must treat it as ephemeral metadata.
+    pub fn terminal_title(&self) -> Option<String> {
+        self.title.lock().ok().and_then(|title| title.clone())
     }
 
     /// Returns a plain-text view of the visible screen for toolkit spikes and
@@ -503,6 +542,18 @@ mod tests {
         let mut model = TerminalModel::new(12, 3);
         model.resize(80, 24);
         assert_eq!(model.dimensions(), (80, 24));
+    }
+
+    #[test]
+    fn captures_only_bounded_osc_title_metadata_without_reading_grid_text() {
+        let mut model = TerminalModel::new(20, 3);
+        model.process_output(b"conversation text\r\n\x1b]0;Claude Code\x07");
+
+        assert_eq!(model.terminal_title().as_deref(), Some("Claude Code"));
+
+        let oversized = format!("\x1b]0;{}\x07", "x".repeat(MAX_SAFE_TITLE_CHARS + 1));
+        model.process_output(oversized.as_bytes());
+        assert_eq!(model.terminal_title(), None);
     }
 
     #[test]

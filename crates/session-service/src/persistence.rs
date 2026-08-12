@@ -8,12 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use rust_mux_protocol::{
     AppearanceColor, AppearanceSettings, Pane, PaneLayout, SessionSnapshot, SplitAxis, Tab,
-    Workspace,
+    TerminalIdentity, TerminalProfile, Workspace,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 1;
+const SCHEMA_VERSION: u16 = 2;
+const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 const MAX_WORKSPACES: usize = 16;
 const MAX_TABS_PER_WORKSPACE: usize = 32;
@@ -284,9 +285,15 @@ enum DesiredLayout {
 #[serde(deny_unknown_fields)]
 struct DesiredPane {
     id: Uuid,
+    /// Compatibility fallback for schema-v1 readers. Live detected identity is
+    /// deliberately projected to "Terminal" instead of being persisted here.
     title: String,
     #[serde(default)]
     color: Option<AppearanceColor>,
+    #[serde(default)]
+    custom_title: Option<String>,
+    #[serde(default)]
+    profile_override: Option<TerminalProfile>,
     local_cwd: PathBuf,
 }
 
@@ -356,9 +363,9 @@ impl DesiredState {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !(MIN_SUPPORTED_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&self.schema_version) {
             bail!(
-                "unsupported recovery schema {}, expected {SCHEMA_VERSION}",
+                "unsupported recovery schema {}, expected {MIN_SUPPORTED_SCHEMA_VERSION} to {SCHEMA_VERSION}",
                 self.schema_version
             );
         }
@@ -485,8 +492,13 @@ impl DesiredPane {
     fn from_runtime(pane: &Pane, cwd_by_pane: &HashMap<Uuid, PathBuf>) -> Result<Self> {
         Ok(Self {
             id: pane.id,
-            title: pane.title.clone(),
+            title: pane
+                .custom_title
+                .clone()
+                .unwrap_or_else(|| "Terminal".to_owned()),
             color: pane.color,
+            custom_title: pane.custom_title.clone(),
+            profile_override: pane.profile_override,
             local_cwd: cwd_by_pane
                 .get(&pane.id)
                 .cloned()
@@ -496,17 +508,33 @@ impl DesiredPane {
 
     fn into_runtime(self, cwd_by_pane: &mut HashMap<Uuid, PathBuf>) -> Pane {
         cwd_by_pane.insert(self.id, self.local_cwd);
+        let custom_title = self
+            .custom_title
+            .or_else(|| legacy_custom_title(&self.title));
+        let title = custom_title
+            .clone()
+            .or_else(|| {
+                self.profile_override
+                    .map(|profile| profile.display_name().to_owned())
+            })
+            .unwrap_or_else(|| "Terminal".to_owned());
         Pane {
             id: self.id,
-            title: self.title,
+            title,
             shell: String::new(),
             color: self.color,
+            identity: TerminalIdentity::default(),
+            custom_title,
+            profile_override: self.profile_override,
         }
     }
 
     fn validate(&self, ids: &mut HashSet<Uuid>, pane_count: &mut usize) -> Result<()> {
         validate_id(self.id, ids)?;
         validate_title(&self.title, "pane")?;
+        if let Some(custom_title) = &self.custom_title {
+            validate_title(custom_title, "custom terminal")?;
+        }
         if !self.local_cwd.is_absolute() {
             bail!("local CWD must be absolute");
         }
@@ -519,6 +547,14 @@ impl DesiredPane {
         }
         Ok(())
     }
+}
+
+fn legacy_custom_title(title: &str) -> Option<String> {
+    let generated = title == "Terminal"
+        || title.strip_prefix("Terminal ").is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    (!generated).then(|| title.to_owned())
 }
 
 fn validate_id(id: Uuid, ids: &mut HashSet<Uuid>) -> Result<()> {
@@ -567,6 +603,8 @@ mod tests {
         assert!(text.contains("local_cwd"));
         for forbidden in [
             "terminal_output",
+            "identity",
+            "identity_source",
             "environment",
             "process_id",
             "socket",
@@ -626,6 +664,13 @@ mod tests {
             panic!("expected leaf");
         };
         pane.color = Some(AppearanceColor::new(0x67, 0xc8, 0xc6));
+        pane.title = "Live-detected Claude".to_owned();
+        pane.identity = rust_mux_protocol::TerminalIdentity {
+            profile: TerminalProfile::Claude,
+            source: rust_mux_protocol::TerminalIdentitySource::Command,
+        };
+        pane.custom_title = Some("Release shell".to_owned());
+        pane.profile_override = Some(TerminalProfile::Hermes);
 
         store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
         let recovered = store.load().unwrap().snapshot;
@@ -642,6 +687,16 @@ mod tests {
             recovered_pane.color,
             Some(AppearanceColor::new(0x67, 0xc8, 0xc6))
         );
+        assert_eq!(recovered_pane.title, "Release shell");
+        assert_eq!(
+            recovered_pane.custom_title.as_deref(),
+            Some("Release shell")
+        );
+        assert_eq!(
+            recovered_pane.profile_override,
+            Some(TerminalProfile::Hermes)
+        );
+        assert_eq!(recovered_pane.identity, TerminalIdentity::default());
 
         let old: DesiredState = serde_json::from_str(
             r#"{
@@ -668,8 +723,48 @@ mod tests {
         .unwrap();
         assert_eq!(old.appearance, AppearanceSettings::default());
         assert_eq!(old.workspaces[0].color, None);
+        let old_runtime = old.into_runtime().snapshot;
+        let PaneLayout::Leaf { pane: old_pane } = &old_runtime.workspaces[0].tabs[0].layout else {
+            panic!("expected old leaf");
+        };
+        assert_eq!(old_pane.custom_title, None);
+        assert_eq!(old_pane.profile_override, None);
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schema_v1_custom_names_migrate_to_explicit_overrides() {
+        let desired: DesiredState = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "revision": 4,
+                "workspaces": [{
+                    "id": "00000000-0000-0000-0000-000000000021",
+                    "title": "Workspace",
+                    "tabs": [{
+                        "id": "00000000-0000-0000-0000-000000000022",
+                        "title": "Terminals",
+                        "layout": {
+                            "kind": "leaf",
+                            "pane": {
+                                "id": "00000000-0000-0000-0000-000000000023",
+                                "title": "Deploy console",
+                                "local_cwd": "/tmp"
+                            }
+                        }
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let runtime = desired.into_runtime().snapshot;
+        let PaneLayout::Leaf { pane } = &runtime.workspaces[0].tabs[0].layout else {
+            panic!("expected leaf");
+        };
+        assert_eq!(pane.custom_title.as_deref(), Some("Deploy console"));
+        assert_eq!(pane.title, "Deploy console");
     }
 
     #[test]

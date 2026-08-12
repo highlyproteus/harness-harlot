@@ -2,7 +2,7 @@
 
 Rust Mux is a lightweight native terminal workspace for local and SSH work on macOS and Linux. It is not an agent harness or runtime: terminals and agents run as ordinary shell workloads while Rust Mux stays out of the way and avoids competing for their CPU or memory. It takes behavior-level inspiration from cmux's workspace, sidebar, tab, split-pane, and freely rearrangeable pane experience while deliberately separating session lifetime from desktop UI lifetime.
 
-The repository now contains runnable local terminals plus a thin system-SSH checkpoint: the GPUI client opens the user's configured shell, sends keyboard and mouse input to service-owned PTYs, renders ANSI SGR color and style from the Alacritty grid, supports selection/copy/paste, bounded scrollback and literal search, resizes PTYs, and creates pane-local tabs and splits. The daemon persists a restricted local desired-state snapshot for fresh-shell recovery, while an explicit two-step SSH action can launch the installed OpenSSH client in the same kind of daemon-owned PTY. Unicode shaping and broader platform soak remain roadmap work.
+The repository now contains runnable local terminals plus a thin system-SSH checkpoint: the GPUI client opens the user's configured shell, sends keyboard and mouse input to service-owned PTYs, renders ANSI SGR color and style from the Alacritty grid, supports selection/copy/paste, bounded scrollback and literal search, resizes PTYs, and creates pane-local tabs and splits. The daemon persists a restricted local desired-state snapshot for fresh-shell recovery and, separately, can keep an owner-only chunked archive of future PTY output for lazy upward scroll/search. An explicit two-step SSH action can launch the installed OpenSSH client in the same kind of daemon-owned PTY. Unicode shaping and broader platform soak remain roadmap work.
 
 ## Architecture
 
@@ -17,6 +17,7 @@ persistent session service
         +-- PTY and child-process ownership
         +-- canonical live workspace/layout state
         +-- Alacritty terminal grids and bounded scrollback
+        +-- optional owner-only, disk-backed historical chunks
 ```
 
 The Rust workspace keeps those responsibilities explicit:
@@ -26,21 +27,29 @@ The Rust workspace keeps those responsibilities explicit:
 - `rust-mux-protocol`: versioned transport messages and shared layout types.
 - `rust-mux-terminal-model`: a narrow adapter around Alacritty's established terminal engine. Rust Mux will not implement VT parsing from scratch.
 
-The client is only a projection of daemon state. Closing it does not stop the service or its PTYs; a new client fetches the current layouts and terminal screens from the owner-only Unix socket. A daemon restart recreates fresh local shells from a restricted owner-only snapshot; it does not claim to preserve live processes.
+The client is only a projection of daemon state. Closing it does not stop the service or its PTYs; a new client fetches current layout metadata and revision-aware pane updates from the owner-only Unix socket. A daemon restart recreates fresh local shells from a restricted owner-only snapshot; it does not claim to preserve live processes.
 
 ### Performance contract
 
 Rust Mux is designed to make idle panes nearly free: update only the panes whose output changes, parse and prepare updates away from the UI thread, keep terminal history bounded, and expose performance diagnostics without recording terminal contents. A focused or recently used pane stays responsive. After roughly 60 seconds without attention, its PTY still drains into bounded daemon-owned history so a local or remote process can never block, but live screen delivery to the desktop is coalesced until the pane is selected again. Selection requests one fresh snapshot before rendering and then resumes live deltas, so normal tab switching remains immediate and no output is lost.
 
-This revision-aware delta-streaming policy is the next IPC/rendering milestone, not a claim about the current full-snapshot checkpoint.
+Protocol v8 implements this policy with coalesced changed-pane screen payloads, content-free dirty/revision metadata for cold panes, targeted focus snapshots, and background desktop polling, alongside private history controls and terminal identity metadata. See [the pane streaming design and validation guide](docs/pane-streaming.md).
 
 For SSH, Rust Mux validates one conservative host or alias and launches structured argv equivalent to `ssh -- <host>`. It does not read SSH keys or config, probe hosts with `ssh -G`, add agent forwarding, change host-key policy, or answer prompts. The installed OpenSSH client remains the sole authority for `~/.ssh/config`, `Include`/`Match`, agents and identity files, known hosts, proxies, multiplexing, authentication, and host-key verification. SSH sessions are runtime-only in this checkpoint: their host intent is deliberately excluded from recovery snapshots, so restarting the daemon cannot initiate network access.
 
 See [the terminal theme architecture](docs/terminal-theme.md) for the `Harbor Night` palette boundary and [the all-Rust renderer roadmap](docs/terminal-renderer-roadmap.md) for the hard no-libghostty decision and the measured typography/cell-rendering plan.
 
+### History storage
+
+The gear opens compact local settings that distinguish the fast 2,000-line live memory buffer from the optional disk archive. The archive defaults to keep-indefinitely with a 5 GiB quota and a pause-and-warn capacity policy: the terminal keeps running when storage is slow or full, gaps are reported honestly, and retained sessions are never silently deleted. Finite retention and oldest-first capacity cleanup delete only after the user opts into those policies. Terminal/workspace/all clears require confirmation.
+
+Scrolling upward from the top of live history loads one bounded local archive page at a time; live-search misses can search older chunks. Archived pages are visibly labeled and do not turn the UI into an unbounded terminal buffer. History begins only for sessions/output recorded after this feature is active—older output cannot be recovered. See [local terminal history storage](docs/terminal-history-storage.md) for formats, permissions, corruption/restart behavior, privacy boundaries, and fidelity limits.
+
 ### Appearance colors
 
 Harbor Night remains the built-in visual foundation, with two independent local defaults: a terminal accent for focus rails, active tabs, and cursor treatment, and a workspace color for the selected workspace in the sidebar. Appearance settings offer a restrained preset/recent-color picker. A terminal tab or workspace can override only its own color from its right-click menu, or return to its matching default. These choices persist in the owner-only desired-state file and never trigger network access or telemetry.
+
+Terminal tabs can also identify known locally running Hermes, Codex/ChatGPT, and Claude Code tools with restrained original text badges. Resolution follows user rename, selected profile, safe OSC title, bounded local child-process basename, then generic terminal fallback. The tab context menu can correct or reset identity. Rust Mux never reads terminal output or agent conversations for detection, persists only explicit overrides, and adds no network activity or telemetry. See [Automatic terminal identity](docs/terminal-identity.md).
 
 ## MVP boundary
 
@@ -106,7 +115,7 @@ See [the project plan](index.html) and [`tasks/rust-mux`](tasks/rust-mux) for ph
 ## Roadmap
 
 1. Harden terminal interaction beyond the current selection, clipboard, bounded scrollback, literal-search, mouse-reporting, and foundational IME checkpoint: grapheme shaping, wide-cell edge cases, richer search, and accessibility.
-2. Replace repeated full-screen polling with revision-aware delta events, off-UI-thread parsing, bounded queues, sequence-gap recovery, and the documented idle-pane subscription policy. Measure update volume, focus-resume latency, UI-thread time, CPU, and memory before calling idle panes nearly free.
+2. Continue hardening protocol-v8 revision-aware pane delivery with request IDs, longer slow-client/high-output soaks, and macOS/Linux release-profile measurements for update volume, focus-resume latency, UI-thread time, CPU, and memory.
 3. Harden the current CWD inheritance, exit/close semantics, and atomic desired-state recovery with crash fault injection and longer lifecycle soak.
 4. Add conservative, side-effect-free configured-host suggestions and harden SSH child-exit presentation without changing the system-OpenSSH authority boundary.
 5. Validate GPUI on real Linux Wayland/X11 GPU sessions and retain Iced/wgpu as the portability fallback.
