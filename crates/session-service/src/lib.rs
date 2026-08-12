@@ -1,8 +1,9 @@
 #![allow(clippy::missing_errors_doc)]
 
+mod history;
 mod persistence;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -10,14 +11,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rust_mux_protocol::{
-    AppearanceColor, ClientRequest, DropPlacement, MAX_FRAME_SIZE, PROTOCOL_VERSION, Pane,
-    PaneLayout, ServiceResponse, SessionSnapshot, SplitAxis, Tab, TerminalModes, TerminalModifiers,
-    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
-    Workspace, validate_ssh_host,
+    AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryClearScope,
+    HistoryCursor, HistoryPageDirection, HistorySettings, MAX_FRAME_SIZE, PROTOCOL_VERSION, Pane,
+    PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionSnapshot, SplitAxis,
+    StreamDiagnostics, Tab, TerminalHistoryPage, TerminalIdentity, TerminalIdentitySource,
+    TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
+    TerminalProfile, TerminalScreen, TerminalSelectionKind, Workspace,
+    terminal_profile_for_command, terminal_profile_for_title, validate_ssh_host,
 };
 use rust_mux_terminal_model::TerminalModel;
 use serde::Serialize;
@@ -27,6 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
+use crate::history::{HistoryArchive, HistorySink};
 use crate::persistence::{SnapshotStore, default_snapshot_path};
 
 const INITIAL_COLUMNS: u16 = 100;
@@ -34,13 +40,20 @@ const INITIAL_ROWS: u16 = 30;
 const MAX_INPUT_FRAME: usize = 64 * 1024;
 const MAX_PANES: usize = 32;
 const MAX_RECENT_COLORS: usize = 8;
+const DIAGNOSTICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_DISCOVERY_PROCESSES: usize = 4_096;
+const MAX_DISCOVERY_DESCENDANTS_PER_PANE: usize = 64;
+const MAX_DISCOVERY_DEPTH: usize = 4;
 
 struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
+    reader: Mutex<Option<thread::JoinHandle<()>>>,
     terminal: Arc<Mutex<TerminalModel>>,
     revision: Arc<AtomicU64>,
+    _history: Arc<HistorySink>,
 }
 
 impl std::fmt::Debug for PtySession {
@@ -61,32 +74,57 @@ impl Drop for PtySession {
             let _ = child.kill();
         }
         let _ = child.wait();
+        if let Ok(reader) = self.reader.get_mut()
+            && let Some(reader) = reader.take()
+        {
+            let _ = reader.join();
+        }
     }
 }
 
 impl PtySession {
-    fn spawn_local(pane_id: Uuid, cwd: &Path) -> Result<Arc<Self>> {
+    fn spawn_local(
+        pane_id: Uuid,
+        workspace_id: Uuid,
+        cwd: &Path,
+        archive: &HistoryArchive,
+    ) -> Result<Arc<Self>> {
         let shell = configured_shell();
         Self::spawn_command(
             pane_id,
+            workspace_id,
             local_shell_command(pane_id, cwd),
             &format!("configured shell {shell}"),
+            archive,
         )
     }
 
-    fn spawn_ssh(pane_id: Uuid, host: &str) -> Result<Arc<Self>> {
+    fn spawn_ssh(
+        pane_id: Uuid,
+        workspace_id: Uuid,
+        host: &str,
+        archive: &HistoryArchive,
+    ) -> Result<Arc<Self>> {
         Self::spawn_command(
             pane_id,
+            workspace_id,
             system_ssh_command(pane_id, host)?,
             "system OpenSSH",
+            archive,
         )
     }
 
     fn spawn_command(
         pane_id: Uuid,
+        workspace_id: Uuid,
         command: CommandBuilder,
         description: &str,
+        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
+        // Session registration may wait behind prior disk work, so do it
+        // before a child exists. Once the PTY is live, its reader only uses
+        // the archive's bounded non-blocking append path.
+        let history = Arc::new(archive.start_session(pane_id, workspace_id));
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: INITIAL_ROWS,
@@ -111,7 +149,8 @@ impl PtySession {
         let revision = Arc::new(AtomicU64::new(0));
         let reader_terminal = Arc::clone(&terminal);
         let reader_revision = Arc::clone(&revision);
-        thread::Builder::new()
+        let reader_history = Arc::clone(&history);
+        let reader = thread::Builder::new()
             .name(format!("rmux-pty-{pane_id}"))
             .spawn(move || {
                 let mut buffer = [0_u8; 16 * 1024];
@@ -125,6 +164,7 @@ impl PtySession {
                             } else {
                                 break;
                             }
+                            reader_history.record(&buffer[..read]);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => break,
@@ -137,8 +177,10 @@ impl PtySession {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
+            reader: Mutex::new(Some(reader)),
             terminal,
             revision,
+            _history: history,
         }))
     }
 
@@ -314,6 +356,13 @@ impl PtySession {
     fn process_id(&self) -> Option<u32> {
         self.child.lock().ok().and_then(|child| child.process_id())
     }
+
+    fn terminal_title(&self) -> Option<String> {
+        self.terminal
+            .lock()
+            .ok()
+            .and_then(|terminal| terminal.terminal_title())
+    }
 }
 
 #[derive(Debug)]
@@ -323,6 +372,7 @@ struct RuntimePane {
     kind: RuntimePaneKind,
     recovered: bool,
     exit_status: Option<String>,
+    detected_command_profile: Option<TerminalProfile>,
 }
 
 #[derive(Debug)]
@@ -350,6 +400,7 @@ struct RegistryState {
     panes: HashMap<Uuid, RuntimePane>,
     next_terminal_number: u32,
     store: Option<SnapshotStore>,
+    last_identity_refresh: Option<Instant>,
 }
 
 impl RegistryState {
@@ -361,6 +412,9 @@ impl RegistryState {
             title,
             shell: shell_title(),
             color: None,
+            identity: TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
         }
     }
 }
@@ -368,11 +422,41 @@ impl RegistryState {
 #[derive(Clone, Debug)]
 pub struct SessionRegistry {
     state: Arc<RwLock<RegistryState>>,
+    diagnostics_sampler: Arc<Mutex<DiagnosticsSampler>>,
+    history: HistoryArchive,
+}
+
+#[derive(Debug)]
+struct DiagnosticsSampler {
+    system: System,
+    last_refresh: Option<Instant>,
+    cpu_milli_percent: u32,
+    memory_bytes: u64,
+}
+
+impl Default for DiagnosticsSampler {
+    fn default() -> Self {
+        Self {
+            system: System::new(),
+            last_refresh: None,
+            cpu_milli_percent: 0,
+            memory_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PaneUpdateBatch {
+    pub session_revision: u64,
+    pub snapshot: Option<SessionSnapshot>,
+    pub screens: Vec<TerminalScreen>,
+    pub pane_states: Vec<PaneStreamState>,
+    pub diagnostics: StreamDiagnostics,
 }
 
 impl SessionRegistry {
     pub fn new() -> Result<Self> {
-        Self::seeded(None)
+        Self::seeded(None, HistoryArchive::disabled())
     }
 
     pub fn load_default() -> Result<Self> {
@@ -384,9 +468,14 @@ impl SessionRegistry {
         if !path.is_absolute() {
             bail!("recovery snapshot path must be absolute");
         }
+        let history_root = path
+            .parent()
+            .context("recovery snapshot path has no parent")?
+            .join("history");
+        let history = HistoryArchive::open(history_root)?;
         let store = SnapshotStore::new(path);
         let Some(mut recovered) = store.load_or_quarantine()? else {
-            let registry = Self::seeded(Some(store))?;
+            let registry = Self::seeded(Some(store), history)?;
             registry.persist()?;
             return Ok(registry);
         };
@@ -395,12 +484,14 @@ impl SessionRegistry {
         let pane_ids = pane_ids_in_snapshot(&recovered.snapshot);
         let mut panes = HashMap::new();
         for pane_id in pane_ids {
+            let workspace_id = workspace_id_for_pane(&recovered.snapshot, pane_id)
+                .context("recovered pane has no workspace")?;
             let cwd = recovered
                 .cwd_by_pane
                 .remove(&pane_id)
                 .filter(|cwd| valid_local_cwd(cwd))
                 .unwrap_or_else(|| fallback.clone());
-            match PtySession::spawn_local(pane_id, &cwd) {
+            match PtySession::spawn_local(pane_id, workspace_id, &cwd, &history) {
                 Ok(session) => {
                     panes.insert(
                         pane_id,
@@ -410,6 +501,7 @@ impl SessionRegistry {
                             kind: RuntimePaneKind::Local,
                             recovered: true,
                             exit_status: None,
+                            detected_command_profile: None,
                         },
                     );
                 }
@@ -431,20 +523,24 @@ impl SessionRegistry {
                 panes,
                 next_terminal_number,
                 store: Some(store),
+                last_identity_refresh: None,
             })),
+            diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
+            history,
         };
         registry.persist()?;
         Ok(registry)
     }
 
-    fn seeded(store: Option<SnapshotStore>) -> Result<Self> {
+    fn seeded(store: Option<SnapshotStore>, history: HistoryArchive) -> Result<Self> {
         let mut snapshot = SessionSnapshot::seeded();
         let pane_id = first_pane_id(&snapshot).context("seeded snapshot has no pane")?;
+        let workspace_id = snapshot.workspaces[0].id;
         if let Some(pane) = find_pane_mut_in_snapshot(&mut snapshot, pane_id) {
             pane.shell = shell_title();
         }
         let cwd = fallback_cwd()?;
-        let session = PtySession::spawn_local(pane_id, &cwd)?;
+        let session = PtySession::spawn_local(pane_id, workspace_id, &cwd, &history)?;
         Ok(Self {
             state: Arc::new(RwLock::new(RegistryState {
                 snapshot,
@@ -456,11 +552,15 @@ impl SessionRegistry {
                         kind: RuntimePaneKind::Local,
                         recovered: false,
                         exit_status: None,
+                        detected_command_profile: None,
                     },
                 )]),
                 next_terminal_number: 2,
                 store,
+                last_identity_refresh: None,
             })),
+            diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
+            history,
         })
     }
 
@@ -488,6 +588,146 @@ impl SessionRegistry {
         Ok((snapshot, screens))
     }
 
+    /// Builds one coalesced receiver update without serializing unchanged or
+    /// unsubscribed terminal screens. PTY reader threads continue advancing
+    /// terminal models independently of this method.
+    pub fn pane_updates(
+        &self,
+        snapshot_revision: Option<u64>,
+        pane_revisions: &[PaneRevisionCursor],
+        subscribed_panes: &[Uuid],
+    ) -> Result<PaneUpdateBatch> {
+        let started = Instant::now();
+        let known_revisions = pane_revisions
+            .iter()
+            .map(|cursor| (cursor.pane_id, cursor.revision))
+            .collect::<HashMap<_, _>>();
+        let subscribed = subscribed_panes.iter().copied().collect::<HashSet<_>>();
+        let state = self
+            .state
+            .read()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+
+        let session_revision = state.snapshot.revision;
+        let snapshot =
+            (snapshot_revision != Some(session_revision)).then(|| state.snapshot.clone());
+        let mut screens = Vec::new();
+        let mut pane_states = Vec::with_capacity(state.panes.len());
+        let mut coalesced_revisions = 0_u64;
+        for (pane_id, runtime) in &state.panes {
+            let subscribed = subscribed.contains(pane_id);
+            let known_revision = known_revisions.get(pane_id).copied();
+            let observed_revision = runtime.session.revision.load(Ordering::Acquire);
+            let changed = known_revision != Some(observed_revision);
+            let delivered = subscribed && changed;
+            let revision = if delivered {
+                let screen = runtime.session.screen(*pane_id)?;
+                let revision = screen.revision;
+                if let Some(known) = known_revision {
+                    coalesced_revisions = coalesced_revisions
+                        .saturating_add(revision.saturating_sub(known).saturating_sub(1));
+                }
+                screens.push(screen);
+                revision
+            } else {
+                observed_revision
+            };
+            pane_states.push(PaneStreamState {
+                pane_id: *pane_id,
+                revision,
+                subscribed,
+                dirty: !delivered && known_revision != Some(revision),
+            });
+        }
+        drop(state);
+
+        pane_states.sort_unstable_by_key(|pane| pane.pane_id);
+        screens.sort_unstable_by_key(|screen| screen.pane_id);
+        let snapshot_bytes = snapshot
+            .as_ref()
+            .map(serialized_len)
+            .transpose()?
+            .unwrap_or(0);
+        let screen_bytes = screens.iter().try_fold(0_u64, |total, screen| {
+            Ok::<_, anyhow::Error>(total.saturating_add(serialized_len(screen)?))
+        })?;
+        let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics()?;
+        let diagnostics = StreamDiagnostics {
+            panes_considered: u32::try_from(pane_states.len()).unwrap_or(u32::MAX),
+            panes_subscribed: u32::try_from(
+                pane_states.iter().filter(|pane| pane.subscribed).count(),
+            )
+            .unwrap_or(u32::MAX),
+            screens_queued: u32::try_from(screens.len()).unwrap_or(u32::MAX),
+            screens_delivered: u32::try_from(screens.len()).unwrap_or(u32::MAX),
+            coalesced_revisions,
+            snapshot_bytes,
+            screen_bytes,
+            preparation_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            desktop_apply_micros: 0,
+            service_cpu_milli_percent,
+            service_memory_bytes,
+        };
+        Ok(PaneUpdateBatch {
+            session_revision,
+            snapshot,
+            screens,
+            pane_states,
+            diagnostics,
+        })
+    }
+
+    /// Returns one current screen for deterministic focus/reconnect resync.
+    pub fn pane_snapshot(&self, pane_id: Uuid) -> Result<(TerminalScreen, StreamDiagnostics)> {
+        let started = Instant::now();
+        let screen = self.pane(pane_id)?.screen(pane_id)?;
+        let screen_bytes = serialized_len(&screen)?;
+        let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics()?;
+        Ok((
+            screen,
+            StreamDiagnostics {
+                panes_considered: 1,
+                panes_subscribed: 1,
+                screens_queued: 1,
+                screens_delivered: 1,
+                screen_bytes,
+                preparation_micros: u64::try_from(started.elapsed().as_micros())
+                    .unwrap_or(u64::MAX),
+                service_cpu_milli_percent,
+                service_memory_bytes,
+                ..StreamDiagnostics::default()
+            },
+        ))
+    }
+
+    fn service_metrics(&self) -> Result<(u32, u64)> {
+        let pid = Pid::from_u32(std::process::id());
+        let mut sampler = self
+            .diagnostics_sampler
+            .lock()
+            .map_err(|_| anyhow!("diagnostics system lock was poisoned"))?;
+        let now = Instant::now();
+        let should_refresh = sampler
+            .last_refresh
+            .is_none_or(|last| now.saturating_duration_since(last) >= DIAGNOSTICS_SAMPLE_INTERVAL);
+        if should_refresh {
+            sampler.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                ProcessRefreshKind::new().with_cpu().with_memory(),
+            );
+            if let Some((cpu_milli_percent, memory_bytes)) = sampler
+                .system
+                .process(pid)
+                .map(|process| (cpu_milli_percent(process.cpu_usage()), process.memory()))
+            {
+                sampler.cpu_milli_percent = cpu_milli_percent;
+                sampler.memory_bytes = memory_bytes;
+            }
+            sampler.last_refresh = Some(now);
+        }
+        Ok((sampler.cpu_milli_percent, sampler.memory_bytes))
+    }
+
     pub fn persist(&self) -> Result<()> {
         let mut state = self
             .state
@@ -497,10 +737,63 @@ impl SessionRegistry {
         persist_state(&state)
     }
 
+    pub fn history_status(&self) -> Result<HistoryArchiveStatus> {
+        self.history.status()
+    }
+
+    pub fn set_history_settings(&self, settings: HistorySettings) -> Result<()> {
+        self.history.update_settings(settings)
+    }
+
+    pub fn clear_history(&self, scope: HistoryClearScope) -> Result<()> {
+        match scope {
+            HistoryClearScope::Terminal { pane_id } => {
+                self.pane(pane_id)?;
+            }
+            HistoryClearScope::Workspace { workspace_id } => {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| anyhow!("session state lock was poisoned"))?;
+                if !state
+                    .snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == workspace_id)
+                {
+                    bail!("workspace {workspace_id} does not exist");
+                }
+            }
+            HistoryClearScope::All => {}
+        }
+        self.history.clear(scope)
+    }
+
+    pub fn load_history_page(
+        &self,
+        pane_id: Uuid,
+        cursor: Option<HistoryCursor>,
+        direction: HistoryPageDirection,
+    ) -> Result<Option<TerminalHistoryPage>> {
+        self.pane(pane_id)?;
+        self.history.load_page(pane_id, cursor, direction)
+    }
+
+    pub fn search_archived_history(
+        &self,
+        pane_id: Uuid,
+        query: &str,
+        before: Option<HistoryCursor>,
+    ) -> Result<Option<TerminalHistoryPage>> {
+        self.pane(pane_id)?;
+        self.history.search(pane_id, query, before)
+    }
+
     pub fn create_pane(&self, target_pane: Uuid, axis: SplitAxis) -> Result<Uuid> {
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
-        let session = PtySession::spawn_local(new_id, &cwd)?;
+        let workspace_id = self.workspace_for_pane(target_pane)?;
+        let session = PtySession::spawn_local(new_id, workspace_id, &cwd, &self.history)?;
         let mut state = self
             .state
             .write()
@@ -526,6 +819,7 @@ impl SessionRegistry {
                 kind: RuntimePaneKind::Local,
                 recovered: false,
                 exit_status: None,
+                detected_command_profile: None,
             },
         );
         state.snapshot.revision += 1;
@@ -536,7 +830,8 @@ impl SessionRegistry {
     pub fn create_tab(&self, target_pane: Uuid) -> Result<Uuid> {
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
-        let session = PtySession::spawn_local(new_id, &cwd)?;
+        let workspace_id = self.workspace_for_pane(target_pane)?;
+        let session = PtySession::spawn_local(new_id, workspace_id, &cwd, &self.history)?;
         let mut state = self
             .state
             .write()
@@ -562,6 +857,7 @@ impl SessionRegistry {
                 kind: RuntimePaneKind::Local,
                 recovered: false,
                 exit_status: None,
+                detected_command_profile: None,
             },
         );
         state.snapshot.revision += 1;
@@ -594,7 +890,8 @@ impl SessionRegistry {
 
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
-        let session = PtySession::spawn_ssh(pane_id, host)?;
+        let workspace_id = self.workspace_for_pane(target_pane)?;
+        let session = PtySession::spawn_ssh(pane_id, workspace_id, host, &self.history)?;
         let result = (|| {
             let mut state = self
                 .state
@@ -608,6 +905,9 @@ impl SessionRegistry {
                 title: format!("SSH {host}"),
                 shell: "ssh".to_owned(),
                 color: None,
+                identity: TerminalIdentity::default(),
+                custom_title: None,
+                profile_override: None,
             };
             let did_add = state.snapshot.workspaces.iter_mut().any(|workspace| {
                 workspace
@@ -628,6 +928,7 @@ impl SessionRegistry {
                     },
                     recovered: false,
                     exit_status: None,
+                    detected_command_profile: None,
                 },
             );
             state.snapshot.revision += 1;
@@ -725,7 +1026,9 @@ impl SessionRegistry {
     ) -> Result<()> {
         let replacement_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(pane_id)?;
-        let replacement_session = PtySession::spawn_local(replacement_id, &cwd)?;
+        let workspace_id = self.workspace_for_pane(pane_id)?;
+        let replacement_session =
+            PtySession::spawn_local(replacement_id, workspace_id, &cwd, &self.history)?;
         let result = (|| {
             let mut state = self
                 .state
@@ -756,6 +1059,7 @@ impl SessionRegistry {
                     kind: RuntimePaneKind::Local,
                     recovered: false,
                     exit_status: None,
+                    detected_command_profile: None,
                 },
             );
             state.snapshot.revision += 1;
@@ -804,10 +1108,62 @@ impl SessionRegistry {
             .map_err(|_| anyhow!("session state lock was poisoned"))?;
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
-        title.clone_into(&mut pane.title);
+        pane.custom_title = Some(title.to_owned());
+        resolve_pane_identity(pane, None, None);
         state.snapshot.revision += 1;
         persist_state(&state)?;
         Ok(())
+    }
+
+    pub fn set_pane_profile(&self, pane_id: Uuid, profile: Option<TerminalProfile>) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let (title_signal, command_profile) = state
+            .panes
+            .get(&pane_id)
+            .map(|runtime| {
+                (
+                    runtime.session.terminal_title(),
+                    runtime.detected_command_profile,
+                )
+            })
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        // Choosing an identity in the context menu is an explicit correction
+        // of any prior free-form name. The resolver itself still preserves
+        // rename precedence for compatible recovered states containing both.
+        pane.custom_title = None;
+        pane.profile_override = profile;
+        resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    pub fn reset_pane_identity(&self, pane_id: Uuid) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let (title_signal, command_profile) = state
+            .panes
+            .get(&pane_id)
+            .map(|runtime| {
+                (
+                    runtime.session.terminal_title(),
+                    runtime.detected_command_profile,
+                )
+            })
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        pane.custom_title = None;
+        pane.profile_override = None;
+        resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
     }
 
     pub fn close_pane(&self, pane_id: Uuid) -> Result<()> {
@@ -944,7 +1300,7 @@ impl SessionRegistry {
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
-        let session = PtySession::spawn_local(pane_id, &cwd)?;
+        let session = PtySession::spawn_local(pane_id, workspace_id, &cwd, &self.history)?;
         let mut state = self
             .state
             .write()
@@ -972,6 +1328,7 @@ impl SessionRegistry {
                 kind: RuntimePaneKind::Local,
                 recovered: false,
                 exit_status: None,
+                detected_command_profile: None,
             },
         );
         state.snapshot.revision += 1;
@@ -1057,12 +1414,35 @@ impl SessionRegistry {
             RuntimePaneKind::SystemSsh { .. } => fallback_cwd(),
         }
     }
+
+    fn workspace_for_pane(&self, pane_id: Uuid) -> Result<Uuid> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        workspace_id_for_pane(&state.snapshot, pane_id)
+            .with_context(|| format!("pane {pane_id} has no workspace"))
+    }
 }
 
 impl Default for SessionRegistry {
     fn default() -> Self {
         Self::new().expect("start seeded configured-shell PTY")
     }
+}
+
+fn serialized_len(value: &impl Serialize) -> Result<u64> {
+    let bytes = serde_json::to_vec(value).context("measure protocol payload")?;
+    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn cpu_milli_percent(percent: f32) -> u32 {
+    (percent.max(0.0) * 1_000.0).round().min(u32::MAX as f32) as u32
 }
 
 fn remember_recent_color(snapshot: &mut SessionSnapshot, color: AppearanceColor) {
@@ -1150,6 +1530,14 @@ fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
         );
     }
 
+    let refresh_identity = state.last_identity_refresh.is_none_or(|last| {
+        Instant::now().saturating_duration_since(last) >= IDENTITY_REFRESH_INTERVAL
+    });
+    if refresh_identity {
+        refresh_command_profiles(state);
+        state.last_identity_refresh = Some(Instant::now());
+    }
+
     let mut labels = Vec::new();
     for (pane_id, runtime) in &mut state.panes {
         if runtime.kind.is_local()
@@ -1183,7 +1571,136 @@ fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
     }
+    let identity_inputs = state
+        .panes
+        .iter()
+        .filter(|(_, runtime)| runtime.kind.is_local())
+        .map(|(pane_id, runtime)| {
+            (
+                *pane_id,
+                runtime.session.terminal_title(),
+                runtime.detected_command_profile,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut identity_changed = false;
+    for (pane_id, title_signal, command_profile) in identity_inputs {
+        if let Some(pane) = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id) {
+            identity_changed |=
+                resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
+        }
+    }
+    if identity_changed {
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+    }
     Ok(())
+}
+
+fn refresh_command_profiles(state: &mut RegistryState) {
+    if !state.panes.iter().any(|(pane_id, runtime)| {
+        runtime.kind.is_local()
+            && find_pane_in_snapshot(&state.snapshot, *pane_id)
+                .is_some_and(|pane| pane.custom_title.is_none() && pane.profile_override.is_none())
+    }) {
+        return;
+    }
+
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
+    if system.processes().len() > MAX_DISCOVERY_PROCESSES {
+        return;
+    }
+    for runtime in state
+        .panes
+        .values_mut()
+        .filter(|runtime| runtime.kind.is_local())
+    {
+        runtime.detected_command_profile = runtime
+            .session
+            .process_id()
+            .map(Pid::from_u32)
+            .and_then(|root| discover_descendant_profile(&system, root));
+    }
+}
+
+fn discover_descendant_profile(system: &System, root: Pid) -> Option<TerminalProfile> {
+    let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
+    for (pid, process) in system.processes() {
+        if let Some(parent) = process.parent() {
+            children.entry(parent).or_default().push(*pid);
+        }
+    }
+    let mut queue = VecDeque::from([(root, 0_usize)]);
+    let mut inspected = 0_usize;
+    while let Some((parent, depth)) = queue.pop_front() {
+        if depth >= MAX_DISCOVERY_DEPTH {
+            continue;
+        }
+        for child in children.get(&parent).into_iter().flatten() {
+            inspected += 1;
+            if inspected > MAX_DISCOVERY_DESCENDANTS_PER_PANE {
+                return None;
+            }
+            if let Some(process) = system.process(*child)
+                && let Some(name) = process.name().to_str()
+                && let Some(profile) = terminal_profile_for_command(name)
+            {
+                return Some(profile);
+            }
+            queue.push_back((*child, depth + 1));
+        }
+    }
+    None
+}
+
+fn resolve_pane_identity(
+    pane: &mut Pane,
+    terminal_title: Option<&str>,
+    command_profile: Option<TerminalProfile>,
+) -> bool {
+    let (profile, source, title) = if let Some(custom_title) = pane.custom_title.as_deref() {
+        (
+            TerminalProfile::Terminal,
+            TerminalIdentitySource::UserRename,
+            custom_title.to_owned(),
+        )
+    } else if let Some(profile) = pane.profile_override {
+        (
+            profile,
+            TerminalIdentitySource::UserProfile,
+            profile.display_name().to_owned(),
+        )
+    } else if let Some(profile) = terminal_title.and_then(terminal_profile_for_title) {
+        (
+            profile,
+            TerminalIdentitySource::TerminalTitle,
+            profile.display_name().to_owned(),
+        )
+    } else if let Some(profile) = command_profile {
+        (
+            profile,
+            TerminalIdentitySource::Command,
+            profile.display_name().to_owned(),
+        )
+    } else {
+        let title = if pane.identity.source == TerminalIdentitySource::Fallback
+            && pane.title.starts_with("Terminal")
+        {
+            pane.title.clone()
+        } else {
+            TerminalProfile::Terminal.display_name().to_owned()
+        };
+        (
+            TerminalProfile::Terminal,
+            TerminalIdentitySource::Fallback,
+            title,
+        )
+    };
+    let identity = TerminalIdentity { profile, source };
+    let changed = pane.identity != identity || pane.title != title;
+    pane.identity = identity;
+    pane.title = title;
+    changed
 }
 
 fn set_pane_runtime_label(
@@ -1345,6 +1862,25 @@ fn find_pane_mut_in_snapshot(snapshot: &mut SessionSnapshot, pane_id: Uuid) -> O
         .find_map(|tab| find_pane_mut(&mut tab.layout, pane_id))
 }
 
+fn find_pane_in_snapshot(snapshot: &SessionSnapshot, pane_id: Uuid) -> Option<&Pane> {
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .find_map(|tab| find_pane(&tab.layout, pane_id))
+}
+
+fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
+    match layout {
+        PaneLayout::Leaf { pane } if pane.id == pane_id => Some(pane),
+        PaneLayout::Leaf { .. } => None,
+        PaneLayout::Stack { panes, .. } => panes.iter().find(|pane| pane.id == pane_id),
+        PaneLayout::Split { first, second, .. } => {
+            find_pane(first, pane_id).or_else(|| find_pane(second, pane_id))
+        }
+    }
+}
+
 fn find_pane_mut(layout: &mut PaneLayout, pane_id: Uuid) -> Option<&mut Pane> {
     match layout {
         PaneLayout::Leaf { pane } if pane.id == pane_id => Some(pane),
@@ -1431,6 +1967,19 @@ fn layout_contains(layout: &PaneLayout, pane_id: Uuid) -> bool {
             layout_contains(first, pane_id) || layout_contains(second, pane_id)
         }
     }
+}
+
+fn workspace_id_for_pane(snapshot: &SessionSnapshot, pane_id: Uuid) -> Option<Uuid> {
+    snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .any(|tab| layout_contains(&tab.layout, pane_id))
+        })
+        .map(|workspace| workspace.id)
 }
 
 fn pane_count(layout: &PaneLayout) -> usize {
@@ -1702,7 +2251,9 @@ pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry
 fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<ServiceResponse> {
     if matches!(
         &request,
-        ClientRequest::BeginSelection { .. }
+        ClientRequest::WriteInput { .. }
+            | ClientRequest::ResizePane { .. }
+            | ClientRequest::BeginSelection { .. }
             | ClientRequest::UpdateSelection { .. }
             | ClientRequest::ClearSelection { .. }
             | ClientRequest::CopySelection { .. }
@@ -1715,91 +2266,230 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
     if is_appearance_request(&request) {
         return handle_appearance_request(sessions, &request);
     }
+    if is_history_request(&request) {
+        return handle_history_request(sessions, request);
+    }
+    if is_identity_request(&request) {
+        return handle_identity_request(sessions, request);
+    }
+    if matches!(
+        &request,
+        ClientRequest::CreatePane { .. }
+            | ClientRequest::CreateTab { .. }
+            | ClientRequest::ConnectSsh { .. }
+    ) {
+        return handle_pane_creation_request(sessions, request);
+    }
+    if is_layout_request(&request) {
+        return handle_layout_request(sessions, request);
+    }
     match request {
         ClientRequest::GetSnapshot => Ok(ServiceResponse::Snapshot {
             snapshot: sessions.snapshot()?,
         }),
-        ClientRequest::GetState => {
-            let (snapshot, screens) = sessions.state()?;
-            Ok(ServiceResponse::State { snapshot, screens })
-        }
-        ClientRequest::CreatePane { target_pane, axis } => Ok(ServiceResponse::PaneCreated {
-            pane_id: sessions.create_pane(target_pane, axis)?,
-        }),
-        ClientRequest::CreateTab { target_pane } => Ok(ServiceResponse::PaneCreated {
-            pane_id: sessions.create_tab(target_pane)?,
-        }),
-        ClientRequest::ConnectSsh { target_pane, host } => Ok(ServiceResponse::PaneCreated {
-            pane_id: sessions.connect_ssh(target_pane, &host)?,
-        }),
-        ClientRequest::ActivateTab { pane_id } => {
-            sessions.activate_tab(pane_id)?;
-            Ok(ServiceResponse::Ack)
-        }
-        ClientRequest::SwapPanes {
-            source_pane,
-            target_pane,
-        } => {
-            sessions.swap_panes(source_pane, target_pane)?;
-            Ok(ServiceResponse::Ack)
-        }
-        ClientRequest::MovePaneToSplit {
-            source_pane,
-            target_pane,
-            placement,
-        } => {
-            sessions.move_pane_to_split(source_pane, target_pane, placement)?;
-            Ok(ServiceResponse::Ack)
-        }
-        ClientRequest::MovePaneToTab {
-            source_pane,
-            target_pane,
-        } => {
-            sessions.move_pane_to_tab(source_pane, target_pane)?;
-            Ok(ServiceResponse::Ack)
-        }
-        ClientRequest::RenamePane { pane_id, title } => {
-            sessions.rename_pane(pane_id, &title)?;
-            Ok(ServiceResponse::Ack)
-        }
-        ClientRequest::ClosePane { pane_id } => {
-            sessions.close_pane(pane_id)?;
-            Ok(ServiceResponse::Ack)
-        }
-        ClientRequest::CreateWorkspace { title } => {
-            let (workspace_id, pane_id) = sessions.create_workspace(title)?;
-            Ok(ServiceResponse::WorkspaceCreated {
-                workspace_id,
-                pane_id,
-            })
-        }
-        ClientRequest::WriteInput { pane_id, bytes } => {
-            sessions.write_input(pane_id, &bytes)?;
-            Ok(ServiceResponse::Ack)
-        }
-        ClientRequest::BeginSelection { .. }
+        ClientRequest::GetUpdates {
+            snapshot_revision,
+            pane_revisions,
+            subscribed_panes,
+        } => handle_get_updates(
+            sessions,
+            snapshot_revision,
+            &pane_revisions,
+            &subscribed_panes,
+        ),
+        ClientRequest::GetPaneSnapshot { pane_id } => handle_get_pane_snapshot(sessions, pane_id),
+        ClientRequest::WriteInput { .. }
+        | ClientRequest::ResizePane { .. }
+        | ClientRequest::BeginSelection { .. }
         | ClientRequest::UpdateSelection { .. }
         | ClientRequest::ClearSelection { .. }
         | ClientRequest::CopySelection { .. }
         | ClientRequest::ScrollPane { .. }
         | ClientRequest::SearchPane { .. }
         | ClientRequest::MouseInput { .. }
+        | ClientRequest::RenamePane { .. }
+        | ClientRequest::SetPaneProfile { .. }
+        | ClientRequest::ResetPaneIdentity { .. }
         | ClientRequest::SetDefaultTerminalAccent { .. }
         | ClientRequest::SetDefaultWorkspaceColor { .. }
         | ClientRequest::SetPaneColor { .. }
-        | ClientRequest::SetWorkspaceColor { .. } => unreachable!("handled above"),
-        ClientRequest::ResizePane {
-            pane_id,
-            columns,
-            rows,
-        } => {
-            sessions.resize_pane(pane_id, columns, rows)?;
-            Ok(ServiceResponse::Ack)
-        }
+        | ClientRequest::SetWorkspaceColor { .. }
+        | ClientRequest::CreatePane { .. }
+        | ClientRequest::CreateTab { .. }
+        | ClientRequest::ConnectSsh { .. }
+        | ClientRequest::ActivateTab { .. }
+        | ClientRequest::SwapPanes { .. }
+        | ClientRequest::MovePaneToSplit { .. }
+        | ClientRequest::MovePaneToTab { .. }
+        | ClientRequest::ClosePane { .. }
+        | ClientRequest::CreateWorkspace { .. }
+        | ClientRequest::GetHistoryStatus
+        | ClientRequest::SetHistorySettings { .. }
+        | ClientRequest::ClearHistory { .. }
+        | ClientRequest::LoadHistoryPage { .. }
+        | ClientRequest::SearchArchivedHistory { .. } => unreachable!("handled above"),
         ClientRequest::Hello { .. } => Ok(ServiceResponse::Error {
             message: "hello was already completed".to_owned(),
         }),
     }
+}
+
+fn is_layout_request(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::ActivateTab { .. }
+            | ClientRequest::SwapPanes { .. }
+            | ClientRequest::MovePaneToSplit { .. }
+            | ClientRequest::MovePaneToTab { .. }
+            | ClientRequest::ClosePane { .. }
+            | ClientRequest::CreateWorkspace { .. }
+    )
+}
+
+fn handle_layout_request(
+    sessions: &SessionRegistry,
+    request: ClientRequest,
+) -> Result<ServiceResponse> {
+    match request {
+        ClientRequest::ActivateTab { pane_id } => sessions.activate_tab(pane_id)?,
+        ClientRequest::SwapPanes {
+            source_pane,
+            target_pane,
+        } => sessions.swap_panes(source_pane, target_pane)?,
+        ClientRequest::MovePaneToSplit {
+            source_pane,
+            target_pane,
+            placement,
+        } => sessions.move_pane_to_split(source_pane, target_pane, placement)?,
+        ClientRequest::MovePaneToTab {
+            source_pane,
+            target_pane,
+        } => sessions.move_pane_to_tab(source_pane, target_pane)?,
+        ClientRequest::ClosePane { pane_id } => sessions.close_pane(pane_id)?,
+        ClientRequest::CreateWorkspace { title } => {
+            let (workspace_id, pane_id) = sessions.create_workspace(title)?;
+            return Ok(ServiceResponse::WorkspaceCreated {
+                workspace_id,
+                pane_id,
+            });
+        }
+        _ => unreachable!("only layout requests are routed here"),
+    }
+    Ok(ServiceResponse::Ack)
+}
+
+fn handle_pane_creation_request(
+    sessions: &SessionRegistry,
+    request: ClientRequest,
+) -> Result<ServiceResponse> {
+    let pane_id = match request {
+        ClientRequest::CreatePane { target_pane, axis } => {
+            sessions.create_pane(target_pane, axis)?
+        }
+        ClientRequest::CreateTab { target_pane } => sessions.create_tab(target_pane)?,
+        ClientRequest::ConnectSsh { target_pane, host } => {
+            sessions.connect_ssh(target_pane, &host)?
+        }
+        _ => unreachable!("only pane creation requests are routed here"),
+    };
+    Ok(ServiceResponse::PaneCreated { pane_id })
+}
+
+fn handle_get_updates(
+    sessions: &SessionRegistry,
+    snapshot_revision: Option<u64>,
+    pane_revisions: &[PaneRevisionCursor],
+    subscribed_panes: &[Uuid],
+) -> Result<ServiceResponse> {
+    let update = sessions.pane_updates(snapshot_revision, pane_revisions, subscribed_panes)?;
+    Ok(ServiceResponse::Updates {
+        session_revision: update.session_revision,
+        snapshot: update.snapshot,
+        screens: update.screens,
+        pane_states: update.pane_states,
+        diagnostics: update.diagnostics,
+    })
+}
+
+fn handle_get_pane_snapshot(sessions: &SessionRegistry, pane_id: Uuid) -> Result<ServiceResponse> {
+    let (screen, diagnostics) = sessions.pane_snapshot(pane_id)?;
+    Ok(ServiceResponse::PaneSnapshot {
+        screen,
+        diagnostics,
+    })
+}
+
+fn is_history_request(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::GetHistoryStatus
+            | ClientRequest::SetHistorySettings { .. }
+            | ClientRequest::ClearHistory { .. }
+            | ClientRequest::LoadHistoryPage { .. }
+            | ClientRequest::SearchArchivedHistory { .. }
+    )
+}
+
+fn handle_history_request(
+    sessions: &SessionRegistry,
+    request: ClientRequest,
+) -> Result<ServiceResponse> {
+    match request {
+        ClientRequest::GetHistoryStatus => Ok(ServiceResponse::HistoryStatus {
+            status: sessions.history_status()?,
+        }),
+        ClientRequest::SetHistorySettings { settings } => {
+            sessions.set_history_settings(settings)?;
+            Ok(ServiceResponse::HistoryStatus {
+                status: sessions.history_status()?,
+            })
+        }
+        ClientRequest::ClearHistory { scope } => {
+            sessions.clear_history(scope)?;
+            Ok(ServiceResponse::HistoryStatus {
+                status: sessions.history_status()?,
+            })
+        }
+        ClientRequest::LoadHistoryPage {
+            pane_id,
+            cursor,
+            direction,
+        } => Ok(ServiceResponse::HistoryPage {
+            page: sessions.load_history_page(pane_id, cursor, direction)?,
+        }),
+        ClientRequest::SearchArchivedHistory {
+            pane_id,
+            query,
+            before,
+        } => Ok(ServiceResponse::HistorySearchResult {
+            page: sessions.search_archived_history(pane_id, &query, before)?,
+        }),
+        _ => unreachable!("only history requests are routed here"),
+    }
+}
+
+fn handle_identity_request(
+    sessions: &SessionRegistry,
+    request: ClientRequest,
+) -> Result<ServiceResponse> {
+    match request {
+        ClientRequest::RenamePane { pane_id, title } => sessions.rename_pane(pane_id, &title)?,
+        ClientRequest::SetPaneProfile { pane_id, profile } => {
+            sessions.set_pane_profile(pane_id, profile)?;
+        }
+        ClientRequest::ResetPaneIdentity { pane_id } => sessions.reset_pane_identity(pane_id)?,
+        _ => unreachable!("only identity requests are routed here"),
+    }
+    Ok(ServiceResponse::Ack)
+}
+
+fn is_identity_request(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::RenamePane { .. }
+            | ClientRequest::SetPaneProfile { .. }
+            | ClientRequest::ResetPaneIdentity { .. }
+    )
 }
 
 fn handle_appearance_request(
@@ -1842,6 +2532,18 @@ fn handle_terminal_interaction_request(
     request: ClientRequest,
 ) -> Result<ServiceResponse> {
     match request {
+        ClientRequest::WriteInput { pane_id, bytes } => {
+            sessions.write_input(pane_id, &bytes)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ResizePane {
+            pane_id,
+            columns,
+            rows,
+        } => {
+            sessions.resize_pane(pane_id, columns, rows)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::BeginSelection {
             pane_id,
             point,
@@ -1981,6 +2683,60 @@ mod tests {
     }
 
     #[test]
+    fn identity_precedence_is_rename_then_profile_then_title_then_command_then_fallback() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let pane_id = first_pane_id(&snapshot).unwrap();
+        let pane = find_pane_mut_in_snapshot(&mut snapshot, pane_id).unwrap();
+        pane.custom_title = Some("Release console".to_owned());
+        pane.profile_override = Some(TerminalProfile::Hermes);
+
+        resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
+        assert_eq!(pane.title, "Release console");
+        assert_eq!(pane.identity.source, TerminalIdentitySource::UserRename);
+
+        pane.custom_title = None;
+        resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
+        assert_eq!(pane.title, "Hermes");
+        assert_eq!(pane.identity.source, TerminalIdentitySource::UserProfile);
+
+        pane.profile_override = None;
+        resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
+        assert_eq!(pane.title, "Claude");
+        assert_eq!(pane.identity.source, TerminalIdentitySource::TerminalTitle);
+
+        resolve_pane_identity(pane, Some("editor"), Some(TerminalProfile::Codex));
+        assert_eq!(pane.title, "Codex");
+        assert_eq!(pane.identity.source, TerminalIdentitySource::Command);
+
+        resolve_pane_identity(pane, Some("editor"), None);
+        assert_eq!(pane.title, "Terminal");
+        assert_eq!(pane.identity, TerminalIdentity::default());
+    }
+
+    #[test]
+    fn manual_profile_correction_and_reset_update_only_safe_desired_identity_fields() {
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        registry.rename_pane(pane_id, "My work").unwrap();
+        registry
+            .set_pane_profile(pane_id, Some(TerminalProfile::Claude))
+            .unwrap();
+
+        let snapshot = registry.snapshot().unwrap();
+        let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
+        assert_eq!(pane.title, "Claude");
+        assert_eq!(pane.custom_title, None);
+        assert_eq!(pane.profile_override, Some(TerminalProfile::Claude));
+        assert_eq!(pane.identity.source, TerminalIdentitySource::UserProfile);
+
+        registry.reset_pane_identity(pane_id).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
+        assert_eq!(pane.custom_title, None);
+        assert_eq!(pane.profile_override, None);
+    }
+
+    #[test]
     fn remote_panes_are_excluded_from_the_network_silent_recovery_projection() {
         let mut snapshot = SessionSnapshot::seeded();
         let local = first_pane_id(&snapshot).unwrap();
@@ -1996,6 +2752,9 @@ mod tests {
                     title: "SSH private-alias".to_owned(),
                     shell: "ssh".to_owned(),
                     color: None,
+                    identity: TerminalIdentity::default(),
+                    custom_title: None,
+                    profile_override: None,
                 },
             ],
             active: remote,

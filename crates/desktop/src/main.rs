@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase,
@@ -23,11 +23,13 @@ use gpui::{
 };
 use rust_mux_desktop::request;
 use rust_mux_protocol::{
-    AppearanceColor, ClientRequest, DropPlacement, MAX_SSH_HOST_LEN, Pane, PaneLayout,
-    ServiceResponse, SessionSnapshot, SplitAxis, TerminalAttributes, TerminalColor, TerminalLine,
-    TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
-    TerminalRun, TerminalScreen, TerminalSelection, TerminalSelectionKind, Workspace,
-    validate_ssh_host,
+    AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryCleanupPolicy,
+    HistoryClearScope, HistoryPageDirection, HistoryPageFlags, HistoryRetention, HistorySettings,
+    HistoryWarning, MAX_SSH_HOST_LEN, Pane, PaneLayout, PaneRevisionCursor, PaneStreamState,
+    ServiceResponse, SessionSnapshot, SplitAxis, StreamDiagnostics, TerminalAttributes,
+    TerminalColor, TerminalHistoryPage, TerminalLine, TerminalModes, TerminalModifiers,
+    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalRun,
+    TerminalScreen, TerminalSelection, TerminalSelectionKind, Workspace, validate_ssh_host,
 };
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
@@ -78,6 +80,7 @@ const COMMAND_PALETTE_LIMIT: usize = 32;
 const MAX_PASTE_BYTES: usize = 64 * 1024;
 const ACTIVE_TERMINAL_POLL_MS: u64 = 33;
 const IDLE_TERMINAL_POLL_MS: u64 = 250;
+const COLD_PANE_AFTER: Duration = Duration::from_mins(1);
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
     AppearanceColor::new(0x62, 0xad, 0xff),
@@ -95,6 +98,13 @@ struct PaneDrag {
     pane_id: Uuid,
     title: String,
     position: Point<Pixels>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TabIdentityPresentation {
+    label: String,
+    badge: &'static str,
+    detail: &'static str,
 }
 
 impl Render for PaneDrag {
@@ -178,6 +188,26 @@ struct RenameEditor {
 struct SearchEditor {
     query: String,
     no_match: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ArchivedView {
+    page: TerminalHistoryPage,
+    first_line: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryEditField {
+    RetentionDays,
+    QuotaGib,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryEditor {
+    field: HistoryEditField,
+    text: String,
+    replace_on_type: bool,
+    invalid: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +383,9 @@ struct RustMux {
     keymap: ResolvedKeymap,
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
+    pane_states: HashMap<Uuid, PaneStreamState>,
+    pane_attention: HashMap<Uuid, Instant>,
+    stream_diagnostics: StreamDiagnostics,
     active_workspace: Option<Uuid>,
     focused_pane: Option<Uuid>,
     split_ratios: HashMap<SplitControlId, f32>,
@@ -365,6 +398,10 @@ struct RustMux {
     tab_menu: Option<TabMenu>,
     workspace_menu: Option<WorkspaceMenu>,
     appearance_settings_open: bool,
+    history_status: Option<HistoryArchiveStatus>,
+    archived_views: HashMap<Uuid, ArchivedView>,
+    history_editor: Option<HistoryEditor>,
+    history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
     rename_editor: Option<RenameEditor>,
     search_editor: Option<SearchEditor>,
@@ -387,6 +424,9 @@ impl RustMux {
             keymap,
             snapshot: None,
             screens: HashMap::new(),
+            pane_states: HashMap::new(),
+            pane_attention: HashMap::new(),
+            stream_diagnostics: StreamDiagnostics::default(),
             active_workspace: None,
             focused_pane: None,
             split_ratios: HashMap::new(),
@@ -399,6 +439,10 @@ impl RustMux {
             tab_menu: None,
             workspace_menu: None,
             appearance_settings_open: false,
+            history_status: None,
+            archived_views: HashMap::new(),
+            history_editor: None,
+            history_clear_confirmation: None,
             color_picker: None,
             rename_editor: None,
             search_editor: None,
@@ -411,6 +455,9 @@ impl RustMux {
         };
         app.update_window_geometry(window);
         app.refresh_state();
+        if app.focused_pane.is_some() && app.screens.is_empty() {
+            app.refresh_state();
+        }
 
         cx.observe_window_bounds(window, |this, window, cx| {
             if this.update_window_geometry(window) {
@@ -424,8 +471,15 @@ impl RustMux {
             let mut poll_delay_ms = ACTIVE_TERMINAL_POLL_MS;
             loop {
                 gpui::Timer::after(Duration::from_millis(poll_delay_ms)).await;
+                let Ok(update_request) = this.update(cx, |this, _| this.pane_update_request())
+                else {
+                    break;
+                };
+                let response = cx
+                    .background_spawn(async move { request(update_request) })
+                    .await;
                 let Ok(state_changed) = this.update(cx, |this, cx| {
-                    let state_changed = this.refresh_state();
+                    let state_changed = this.apply_update_result(response);
                     this.sync_pty_sizes();
                     if state_changed {
                         cx.notify();
@@ -438,55 +492,132 @@ impl RustMux {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                gpui::Timer::after(Duration::from_secs(5)).await;
+                let Ok(()) = this.update(cx, |this, cx| {
+                    if this.refresh_history_status() {
+                        cx.notify();
+                    }
+                }) else {
+                    break;
+                };
+            }
+        })
+        .detach();
         app
     }
 
     fn refresh_state(&mut self) -> bool {
-        match request(ClientRequest::GetState) {
-            Ok(ServiceResponse::State { snapshot, screens }) => {
-                let state_changed = self.snapshot.as_ref() != Some(&snapshot)
-                    || screens.len() != self.screens.len()
-                    || screens.iter().any(|screen| {
-                        self.screens
-                            .get(&screen.pane_id)
-                            .is_none_or(|current| current.revision != screen.revision)
-                    });
-                if self.active_workspace.is_none()
-                    || !snapshot
-                        .workspaces
-                        .iter()
-                        .any(|workspace| Some(workspace.id) == self.active_workspace)
+        self.apply_update_result(request(self.pane_update_request()))
+    }
+
+    fn pane_update_request(&self) -> ClientRequest {
+        let now = Instant::now();
+        let pane_revisions = self
+            .screens
+            .values()
+            .map(|screen| PaneRevisionCursor {
+                pane_id: screen.pane_id,
+                revision: screen.revision,
+            })
+            .collect();
+        let subscribed_panes = responsive_panes(now, self.focused_pane, &self.pane_attention);
+        ClientRequest::GetUpdates {
+            snapshot_revision: self.snapshot.as_ref().map(|snapshot| snapshot.revision),
+            pane_revisions,
+            subscribed_panes,
+        }
+    }
+
+    fn apply_update_result(&mut self, result: anyhow::Result<ServiceResponse>) -> bool {
+        match result {
+            Ok(ServiceResponse::Updates {
+                session_revision,
+                snapshot,
+                screens,
+                pane_states,
+                diagnostics,
+            }) => {
+                let apply_started = Instant::now();
+                let current_session_revision =
+                    self.snapshot.as_ref().map(|snapshot| snapshot.revision);
+                let topology_is_current =
+                    current_session_revision.is_none_or(|current| session_revision >= current);
+                let mut snapshot_changed = false;
+                let mut screens_applied = 0;
+                let mut focus_resync = None;
+                if let Some(snapshot) = snapshot
+                    && current_session_revision.is_none_or(|current| snapshot.revision >= current)
                 {
-                    self.active_workspace =
-                        snapshot.workspaces.first().map(|workspace| workspace.id);
-                }
-                let visible = self
-                    .active_workspace_in(&snapshot)
-                    .and_then(|workspace| workspace.tabs.first())
-                    .map(|tab| visible_panes(&tab.layout))
-                    .unwrap_or_default();
-                if self
-                    .zoomed_pane
-                    .is_some_and(|pane| !visible.contains(&pane))
-                {
-                    self.zoomed_pane = None;
-                    self.last_sizes.clear();
-                }
-                if self.focused_pane.is_none()
-                    || !visible.iter().any(|pane| Some(*pane) == self.focused_pane)
-                {
-                    self.focused_pane = visible.first().copied();
-                }
-                if state_changed {
-                    self.screens = screens
-                        .into_iter()
-                        .map(|screen| (screen.pane_id, screen))
-                        .collect();
+                    snapshot_changed = self.snapshot.as_ref() != Some(&snapshot);
+                    if self.active_workspace.is_none()
+                        || !snapshot
+                            .workspaces
+                            .iter()
+                            .any(|workspace| Some(workspace.id) == self.active_workspace)
+                    {
+                        self.active_workspace =
+                            snapshot.workspaces.first().map(|workspace| workspace.id);
+                    }
+                    let visible = self
+                        .active_workspace_in(&snapshot)
+                        .and_then(|workspace| workspace.tabs.first())
+                        .map(|tab| visible_panes(&tab.layout))
+                        .unwrap_or_default();
+                    if self
+                        .zoomed_pane
+                        .is_some_and(|pane| !visible.contains(&pane))
+                    {
+                        self.zoomed_pane = None;
+                        self.last_sizes.clear();
+                    }
+                    if self.focused_pane.is_none()
+                        || !visible.iter().any(|pane| Some(*pane) == self.focused_pane)
+                    {
+                        focus_resync = visible.first().copied();
+                        if focus_resync.is_none() {
+                            self.focused_pane = None;
+                        }
+                    }
                     self.snapshot = Some(snapshot);
                 }
+                for screen in screens {
+                    let is_newer = self
+                        .screens
+                        .get(&screen.pane_id)
+                        .is_none_or(|current| screen.revision > current.revision);
+                    if is_newer {
+                        self.screens.insert(screen.pane_id, screen);
+                        screens_applied += 1;
+                    }
+                }
+                if topology_is_current {
+                    let live_panes = pane_states
+                        .iter()
+                        .map(|state| state.pane_id)
+                        .collect::<std::collections::HashSet<_>>();
+                    self.screens
+                        .retain(|pane_id, _| live_panes.contains(pane_id));
+                    self.pane_attention
+                        .retain(|pane_id, _| live_panes.contains(pane_id));
+                    self.pane_states = pane_states
+                        .into_iter()
+                        .map(|state| (state.pane_id, state))
+                        .collect();
+                }
+                self.stream_diagnostics = diagnostics;
                 let connection_changed = self.connection_error.take().is_some();
                 self.connection_error = None;
-                state_changed || connection_changed
+                let mut state_changed =
+                    pane_update_requires_repaint(snapshot_changed, screens_applied)
+                        || connection_changed;
+                if let Some(pane_id) = focus_resync {
+                    state_changed |= self.focus_pane_with_snapshot(pane_id);
+                }
+                self.stream_diagnostics.desktop_apply_micros =
+                    u64::try_from(apply_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                state_changed
             }
             Ok(response) => {
                 let error = format!("unexpected response: {response:?}");
@@ -499,6 +630,54 @@ impl RustMux {
                 let changed = self.connection_error.as_deref() != Some(error.as_str());
                 self.connection_error = Some(error);
                 changed
+            }
+        }
+    }
+
+    fn focus_pane_with_snapshot(&mut self, pane_id: Uuid) -> bool {
+        if self.focused_pane == Some(pane_id) {
+            self.pane_attention.insert(pane_id, Instant::now());
+            return false;
+        }
+        match request(ClientRequest::GetPaneSnapshot { pane_id }) {
+            Ok(ServiceResponse::PaneSnapshot {
+                screen,
+                diagnostics,
+            }) => {
+                let attended_at = Instant::now();
+                let changed = self.focused_pane != Some(pane_id)
+                    || self
+                        .screens
+                        .get(&pane_id)
+                        .is_none_or(|current| current.revision != screen.revision);
+                if self.focused_pane != Some(pane_id)
+                    && let Some(previous) = self.focused_pane
+                {
+                    self.pane_attention.insert(previous, attended_at);
+                }
+                self.pane_states.insert(
+                    pane_id,
+                    PaneStreamState {
+                        pane_id,
+                        revision: screen.revision,
+                        subscribed: true,
+                        dirty: false,
+                    },
+                );
+                self.screens.insert(pane_id, screen);
+                self.focused_pane = Some(pane_id);
+                self.pane_attention.insert(pane_id, attended_at);
+                self.stream_diagnostics = diagnostics;
+                self.connection_error = None;
+                changed
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                false
+            }
+            Err(error) => {
+                self.connection_error = Some(format!("{error:#}"));
+                false
             }
         }
     }
@@ -620,14 +799,158 @@ impl RustMux {
         self.tab_menu = None;
         self.workspace_menu = None;
         self.color_picker = None;
+        self.history_editor = None;
+        self.history_clear_confirmation = None;
+        let _ = self.refresh_history_status();
         cx.notify();
     }
 
+    fn refresh_history_status(&mut self) -> bool {
+        let previous = self.history_status.clone();
+        match request(ClientRequest::GetHistoryStatus) {
+            Ok(ServiceResponse::HistoryStatus { status }) => {
+                self.history_status = Some(status);
+                self.connection_error = None;
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
+        self.history_status != previous
+    }
+
+    fn apply_history_settings(&mut self, settings: HistorySettings, cx: &mut Context<Self>) {
+        match request(ClientRequest::SetHistorySettings { settings }) {
+            Ok(ServiceResponse::HistoryStatus { status }) => {
+                self.history_status = Some(status);
+                self.history_editor = None;
+                self.connection_error = None;
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn mutate_history_settings(
+        &mut self,
+        update: impl FnOnce(&mut HistorySettings),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut settings) = self
+            .history_status
+            .as_ref()
+            .map(|status| status.settings.clone())
+        else {
+            let _ = self.refresh_history_status();
+            cx.notify();
+            return;
+        };
+        update(&mut settings);
+        self.apply_history_settings(settings, cx);
+    }
+
+    fn clear_history(&mut self, scope: HistoryClearScope, cx: &mut Context<Self>) {
+        if self.history_clear_confirmation != Some(scope) {
+            self.history_clear_confirmation = Some(scope);
+            cx.notify();
+            return;
+        }
+        match request(ClientRequest::ClearHistory { scope }) {
+            Ok(ServiceResponse::HistoryStatus { status }) => {
+                self.history_status = Some(status);
+                self.history_clear_confirmation = None;
+                self.archived_views.clear();
+                self.connection_error = None;
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn begin_history_edit(&mut self, field: HistoryEditField, cx: &mut Context<Self>) {
+        let text = match (field, self.history_status.as_ref()) {
+            (
+                HistoryEditField::RetentionDays,
+                Some(HistoryArchiveStatus {
+                    settings:
+                        HistorySettings {
+                            retention: HistoryRetention::Days { days },
+                            ..
+                        },
+                    ..
+                }),
+            ) => days.to_string(),
+            (HistoryEditField::RetentionDays, _) => "30".to_owned(),
+            (HistoryEditField::QuotaGib, Some(status)) => {
+                (status.settings.quota_bytes / 1024 / 1024 / 1024).to_string()
+            }
+            (HistoryEditField::QuotaGib, None) => "5".to_owned(),
+        };
+        self.history_editor = Some(HistoryEditor {
+            field,
+            text,
+            replace_on_type: true,
+            invalid: false,
+        });
+        cx.notify();
+    }
+
+    fn submit_history_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.history_editor.as_ref() else {
+            return;
+        };
+        let field = editor.field;
+        let Ok(value) = editor.text.parse::<u64>() else {
+            if let Some(editor) = self.history_editor.as_mut() {
+                editor.invalid = true;
+            }
+            cx.notify();
+            return;
+        };
+        match field {
+            HistoryEditField::RetentionDays if (1..=3_650).contains(&value) => {
+                self.mutate_history_settings(
+                    |settings| {
+                        settings.retention = HistoryRetention::Days {
+                            days: u32::try_from(value).unwrap_or(3_650),
+                        };
+                    },
+                    cx,
+                );
+            }
+            HistoryEditField::QuotaGib if (1..=4_096).contains(&value) => {
+                self.mutate_history_settings(
+                    |settings| {
+                        settings.quota_bytes = value * 1024 * 1024 * 1024;
+                    },
+                    cx,
+                );
+            }
+            _ => {
+                if let Some(editor) = self.history_editor.as_mut() {
+                    editor.invalid = true;
+                }
+                cx.notify();
+            }
+        }
+    }
+
     fn send(&mut self, request_message: ClientRequest) {
+        self.send_control(request_message);
+        self.refresh_state();
+    }
+
+    fn send_control(&mut self, request_message: ClientRequest) {
         if let Err(error) = request(request_message) {
             self.connection_error = Some(format!("{error:#}"));
         }
-        self.refresh_state();
     }
 
     fn new_workspace(&mut self, cx: &mut Context<Self>) {
@@ -637,7 +960,7 @@ impl RustMux {
                 pane_id,
             }) => {
                 self.active_workspace = Some(workspace_id);
-                self.focused_pane = Some(pane_id);
+                self.focus_pane_with_snapshot(pane_id);
                 self.refresh_state();
             }
             Ok(response) => {
@@ -655,9 +978,10 @@ impl RustMux {
     }
 
     fn new_tab_at(&mut self, target_pane: Uuid, cx: &mut Context<Self>) {
-        self.focused_pane = Some(target_pane);
         match request(ClientRequest::CreateTab { target_pane }) {
-            Ok(ServiceResponse::PaneCreated { pane_id }) => self.focused_pane = Some(pane_id),
+            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                self.focus_pane_with_snapshot(pane_id);
+            }
             Ok(response) => {
                 self.connection_error = Some(format!("unexpected response: {response:?}"))
             }
@@ -674,10 +998,11 @@ impl RustMux {
     }
 
     fn split_at(&mut self, target_pane: Uuid, axis: SplitAxis, cx: &mut Context<Self>) {
-        self.focused_pane = Some(target_pane);
         self.zoomed_pane = None;
         match request(ClientRequest::CreatePane { target_pane, axis }) {
-            Ok(ServiceResponse::PaneCreated { pane_id }) => self.focused_pane = Some(pane_id),
+            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                self.focus_pane_with_snapshot(pane_id);
+            }
             Ok(response) => {
                 self.connection_error = Some(format!("unexpected response: {response:?}"))
             }
@@ -689,8 +1014,16 @@ impl RustMux {
     }
 
     fn activate_tab(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        self.focused_pane = Some(pane_id);
-        self.send(ClientRequest::ActivateTab { pane_id });
+        match request(ClientRequest::ActivateTab { pane_id }) {
+            Ok(ServiceResponse::Ack) => {
+                self.focus_pane_with_snapshot(pane_id);
+                self.refresh_state();
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
         cx.notify();
     }
 
@@ -701,7 +1034,7 @@ impl RustMux {
                 source_pane,
                 target_pane,
             });
-            self.focused_pane = Some(source_pane);
+            self.focus_pane_with_snapshot(source_pane);
             self.last_sizes.clear();
             cx.notify();
         }
@@ -722,7 +1055,7 @@ impl RustMux {
             target_pane,
             placement,
         });
-        self.focused_pane = Some(source_pane);
+        self.focus_pane_with_snapshot(source_pane);
         self.last_sizes.clear();
         cx.notify();
     }
@@ -735,7 +1068,7 @@ impl RustMux {
             source_pane,
             target_pane,
         });
-        self.focused_pane = Some(source_pane);
+        self.focus_pane_with_snapshot(source_pane);
         self.last_sizes.clear();
         cx.notify();
     }
@@ -751,8 +1084,11 @@ impl RustMux {
     }
 
     fn open_tab_menu(&mut self, pane_id: Uuid, position: Point<Pixels>, cx: &mut Context<Self>) {
-        self.focused_pane = Some(pane_id);
-        self.send(ClientRequest::ActivateTab { pane_id });
+        if let Err(error) = request(ClientRequest::ActivateTab { pane_id }) {
+            self.connection_error = Some(format!("{error:#}"));
+        }
+        self.focus_pane_with_snapshot(pane_id);
+        self.refresh_state();
         self.tab_menu = Some(TabMenu { pane_id, position });
         self.workspace_menu = None;
         self.rename_editor = None;
@@ -767,7 +1103,7 @@ impl RustMux {
         cx: &mut Context<Self>,
     ) {
         self.active_workspace = Some(workspace_id);
-        self.focused_pane = self.snapshot.as_ref().and_then(|snapshot| {
+        let pane_id = self.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .workspaces
                 .iter()
@@ -775,6 +1111,9 @@ impl RustMux {
                 .and_then(|workspace| workspace.tabs.first())
                 .and_then(|tab| visible_panes(&tab.layout).first().copied())
         });
+        if let Some(pane_id) = pane_id {
+            self.focus_pane_with_snapshot(pane_id);
+        }
         self.workspace_menu = Some(WorkspaceMenu {
             workspace_id,
             position,
@@ -785,7 +1124,7 @@ impl RustMux {
     }
 
     fn begin_rename(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        self.focused_pane = Some(pane_id);
+        self.focus_pane_with_snapshot(pane_id);
         if let Some(pane) = self.pane_metadata(pane_id) {
             self.rename_editor = Some(RenameEditor {
                 pane_id,
@@ -808,8 +1147,25 @@ impl RustMux {
         cx.notify();
     }
 
+    fn set_pane_profile(
+        &mut self,
+        pane_id: Uuid,
+        profile: Option<TerminalProfile>,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(ClientRequest::SetPaneProfile { pane_id, profile });
+        self.tab_menu = None;
+        cx.notify();
+    }
+
+    fn reset_pane_identity(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        self.send(ClientRequest::ResetPaneIdentity { pane_id });
+        self.tab_menu = None;
+        cx.notify();
+    }
+
     fn begin_close(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        self.focused_pane = Some(pane_id);
+        self.focus_pane_with_snapshot(pane_id);
         if let Some(pane) = self.pane_metadata(pane_id) {
             self.close_confirmation = Some(CloseConfirmation::for_pane(&pane));
             self.tab_menu = None;
@@ -854,7 +1210,7 @@ impl RustMux {
         };
         match request(request_message) {
             Ok(ServiceResponse::PaneCreated { pane_id }) => {
-                self.focused_pane = Some(pane_id);
+                self.focus_pane_with_snapshot(pane_id);
                 self.ssh_connect = None;
                 self.refresh_state();
             }
@@ -896,7 +1252,7 @@ impl RustMux {
         } else {
             index - 1
         };
-        self.focused_pane = Some(panes[next]);
+        self.focus_pane_with_snapshot(panes[next]);
         if self.zoomed_pane.is_some() {
             self.zoomed_pane = self.focused_pane;
             self.last_sizes.clear();
@@ -1041,7 +1397,7 @@ impl RustMux {
             .get(&pane_id)
             .is_some_and(|screen| screen.modes.contains(TerminalModes::BRACKETED_PASTE));
         match prepare_paste(&text, bracketed) {
-            Ok(bytes) => self.send(ClientRequest::WriteInput { pane_id, bytes }),
+            Ok(bytes) => self.send_control(ClientRequest::WriteInput { pane_id, bytes }),
             Err(message) => self.connection_error = Some(message.to_owned()),
         }
         cx.notify();
@@ -1061,21 +1417,66 @@ impl RustMux {
         let Some(pane_id) = self.focused_pane else {
             return;
         };
-        let Some(editor) = self.search_editor.as_mut() else {
+        let Some(editor) = self.search_editor.as_ref() else {
             return;
         };
         if editor.query.is_empty() {
-            editor.no_match = false;
+            if let Some(editor) = self.search_editor.as_mut() {
+                editor.no_match = false;
+            }
             cx.notify();
             return;
         }
+        let query = editor.query.clone();
         match request(ClientRequest::SearchPane {
             pane_id,
-            query: editor.query.clone(),
+            query: query.clone(),
             forward,
         }) {
             Ok(ServiceResponse::SearchResult { found }) => {
-                editor.no_match = !found;
+                if !found {
+                    let before = self
+                        .archived_views
+                        .get(&pane_id)
+                        .map(|view| view.page.cursor);
+                    match request(ClientRequest::SearchArchivedHistory {
+                        pane_id,
+                        query: query.clone(),
+                        before,
+                    }) {
+                        Ok(ServiceResponse::HistorySearchResult { page: Some(page) }) => {
+                            let rows = self
+                                .screens
+                                .get(&pane_id)
+                                .map_or(30, |screen| usize::from(screen.rows));
+                            let first_line = page
+                                .lines
+                                .iter()
+                                .position(|line| line.contains(&query))
+                                .unwrap_or(0)
+                                .min(page.lines.len().saturating_sub(rows));
+                            self.archived_views.clear();
+                            self.archived_views
+                                .insert(pane_id, ArchivedView { page, first_line });
+                            if let Some(editor) = self.search_editor.as_mut() {
+                                editor.no_match = false;
+                            }
+                        }
+                        Ok(ServiceResponse::HistorySearchResult { page: None }) => {
+                            if let Some(editor) = self.search_editor.as_mut() {
+                                editor.no_match = true;
+                            }
+                        }
+                        Ok(response) => {
+                            self.connection_error =
+                                Some(format!("unexpected response: {response:?}"));
+                        }
+                        Err(error) => self.connection_error = Some(format!("{error:#}")),
+                    }
+                } else if let Some(editor) = self.search_editor.as_mut() {
+                    editor.no_match = false;
+                    self.archived_views.remove(&pane_id);
+                }
                 self.connection_error = None;
                 self.refresh_state();
             }
@@ -1107,6 +1508,19 @@ impl RustMux {
             cx.notify();
             return;
         }
+        if let Some(editor) = self.history_editor.as_mut() {
+            if editor.replace_on_type {
+                editor.text.clear();
+            }
+            let remaining = 4_usize.saturating_sub(editor.text.len());
+            editor
+                .text
+                .extend(text.chars().filter(char::is_ascii_digit).take(remaining));
+            editor.replace_on_type = false;
+            editor.invalid = false;
+            cx.notify();
+            return;
+        }
         if let Some(editor) = self.rename_editor.as_mut() {
             if editor.replace_on_type {
                 editor.value.clear();
@@ -1129,7 +1543,7 @@ impl RustMux {
             return;
         }
         if let Some(pane_id) = self.focused_pane {
-            self.send(ClientRequest::WriteInput {
+            self.send_control(ClientRequest::WriteInput {
                 pane_id,
                 bytes: text.as_bytes().to_vec(),
             });
@@ -1145,7 +1559,7 @@ impl RustMux {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focused_pane = Some(pane_id);
+        self.focus_pane_with_snapshot(pane_id);
         self.focus_handle.focus(window);
         let mouse_reporting = self
             .screens
@@ -1153,7 +1567,7 @@ impl RustMux {
             .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING));
         if mouse_reporting && !event.modifiers.shift {
             if let Some(button) = terminal_mouse_button(event.button) {
-                self.send(ClientRequest::MouseInput {
+                self.send_control(ClientRequest::MouseInput {
                     pane_id,
                     point,
                     button,
@@ -1179,7 +1593,7 @@ impl RustMux {
                     TerminalSelectionKind::Semantic | TerminalSelectionKind::Lines
                 ),
             });
-            self.send(ClientRequest::BeginSelection {
+            self.send_control(ClientRequest::BeginSelection {
                 pane_id,
                 point,
                 kind,
@@ -1201,7 +1615,7 @@ impl RustMux {
             .is_some_and(|selection| selection.pane_id == pane_id)
             && event.dragging()
         {
-            self.send(ClientRequest::UpdateSelection { pane_id, point });
+            self.send_control(ClientRequest::UpdateSelection { pane_id, point });
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1211,7 +1625,7 @@ impl RustMux {
             .get(&pane_id)
             .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_MOTION));
         if mouse_motion && let Some(button) = event.pressed_button.and_then(terminal_mouse_button) {
-            self.send(ClientRequest::MouseInput {
+            self.send_control(ClientRequest::MouseInput {
                 pane_id,
                 point,
                 button,
@@ -1235,9 +1649,9 @@ impl RustMux {
             .filter(|selection| selection.pane_id == pane_id)
         {
             if point == selection.anchor && !selection.preserve_single_cell {
-                self.send(ClientRequest::ClearSelection { pane_id });
+                self.send_control(ClientRequest::ClearSelection { pane_id });
             } else {
-                self.send(ClientRequest::UpdateSelection { pane_id, point });
+                self.send_control(ClientRequest::UpdateSelection { pane_id, point });
             }
         } else if self
             .screens
@@ -1246,7 +1660,7 @@ impl RustMux {
             && !event.modifiers.shift
             && let Some(button) = terminal_mouse_button(event.button)
         {
-            self.send(ClientRequest::MouseInput {
+            self.send_control(ClientRequest::MouseInput {
                 pane_id,
                 point,
                 button,
@@ -1274,13 +1688,18 @@ impl RustMux {
         } else {
             lines
         };
+        if self.archived_views.contains_key(&pane_id) {
+            self.scroll_archived_view(pane_id, lines, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self
             .screens
             .get(&pane_id)
             .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING))
             && !event.modifiers.shift
         {
-            self.send(ClientRequest::MouseInput {
+            self.send_control(ClientRequest::MouseInput {
                 pane_id,
                 point,
                 button: if lines > 0 {
@@ -1291,11 +1710,93 @@ impl RustMux {
                 action: TerminalMouseAction::Press,
                 modifiers: terminal_modifiers(event.modifiers),
             });
+        } else if lines > 0
+            && self.screens.get(&pane_id).is_some_and(|screen| {
+                screen.display_offset >= screen.history_size && screen.history_size > 0
+            })
+        {
+            self.load_archived_page(pane_id, None, HistoryPageDirection::Older, cx);
         } else {
-            self.send(ClientRequest::ScrollPane { pane_id, lines });
+            self.send_control(ClientRequest::ScrollPane { pane_id, lines });
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn load_archived_page(
+        &mut self,
+        pane_id: Uuid,
+        cursor: Option<rust_mux_protocol::HistoryCursor>,
+        direction: HistoryPageDirection,
+        cx: &mut Context<Self>,
+    ) {
+        match request(ClientRequest::LoadHistoryPage {
+            pane_id,
+            cursor,
+            direction,
+        }) {
+            Ok(ServiceResponse::HistoryPage { page: Some(page) }) => {
+                let rows = self
+                    .screens
+                    .get(&pane_id)
+                    .map_or(30, |screen| usize::from(screen.rows));
+                let first_line = match direction {
+                    HistoryPageDirection::Older => page.lines.len().saturating_sub(rows),
+                    HistoryPageDirection::Newer => 0,
+                };
+                self.archived_views.clear();
+                self.archived_views
+                    .insert(pane_id, ArchivedView { page, first_line });
+                self.connection_error = None;
+            }
+            Ok(ServiceResponse::HistoryPage { page: None }) => {
+                if direction == HistoryPageDirection::Newer {
+                    self.archived_views.remove(&pane_id);
+                }
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn scroll_archived_view(&mut self, pane_id: Uuid, lines: i32, cx: &mut Context<Self>) {
+        let rows = self
+            .screens
+            .get(&pane_id)
+            .map_or(30, |screen| usize::from(screen.rows));
+        let Some(view) = self.archived_views.get_mut(&pane_id) else {
+            return;
+        };
+        if lines > 0 {
+            let amount = usize::try_from(lines).unwrap_or(usize::MAX);
+            if view.first_line > 0 {
+                view.first_line = view.first_line.saturating_sub(amount);
+                cx.notify();
+                return;
+            }
+            if view.page.flags.contains(HistoryPageFlags::HAS_OLDER) {
+                let cursor = view.page.cursor;
+                self.load_archived_page(pane_id, Some(cursor), HistoryPageDirection::Older, cx);
+            }
+            return;
+        }
+        let amount = usize::try_from(lines.unsigned_abs()).unwrap_or(usize::MAX);
+        let maximum = view.page.lines.len().saturating_sub(rows);
+        if view.first_line < maximum {
+            view.first_line = view.first_line.saturating_add(amount).min(maximum);
+            cx.notify();
+            return;
+        }
+        if view.page.flags.contains(HistoryPageFlags::HAS_NEWER) {
+            let cursor = view.page.cursor;
+            self.load_archived_page(pane_id, Some(cursor), HistoryPageDirection::Newer, cx);
+        } else {
+            self.archived_views.remove(&pane_id);
+            cx.notify();
+        }
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -1319,6 +1820,28 @@ impl RustMux {
                     }
                     picker.replace_on_type = false;
                     picker.invalid = false;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(editor) = self.history_editor.as_mut() {
+            match keystroke.key.as_str() {
+                "enter" => self.submit_history_edit(cx),
+                "escape" => {
+                    self.history_editor = None;
+                    cx.notify();
+                }
+                "backspace" => {
+                    if editor.replace_on_type {
+                        editor.text.clear();
+                    } else {
+                        editor.text.pop();
+                    }
+                    editor.replace_on_type = false;
+                    editor.invalid = false;
                     cx.notify();
                 }
                 _ => {}
@@ -1411,7 +1934,7 @@ impl RustMux {
                     editor.no_match = false;
                     if editor.query.is_empty() {
                         if let Some(pane_id) = self.focused_pane {
-                            self.send(ClientRequest::ClearSelection { pane_id });
+                            self.send_control(ClientRequest::ClearSelection { pane_id });
                         }
                     } else {
                         self.run_search(true, cx);
@@ -1462,7 +1985,7 @@ impl RustMux {
             keystroke.modifiers.platform,
         );
         if let (Some(pane_id), Some(bytes)) = (self.focused_pane, bytes) {
-            self.send(ClientRequest::WriteInput { pane_id, bytes });
+            self.send_control(ClientRequest::WriteInput { pane_id, bytes });
             cx.stop_propagation();
             cx.notify();
         }
@@ -1568,6 +2091,10 @@ impl RustMux {
             .as_ref()
             .map(|snapshot| snapshot.workspaces.clone())
             .unwrap_or_default();
+        let history_needs_attention = self
+            .history_status
+            .as_ref()
+            .is_some_and(|status| status.warning.is_some());
         div()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
@@ -1592,18 +2119,31 @@ impl RustMux {
                     .child(
                         div()
                             .id("appearance-settings")
+                            .relative()
                             .cursor_pointer()
                             .hover(|element| element.text_color(rgb(THEME.foreground)))
                             .tooltip(|_, cx| {
                                 cx.new(|_| TooltipView {
-                                    text: "Appearance".to_owned(),
+                                    text: "Settings".to_owned(),
                                 })
                                 .into()
                             })
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.open_appearance_settings(cx)),
                             )
-                            .child("⚙"),
+                            .child("⚙")
+                            .when(history_needs_attention, |element| {
+                                element.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(-2.0))
+                                        .right(px(-4.0))
+                                        .w(px(5.0))
+                                        .h(px(5.0))
+                                        .rounded_full()
+                                        .bg(rgb(THEME.danger)),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -1668,10 +2208,13 @@ impl RustMux {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.active_workspace = Some(workspace_id);
-                                this.focused_pane = workspace
+                                let pane_id = workspace
                                     .tabs
                                     .first()
                                     .and_then(|tab| visible_panes(&tab.layout).first().copied());
+                                if let Some(pane_id) = pane_id {
+                                    this.focus_pane_with_snapshot(pane_id);
+                                }
                                 this.last_sizes.clear();
                                 cx.notify();
                             }))
@@ -1793,15 +2336,17 @@ impl RustMux {
                     .flex()
                     .children(panes.into_iter().map(|pane| {
                         let pane_id = pane.id;
+                        let identity = tab_identity_presentation(&pane);
+                        let identity_detail = identity.detail;
                         let selected = pane_id == active;
                         let pane_accent = pane
                             .color
                             .unwrap_or_else(|| self.terminal_accent(pane_id))
                             .as_rgb();
-                        let close_tooltip = format!("Close {}…", pane.title);
+                        let close_tooltip = format!("Close {}…", identity.label);
                         let drag = PaneDrag {
                             pane_id,
-                            title: pane.title.clone(),
+                            title: identity.label.clone(),
                             position: Point::default(),
                         };
                         div()
@@ -1843,16 +2388,36 @@ impl RustMux {
                             })
                             .child(
                                 div()
+                                    .id(("identity-badge", element_key(pane_id)))
                                     .flex_none()
-                                    .w(px(8.0))
-                                    .h(px(8.0))
-                                    .rounded(px(2.0))
+                                    .min_w(px(18.0))
+                                    .h(px(15.0))
+                                    .px(px(3.0))
+                                    .rounded(px(4.0))
                                     .border_1()
                                     .border_color(if selected {
                                         rgb(pane_accent)
                                     } else {
                                         rgb(THEME.muted)
-                                    }),
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .font_family("SF Mono")
+                                    .text_size(px(8.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if selected {
+                                        rgb(THEME.foreground)
+                                    } else {
+                                        rgb(THEME.muted)
+                                    })
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: identity_detail.to_owned(),
+                                        })
+                                        .into()
+                                    })
+                                    .child(identity.badge),
                             )
                             .child(
                                 div()
@@ -1871,7 +2436,7 @@ impl RustMux {
                                     } else {
                                         rgb(THEME.muted)
                                     })
-                                    .child(pane.title),
+                                    .child(identity.label),
                             )
                             .child(
                                 div()
@@ -2027,35 +2592,61 @@ impl RustMux {
         let focused = self.focused_pane == Some(active);
         let terminal_accent = self.terminal_accent(active).as_rgb();
         let screen = self.screens.get(&active).cloned();
+        let archived = self.archived_views.get(&active);
         let drop_target = self
             .dragging_pane
             .and_then(|source| split_target_for_drag(source, &panes, active));
         let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
-        let rendered_lines = screen
-            .as_ref()
-            .map(|screen| {
-                screen
-                    .lines
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(row, line)| {
-                        self.render_terminal_line(
-                            line,
-                            TerminalLineRender {
-                                row,
-                                cursor: screen.cursor,
-                                focused,
-                                pane_id: active,
-                                columns: screen.columns,
-                                selection: screen.selection,
-                            },
-                            cx,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let rendered_lines = if let (Some(view), Some(screen)) = (archived, screen.as_ref()) {
+            view.page
+                .lines
+                .iter()
+                .skip(view.first_line)
+                .take(usize::from(screen.rows))
+                .map(|line| plain_history_line(line))
+                .enumerate()
+                .map(|(row, line)| {
+                    self.render_terminal_line(
+                        line,
+                        TerminalLineRender {
+                            row,
+                            cursor: None,
+                            focused,
+                            pane_id: active,
+                            columns: screen.columns,
+                            selection: None,
+                        },
+                        cx,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            screen
+                .as_ref()
+                .map(|screen| {
+                    screen
+                        .lines
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(row, line)| {
+                            self.render_terminal_line(
+                                line,
+                                TerminalLineRender {
+                                    row,
+                                    cursor: screen.cursor,
+                                    focused,
+                                    pane_id: active,
+                                    columns: screen.columns,
+                                    selection: screen.selection,
+                                },
+                                cx,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
         div()
             .id(("terminal", element_key(active)))
             .size_full()
@@ -2066,7 +2657,7 @@ impl RustMux {
             .flex()
             .flex_col()
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.focused_pane = Some(active);
+                this.focus_pane_with_snapshot(active);
                 this.focus_handle.focus(window);
                 cx.notify();
             }))
@@ -2111,6 +2702,31 @@ impl RustMux {
                     .line_height(px(self.terminal_font.metrics.line_height))
                     .text_color(rgb(THEME.foreground))
                     .children(rendered_lines)
+                    .when_some(archived, |element, view| {
+                        let notice = if view.page.flags.contains(HistoryPageFlags::CORRUPT) {
+                            "LOCAL HISTORY · CORRUPT CHUNK · gap preserved"
+                        } else if view.page.flags.contains(HistoryPageFlags::GAP_BEFORE)
+                            || view.page.flags.contains(HistoryPageFlags::GAP_AFTER)
+                        {
+                            "LOCAL HISTORY · archive gap · live terminal unaffected"
+                        } else {
+                            "LOCAL HISTORY · disk-backed page · scroll down for live"
+                        };
+                        element.child(
+                            div()
+                                .absolute()
+                                .top(px(3.0))
+                                .right(px(8.0))
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(THEME.elevated))
+                                .font_family("SF Mono")
+                                .text_xs()
+                                .text_color(rgb(THEME.muted))
+                                .child(notice),
+                        )
+                    })
                     .when(
                         focused
                             && self.search_editor.is_none()
@@ -2468,6 +3084,36 @@ impl RustMux {
                     .font_family(".SystemUIFont")
                     .text_xs()
                     .text_color(rgb(THEME.dim))
+                    .child("Terminal identity"),
+            )
+            .child(self.render_profile_choices(pane_id, cx))
+            .child(
+                div()
+                    .id(("reset-identity-menu", element_key(pane_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.reset_pane_identity(pane_id, cx)),
+                    )
+                    .child("Reset name and identity"),
+            )
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .mx(px(8.0))
+                    .pt(px(7.0))
+                    .border_t_1()
+                    .border_color(rgb(THEME.border))
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.dim))
                     .child("Terminal color"),
             )
             .child(self.render_color_choices(ColorTarget::Pane(pane_id), "tab-menu", cx))
@@ -2520,6 +3166,59 @@ impl RustMux {
                     .on_click(cx.listener(move |this, _, _, cx| this.begin_close(pane_id, cx)))
                     .child("Close Terminal…"),
             )
+            .into_any_element()
+    }
+
+    fn render_profile_choices(&self, pane_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self
+            .pane_metadata(pane_id)
+            .and_then(|pane| pane.profile_override);
+        let choices = std::iter::once(("Auto".to_owned(), None)).chain(
+            TerminalProfile::ALL.into_iter().map(|profile| {
+                (
+                    format!("{} {}", profile.badge(), profile.display_name()),
+                    Some(profile),
+                )
+            }),
+        );
+        div()
+            .mx(px(8.0))
+            .my(px(6.0))
+            .flex()
+            .flex_wrap()
+            .gap(px(5.0))
+            .children(choices.enumerate().map(|(index, (label, profile))| {
+                let active = selected == profile;
+                div()
+                    .id(("identity-profile", index))
+                    .px(px(7.0))
+                    .py(px(5.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if active {
+                        rgb(THEME.accent)
+                    } else {
+                        rgb(THEME.border_strong)
+                    })
+                    .bg(if active {
+                        rgb(THEME.accent_soft)
+                    } else {
+                        rgb(THEME.surface)
+                    })
+                    .font_family("SF Mono")
+                    .text_size(px(9.5))
+                    .text_color(if active {
+                        rgb(THEME.foreground)
+                    } else {
+                        rgb(THEME.muted)
+                    })
+                    .hover(|element| element.border_color(rgb(THEME.foreground)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_pane_profile(pane_id, profile, cx)
+                    }))
+                    .child(label)
+            }))
             .into_any_element()
     }
 
@@ -2648,7 +3347,7 @@ impl RustMux {
             .occlude()
             .child(
                 div()
-                    .w(px(500.0))
+                    .w(px(680.0))
                     .p(px(18.0))
                     .rounded(px(10.0))
                     .bg(rgb(THEME.elevated))
@@ -2668,7 +3367,7 @@ impl RustMux {
                                     .font_family(".SystemUIFont")
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(THEME.foreground))
-                                    .child("Appearance"),
+                                    .child("Settings"),
                             )
                             .child(
                                 div()
@@ -2692,6 +3391,14 @@ impl RustMux {
                                     }))
                                     .child("×"),
                             ),
+                    )
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child("Appearance"),
                     )
                     .child(
                         div()
@@ -2721,8 +3428,372 @@ impl RustMux {
                             .text_xs()
                             .text_color(rgb(THEME.dim))
                             .child("Saved locally with session layout · no network or telemetry"),
+                    )
+                    .child(self.render_history_settings(cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_history_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let status = self.history_status.clone().unwrap_or(HistoryArchiveStatus {
+            settings: HistorySettings::default(),
+            live_scrollback_lines: 2_000,
+            archived_bytes: 0,
+            retained_sessions: 0,
+            oldest_started_ms: None,
+            dropped_bytes: 0,
+            warning: None,
+        });
+        let settings = status.settings.clone();
+        let oldest = status
+            .oldest_started_ms
+            .map_or_else(|| "none yet".to_owned(), format_history_date);
+        let warning = history_warning_text(status.warning, status.dropped_bytes);
+        let active_workspace = self.active_workspace;
+        let focused_pane = self.focused_pane;
+        div()
+            .pt(px(4.0))
+            .border_t_1()
+            .border_color(rgb(THEME.border))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .pt(px(6.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child("History Storage"),
+                    )
+                    .child(
+                        div()
+                            .id("history-enabled")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .bg(rgb(if settings.enabled {
+                                THEME.accent_soft
+                            } else {
+                                THEME.surface
+                            }))
+                            .text_xs()
+                            .text_color(rgb(THEME.foreground))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.mutate_history_settings(
+                                    |settings| settings.enabled = !settings.enabled,
+                                    cx,
+                                );
+                            }))
+                            .child(if settings.enabled {
+                                "On · local only"
+                            } else {
+                                "Off"
+                            }),
                     ),
             )
+            .child(
+                div()
+                    .font_family("SF Mono")
+                    .text_xs()
+                    .text_color(rgb(THEME.muted))
+                    .child(format!(
+                        "Live memory: {} lines · Local archive: {} · {} sessions · oldest {}",
+                        status.live_scrollback_lines,
+                        format_bytes(status.archived_bytes),
+                        status.retained_sessions,
+                        oldest
+                    )),
+            )
+            .when_some(warning, |element, warning| {
+                element.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(px(5.0))
+                        .bg(rgb(THEME.surface))
+                        .font_family(".SystemUIFont")
+                        .text_xs()
+                        .text_color(rgb(THEME.danger))
+                        .child(warning),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(history_label("Retention"))
+                    .children(
+                        [
+                            ("Forever", HistoryRetention::Indefinite),
+                            ("7d", HistoryRetention::Days { days: 7 }),
+                            ("30d", HistoryRetention::Days { days: 30 }),
+                            ("90d", HistoryRetention::Days { days: 90 }),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (label, retention))| {
+                            let selected = settings.retention == retention;
+                            div()
+                                .id(("history-retention", index))
+                                .px(px(7.0))
+                                .py(px(3.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .bg(rgb(if selected {
+                                    THEME.accent_soft
+                                } else {
+                                    THEME.surface
+                                }))
+                                .text_xs()
+                                .text_color(rgb(THEME.foreground))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mutate_history_settings(
+                                        |settings| settings.retention = retention,
+                                        cx,
+                                    );
+                                }))
+                                .child(label)
+                        }),
+                    )
+                    .child(self.render_history_custom_field(
+                        HistoryEditField::RetentionDays,
+                        "Custom days",
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(history_label("Quota"))
+                    .children(
+                        [
+                            ("1 GiB", 1_u64),
+                            ("5 GiB", 5),
+                            ("10 GiB", 10),
+                            ("50 GiB", 50),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (label, gib))| {
+                            let bytes = gib * 1024 * 1024 * 1024;
+                            let selected = settings.quota_bytes == bytes;
+                            div()
+                                .id(("history-quota", index))
+                                .px(px(7.0))
+                                .py(px(3.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .bg(rgb(if selected {
+                                    THEME.accent_soft
+                                } else {
+                                    THEME.surface
+                                }))
+                                .text_xs()
+                                .text_color(rgb(THEME.foreground))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mutate_history_settings(
+                                        |settings| settings.quota_bytes = bytes,
+                                        cx,
+                                    );
+                                }))
+                                .child(label)
+                        }),
+                    )
+                    .child(self.render_history_custom_field(
+                        HistoryEditField::QuotaGib,
+                        "Custom GiB",
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(history_label("At capacity"))
+                    .child(
+                        div()
+                            .id("history-pause-policy")
+                            .px(px(7.0))
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .bg(rgb(
+                                if settings.cleanup_policy == HistoryCleanupPolicy::PauseWhenFull {
+                                    THEME.accent_soft
+                                } else {
+                                    THEME.surface
+                                },
+                            ))
+                            .text_xs()
+                            .text_color(rgb(THEME.foreground))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mutate_history_settings(
+                                    |settings| {
+                                        settings.cleanup_policy =
+                                            HistoryCleanupPolicy::PauseWhenFull;
+                                    },
+                                    cx,
+                                );
+                            }))
+                            .child("Pause + warn (safe)"),
+                    )
+                    .child(
+                        div()
+                            .id("history-delete-oldest-policy")
+                            .px(px(7.0))
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .bg(rgb(
+                                if settings.cleanup_policy == HistoryCleanupPolicy::DeleteOldest {
+                                    THEME.accent_soft
+                                } else {
+                                    THEME.surface
+                                },
+                            ))
+                            .text_xs()
+                            .text_color(rgb(THEME.foreground))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mutate_history_settings(
+                                    |settings| {
+                                        settings.cleanup_policy =
+                                            HistoryCleanupPolicy::DeleteOldest;
+                                    },
+                                    cx,
+                                );
+                            }))
+                            .child("Auto-delete oldest (opt-in)"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(history_label("Clear"))
+                    .when_some(focused_pane, |element, pane_id| {
+                        element.child(self.render_clear_history_button(
+                            "Terminal",
+                            HistoryClearScope::Terminal { pane_id },
+                            cx,
+                        ))
+                    })
+                    .when_some(active_workspace, |element, workspace_id| {
+                        element.child(self.render_clear_history_button(
+                            "Workspace",
+                            HistoryClearScope::Workspace { workspace_id },
+                            cx,
+                        ))
+                    })
+                    .child(self.render_clear_history_button(
+                        "All history",
+                        HistoryClearScope::All,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_right()
+                            .font_family("SF Mono")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child("Future output only · older sessions cannot be recovered"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_history_custom_field(
+        &self,
+        field: HistoryEditField,
+        placeholder: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let editor = self
+            .history_editor
+            .as_ref()
+            .filter(|editor| editor.field == field);
+        let label = editor.map_or_else(
+            || placeholder.to_owned(),
+            |editor| {
+                if editor.invalid {
+                    format!("{} · invalid", editor.text)
+                } else {
+                    format!("{} ↵", editor.text)
+                }
+            },
+        );
+        div()
+            .id(match field {
+                HistoryEditField::RetentionDays => "custom-retention",
+                HistoryEditField::QuotaGib => "custom-quota",
+            })
+            .px(px(7.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(if editor.is_some() {
+                THEME.accent
+            } else {
+                THEME.border
+            }))
+            .font_family("SF Mono")
+            .text_xs()
+            .text_color(rgb(if editor.is_some_and(|editor| editor.invalid) {
+                THEME.danger
+            } else {
+                THEME.muted
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.begin_history_edit(field, cx)))
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_clear_history_button(
+        &self,
+        label: &'static str,
+        scope: HistoryClearScope,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let confirming = self.history_clear_confirmation == Some(scope);
+        div()
+            .id(("clear-history", history_scope_key(scope)))
+            .px(px(7.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(if confirming {
+                THEME.danger
+            } else {
+                THEME.border
+            }))
+            .font_family(".SystemUIFont")
+            .text_xs()
+            .text_color(rgb(if confirming {
+                THEME.danger
+            } else {
+                THEME.muted
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.clear_history(scope, cx)))
+            .child(if confirming {
+                format!("Confirm {label}")
+            } else {
+                label.to_owned()
+            })
             .into_any_element()
     }
 
@@ -4023,6 +5094,32 @@ fn next_terminal_poll_delay_ms(current: u64, state_changed: bool) -> u64 {
     }
 }
 
+fn pane_update_requires_repaint(snapshot_delivered: bool, screens_delivered: usize) -> bool {
+    snapshot_delivered || screens_delivered > 0
+}
+
+fn responsive_panes(
+    now: Instant,
+    focused_pane: Option<Uuid>,
+    pane_attention: &HashMap<Uuid, Instant>,
+) -> Vec<Uuid> {
+    let mut panes = pane_attention
+        .iter()
+        .filter_map(|(pane_id, attended)| {
+            (Some(*pane_id) == focused_pane
+                || now.saturating_duration_since(*attended) < COLD_PANE_AFTER)
+                .then_some(*pane_id)
+        })
+        .collect::<Vec<_>>();
+    if let Some(focused) = focused_pane
+        && !panes.contains(&focused)
+    {
+        panes.push(focused);
+    }
+    panes.sort_unstable();
+    panes
+}
+
 fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
     match button {
         MouseButton::Left => Some(TerminalMouseButton::Left),
@@ -4127,6 +5224,101 @@ fn split_placement_at(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Option
     }
 }
 
+fn history_label(label: &'static str) -> AnyElement {
+    div()
+        .w(px(76.0))
+        .font_family(".SystemUIFont")
+        .text_xs()
+        .text_color(rgb(THEME.muted))
+        .child(label)
+        .into_any_element()
+}
+
+fn history_scope_key(scope: HistoryClearScope) -> usize {
+    match scope {
+        HistoryClearScope::Terminal { .. } => 0,
+        HistoryClearScope::Workspace { .. } => 1,
+        HistoryClearScope::All => 2,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        format!("{}.{} GiB", bytes / GIB, (bytes % GIB) * 10 / GIB)
+    } else {
+        format!("{}.{} MiB", bytes / MIB, (bytes % MIB) * 10 / MIB)
+    }
+}
+
+fn format_history_date(milliseconds: u64) -> String {
+    let days = i64::try_from(milliseconds / 1_000 / 86_400).unwrap_or(i64::MAX);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let days = days_since_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (
+        year,
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
+}
+
+fn history_warning_text(warning: Option<HistoryWarning>, dropped_bytes: u64) -> Option<String> {
+    match warning {
+        Some(HistoryWarning::ApproachingCapacity) => Some(
+            "Archive is nearing its quota. Increase the limit or clear selected history before it fills."
+                .to_owned(),
+        ),
+        Some(HistoryWarning::PausedAtCapacity) => Some(format!(
+            "Archive is full and paused; the terminal is still live. {} could not be archived. Increase the quota or clear selected history.",
+            format_bytes(dropped_bytes)
+        )),
+        Some(HistoryWarning::QueueOverflow) => Some(format!(
+            "The storage queue could not keep up; {} is marked as an archive gap. Terminal input and output continued normally.",
+            format_bytes(dropped_bytes)
+        )),
+        Some(HistoryWarning::CorruptChunk) => Some(
+            "A local archive chunk failed integrity checks. It is shown as a gap; other chunks remain available."
+                .to_owned(),
+        ),
+        None => None,
+    }
+}
+
+fn plain_history_line(text: &str) -> TerminalLine {
+    TerminalLine {
+        runs: if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![TerminalRun {
+                text: text.to_owned(),
+                columns: text.chars().fold(0_u16, |columns, character| {
+                    columns.saturating_add(
+                        u16::try_from(character.width().unwrap_or(0)).unwrap_or(u16::MAX),
+                    )
+                }),
+                foreground: TerminalColor::DefaultForeground,
+                background: TerminalColor::DefaultBackground,
+                attributes: TerminalAttributes::default(),
+            }]
+        },
+    }
+}
+
 fn terminal_run_columns(run: &TerminalRun, start_column: u16) -> u16 {
     if run.columns == 0 {
         legacy_text_columns(&run.text, start_column)
@@ -4187,6 +5379,25 @@ fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
         PaneLayout::Split { first, second, .. } => {
             find_pane(first, pane_id).or_else(|| find_pane(second, pane_id))
         }
+    }
+}
+
+fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
+    let detail = match pane.identity.source {
+        rust_mux_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
+        rust_mux_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
+        rust_mux_protocol::TerminalIdentitySource::TerminalTitle => {
+            "Detected from a bounded terminal-title signal; terminal content is not inspected"
+        }
+        rust_mux_protocol::TerminalIdentitySource::Command => {
+            "Detected from a bounded local child-process name; terminal content is not inspected"
+        }
+        rust_mux_protocol::TerminalIdentitySource::Fallback => "Ordinary terminal",
+    };
+    TabIdentityPresentation {
+        label: pane.title.clone(),
+        badge: pane.identity.profile.badge(),
+        detail,
     }
 }
 
@@ -4570,6 +5781,9 @@ mod tests {
             title: "build".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
+            identity: rust_mux_protocol::TerminalIdentity::default(),
+            custom_title: Some("build".to_owned()),
+            profile_override: None,
         };
 
         let confirmation = CloseConfirmation::for_pane(&pane);
@@ -4580,6 +5794,39 @@ mod tests {
             confirmation.request(),
             ClientRequest::ClosePane { pane_id: pane.id }
         );
+    }
+
+    #[test]
+    fn native_tab_identity_label_and_neutral_badge_smoke_test() {
+        let cases = [
+            (TerminalProfile::Terminal, "Terminal", ">_"),
+            (TerminalProfile::Hermes, "Hermes", "H"),
+            (TerminalProfile::Codex, "Codex", "CX"),
+            (TerminalProfile::Claude, "Claude", "CL"),
+        ];
+        for (profile, label, badge) in cases {
+            let pane = Pane {
+                id: Uuid::new_v4(),
+                title: label.to_owned(),
+                shell: "zsh".to_owned(),
+                color: None,
+                identity: rust_mux_protocol::TerminalIdentity {
+                    profile,
+                    source: if profile == TerminalProfile::Terminal {
+                        rust_mux_protocol::TerminalIdentitySource::Fallback
+                    } else {
+                        rust_mux_protocol::TerminalIdentitySource::Command
+                    },
+                },
+                custom_title: None,
+                profile_override: None,
+            };
+
+            let presentation = tab_identity_presentation(&pane);
+            assert_eq!(presentation.label, label);
+            assert_eq!(presentation.badge, badge);
+            assert!(presentation.detail.contains("terminal") || label == "Terminal");
+        }
     }
 
     #[test]
@@ -4823,12 +6070,40 @@ mod tests {
     }
 
     #[test]
+    fn attention_policy_keeps_focused_and_recent_panes_but_cools_old_inactive_panes() {
+        let now = Instant::now();
+        let focused = Uuid::from_u128(1);
+        let recent = Uuid::from_u128(2);
+        let cold = Uuid::from_u128(3);
+        let attention = HashMap::from([
+            (focused, now.checked_sub(Duration::from_mins(2)).unwrap()),
+            (recent, now.checked_sub(Duration::from_secs(59)).unwrap()),
+            (cold, now.checked_sub(Duration::from_secs(61)).unwrap()),
+        ]);
+
+        assert_eq!(
+            responsive_panes(now, Some(focused), &attention),
+            vec![focused, recent]
+        );
+    }
+
+    #[test]
+    fn revision_metadata_alone_does_not_repaint_inactive_panes() {
+        assert!(!pane_update_requires_repaint(false, 0));
+        assert!(pane_update_requires_repaint(false, 1));
+        assert!(pane_update_requires_repaint(true, 0));
+    }
+
+    #[test]
     fn pane_geometry_tracks_narrow_medium_and_wide_windows_without_fixed_columns() {
         let pane = Pane {
             id: Uuid::from_u128(10),
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
+            identity: rust_mux_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
         };
         let layout = PaneLayout::Leaf { pane };
         let metrics = typography::TerminalCellMetrics {
@@ -4875,12 +6150,18 @@ mod tests {
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
+            identity: rust_mux_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
         };
         let second = Pane {
             id: Uuid::from_u128(22),
             title: "Terminal 2".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
+            identity: rust_mux_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
         };
         let layout = PaneLayout::Split {
             axis: SplitAxis::Horizontal,
@@ -4972,12 +6253,18 @@ mod tests {
             title: "one".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
+            identity: rust_mux_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
         };
         let second = Pane {
             id: Uuid::from_u128(102),
             title: "two".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
+            identity: rust_mux_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
         };
         let layout = PaneLayout::Split {
             axis: SplitAxis::Horizontal,
@@ -5010,6 +6297,9 @@ mod tests {
             title: format!("pane {id}"),
             shell: "zsh".to_owned(),
             color: None,
+            identity: rust_mux_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
         };
         let nested = PaneLayout::Split {
             axis: SplitAxis::Vertical,

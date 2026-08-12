@@ -1,8 +1,8 @@
 {
   "task_dir": "tasks/rust-mux",
-  "complete": 42,
-  "total": 64,
-  "percent": 66,
+  "complete": 51,
+  "total": 65,
+  "percent": 78,
   "tasks": [
     {
       "file": "tasks/rust-mux/00-vision.md",
@@ -118,9 +118,9 @@
       "file": "tasks/rust-mux/02-pty-sessions.md",
       "title": "Persistent PTY Sessions",
       "goal": "Make the session service own real local and system-SSH shell processes and terminal byte streams.",
-      "complete": 7,
+      "complete": 10,
       "total": 12,
-      "percent": 58,
+      "percent": 83,
       "checks": [
         {
           "text": "Add `portable-pty` behind a narrow service-owned Unix PTY abstraction on macOS and Linux.",
@@ -139,7 +139,7 @@
         },
         {
           "text": "Keep every PTY draining into bounded daemon-owned history even when its desktop subscription is idle or disconnected.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -174,12 +174,12 @@
         },
         {
           "text": "Backpressure behavior is documented and tested.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         },
         {
           "text": "A pane left unattended beyond the idle threshold cannot block its local or SSH child and can resume from a fresh snapshot without lost output.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         }
       ]
@@ -188,9 +188,9 @@
       "file": "tasks/rust-mux/03-terminal-rendering.md",
       "title": "Terminal Rendering and Input",
       "goal": "Render interactive terminal panes in the native desktop without duplicating terminal-emulation logic.",
-      "complete": 8,
-      "total": 12,
-      "percent": 67,
+      "complete": 12,
+      "total": 13,
+      "percent": 92,
       "checks": [
         {
           "text": "Expand the `alacritty_terminal` adapter around parsing, resize, and visible-grid snapshots.",
@@ -218,18 +218,23 @@
           "section": "Requirements"
         },
         {
+          "text": "Add optional owner-only chunked terminal history with bounded non-blocking writes, visible gaps, lazy upward paging/search, and pause-without-deletion capacity defaults.",
+          "done": true,
+          "section": "Requirements"
+        },
+        {
           "text": "Keep terminal-model APIs independent of GPUI.",
           "done": true,
           "section": "Requirements"
         },
         {
           "text": "Move protocol decoding, terminal update preparation, and other non-paint work off the UI thread.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
           "text": "Render revision-aware deltas only for changed, actively subscribed panes and resync stale panes from one fresh snapshot on focus.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -249,7 +254,7 @@
         },
         {
           "text": "Size and activity matrix measurements cover update volume, UI-thread work, resume latency, CPU, and memory for focused, recent, and stale panes.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         }
       ]
@@ -323,9 +328,9 @@
       "file": "tasks/rust-mux/05-reliability-hardening.md",
       "title": "macOS Reliability Hardening",
       "goal": "Validate the reliability claim under desktop, display, daemon, and SSH lifecycle stress on macOS and Linux.",
-      "complete": 2,
+      "complete": 4,
       "total": 11,
-      "percent": 18,
+      "percent": 36,
       "checks": [
         {
           "text": "Add structured service logs and opt-in diagnostics without recording terminal contents.",
@@ -339,7 +344,7 @@
         },
         {
           "text": "Define and measure idle-pane CPU, memory, serialized-byte, UI-thread, and focus-resume targets with diagnostics that never record terminal contents.",
-          "done": false,
+          "done": true,
           "section": "Requirements"
         },
         {
@@ -379,7 +384,7 @@
         },
         {
           "text": "Focused/recent panes remain responsive, stale panes stop generating live desktop traffic, and refocus performs one bounded fresh-snapshot resync before live deltas resume.",
-          "done": false,
+          "done": true,
           "section": "Acceptance Criteria"
         }
       ]

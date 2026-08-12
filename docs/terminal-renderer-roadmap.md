@@ -68,8 +68,9 @@ This is the first incremental implementation to authorize. It should visibly imp
 
 ### Phase R4: history and navigation
 
-- Expose bounded Alacritty scrollback through the service protocol without copying an unbounded client buffer.
-- Add wheel/trackpad scroll, scrollbar affordance, search, next/previous match, and selection across history.
+- Bounded Alacritty scrollback, wheel/trackpad scrolling, and literal search are integrated without copying an unbounded client buffer.
+- The daemon now records future PTY output into optional owner-only atomic/checksummed chunks through a bounded non-blocking queue. Reaching the top of live scrollback or missing a live search lazily loads one clearly labeled local-history page; the UI never retains a full archived session.
+- Rich styled historical replay, a scrollbar affordance spanning live plus archived ranges, and selection across archive-page boundaries remain open. The current archive is an honest bounded plain-text projection of raw output, not a restored live terminal snapshot.
 - Preserve deterministic reconnect/snapshot behavior and measure high-output backpressure before calling the renderer complete.
 
 ## Approved product sequence after responsive fidelity

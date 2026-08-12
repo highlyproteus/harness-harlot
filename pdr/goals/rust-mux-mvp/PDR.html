@@ -167,7 +167,7 @@
   "goal_id": "rust-mux-mvp",
   "goal": "Deliver a reliability-first local and SSH terminal workspace for macOS and Linux whose live sessions survive desktop-client restarts",
   "created": "2026-08-11",
-  "last_updated": "2026-08-11T23:09:03Z",
+  "last_updated": "2026-08-12T05:01:00Z",
   "context": "Rust Mux is a lightweight terminal workspace, not an agent harness or runtime: a dense workspace list on the left and real terminal panes on the right. Users create and switch workspaces, add panes, split, resize, focus, and rearrange them; terminals and agents run as ordinary shell workloads without the workspace competing for their CPU or memory. The integrated checkpoint runs configured local shells in daemon-owned PTYs with real input, output, parsing, resize, terminal interaction, restricted desired-state recovery, stable commands/navigation, and an explicit two-step system-OpenSSH action; fake terminal cards, activity dashboards, health badges, and agent status are not acceptable. The performance contract is change-only updates, off-UI-thread processing, bounded history, content-safe diagnostics, and nearly free idle panes. A focused or recently attended pane remains subscribed to responsive revision-aware deltas. After about 60 seconds without attention, its daemon-owned PTY must keep draining and recording into bounded history, but the daemon stops serializing and pushing live screen updates to the desktop and treats the projection as coalesced or stale. Selection requests one immediate fresh snapshot before rendering, then resumes live deltas; normal frequent switching must remain immediate. This policy must never disconnect a PTY, lose output, or let a local or remote process block. SSH host discovery, remote lifecycle soak, and durable remote reattachment remain later slices, and a privacy-focused isolated browser pane remains after terminal reliability and agent-as-terminal-workload support. Behavior and layout may be informed by public cmux material, but Rust Mux will use no cmux source, branding, icons, assets, or documentation prose. The desktop remains Rust-authored, GPU-rendered, WebView-free, and restartable independently of sessions on macOS and Linux. The terminal stack is a hard all-Rust boundary: Alacritty owns VT/grid semantics and GPUI/Rust owns rendering; Ghostty, libghostty, GhosttyKit, and other non-Rust terminal engines are excluded unless a future approved PDR revision reverses that decision. The application is network-silent by default: recovery snapshots exclude SSH host intent, and network access occurs only after explicit user confirmation, with no unauthenticated listener or background telemetry.",
   "objectives": [
     "Keep PTYs, processes, terminal state, and canonical layouts alive in a separate Rust service when the desktop exits or restarts",
@@ -178,12 +178,13 @@
     "Make the first runnable product proof a real configured-shell command flow across two daemon-owned local panes, not synthetic terminal content",
     "Select a WebView-free native GPU UI through a measured GPUI-first spike before locking the frontend framework",
     "Prove reliability with bounded streaming, deterministic state mutations, local and SSH reconnect tests, and platform-specific lifecycle tests",
-    "Make idle panes nearly free through revision-aware delta subscriptions while every PTY continues draining into bounded daemon-owned history",
+    "Make idle panes nearly free through revision-aware delta subscriptions while every PTY continues draining into bounded daemon-owned live history and an optional owner-only disk archive",
+    "Retain future full-session output locally through atomic checksummed chunks, bounded non-blocking queues, honest gaps, lazy paging, and pause-without-deletion capacity defaults",
     "Remain network-silent by default, with network access occurring only for explicit SSH or later user-initiated isolated-browser actions"
   ],
   "roadmap": [
-    "Finish responsive terminal fidelity and text correctness, then replace full-screen polling with revision-aware delta streaming, off-UI-thread processing, and the measured focused, recent, and stale idle-pane subscription contract",
-    "Continue hardening the now-integrated terminal interaction, session recovery, commands/navigation, and native system-OpenSSH tracks from their shared local checkpoint",
+    "Finish responsive terminal fidelity and text correctness on top of the implemented revision-aware pane stream, background decoding, measured focused/recent/stale attention contract, and optional private local history archive",
+    "Continue hardening the now-integrated terminal interaction, optional local history archive, session recovery, commands/navigation, and native system-OpenSSH tracks from their shared local checkpoint",
     "Treat agents as ordinary terminal workloads, then add a thin provider-neutral status and resume layer",
     "Later evaluate a privacy-focused isolated browser pane and richer optional agent workflows after the terminal and reliability core is mature"
   ],

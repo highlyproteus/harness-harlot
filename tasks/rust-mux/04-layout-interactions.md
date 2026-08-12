@@ -22,6 +22,8 @@ Current checkpoint: pane headers now pass their own pane ID into add, split, ren
 
 Appearance remains intentionally small: a local settings dialog and the existing right-click surfaces share one preset/recent picker. Override precedence is explicit, colors apply live, and terminal/workspace scopes never inherit from one another.
 
+Automatic terminal identity is presentation metadata, not agent status or supervision. Explicit rename, selected profile, exact bounded OSC title, bounded/throttled child-process basename, and generic terminal fallback resolve in that order. The tab menu can correct or reset identity. Only explicit rename/profile overrides enter desired-state recovery; raw titles, process metadata, terminal content, and live detection do not. Original neutral text badges avoid unclear third-party logo redistribution rights.
+
 ## Acceptance Criteria
 - [ ] Every layout mutation has deterministic model tests.
 - [ ] Drag/drop works across splits and tabs without losing a local or SSH session.

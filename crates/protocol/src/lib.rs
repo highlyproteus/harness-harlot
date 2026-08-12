@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const SOCKET_ENV: &str = "RUST_MUX_SOCKET";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_SSH_HOST_LEN: usize = 253;
@@ -71,6 +71,9 @@ impl SessionSnapshot {
             title: "Terminal 1".to_owned(),
             shell: "shell".to_owned(),
             color: None,
+            identity: TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
         };
         let tab = Tab {
             id: Uuid::new_v4(),
@@ -139,6 +142,133 @@ pub struct Pane {
     pub shell: String,
     #[serde(default)]
     pub color: Option<AppearanceColor>,
+    /// Ephemeral resolved identity projected by the local session service.
+    /// Only explicit overrides below are included in desired-state recovery.
+    #[serde(default)]
+    pub identity: TerminalIdentity,
+    #[serde(default)]
+    pub custom_title: Option<String>,
+    #[serde(default)]
+    pub profile_override: Option<TerminalProfile>,
+}
+
+/// A stable local terminal profile. Badge glyphs are original neutral text
+/// marks rather than third-party logos or copied application assets.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalProfile {
+    #[default]
+    Terminal,
+    Hermes,
+    Codex,
+    Claude,
+}
+
+impl TerminalProfile {
+    pub const ALL: [Self; 4] = [Self::Terminal, Self::Hermes, Self::Codex, Self::Claude];
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::Hermes => "Hermes",
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+        }
+    }
+
+    pub const fn badge(self) -> &'static str {
+        match self {
+            Self::Terminal => ">_",
+            Self::Hermes => "H",
+            Self::Codex => "CX",
+            Self::Claude => "CL",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalIdentitySource {
+    UserRename,
+    UserProfile,
+    TerminalTitle,
+    Command,
+    #[default]
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalIdentity {
+    pub profile: TerminalProfile,
+    pub source: TerminalIdentitySource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalProfileDefinition {
+    pub profile: TerminalProfile,
+    pub commands: &'static [&'static str],
+    pub terminal_titles: &'static [&'static str],
+}
+
+/// Local, compile-time registry used for explicit profiles and bounded safe
+/// detection. It performs no network access and contains no third-party art.
+pub const TERMINAL_PROFILE_REGISTRY: [TerminalProfileDefinition; 3] = [
+    TerminalProfileDefinition {
+        profile: TerminalProfile::Hermes,
+        commands: &["hermes", "hermes-agent"],
+        terminal_titles: &["hermes", "hermes agent"],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::Codex,
+        commands: &["codex", "chatgpt"],
+        terminal_titles: &["codex", "chatgpt", "chatgpt codex"],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::Claude,
+        commands: &["claude", "claude-code"],
+        terminal_titles: &["claude", "claude code"],
+    },
+];
+
+pub fn terminal_profile_for_command(command: &str) -> Option<TerminalProfile> {
+    let command = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let command = command
+        .get(..command.len().saturating_sub(4))
+        .filter(|_| {
+            command
+                .get(command.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        })
+        .unwrap_or(command);
+    TERMINAL_PROFILE_REGISTRY.iter().find_map(|definition| {
+        definition
+            .commands
+            .iter()
+            .any(|known| command.eq_ignore_ascii_case(known))
+            .then_some(definition.profile)
+    })
+}
+
+pub fn terminal_profile_for_title(title: &str) -> Option<TerminalProfile> {
+    if title.chars().count() > 80 || title.chars().any(char::is_control) {
+        return None;
+    }
+    let normalized = title
+        .trim()
+        .trim_matches(|character: char| {
+            character.is_ascii_whitespace()
+                || matches!(
+                    character,
+                    '[' | ']' | '(' | ')' | '{' | '}' | '*' | '✳' | '•'
+                )
+        })
+        .to_ascii_lowercase();
+    TERMINAL_PROFILE_REGISTRY.iter().find_map(|definition| {
+        definition
+            .terminal_titles
+            .contains(&normalized.as_str())
+            .then_some(definition.profile)
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -153,6 +283,43 @@ pub struct TerminalScreen {
     pub display_offset: u32,
     pub history_size: u32,
     pub modes: TerminalModes,
+}
+
+/// The last terminal revision a receiver has applied for one pane.
+///
+/// Cursors contain no terminal contents and are safe to include in local
+/// performance diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PaneRevisionCursor {
+    pub pane_id: Uuid,
+    pub revision: u64,
+}
+
+/// Content-free delivery state for one daemon-owned pane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PaneStreamState {
+    pub pane_id: Uuid,
+    pub revision: u64,
+    pub subscribed: bool,
+    pub dirty: bool,
+}
+
+/// Per-response, content-free measurements for the pane stream hot path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StreamDiagnostics {
+    pub panes_considered: u32,
+    pub panes_subscribed: u32,
+    pub screens_queued: u32,
+    pub screens_delivered: u32,
+    pub coalesced_revisions: u64,
+    pub snapshot_bytes: u64,
+    pub screen_bytes: u64,
+    pub preparation_micros: u64,
+    /// Filled by the desktop after merging a decoded response. The daemon
+    /// leaves this at zero.
+    pub desktop_apply_micros: u64,
+    pub service_cpu_milli_percent: u32,
+    pub service_memory_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -288,6 +455,116 @@ pub enum DropPlacement {
     Bottom,
 }
 
+/// Local terminal history retention. Selecting a finite duration is an
+/// explicit opt-in to deleting closed archive sessions after that age.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryRetention {
+    Indefinite,
+    Days { days: u32 },
+}
+
+/// Behavior when the local archive reaches its configured capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryCleanupPolicy {
+    /// Stop accepting archive bytes while keeping the terminal itself live.
+    PauseWhenFull,
+    /// Explicit opt-in to remove the oldest closed sessions first.
+    DeleteOldest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistorySettings {
+    pub enabled: bool,
+    pub retention: HistoryRetention,
+    pub quota_bytes: u64,
+    pub cleanup_policy: HistoryCleanupPolicy,
+}
+
+impl Default for HistorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention: HistoryRetention::Indefinite,
+            quota_bytes: 5 * 1024 * 1024 * 1024,
+            cleanup_policy: HistoryCleanupPolicy::PauseWhenFull,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryWarning {
+    ApproachingCapacity,
+    PausedAtCapacity,
+    QueueOverflow,
+    CorruptChunk,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoryArchiveStatus {
+    pub settings: HistorySettings,
+    pub live_scrollback_lines: u32,
+    pub archived_bytes: u64,
+    pub retained_sessions: u32,
+    pub oldest_started_ms: Option<u64>,
+    pub dropped_bytes: u64,
+    pub warning: Option<HistoryWarning>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryClearScope {
+    Terminal { pane_id: Uuid },
+    Workspace { workspace_id: Uuid },
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoryCursor {
+    pub session_id: Uuid,
+    pub chunk_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryPageDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HistoryPageFlags {
+    bits: u8,
+}
+
+impl HistoryPageFlags {
+    pub const HAS_OLDER: u8 = 1 << 0;
+    pub const HAS_NEWER: u8 = 1 << 1;
+    pub const GAP_BEFORE: u8 = 1 << 2;
+    pub const GAP_AFTER: u8 = 1 << 3;
+    pub const CORRUPT: u8 = 1 << 4;
+
+    pub const fn new(bits: u8) -> Self {
+        Self { bits }
+    }
+
+    pub const fn contains(self, flag: u8) -> bool {
+        self.bits & flag != 0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalHistoryPage {
+    pub pane_id: Uuid,
+    pub cursor: HistoryCursor,
+    pub started_ms: u64,
+    pub lines: Vec<String>,
+    pub flags: HistoryPageFlags,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientRequest {
@@ -295,7 +572,14 @@ pub enum ClientRequest {
         protocol_version: u16,
     },
     GetSnapshot,
-    GetState,
+    GetUpdates {
+        snapshot_revision: Option<u64>,
+        pane_revisions: Vec<PaneRevisionCursor>,
+        subscribed_panes: Vec<Uuid>,
+    },
+    GetPaneSnapshot {
+        pane_id: Uuid,
+    },
     CreatePane {
         target_pane: Uuid,
         axis: SplitAxis,
@@ -326,6 +610,13 @@ pub enum ClientRequest {
     RenamePane {
         pane_id: Uuid,
         title: String,
+    },
+    SetPaneProfile {
+        pane_id: Uuid,
+        profile: Option<TerminalProfile>,
+    },
+    ResetPaneIdentity {
+        pane_id: Uuid,
     },
     ClosePane {
         pane_id: Uuid,
@@ -387,6 +678,23 @@ pub enum ClientRequest {
         columns: u16,
         rows: u16,
     },
+    GetHistoryStatus,
+    SetHistorySettings {
+        settings: HistorySettings,
+    },
+    ClearHistory {
+        scope: HistoryClearScope,
+    },
+    LoadHistoryPage {
+        pane_id: Uuid,
+        cursor: Option<HistoryCursor>,
+        direction: HistoryPageDirection,
+    },
+    SearchArchivedHistory {
+        pane_id: Uuid,
+        query: String,
+        before: Option<HistoryCursor>,
+    },
 }
 
 /// Validates the single OpenSSH destination accepted from the desktop UI.
@@ -431,9 +739,16 @@ pub enum ServiceResponse {
     Snapshot {
         snapshot: SessionSnapshot,
     },
-    State {
-        snapshot: SessionSnapshot,
+    Updates {
+        session_revision: u64,
+        snapshot: Option<SessionSnapshot>,
         screens: Vec<TerminalScreen>,
+        pane_states: Vec<PaneStreamState>,
+        diagnostics: StreamDiagnostics,
+    },
+    PaneSnapshot {
+        screen: TerminalScreen,
+        diagnostics: StreamDiagnostics,
     },
     PaneCreated {
         pane_id: Uuid,
@@ -448,6 +763,15 @@ pub enum ServiceResponse {
     },
     SearchResult {
         found: bool,
+    },
+    HistoryStatus {
+        status: HistoryArchiveStatus,
+    },
+    HistoryPage {
+        page: Option<TerminalHistoryPage>,
+    },
+    HistorySearchResult {
+        page: Option<TerminalHistoryPage>,
     },
     Error {
         message: String,
@@ -579,6 +903,35 @@ mod tests {
             panic!("expected leaf");
         };
         assert_eq!(pane.color, None);
+        assert_eq!(pane.identity, TerminalIdentity::default());
+        assert_eq!(pane.custom_title, None);
+        assert_eq!(pane.profile_override, None);
+    }
+
+    #[test]
+    fn local_profile_registry_maps_known_commands_titles_and_unknown_fallbacks() {
+        assert_eq!(
+            terminal_profile_for_command("/opt/homebrew/bin/hermes"),
+            Some(TerminalProfile::Hermes)
+        );
+        assert_eq!(
+            terminal_profile_for_command("CHATGPT.EXE"),
+            Some(TerminalProfile::Codex)
+        );
+        assert_eq!(
+            terminal_profile_for_title(" ✳ Claude Code "),
+            Some(TerminalProfile::Claude)
+        );
+        assert_eq!(terminal_profile_for_command("vim"), None);
+        assert_eq!(terminal_profile_for_title("fix claude code docs"), None);
+    }
+
+    #[test]
+    fn neutral_profile_badges_are_small_text_marks() {
+        assert_eq!(TerminalProfile::Hermes.badge(), "H");
+        assert_eq!(TerminalProfile::Codex.badge(), "CX");
+        assert_eq!(TerminalProfile::Claude.badge(), "CL");
+        assert_eq!(TerminalProfile::Terminal.badge(), ">_");
     }
 
     #[test]

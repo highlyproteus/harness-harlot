@@ -44,6 +44,28 @@ async fn client_can_handshake_and_fetch_snapshot() {
             };
             write_message(
                 &mut client,
+                &ClientRequest::GetUpdates {
+                    snapshot_revision: Some(snapshot.revision),
+                    pane_revisions: Vec::new(),
+                    subscribed_panes: vec![target_pane],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_message::<ServiceResponse>(&mut client).await.unwrap(),
+                ServiceResponse::Updates {
+                    snapshot: None,
+                    screens,
+                    pane_states,
+                    ..
+                } if screens.len() == 1
+                    && screens[0].pane_id == target_pane
+                    && pane_states.len() == 1
+                    && !pane_states[0].dirty
+            ));
+            write_message(
+                &mut client,
                 &ClientRequest::ConnectSsh {
                     target_pane,
                     host: "-A".to_owned(),
@@ -59,6 +81,36 @@ async fn client_can_handshake_and_fetch_snapshot() {
         }
         other => panic!("unexpected response: {other:?}"),
     }
+
+    drop(client);
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn older_full_state_protocol_is_rejected_before_any_request() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_task = tokio::spawn(async move {
+        assert!(
+            serve_connection(server, &SessionRegistry::default())
+                .await
+                .is_err()
+        );
+    });
+
+    write_message(
+        &mut client,
+        &ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION - 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_message::<ServiceResponse>(&mut client).await.unwrap(),
+        ServiceResponse::Error { message }
+            if message.contains("protocol mismatch")
+                && message.contains(&PROTOCOL_VERSION.to_string())
+    ));
 
     drop(client);
     server_task.await.unwrap();

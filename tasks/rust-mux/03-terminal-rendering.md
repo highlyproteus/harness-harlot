@@ -12,9 +12,10 @@ Alacritty's engine should own VT parsing and terminal cell state while Rust Mux 
 - [x] Translate core keyboard and focus events into PTY input.
 - [ ] Add styled cells, cursor rendering, Unicode-width handling, IME, mouse reporting, and paste/clipboard integration.
 - [x] Add scrollback, selection, copy, and search.
+- [x] Add optional owner-only chunked terminal history with bounded non-blocking writes, visible gaps, lazy upward paging/search, and pause-without-deletion capacity defaults.
 - [x] Keep terminal-model APIs independent of GPUI.
-- [ ] Move protocol decoding, terminal update preparation, and other non-paint work off the UI thread.
-- [ ] Render revision-aware deltas only for changed, actively subscribed panes and resync stale panes from one fresh snapshot on focus.
+- [x] Move protocol decoding, terminal update preparation, and other non-paint work off the UI thread.
+- [x] Render revision-aware deltas only for changed, actively subscribed panes and resync stale panes from one fresh snapshot on focus.
 
 ## Technical Notes
 Use representative shell fixtures and escape-sequence recordings rather than hand-authored assumptions about VT behavior.
@@ -27,4 +28,4 @@ Idle-pane contract: focused and recently attended panes receive responsive delta
 - [x] Interactive local shells render and accept input.
 - [x] Unicode, colors, cursor modes, resize, and scrollback have regression coverage.
 - [x] Desktop restart reconnects to the current rendered state.
-- [ ] Size and activity matrix measurements cover update volume, UI-thread work, resume latency, CPU, and memory for focused, recent, and stale panes.
+- [x] Size and activity matrix measurements cover update volume, UI-thread work, resume latency, CPU, and memory for focused, recent, and stale panes.
