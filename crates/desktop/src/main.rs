@@ -8,7 +8,7 @@
     clippy::unused_self
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,7 @@ actions!(
     rust_mux,
     [
         NewWorkspace,
+        ToggleSidebar,
         NewTab,
         SplitRight,
         SplitDown,
@@ -798,6 +799,7 @@ struct RustMux {
     pane_attention: HashMap<Uuid, Instant>,
     stream_diagnostics: StreamDiagnostics,
     active_workspace: Option<Uuid>,
+    expanded_workspaces: HashSet<Uuid>,
     focused_pane: Option<Uuid>,
     split_ratios: HashMap<SplitControlId, f32>,
     zoomed_pane: Option<Uuid>,
@@ -806,6 +808,7 @@ struct RustMux {
     sidebar_resize: SidebarResizeLifecycle,
     ui_state_store: Option<UiStateStore>,
     preferred_sidebar_width: f32,
+    sidebar_visible: bool,
     sidebar_pixels: f32,
     last_sizes: HashMap<Uuid, (u16, u16)>,
     workspace_pixels: (f32, f32),
@@ -864,6 +867,7 @@ impl RustMux {
             pane_attention: HashMap::new(),
             stream_diagnostics: StreamDiagnostics::default(),
             active_workspace: None,
+            expanded_workspaces: HashSet::new(),
             focused_pane: None,
             split_ratios: HashMap::new(),
             zoomed_pane: None,
@@ -872,6 +876,7 @@ impl RustMux {
             sidebar_resize: SidebarResizeLifecycle::default(),
             ui_state_store,
             preferred_sidebar_width,
+            sidebar_visible: true,
             sidebar_pixels: DEFAULT_SIDEBAR_WIDTH,
             last_sizes: HashMap::new(),
             workspace_pixels: (0.0, 0.0),
@@ -1411,6 +1416,36 @@ impl RustMux {
         self.begin_workspace_creation(cx);
     }
 
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_visible = !self.sidebar_visible;
+        if self.sidebar_resize.finish() {
+            self.persist_sidebar_width();
+        }
+        let window_width = self.workspace_pixels.0 + self.sidebar_pixels;
+        self.sidebar_pixels = sidebar_width_for_visibility(
+            self.preferred_sidebar_width,
+            window_width,
+            self.sidebar_visible,
+        );
+        self.workspace_pixels.0 = (window_width - self.sidebar_pixels).max(1.0);
+        self.last_sizes.clear();
+        self.sync_pty_sizes();
+        cx.notify();
+    }
+
+    fn toggle_workspace_expanded(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        if !self.expanded_workspaces.remove(&workspace_id) {
+            self.expanded_workspaces.insert(workspace_id);
+        }
+        cx.notify();
+    }
+
+    fn select_workspace_tab(&mut self, workspace_id: Uuid, pane_id: Uuid, cx: &mut Context<Self>) {
+        self.active_workspace = Some(workspace_id);
+        self.activate_tab(pane_id, cx);
+        self.last_sizes.clear();
+    }
+
     fn new_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(target_pane) = self.focused_pane {
             self.new_tab_at(target_pane, cx);
@@ -1870,6 +1905,7 @@ impl RustMux {
         self.command_palette = None;
         match command {
             AppCommand::NewWorkspace => self.new_workspace(cx),
+            AppCommand::ToggleSidebar => self.toggle_sidebar(cx),
             AppCommand::NewTab => self.new_tab(cx),
             AppCommand::SplitRight => self.split(SplitAxis::Horizontal, cx),
             AppCommand::SplitDown => self.split(SplitAxis::Vertical, cx),
@@ -2799,7 +2835,11 @@ impl RustMux {
 
     fn update_window_geometry(&mut self, window: &Window) -> bool {
         let window_width = f32::from(window.bounds().size.width);
-        let sidebar_pixels = constrained_sidebar_width(self.preferred_sidebar_width, window_width);
+        let sidebar_pixels = sidebar_width_for_visibility(
+            self.preferred_sidebar_width,
+            window_width,
+            self.sidebar_visible,
+        );
         let next = workspace_pixel_size(
             window_width,
             f32::from(window.bounds().size.height),
@@ -2926,10 +2966,33 @@ impl RustMux {
                     .pr(px(8.0))
                     .flex()
                     .items_center()
-                    .gap(px(14.0))
+                    .gap(px(10.0))
                     .text_sm()
                     .text_color(rgb(THEME.muted))
-                    .child("▣")
+                    .child(
+                        div()
+                            .id("hide-workspace-sidebar")
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(THEME.elevated))
+                                    .text_color(rgb(THEME.foreground))
+                            })
+                            .tooltip(|_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: "Hide workspace sidebar (⌘B)".to_owned(),
+                                })
+                                .into()
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+                            .child(render_sidebar_toggle_icon(true)),
+                    )
                     .child(
                         div()
                             .id("appearance-settings")
@@ -2972,7 +3035,7 @@ impl RustMux {
                 div()
                     .px(px(10.0))
                     .pt(px(10.0))
-                    .pb(px(8.0))
+                    .pb(px(6.0))
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
@@ -2982,13 +3045,6 @@ impl RustMux {
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(THEME.foreground))
                             .child("Workspaces"),
-                    )
-                    .child(
-                        div()
-                            .font_family("SF Mono")
-                            .text_xs()
-                            .text_color(rgb(THEME.dim))
-                            .child("~/Projects"),
                     ),
             )
             .children(
@@ -3014,10 +3070,16 @@ impl RustMux {
                         );
                         let pinned = workspace.pinned;
                         let workspace_title = workspace.title.clone();
+                        let terminal_tabs = workspace_terminal_tabs(&workspace)
+                            .into_iter()
+                            .cloned()
+                            .collect::<Vec<_>>();
                         let first_pane = workspace
                             .tabs
                             .first()
                             .and_then(|tab| visible_panes(&tab.layout).first().copied());
+                        let terminal_count = terminal_tabs.len();
+                        let expanded = self.expanded_workspaces.contains(&workspace_id);
                         let workspace_color = self.workspace_color(workspace_id).as_rgb();
                         let card_color = if connected {
                             0x234b38
@@ -3027,68 +3089,104 @@ impl RustMux {
                             workspace_color
                         };
                         let active_text = readable_text_color(card_color);
-                        let pane_count = workspace
-                            .tabs
-                            .first()
-                            .map_or(0, |tab| visible_panes(&tab.layout).len());
-                        let status = match &workspace.connection {
-                            WorkspaceConnection::Local => format!(
-                                "local · {pane_count} pane{}",
-                                if pane_count == 1 { "" } else { "s" }
-                            ),
+                        let connection_status = match &workspace.connection {
+                            WorkspaceConnection::Local => None,
                             WorkspaceConnection::SystemSsh {
                                 destination,
                                 status: WorkspaceConnectionStatus::Connected,
-                            } => format!("connected · {destination}"),
+                            } => Some(format!("Connected · {destination}")),
                             WorkspaceConnection::SystemSsh {
                                 destination,
                                 status: WorkspaceConnectionStatus::Offline,
-                            } => format!("offline · {destination}"),
+                            } => Some(format!("Offline · {destination}")),
                         };
                         div()
-                            .id(("workspace", element_key(workspace.id)))
+                            .id(("workspace-section", element_key(workspace.id)))
                             .mx(px(7.0))
                             .mb(px(3.0))
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .rounded(px(6.0))
-                            .when(!offline || pane_count == 0, |element| {
-                                element.cursor_pointer()
-                            })
-                            .when(offline, |element| element.bg(rgb(card_color)))
-                            .when(active || connected, |element| element.bg(rgb(card_color)))
-                            .hover(|element| {
-                                if active || connected || offline {
-                                    element
-                                } else {
-                                    element.bg(rgb(THEME.surface))
-                                }
-                            })
-                            .when(!offline || pane_count == 0, |element| {
-                                element.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.active_workspace = Some(workspace_id);
-                                    if let Some(pane_id) = first_pane {
-                                        this.focus_pane_with_snapshot(pane_id);
-                                    }
-                                    this.last_sizes.clear();
-                                    cx.notify();
-                                }))
-                            })
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.open_workspace_menu(workspace_id, event.position, cx);
-                                    cx.stop_propagation();
-                                }),
-                            )
                             .flex()
                             .flex_col()
-                            .gap(px(3.0))
+                            .gap(px(2.0))
                             .child(
                                 div()
+                                    .id(("workspace", element_key(workspace.id)))
+                                    .h(px(31.0))
+                                    .px(px(8.0))
+                                    .rounded(px(6.0))
+                                    .when(!offline || terminal_count == 0, |element| {
+                                        element.cursor_pointer()
+                                    })
+                                    .when(offline, |element| element.bg(rgb(card_color)))
+                                    .when(active || connected, |element| {
+                                        element.bg(rgb(card_color))
+                                    })
+                                    .hover(|element| {
+                                        if active || connected || offline {
+                                            element
+                                        } else {
+                                            element.bg(rgb(THEME.surface))
+                                        }
+                                    })
+                                    .when(!offline || terminal_count == 0, |element| {
+                                        element.on_click(cx.listener(move |this, _, _, cx| {
+                                            this.active_workspace = Some(workspace_id);
+                                            if let Some(pane_id) = first_pane {
+                                                this.focus_pane_with_snapshot(pane_id);
+                                            }
+                                            this.last_sizes.clear();
+                                            cx.notify();
+                                        }))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            this.open_workspace_menu(
+                                                workspace_id,
+                                                event.position,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }),
+                                    )
                                     .flex()
                                     .items_center()
                                     .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .id((
+                                                "toggle-workspace-tabs",
+                                                element_key(workspace_id),
+                                            ))
+                                            .flex_none()
+                                            .w(px(14.0))
+                                            .h(px(18.0))
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .font_family(".SystemUIFont")
+                                            .text_sm()
+                                            .text_color(if active || connected || offline {
+                                                rgb(active_text)
+                                            } else {
+                                                rgb(THEME.muted)
+                                            })
+                                            .tooltip(move |_, cx| {
+                                                cx.new(|_| TooltipView {
+                                                    text: if expanded {
+                                                        "Collapse terminal tabs".to_owned()
+                                                    } else {
+                                                        "Expand terminal tabs".to_owned()
+                                                    },
+                                                })
+                                                .into()
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle_workspace_expanded(workspace_id, cx);
+                                                cx.stop_propagation();
+                                            }))
+                                            .child(if expanded { "⌄" } else { "›" }),
+                                    )
                                     .child(
                                         div()
                                             .flex_1()
@@ -3100,6 +3198,37 @@ impl RustMux {
                                                 rgb(THEME.foreground)
                                             })
                                             .child(format!("{}  {workspace_title}", index + 1)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("workspace-tab-count", element_key(workspace_id)))
+                                            .flex_none()
+                                            .min_w(px(18.0))
+                                            .h(px(17.0))
+                                            .px(px(5.0))
+                                            .rounded_full()
+                                            .bg(rgba(if active || connected || offline {
+                                                0xffffff20
+                                            } else {
+                                                0xffffff0c
+                                            }))
+                                            .font_family("SF Mono")
+                                            .text_size(px(9.5))
+                                            .text_color(if active || connected || offline {
+                                                rgb(active_text)
+                                            } else {
+                                                rgb(THEME.muted)
+                                            })
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .tooltip(move |_, cx| {
+                                                cx.new(|_| TooltipView {
+                                                    text: terminal_tab_count_label(terminal_count),
+                                                })
+                                                .into()
+                                            })
+                                            .child(terminal_count.to_string()),
                                     )
                                     .child(
                                         div()
@@ -3136,59 +3265,151 @@ impl RustMux {
                                             .child("×"),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
+                            .when_some(connection_status, |element, status| {
+                                element.child(
+                                    div()
+                                        .ml(px(21.0))
+                                        .mr(px(4.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_sm()
+                                                .font_family("SF Mono")
+                                                .text_xs()
+                                                .text_color(rgb(THEME.dim))
+                                                .child(status),
+                                        )
+                                        .when(connected, |element| {
+                                            element.child(
+                                                div()
+                                                    .id((
+                                                        "disconnect-workspace",
+                                                        element_key(workspace_id),
+                                                    ))
+                                                    .cursor_pointer()
+                                                    .text_xs()
+                                                    .text_color(rgb(THEME.foreground))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.disconnect_workspace(workspace_id, cx);
+                                                        cx.stop_propagation();
+                                                    }))
+                                                    .child("Disconnect"),
+                                            )
+                                        })
+                                        .when(offline, |element| {
+                                            element.child(
+                                                div()
+                                                    .id((
+                                                        "reconnect-workspace",
+                                                        element_key(workspace_id),
+                                                    ))
+                                                    .cursor_pointer()
+                                                    .text_xs()
+                                                    .text_color(rgb(THEME.ansi[2]))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.reconnect_workspace(workspace_id, cx);
+                                                        cx.stop_propagation();
+                                                    }))
+                                                    .child("Reconnect"),
+                                            )
+                                        }),
+                                )
+                            })
+                            .when(expanded, |element| {
+                                if terminal_tabs.is_empty() {
+                                    element.child(
                                         div()
-                                            .flex_1()
-                                            .text_sm()
-                                            .font_family("SF Mono")
+                                            .ml(px(28.0))
+                                            .mr(px(4.0))
+                                            .py(px(5.0))
+                                            .font_family(".SystemUIFont")
                                             .text_xs()
-                                            .text_color(if active || connected || offline {
-                                                rgb(active_text)
-                                            } else {
-                                                rgb(THEME.dim)
-                                            })
-                                            .child(status),
+                                            .text_color(rgb(THEME.dim))
+                                            .child("No open terminal tabs"),
                                     )
-                                    .when(connected, |element| {
-                                        element.child(
-                                            div()
-                                                .id((
-                                                    "disconnect-workspace",
-                                                    element_key(workspace_id),
-                                                ))
-                                                .cursor_pointer()
-                                                .text_xs()
-                                                .text_color(rgb(THEME.foreground))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.disconnect_workspace(workspace_id, cx);
-                                                    cx.stop_propagation();
-                                                }))
-                                                .child("Disconnect"),
-                                        )
-                                    })
-                                    .when(offline, |element| {
-                                        element.child(
-                                            div()
-                                                .id((
-                                                    "reconnect-workspace",
-                                                    element_key(workspace_id),
-                                                ))
-                                                .cursor_pointer()
-                                                .text_xs()
-                                                .text_color(rgb(THEME.ansi[2]))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.reconnect_workspace(workspace_id, cx);
-                                                    cx.stop_propagation();
-                                                }))
-                                                .child("Reconnect"),
-                                        )
-                                    }),
-                            )
+                                } else {
+                                    element.children(terminal_tabs.into_iter().map(|pane| {
+                                        let pane_id = pane.id;
+                                        let selected = self.focused_pane == Some(pane_id);
+                                        let identity = tab_identity_presentation(&pane);
+                                        let identity_detail = identity.detail.clone();
+                                        let pane_accent = self.terminal_accent(pane_id).as_rgb();
+                                        div()
+                                            .id(("workspace-tab", element_key(pane_id)))
+                                            .ml(px(20.0))
+                                            .mr(px(4.0))
+                                            .px(px(7.0))
+                                            .h(px(27.0))
+                                            .rounded(px(4.0))
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(7.0))
+                                            .when(selected, |element| {
+                                                element.bg(rgb(THEME.surface))
+                                            })
+                                            .hover(|element| element.bg(rgb(THEME.elevated)))
+                                            .tooltip(move |_, cx| {
+                                                cx.new(|_| TooltipView {
+                                                    text: identity_detail.clone(),
+                                                })
+                                                .into()
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.select_workspace_tab(
+                                                    workspace_id,
+                                                    pane_id,
+                                                    cx,
+                                                );
+                                                cx.stop_propagation();
+                                            }))
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(18.0))
+                                                    .h(px(18.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(render_terminal_profile_mark(
+                                                        identity.profile,
+                                                        if selected {
+                                                            THEME.foreground
+                                                        } else {
+                                                            THEME.muted
+                                                        },
+                                                        if selected {
+                                                            pane_accent
+                                                        } else {
+                                                            THEME.muted
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.0))
+                                                    .flex_1()
+                                                    .truncate()
+                                                    .font_family(".SystemUIFont")
+                                                    .text_xs()
+                                                    .font_weight(if selected {
+                                                        gpui::FontWeight::MEDIUM
+                                                    } else {
+                                                        gpui::FontWeight::NORMAL
+                                                    })
+                                                    .text_color(if selected {
+                                                        rgb(THEME.foreground)
+                                                    } else {
+                                                        rgb(THEME.muted)
+                                                    })
+                                                    .child(identity.label),
+                                            )
+                                    }))
+                                }
+                            })
                     }),
             )
             .child(div().flex_1())
@@ -6134,13 +6355,42 @@ impl RustMux {
                 div()
                     .h(px(TITLEBAR_HEIGHT))
                     .flex_none()
-                    .px(px(11.0))
+                    .pl(px(if self.sidebar_visible { 11.0 } else { 79.0 }))
+                    .pr(px(11.0))
                     .bg(rgb(THEME.surface))
                     .border_b_1()
                     .border_color(rgb(THEME.border))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    .when(!self.sidebar_visible, |element| {
+                        element.child(
+                            div()
+                                .id("show-workspace-sidebar")
+                                .flex_none()
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(rgb(THEME.muted))
+                                .hover(|element| {
+                                    element
+                                        .bg(rgb(THEME.elevated))
+                                        .text_color(rgb(THEME.foreground))
+                                })
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| TooltipView {
+                                        text: "Show workspace sidebar (⌘B)".to_owned(),
+                                    })
+                                    .into()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+                                .child(render_sidebar_toggle_icon(false)),
+                        )
+                    })
                     .child(
                         div()
                             .font_family("SF Mono")
@@ -6226,6 +6476,10 @@ impl Render for RustMux {
                 this.execute_command(AppCommand::NewWorkspace, cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.execute_command(AppCommand::ToggleSidebar, cx);
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(|this, _: &NewTab, _, cx| {
                 this.execute_command(AppCommand::NewTab, cx);
                 cx.stop_propagation();
@@ -6291,8 +6545,11 @@ impl Render for RustMux {
                         .child(SidebarResizeCaptureElement { input: cx.entity() }),
                 )
             })
-            .child(self.render_sidebar(cx))
-            .child(self.render_sidebar_resize_handle(cx))
+            .when(self.sidebar_visible, |element| {
+                element
+                    .child(self.render_sidebar(cx))
+                    .child(self.render_sidebar_resize_handle(cx))
+            })
             .child(self.render_workspace(cx))
             .when_some(self.tab_menu, |element, menu| {
                 element.child(self.render_tab_menu(menu, cx))
@@ -7290,6 +7547,29 @@ fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
     }
 }
 
+fn collect_terminal_tabs<'a>(layout: &'a PaneLayout, panes: &mut Vec<&'a Pane>) {
+    match layout {
+        PaneLayout::Leaf { pane } => panes.push(pane),
+        PaneLayout::Stack { panes: stacked, .. } => panes.extend(stacked),
+        PaneLayout::Split { first, second, .. } => {
+            collect_terminal_tabs(first, panes);
+            collect_terminal_tabs(second, panes);
+        }
+    }
+}
+
+fn workspace_terminal_tabs(workspace: &Workspace) -> Vec<&Pane> {
+    let mut panes = Vec::new();
+    for tab in &workspace.tabs {
+        collect_terminal_tabs(&tab.layout, &mut panes);
+    }
+    panes
+}
+
+fn terminal_tab_count_label(count: usize) -> String {
+    format!("{count} terminal tab{}", if count == 1 { "" } else { "s" })
+}
+
 fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
     let detection_detail = match pane.identity.source {
         rust_mux_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
@@ -7359,6 +7639,36 @@ fn render_terminal_profile_mark(
     } else {
         icon
     }
+}
+
+fn render_sidebar_toggle_icon(sidebar_visible: bool) -> AnyElement {
+    div()
+        .relative()
+        .w(px(15.0))
+        .h(px(13.0))
+        .rounded(px(3.0))
+        .border_1()
+        .border_color(rgb(THEME.muted))
+        .child(
+            div()
+                .absolute()
+                .left(px(4.0))
+                .top(px(0.0))
+                .w(px(1.0))
+                .h_full()
+                .bg(rgb(THEME.muted)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(if sidebar_visible { 1.5 } else { 7.0 }))
+                .top(px(3.0))
+                .w(px(if sidebar_visible { 1.5 } else { 4.0 }))
+                .h(px(5.0))
+                .rounded(px(1.0))
+                .bg(rgb(THEME.muted)),
+        )
+        .into_any_element()
 }
 
 fn render_terminal_profile_icon(
@@ -7483,6 +7793,14 @@ fn constrained_sidebar_width(preferred_width: f32, window_width: f32) -> f32 {
     let maximum_for_window =
         (window_width - MIN_TERMINAL_AREA_WIDTH).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
     preferred_width.clamp(MIN_SIDEBAR_WIDTH, maximum_for_window)
+}
+
+fn sidebar_width_for_visibility(preferred_width: f32, window_width: f32, visible: bool) -> f32 {
+    if visible {
+        constrained_sidebar_width(preferred_width, window_width)
+    } else {
+        0.0
+    }
 }
 
 fn workspace_pixel_size(window_width: f32, window_height: f32, sidebar_width: f32) -> (f32, f32) {
@@ -7710,6 +8028,9 @@ fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
         AppCommand::NewWorkspace => {
             KeyBinding::new(&binding.sequence, NewWorkspace, Some(ROOT_KEY_CONTEXT))
         }
+        AppCommand::ToggleSidebar => {
+            KeyBinding::new(&binding.sequence, ToggleSidebar, Some(ROOT_KEY_CONTEXT))
+        }
         AppCommand::NewTab => KeyBinding::new(&binding.sequence, NewTab, Some(ROOT_KEY_CONTEXT)),
         AppCommand::SplitRight => {
             KeyBinding::new(&binding.sequence, SplitRight, Some(ROOT_KEY_CONTEXT))
@@ -7884,6 +8205,65 @@ mod tests {
             };
             assert!((terminal_profile_icon_size(profile) - expected_size).abs() < f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn workspace_rail_lists_every_terminal_tab_across_stacks_and_splits() {
+        let make_pane = |id: u128, title: &str, profile: TerminalProfile| Pane {
+            id: Uuid::from_u128(id),
+            title: title.to_owned(),
+            shell: "zsh".to_owned(),
+            color: None,
+            identity: rust_mux_protocol::TerminalIdentity {
+                profile,
+                source: rust_mux_protocol::TerminalIdentitySource::Command,
+            },
+            custom_title: None,
+            profile_override: None,
+        };
+        let codex = make_pane(1, "Codex review", TerminalProfile::Codex);
+        let droid = make_pane(2, "Droid build", TerminalProfile::Droid);
+        let terminal = make_pane(3, "Logs", TerminalProfile::Terminal);
+        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
+        workspace.tabs[0].layout = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneLayout::Stack {
+                panes: vec![codex.clone(), droid.clone()],
+                active: droid.id,
+            }),
+            second: Box::new(PaneLayout::Leaf {
+                pane: terminal.clone(),
+            }),
+        };
+
+        let tabs = workspace_terminal_tabs(&workspace);
+
+        assert_eq!(
+            tabs.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+            vec![codex.id, droid.id, terminal.id]
+        );
+        assert_eq!(
+            tabs.iter()
+                .map(|pane| tab_identity_presentation(pane).profile)
+                .collect::<Vec<_>>(),
+            vec![
+                TerminalProfile::Codex,
+                TerminalProfile::Droid,
+                TerminalProfile::Terminal
+            ]
+        );
+        assert_eq!(terminal_tab_count_label(tabs.len()), "3 terminal tabs");
+    }
+
+    #[test]
+    fn workspace_rail_empty_state_and_tab_count_labels_are_explicit() {
+        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
+        workspace.tabs.clear();
+
+        assert!(workspace_terminal_tabs(&workspace).is_empty());
+        assert_eq!(terminal_tab_count_label(0), "0 terminal tabs");
+        assert_eq!(terminal_tab_count_label(1), "1 terminal tab");
     }
 
     #[test]
@@ -8385,6 +8765,16 @@ mod tests {
         assert_eq!(resize.cancel(), Some(310.0));
         assert_eq!(resize.cancel(), None);
         assert!(!resize.is_active());
+    }
+
+    #[test]
+    fn hidden_sidebar_gives_the_workspace_the_full_window_width() {
+        let visible = sidebar_width_for_visibility(260.0, 1280.0, true);
+        let hidden = sidebar_width_for_visibility(260.0, 1280.0, false);
+
+        assert!((visible - 260.0).abs() < f32::EPSILON);
+        assert!(hidden.abs() < f32::EPSILON);
+        assert!((workspace_pixel_size(1280.0, 820.0, hidden).0 - 1280.0).abs() < f32::EPSILON);
     }
 
     #[test]
