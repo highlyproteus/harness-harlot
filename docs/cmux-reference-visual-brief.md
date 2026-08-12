@@ -5,14 +5,14 @@ This brief derives observable layout and interaction direction from the public c
 ## Whole-window hierarchy
 
 - Treat the native window as one terminal workspace, not a dashboard. Chrome is a thin integrated titlebar/tool row; everything below is either the narrow workspace rail or terminal surface.
-- Keep the left rail near 190 px. Its top row aligns tiny navigation/new-workspace controls with the macOS traffic lights. Below it, show a compact current directory/title and a dense plain list.
+- Keep the left rail compact and resizable within the product's 150–420 px bounds. Its top row aligns tiny navigation/new-workspace controls with the macOS traffic lights. Below it, show a dense workspace-and-terminal hierarchy without a generic directory subtitle.
 - The selected workspace is one restrained bright-blue rounded rectangle. Unselected workspaces sit directly on charcoal with no card border, badge block, metric, or health panel.
 - The right side has a compact workspace title strip, then an edge-to-edge pane tree. There is no marketing header, global dashboard tab bar, status card, footer, or floating overlay.
 
 ## Workspace rail
 
 - Use system UI text around 12–13 px with roughly 8–10 px horizontal insets and tight 8–12 px vertical rhythm.
-- Each row shows a short title, then at most one muted path/context line. Local shells do not need a status badge.
+- Each workspace is a standalone row with a compact terminal-tab count. Expanding it shows visually independent indented terminal rows with their actual identity icon and tab name. Local shells do not need a status badge or generic path line.
 - New workspace is a tiny top-strip action. Selection and keyboard focus use the same blue family; inactive metadata remains low contrast.
 
 ## Terminal panes and per-pane tabs

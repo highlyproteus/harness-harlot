@@ -13,14 +13,14 @@ Proceed provisionally with GPUI 0.2.2 for the macOS/Linux MVP client. Keep the U
 - A clean `rust:1.96-bookworm` Linux container compiled the desktop against GPUI's native Vulkan, Wayland, and X11 dependencies. Linux runtime/compositor coverage remains required before packaging.
 - Local native-window captures verified real ANSI SGR output, two-pane action targeting, guarded close, pointer-local directional previews, lone-tab replacement, and tab-strip merge. Those generated verification artifacts are intentionally excluded from source control.
 
-## Known limits and fallback gates
+## Current limits and fallback gates
 
-- The current renderer projects styled visible runs from Alacritty's grid and maps ANSI 16-color, indexed, and truecolor foreground/background plus bold, dim, italic, underline, strike, and cursor state. Unicode-width shaping, selection, clipboard, search, mouse reporting, IME, and scrollback controls are not complete.
-- Live state survives a desktop restart but is not yet journaled to disk, so a service restart still ends shells and loses the layout.
-- SSH is not implemented yet.
+- The current renderer projects cell-counted styled runs from Alacritty's grid and maps ANSI 16-color, indexed, and truecolor foreground/background plus bold, dim, italic, underline, strike, cursor, selection, clipboard, bounded scrollback/search, mouse reporting, and foundational IME behavior. Grapheme shaping, remaining wide-cell edge cases, richer search, and accessibility are not complete.
+- Live state survives a desktop restart. Restricted desired-state metadata is journaled atomically to an owner-only file, so a service restart recreates fresh local shells and retains saved SSH layouts offline; it does not preserve arbitrary live processes or terminal output.
+- System-SSH workspaces are implemented through an explicit reviewed action that launches the installed OpenSSH client. Host discovery, remote lifecycle soak, and optional durable remote reattachment remain later work.
 - GPUI's pre-1.0 API and large native dependency graph increase upgrade and packaging cost.
 - Linux must still pass Wayland and X11 runtime tests on real GPU drivers, and macOS must pass Spaces/display-switching soak tests.
-- Accessibility, IME, text selection, glyph throughput, and a sustained 120x40 multi-pane benchmark are not proven by this spike.
+- Accessibility, complete grapheme/IME coverage, glyph throughput, and a sustained 120x40 multi-pane benchmark are not proven by this spike.
 - If those gates block the MVP, port this same behavior test to Iced/wgpu. The service and protocol boundary prevents that change from affecting session ownership.
 
 ## Security and ownership boundary
