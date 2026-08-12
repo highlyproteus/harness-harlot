@@ -48,6 +48,8 @@ const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_DISCOVERY_PROCESSES: usize = 4_096;
 const MAX_DISCOVERY_DESCENDANTS_PER_PANE: usize = 64;
 const MAX_DISCOVERY_DEPTH: usize = 4;
+#[cfg(debug_assertions)]
+const LOCAL_SSH_TEST_SEAM_ENV: &str = "NAH_TEST_LOCAL_SSH_SEAM";
 
 struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -108,6 +110,10 @@ impl PtySession {
         host: &str,
         archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os(LOCAL_SSH_TEST_SEAM_ENV).is_some() {
+            return Self::spawn_local(pane_id, workspace_id, &fallback_cwd()?, archive);
+        }
         Self::spawn_command(
             pane_id,
             workspace_id,
@@ -1480,41 +1486,27 @@ impl SessionRegistry {
     ) -> Result<(Uuid, Uuid)> {
         validate_ssh_host(destination).map_err(|message| anyhow!(message))?;
         let title = normalize_workspace_title(title)?;
-        {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
-            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
-                bail!("workstation limit of {MAX_WORKSPACES} reached");
-            }
-            if state.panes.len() >= MAX_PANES {
-                bail!("pane limit of {MAX_PANES} reached");
-            }
-        }
-
         let ids = SshWorkspaceIds {
             workspace: Uuid::new_v4(),
             tab: Uuid::new_v4(),
             pane: Uuid::new_v4(),
         };
         let cwd = fallback_cwd()?;
+        self.persist_ssh_workspace_intent(title, destination, ids)?;
         let session = PtySession::spawn_ssh(ids.pane, ids.workspace, destination, &self.history)?;
-        let result = self.persist_ssh_workspace(title, destination, ids, cwd, Arc::clone(&session));
+        let result = self.attach_ssh_workspace(destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
         }
         result
     }
 
-    fn persist_ssh_workspace(
+    fn persist_ssh_workspace_intent(
         &self,
         title: Option<String>,
         destination: &str,
         ids: SshWorkspaceIds,
-        cwd: PathBuf,
-        session: Arc<PtySession>,
-    ) -> Result<(Uuid, Uuid)> {
+    ) -> Result<()> {
         let mut state = self
             .state
             .write()
@@ -1541,10 +1533,10 @@ impl SessionRegistry {
             color: None,
             pinned: false,
             pin_order: 0,
-            active_terminal_count: 1,
+            active_terminal_count: 0,
             connection: WorkspaceConnection::SystemSsh {
                 destination: destination.to_owned(),
-                status: WorkspaceConnectionStatus::Connected,
+                status: WorkspaceConnectionStatus::Offline,
             },
             tabs: vec![Tab {
                 id: ids.tab,
@@ -1552,6 +1544,35 @@ impl SessionRegistry {
                 layout: PaneLayout::Leaf { pane },
             }],
         });
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)
+    }
+
+    fn attach_ssh_workspace(
+        &self,
+        destination: &str,
+        ids: SshWorkspaceIds,
+        cwd: PathBuf,
+        session: Arc<PtySession>,
+    ) -> Result<(Uuid, Uuid)> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        if state.panes.len() >= MAX_PANES {
+            bail!("pane limit of {MAX_PANES} reached");
+        }
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == ids.workspace)
+            .context("saved SSH workstation disappeared before session attachment")?;
+        let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection else {
+            bail!("saved workstation connection type changed before session attachment");
+        };
+        *status = WorkspaceConnectionStatus::Connected;
+        workspace.active_terminal_count = 1;
         state.panes.insert(
             ids.pane,
             RuntimePane {
@@ -1584,8 +1605,9 @@ impl SessionRegistry {
             pane: Uuid::new_v4(),
         };
         let cwd = fallback_cwd()?;
+        self.persist_ssh_workspace_intent(title, destination, ids)?;
         let session = PtySession::spawn_local(ids.pane, ids.workspace, &cwd, &self.history)?;
-        let result = self.persist_ssh_workspace(title, destination, ids, cwd, Arc::clone(&session));
+        let result = self.attach_ssh_workspace(destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
         }
@@ -3402,6 +3424,51 @@ mod tests {
             .find(|workspace| workspace.id == workspace_id)
             .expect("saved SSH workstation remains after restart");
         assert_eq!(saved.title, "Safe local simulation");
+        assert!(matches!(
+            saved.connection,
+            WorkspaceConnection::SystemSsh {
+                ref destination,
+                status: WorkspaceConnectionStatus::Offline,
+            } if destination == "test@local-host"
+        ));
+
+        drop(recovered);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn confirmed_ssh_workstation_is_durable_before_session_attachment() {
+        let directory = std::env::temp_dir().join(format!(
+            "nah-ssh-workstation-intent-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let snapshot_path = directory.join("sessions.json");
+        let ids = SshWorkspaceIds {
+            workspace: Uuid::new_v4(),
+            tab: Uuid::new_v4(),
+            pane: Uuid::new_v4(),
+        };
+
+        let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
+        registry
+            .persist_ssh_workspace_intent(
+                Some("Durable before connection".to_owned()),
+                "test@local-host",
+                ids,
+            )
+            .unwrap();
+        drop(registry);
+
+        let recovered = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let snapshot = recovered.snapshot().unwrap();
+        let saved = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == ids.workspace)
+            .expect("confirmed SSH workstation remains after a restart");
+        assert_eq!(saved.title, "Durable before connection");
+        assert_eq!(saved.active_terminal_count, 0);
         assert!(matches!(
             saved.connection,
             WorkspaceConnection::SystemSsh {
