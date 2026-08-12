@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/desktop",
+  "crates/macos-icon",
   "crates/protocol",
   "crates/session-service",
   "crates/terminal-model",
