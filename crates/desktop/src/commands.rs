@@ -13,6 +13,7 @@ pub const ROOT_KEY_CONTEXT: &str = "RustMuxTerminal";
 #[repr(u8)]
 pub enum AppCommand {
     NewWorkspace,
+    ToggleSidebar,
     NewTab,
     SplitRight,
     SplitDown,
@@ -26,7 +27,7 @@ pub enum AppCommand {
 }
 
 impl AppCommand {
-    const COUNT: usize = 11;
+    const COUNT: usize = 12;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +48,13 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         title: "New Workspace",
         category: "Workspace",
         default_bindings: &["cmd-n"],
+    },
+    CommandDescriptor {
+        command: AppCommand::ToggleSidebar,
+        id: "workspace.toggle-sidebar",
+        title: "Toggle Workspace Sidebar",
+        category: "Workspace",
+        default_bindings: &["cmd-b"],
     },
     CommandDescriptor {
         command: AppCommand::NewTab,
@@ -386,6 +394,14 @@ mod tests {
             descriptor(AppCommand::TogglePaneZoom).id,
             "pane.toggle-zoom"
         );
+        assert_eq!(
+            descriptor(AppCommand::ToggleSidebar).id,
+            "workspace.toggle-sidebar"
+        );
+        assert_eq!(
+            descriptor(AppCommand::ToggleSidebar).default_bindings,
+            &["cmd-b"]
+        );
     }
 
     #[test]
@@ -466,7 +482,7 @@ mod tests {
         let matches = palette_matches("", usize::MAX);
         assert_eq!(matches.len(), COMMAND_DESCRIPTORS.len());
         assert_eq!(matches[0].command, AppCommand::NewWorkspace);
-        assert_eq!(matches[10].command, AppCommand::EqualizePanes);
+        assert_eq!(matches[11].command, AppCommand::EqualizePanes);
 
         let matches = palette_matches("eq pane", 8);
         assert_eq!(
