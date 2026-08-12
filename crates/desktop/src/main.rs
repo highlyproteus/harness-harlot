@@ -84,6 +84,7 @@ const MIN_TERMINAL_AREA_WIDTH: f32 = 320.0;
 const SIDEBAR_RESIZE_HIT_WIDTH: f32 = 8.0;
 const SIDEBAR_RESIZE_VISUAL_WIDTH: f32 = 2.0;
 const TITLEBAR_HEIGHT: f32 = 38.0;
+const WORKSTATION_BANNER_ASPECT_RATIO: f32 = 3.0;
 const PANE_HEADER_HEIGHT: f32 = 29.0;
 const SPLIT_DIVIDER_SIZE: f32 = 4.0;
 const TERMINAL_HORIZONTAL_PADDING: f32 = 18.0;
@@ -3135,8 +3136,9 @@ impl NahApp {
             .history_status
             .as_ref()
             .is_some_and(|status| status.warning.is_some());
+        let sidebar_content_width = self.sidebar_pixels - SIDEBAR_RESIZE_HIT_WIDTH;
         div()
-            .w(px(self.sidebar_pixels - SIDEBAR_RESIZE_HIT_WIDTH))
+            .w(px(sidebar_content_width))
             .h_full()
             .flex_none()
             .bg(rgb(THEME.sidebar))
@@ -3148,85 +3150,14 @@ impl NahApp {
             .flex_col()
             .child(
                 div()
-                    .h(px(TITLEBAR_HEIGHT))
-                    .flex_none()
-                    .pl(px(79.0))
-                    .pr(px(8.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .text_sm()
-                    .text_color(rgb(THEME.muted))
-                    .child(
-                        div()
-                            .id("hide-workspace-sidebar")
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|element| {
-                                element
-                                    .bg(rgb(THEME.elevated))
-                                    .text_color(rgb(THEME.foreground))
-                            })
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "Hide workstation sidebar (⌘B)".to_owned(),
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-                            .child(render_sidebar_toggle_icon(true)),
-                    )
-                    .child(
-                        div()
-                            .id("appearance-settings")
-                            .relative()
-                            .cursor_pointer()
-                            .hover(|element| element.text_color(rgb(THEME.foreground)))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "Settings".to_owned(),
-                                })
-                                .into()
-                            })
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.open_appearance_settings(cx)),
-                            )
-                            .child("⚙")
-                            .when(history_needs_attention, |element| {
-                                element.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(-2.0))
-                                        .right(px(-4.0))
-                                        .w(px(5.0))
-                                        .h(px(5.0))
-                                        .rounded_full()
-                                        .bg(rgb(THEME.danger)),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("new-workspace")
-                            .cursor_pointer()
-                            .hover(|element| element.text_color(rgb(THEME.foreground)))
-                            .on_click(cx.listener(|this, _, _, cx| this.new_workspace(cx)))
-                            .child("＋"),
-                    ),
-            )
-            .child(
-                div()
                     .id("workstation-banner")
                     .relative()
                     .w_full()
-                    .h(px((self.sidebar_pixels - SIDEBAR_RESIZE_HIT_WIDTH)
-                        .clamp(120.0, 240.0)
-                        / 3.0))
+                    // The artwork is exactly 3:1. Matching the rail width to
+                    // that aspect ratio keeps the complete branded design
+                    // visible at every resizable width, rather than clipping
+                    // its top and bottom with a fixed-height cover crop.
+                    .h(px(workstation_banner_header_height(sidebar_content_width)))
                     .flex_none()
                     .overflow_hidden()
                     .bg(rgb(THEME.terminal))
@@ -3237,7 +3168,83 @@ impl NahApp {
                             .top(px(0.0))
                             .left(px(0.0))
                             .size_full()
-                            .object_fit(gpui::ObjectFit::Cover),
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(0.0))
+                            .w_full()
+                            .h(px(TITLEBAR_HEIGHT))
+                            .pl(px(79.0))
+                            .pr(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .text_sm()
+                            .text_color(rgb(THEME.muted))
+                            .child(
+                                div()
+                                    .id("hide-workspace-sidebar")
+                                    .w(px(20.0))
+                                    .h(px(20.0))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .hover(|element| {
+                                        element
+                                            .bg(rgb(THEME.elevated))
+                                            .text_color(rgb(THEME.foreground))
+                                    })
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: "Hide workstation sidebar (⌘B)".to_owned(),
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+                                    .child(render_sidebar_toggle_icon(true)),
+                            )
+                            .child(
+                                div()
+                                    .id("appearance-settings")
+                                    .relative()
+                                    .cursor_pointer()
+                                    .hover(|element| element.text_color(rgb(THEME.foreground)))
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: "Settings".to_owned(),
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_appearance_settings(cx)
+                                    }))
+                                    .child("⚙")
+                                    .when(history_needs_attention, |element| {
+                                        element.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(-2.0))
+                                                .right(px(-4.0))
+                                                .w(px(5.0))
+                                                .h(px(5.0))
+                                                .rounded_full()
+                                                .bg(rgb(THEME.danger)),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("new-workspace")
+                                    .cursor_pointer()
+                                    .hover(|element| element.text_color(rgb(THEME.foreground)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.new_workspace(cx)))
+                                    .child("＋"),
+                            ),
                     ),
             )
             .children(
@@ -8692,6 +8699,10 @@ fn product_name(development_build: bool) -> &'static str {
     }
 }
 
+fn workstation_banner_header_height(sidebar_content_width: f32) -> f32 {
+    sidebar_content_width.max(0.0) / WORKSTATION_BANNER_ASPECT_RATIO
+}
+
 /// Prefer the copy packaged inside a native macOS bundle. The source-tree path
 /// keeps local non-bundled development builds visually faithful as well.
 fn workstation_banner_path() -> PathBuf {
@@ -9467,6 +9478,16 @@ mod tests {
             banner.file_name().and_then(|name| name.to_str()),
             Some("notaharness-banner.png")
         );
+    }
+
+    #[test]
+    fn workstation_banner_header_preserves_the_artwork_aspect_at_normal_and_wide_rails() {
+        for sidebar_content_width in [136.0, 217.0, 412.0] {
+            let height = workstation_banner_header_height(sidebar_content_width);
+            assert!(
+                (height * WORKSTATION_BANNER_ASPECT_RATIO - sidebar_content_width).abs() < 0.0001
+            );
+        }
     }
 
     #[test]
