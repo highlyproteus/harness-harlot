@@ -93,6 +93,12 @@ Not a Harness icon. Its display name, executable, and bundle identifier are
 service only when a local service is unavailable; closing the desktop leaves
 active terminal sessions alone.
 
+For side-by-side local development inspection, `scripts/build-macos-dev-app.sh`
+creates `target/debug/Not a Harness Dev.app` with bundle identifier
+`com.nah.desktop.dev`, executable `nah-dev`, and the separate monochrome
+development icon. Launch it with isolated `NAH_SOCKET`, `NAH_STATE_DIR`, and
+`NAH_CONFIG` values so it never reads or writes the stable app's local state.
+
 The technical package, crate, and executable prefix is `nah`. The built
 executables are `nah-service` and `nah`. Set `NAH_SOCKET` in both processes to
 override the default socket path. The default is `nah-session.sock` in the

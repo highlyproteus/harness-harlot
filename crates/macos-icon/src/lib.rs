@@ -2,17 +2,23 @@
 
 use objc2::AnyThread as _;
 use objc2_app_kit::{NSApplication, NSImage};
-use objc2_foundation::{NSBundle, ns_string};
+use objc2_foundation::{NSBundle, NSString, ns_string};
 
 unsafe extern "C" {
     static NSApp: Option<&'static NSApplication>;
 }
 
-/// Loads the packaged ICNS and assigns it to the live AppKit application.
-pub fn install_dock_icon() {
-    let Some(icon_path) = NSBundle::mainBundle()
-        .pathForResource_ofType(Some(ns_string!("Not-a-Harness")), Some(ns_string!("icns")))
-    else {
+/// Loads the selected packaged ICNS and assigns it to the live AppKit application.
+pub fn install_dock_icon(development_build: bool) {
+    let icon_name = if development_build {
+        "Not-a-Harness-Dev"
+    } else {
+        "Not-a-Harness"
+    };
+    let Some(icon_path) = NSBundle::mainBundle().pathForResource_ofType(
+        Some(&NSString::from_str(icon_name)),
+        Some(ns_string!("icns")),
+    ) else {
         eprintln!("Not a Harness could not locate its bundled macOS icon");
         return;
     };

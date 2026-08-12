@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+export NAH_DEVELOPMENT_BUILD=1
+exec "$(dirname "$0")/nah" "$@"
