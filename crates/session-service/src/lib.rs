@@ -378,6 +378,13 @@ struct RuntimePane {
     detected_command_profile: Option<TerminalProfile>,
 }
 
+#[derive(Clone, Copy)]
+struct SshWorkspaceIds {
+    workspace: Uuid,
+    tab: Uuid,
+    pane: Uuid,
+}
+
 #[derive(Debug)]
 enum RuntimePaneKind {
     Local,
@@ -1486,66 +1493,99 @@ impl SessionRegistry {
             }
         }
 
-        let workspace_id = Uuid::new_v4();
-        let tab_id = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
+        let ids = SshWorkspaceIds {
+            workspace: Uuid::new_v4(),
+            tab: Uuid::new_v4(),
+            pane: Uuid::new_v4(),
+        };
         let cwd = fallback_cwd()?;
-        let session = PtySession::spawn_ssh(pane_id, workspace_id, destination, &self.history)?;
-        let result = (|| {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
-            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
-                bail!("workstation limit of {MAX_WORKSPACES} reached");
-            }
-            if state.panes.len() >= MAX_PANES {
-                bail!("pane limit of {MAX_PANES} reached");
-            }
-            let number = state.snapshot.workspaces.len() + 1;
-            let pane = Pane {
-                id: pane_id,
-                title: format!("SSH {destination}"),
-                shell: "ssh".to_owned(),
-                color: None,
-                identity: TerminalIdentity::default(),
-                custom_title: None,
-                profile_override: None,
-            };
-            state.snapshot.workspaces.push(Workspace {
-                id: workspace_id,
-                title: title.unwrap_or_else(|| format!("SSH Workstation {number}")),
-                color: None,
-                pinned: false,
-                pin_order: 0,
-                active_terminal_count: 1,
-                connection: WorkspaceConnection::SystemSsh {
-                    destination: destination.to_owned(),
-                    status: WorkspaceConnectionStatus::Connected,
+        let session = PtySession::spawn_ssh(ids.pane, ids.workspace, destination, &self.history)?;
+        let result = self.persist_ssh_workspace(title, destination, ids, cwd, Arc::clone(&session));
+        if result.is_err() {
+            let _ = session.terminate_and_wait();
+        }
+        result
+    }
+
+    fn persist_ssh_workspace(
+        &self,
+        title: Option<String>,
+        destination: &str,
+        ids: SshWorkspaceIds,
+        cwd: PathBuf,
+        session: Arc<PtySession>,
+    ) -> Result<(Uuid, Uuid)> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+            bail!("workstation limit of {MAX_WORKSPACES} reached");
+        }
+        if state.panes.len() >= MAX_PANES {
+            bail!("pane limit of {MAX_PANES} reached");
+        }
+        let number = state.snapshot.workspaces.len() + 1;
+        let pane = Pane {
+            id: ids.pane,
+            title: format!("SSH {destination}"),
+            shell: "ssh".to_owned(),
+            color: None,
+            identity: TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+        };
+        state.snapshot.workspaces.push(Workspace {
+            id: ids.workspace,
+            title: title.unwrap_or_else(|| format!("SSH Workstation {number}")),
+            color: None,
+            pinned: false,
+            pin_order: 0,
+            active_terminal_count: 1,
+            connection: WorkspaceConnection::SystemSsh {
+                destination: destination.to_owned(),
+                status: WorkspaceConnectionStatus::Connected,
+            },
+            tabs: vec![Tab {
+                id: ids.tab,
+                title: "Remote".to_owned(),
+                layout: PaneLayout::Leaf { pane },
+            }],
+        });
+        state.panes.insert(
+            ids.pane,
+            RuntimePane {
+                session,
+                last_valid_cwd: cwd,
+                kind: RuntimePaneKind::SystemSsh {
+                    host: destination.to_owned(),
                 },
-                tabs: vec![Tab {
-                    id: tab_id,
-                    title: "Remote".to_owned(),
-                    layout: PaneLayout::Leaf { pane },
-                }],
-            });
-            state.panes.insert(
-                pane_id,
-                RuntimePane {
-                    session: Arc::clone(&session),
-                    last_valid_cwd: cwd,
-                    kind: RuntimePaneKind::SystemSsh {
-                        host: destination.to_owned(),
-                    },
-                    recovered: false,
-                    exit_status: None,
-                    detected_command_profile: None,
-                },
-            );
-            state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-            persist_state(&state)?;
-            Ok((workspace_id, pane_id))
-        })();
+                recovered: false,
+                exit_status: None,
+                detected_command_profile: None,
+            },
+        );
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        persist_state(&state)?;
+        Ok((ids.workspace, ids.pane))
+    }
+
+    #[cfg(test)]
+    fn create_simulated_ssh_workspace(
+        &self,
+        title: Option<&str>,
+        destination: &str,
+    ) -> Result<(Uuid, Uuid)> {
+        validate_ssh_host(destination).map_err(|message| anyhow!(message))?;
+        let title = normalize_workspace_title(title)?;
+        let ids = SshWorkspaceIds {
+            workspace: Uuid::new_v4(),
+            tab: Uuid::new_v4(),
+            pane: Uuid::new_v4(),
+        };
+        let cwd = fallback_cwd()?;
+        let session = PtySession::spawn_local(ids.pane, ids.workspace, &cwd, &self.history)?;
+        let result = self.persist_ssh_workspace(title, destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
         }
@@ -3311,6 +3351,67 @@ mod tests {
                 "host: {host:?}"
             );
         }
+    }
+
+    #[test]
+    fn stable_ssh_workstation_creation_is_delivered_to_the_rail_and_survives_restart() {
+        let directory =
+            std::env::temp_dir().join(format!("nah-ssh-workstation-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let snapshot_path = directory.join("sessions.json");
+
+        let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let before = registry.snapshot().unwrap();
+        let (workspace_id, _) = registry
+            .create_simulated_ssh_workspace(Some("Safe local simulation"), "test@local-host")
+            .unwrap();
+
+        let update = registry
+            .pane_updates(Some(before.revision), &[], &[])
+            .unwrap();
+        let delivered = update
+            .snapshot
+            .expect("new workstation snapshot is delivered");
+        assert!(
+            delivered
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id)
+        );
+        let created = delivered
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .unwrap();
+        assert_eq!(created.title, "Safe local simulation");
+        assert!(matches!(
+            created.connection,
+            WorkspaceConnection::SystemSsh {
+                ref destination,
+                status: WorkspaceConnectionStatus::Connected,
+            } if destination == "test@local-host"
+        ));
+
+        drop(registry);
+
+        let recovered = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let snapshot = recovered.snapshot().unwrap();
+        let saved = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("saved SSH workstation remains after restart");
+        assert_eq!(saved.title, "Safe local simulation");
+        assert!(matches!(
+            saved.connection,
+            WorkspaceConnection::SystemSsh {
+                ref destination,
+                status: WorkspaceConnectionStatus::Offline,
+            } if destination == "test@local-host"
+        ));
+
+        drop(recovered);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
