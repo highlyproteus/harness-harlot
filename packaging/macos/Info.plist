@@ -12,6 +12,8 @@
   <string>com.nah.desktop</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
+  <key>CFBundleIconFile</key>
+  <string>Not-a-Harness.icns</string>
   <key>CFBundleName</key>
   <string>Not a Harness</string>
   <key>CFBundlePackageType</key>
