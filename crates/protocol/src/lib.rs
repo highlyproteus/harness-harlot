@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const SOCKET_ENV: &str = "RUST_MUX_SOCKET";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_SSH_HOST_LEN: usize = 253;
+pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -88,6 +89,10 @@ impl SessionSnapshot {
                 id: Uuid::new_v4(),
                 title: "Workspace 1".to_owned(),
                 color: None,
+                pinned: false,
+                pin_order: 0,
+                active_terminal_count: 1,
+                connection: WorkspaceConnection::Local,
                 tabs: vec![tab],
             }],
         }
@@ -100,7 +105,41 @@ pub struct Workspace {
     pub title: String,
     #[serde(default)]
     pub color: Option<AppearanceColor>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub pin_order: u32,
+    #[serde(default)]
+    pub active_terminal_count: u32,
+    #[serde(default)]
+    pub connection: WorkspaceConnection,
     pub tabs: Vec<Tab>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceConnection {
+    #[default]
+    Local,
+    SystemSsh {
+        destination: String,
+        status: WorkspaceConnectionStatus,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceConnectionStatus {
+    Connected,
+    #[default]
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePinMove {
+    Up,
+    Down,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -152,8 +191,8 @@ pub struct Pane {
     pub profile_override: Option<TerminalProfile>,
 }
 
-/// A stable local terminal profile. Badge glyphs are original neutral text
-/// marks rather than third-party logos or copied application assets.
+/// A stable local terminal profile. The protocol carries only identity, never
+/// artwork; the desktop resolves bundled icons from its local asset registry.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalProfile {
@@ -162,27 +201,47 @@ pub enum TerminalProfile {
     Hermes,
     Codex,
     Claude,
+    KiloCode,
+    Cursor,
+    OpenCode,
+    Aider,
+    GitHubCopilot,
+    Gemini,
 }
 
 impl TerminalProfile {
-    pub const ALL: [Self; 4] = [Self::Terminal, Self::Hermes, Self::Codex, Self::Claude];
+    pub const ALL: [Self; 10] = [
+        Self::Terminal,
+        Self::Hermes,
+        Self::Codex,
+        Self::Claude,
+        Self::KiloCode,
+        Self::Cursor,
+        Self::OpenCode,
+        Self::Aider,
+        Self::GitHubCopilot,
+        Self::Gemini,
+    ];
 
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Terminal => "Terminal",
-            Self::Hermes => "Hermes",
-            Self::Codex => "Codex",
-            Self::Claude => "Claude",
+            Self::Hermes => "Hermes Agent",
+            Self::Codex => "Codex CLI",
+            Self::Claude => "Claude Code",
+            Self::KiloCode => "Kilo Code",
+            Self::Cursor => "Cursor",
+            Self::OpenCode => "OpenCode",
+            Self::Aider => "Aider",
+            Self::GitHubCopilot => "GitHub Copilot CLI",
+            Self::Gemini => "Gemini CLI",
         }
     }
 
-    pub const fn badge(self) -> &'static str {
-        match self {
-            Self::Terminal => ">_",
-            Self::Hermes => "H",
-            Self::Codex => "CX",
-            Self::Claude => "CL",
-        }
+    /// Neutral fallback used only when no official bundled product asset is
+    /// available. Full product labels remain visible beside this glyph.
+    pub const fn fallback_glyph(self) -> &'static str {
+        ">_"
     }
 }
 
@@ -210,23 +269,53 @@ pub struct TerminalProfileDefinition {
     pub terminal_titles: &'static [&'static str],
 }
 
-/// Local, compile-time registry used for explicit profiles and bounded safe
+/// Local, compile-time registry used for explicit profiles and bounded exact
 /// detection. It performs no network access and contains no third-party art.
-pub const TERMINAL_PROFILE_REGISTRY: [TerminalProfileDefinition; 3] = [
+pub const TERMINAL_PROFILE_REGISTRY: [TerminalProfileDefinition; 9] = [
     TerminalProfileDefinition {
         profile: TerminalProfile::Hermes,
         commands: &["hermes", "hermes-agent"],
-        terminal_titles: &["hermes", "hermes agent"],
+        terminal_titles: &[],
     },
     TerminalProfileDefinition {
         profile: TerminalProfile::Codex,
-        commands: &["codex", "chatgpt"],
-        terminal_titles: &["codex", "chatgpt", "chatgpt codex"],
+        commands: &["codex"],
+        terminal_titles: &[],
     },
     TerminalProfileDefinition {
         profile: TerminalProfile::Claude,
-        commands: &["claude", "claude-code"],
-        terminal_titles: &["claude", "claude code"],
+        commands: &["claude"],
+        terminal_titles: &[],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::KiloCode,
+        commands: &["kilo", "kilocode"],
+        terminal_titles: &[],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::Cursor,
+        commands: &["cursor-agent"],
+        terminal_titles: &[],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::OpenCode,
+        commands: &["opencode"],
+        terminal_titles: &[],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::Aider,
+        commands: &["aider"],
+        terminal_titles: &[],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::GitHubCopilot,
+        commands: &["copilot"],
+        terminal_titles: &[],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::Gemini,
+        commands: &["gemini"],
+        terminal_titles: &[],
     },
 ];
 
@@ -253,16 +342,7 @@ pub fn terminal_profile_for_title(title: &str) -> Option<TerminalProfile> {
     if title.chars().count() > 80 || title.chars().any(char::is_control) {
         return None;
     }
-    let normalized = title
-        .trim()
-        .trim_matches(|character: char| {
-            character.is_ascii_whitespace()
-                || matches!(
-                    character,
-                    '[' | ']' | '(' | ')' | '{' | '}' | '*' | '✳' | '•'
-                )
-        })
-        .to_ascii_lowercase();
+    let normalized = title.trim().to_ascii_lowercase();
     TERMINAL_PROFILE_REGISTRY.iter().find_map(|definition| {
         definition
             .terminal_titles
@@ -587,6 +667,9 @@ pub enum ClientRequest {
     CreateTab {
         target_pane: Uuid,
     },
+    CreateWorkspaceTerminal {
+        workspace_id: Uuid,
+    },
     ConnectSsh {
         target_pane: Uuid,
         host: String,
@@ -637,6 +720,31 @@ pub enum ClientRequest {
     },
     CreateWorkspace {
         title: Option<String>,
+    },
+    CreateSshWorkspace {
+        title: Option<String>,
+        destination: String,
+    },
+    RenameWorkspace {
+        workspace_id: Uuid,
+        title: String,
+    },
+    SetWorkspacePinned {
+        workspace_id: Uuid,
+        pinned: bool,
+    },
+    MovePinnedWorkspace {
+        workspace_id: Uuid,
+        direction: WorkspacePinMove,
+    },
+    DisconnectWorkspace {
+        workspace_id: Uuid,
+    },
+    ReconnectWorkspace {
+        workspace_id: Uuid,
+    },
+    DeleteWorkspace {
+        workspace_id: Uuid,
     },
     WriteInput {
         pane_id: Uuid,
@@ -697,23 +805,72 @@ pub enum ClientRequest {
     },
 }
 
-/// Validates the single OpenSSH destination accepted from the desktop UI.
+/// Normalizes the single OpenSSH destination accepted from the desktop UI.
 ///
-/// Rust Mux deliberately accepts only a conservative host or `Host` alias
-/// subset. In particular, option prefixes, usernames, ports, commands, shell
-/// syntax, whitespace, and control characters are not part of this value.
-/// OpenSSH remains responsible for resolving all connection configuration.
+/// A user may enter a bare `[user@]host` destination or paste the exact command
+/// form `ssh [user@]host`. Rust Mux strips only that known executable token;
+/// options, extra commands, shell syntax, and other executables remain outside
+/// this boundary. OpenSSH remains responsible for resolving normal config and
+/// agent behavior after the normalized destination is validated.
 ///
 /// # Errors
 ///
-/// Returns a user-facing validation message when `host` is empty, too long,
-/// starts like an option, or contains anything outside the accepted subset.
+/// Returns a user-facing validation message when the input is empty, too long,
+/// contains control characters, or is not one of the two accepted forms.
+pub fn normalize_ssh_input(input: &str) -> Result<String, &'static str> {
+    if input.len() > MAX_SSH_INPUT_LEN {
+        return Err("SSH destination or command is too long");
+    }
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("SSH host, alias, or command is required");
+    }
+    if input.chars().any(char::is_control) {
+        return Err("SSH destination or command may not contain control characters");
+    }
+    let parts = input.split_ascii_whitespace().collect::<Vec<_>>();
+    let destination = match parts.as_slice() {
+        [destination] | ["ssh" | "/usr/bin/ssh" | "/bin/ssh", destination] => *destination,
+        _ => {
+            return Err(
+                "Enter one destination or paste `ssh <destination>` without options or extra commands",
+            );
+        }
+    };
+    validate_ssh_host(destination)?;
+    Ok(destination.to_owned())
+}
+
+/// Validates the normalized OpenSSH destination sent to the session service.
+///
+/// Rust Mux deliberately accepts only a conservative `[user@]host` or SSH
+/// config `Host` alias subset. Option prefixes, ports, commands, shell syntax,
+/// whitespace, and control characters are not part of this value.
+///
+/// # Errors
+///
+/// Returns a user-facing validation message when `host` is empty, too long, or
+/// contains anything outside the accepted destination subset.
 pub fn validate_ssh_host(host: &str) -> Result<(), &'static str> {
     if host.is_empty() {
-        return Err("SSH host or alias is required");
+        return Err("SSH host, alias, or destination is required");
     }
     if host.len() > MAX_SSH_HOST_LEN {
-        return Err("SSH host or alias is too long");
+        return Err("SSH destination is too long");
+    }
+    let (user, host) = match host.split_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.is_empty() && !host.contains('@') => {
+            (Some(user), host)
+        }
+        Some(_) => return Err("SSH destination must contain at most one non-empty `user@` prefix"),
+        None => (None, host),
+    };
+    if let Some(user) = user
+        && !user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("SSH user may contain only letters, numbers, dots, underscores, and hyphens");
     }
     let mut bytes = host.bytes();
     let Some(first) = bytes.next() else {
@@ -915,23 +1072,46 @@ mod tests {
             Some(TerminalProfile::Hermes)
         );
         assert_eq!(
-            terminal_profile_for_command("CHATGPT.EXE"),
+            terminal_profile_for_command("CODEX.EXE"),
             Some(TerminalProfile::Codex)
         );
         assert_eq!(
-            terminal_profile_for_title(" ✳ Claude Code "),
-            Some(TerminalProfile::Claude)
+            terminal_profile_for_command("/usr/local/bin/kilocode"),
+            Some(TerminalProfile::KiloCode)
+        );
+        assert_eq!(
+            terminal_profile_for_command("cursor-agent"),
+            Some(TerminalProfile::Cursor)
+        );
+        assert_eq!(
+            terminal_profile_for_command("opencode"),
+            Some(TerminalProfile::OpenCode)
+        );
+        assert_eq!(
+            terminal_profile_for_command("aider"),
+            Some(TerminalProfile::Aider)
+        );
+        assert_eq!(
+            terminal_profile_for_command("copilot"),
+            Some(TerminalProfile::GitHubCopilot)
+        );
+        assert_eq!(
+            terminal_profile_for_command("gemini"),
+            Some(TerminalProfile::Gemini)
         );
         assert_eq!(terminal_profile_for_command("vim"), None);
+        assert_eq!(terminal_profile_for_command("chatgpt"), None);
+        assert_eq!(terminal_profile_for_command("agent"), None);
+        assert_eq!(terminal_profile_for_title("Claude Code"), None);
         assert_eq!(terminal_profile_for_title("fix claude code docs"), None);
     }
 
     #[test]
-    fn neutral_profile_badges_are_small_text_marks() {
-        assert_eq!(TerminalProfile::Hermes.badge(), "H");
-        assert_eq!(TerminalProfile::Codex.badge(), "CX");
-        assert_eq!(TerminalProfile::Claude.badge(), "CL");
-        assert_eq!(TerminalProfile::Terminal.badge(), ">_");
+    fn every_profile_has_a_full_accessible_product_name_and_neutral_fallback() {
+        for profile in TerminalProfile::ALL {
+            assert!(!profile.display_name().is_empty());
+            assert_eq!(profile.fallback_glyph(), ">_");
+        }
     }
 
     #[test]
@@ -942,8 +1122,41 @@ mod tests {
             "prod_us",
             "host.example.com",
             "192.0.2.10",
+            "admin@build-01",
+            "tailscale_user@host.tailnet-name.ts.net",
         ] {
             assert_eq!(validate_ssh_host(host), Ok(()), "host: {host}");
+        }
+    }
+
+    #[test]
+    fn ssh_input_normalizes_bare_destinations_and_exact_system_ssh_commands() {
+        for (input, destination) in [
+            ("build", "build"),
+            (" admin@build-01\n", "admin@build-01"),
+            ("ssh prod_us", "prod_us"),
+            (
+                "/usr/bin/ssh admin@host.example.com",
+                "admin@host.example.com",
+            ),
+            ("/bin/ssh 192.0.2.10", "192.0.2.10"),
+        ] {
+            assert_eq!(normalize_ssh_input(input), Ok(destination.to_owned()));
+        }
+    }
+
+    #[test]
+    fn ssh_input_rejects_options_extra_commands_and_other_executables() {
+        for input in [
+            "ssh -A build",
+            "ssh -p 22 build",
+            "ssh build command",
+            "tailscale ssh build",
+            "env ssh build",
+            "ssh build;bad",
+            "ssh\nbuild",
+        ] {
+            assert!(normalize_ssh_input(input).is_err(), "input: {input:?}");
         }
     }
 
@@ -952,7 +1165,10 @@ mod tests {
         for host in [
             "",
             "-A",
-            "user@host",
+            "user@@host",
+            "user@",
+            "@host",
+            "user name@host",
             "host:22",
             "host command",
             "host\nProxyCommand=bad",

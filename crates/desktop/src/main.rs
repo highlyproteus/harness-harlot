@@ -13,37 +13,42 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Application, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase,
-    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, KeyBinding, KeyDownEvent,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollWheelEvent, StrikethroughStyle, Style, StyledText, TextRun, TitlebarOptions,
-    UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, point,
-    prelude::*, px, relative, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
+    DispatchPhase, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, KeyBinding,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, ScrollWheelEvent, ShapedLine, StrikethroughStyle, Style, StyledText, TextRun,
+    TitlebarOptions, UTF16Selection, UnderlineStyle, Window, WindowBounds, WindowOptions, actions,
+    div, fill, img, point, prelude::*, px, relative, rgb, rgba, size, svg,
 };
 use rust_mux_desktop::request;
 use rust_mux_protocol::{
     AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryCleanupPolicy,
     HistoryClearScope, HistoryPageDirection, HistoryPageFlags, HistoryRetention, HistorySettings,
-    HistoryWarning, MAX_SSH_HOST_LEN, Pane, PaneLayout, PaneRevisionCursor, PaneStreamState,
+    HistoryWarning, MAX_SSH_INPUT_LEN, Pane, PaneLayout, PaneRevisionCursor, PaneStreamState,
     ServiceResponse, SessionSnapshot, SplitAxis, StreamDiagnostics, TerminalAttributes,
     TerminalColor, TerminalHistoryPage, TerminalLine, TerminalModes, TerminalModifiers,
     TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalRun,
-    TerminalScreen, TerminalSelection, TerminalSelectionKind, Workspace, validate_ssh_host,
+    TerminalScreen, TerminalSelection, TerminalSelectionKind, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus, WorkspacePinMove, normalize_ssh_input, validate_ssh_host,
 };
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
+mod agent_icons;
 mod commands;
 mod theme;
 mod typography;
+mod ui_state;
 
+use agent_icons::{AgentIconAssets, AgentIconFormat, agent_icon_definition};
 use commands::{
     AppCommand, AppConfig, ROOT_KEY_CONTEXT, ResolvedBinding, ResolvedKeymap, descriptor,
     palette_matches,
 };
 use theme::{AppTheme, BuiltInTheme};
 use typography::TerminalFontProfile;
+use ui_state::UiStateStore;
 
 actions!(
     rust_mux,
@@ -67,7 +72,11 @@ actions!(
     ]
 );
 
-const SIDEBAR_WIDTH: f32 = 190.0;
+const DEFAULT_SIDEBAR_WIDTH: f32 = 190.0;
+const MIN_SIDEBAR_WIDTH: f32 = 150.0;
+const MAX_SIDEBAR_WIDTH: f32 = 420.0;
+const MIN_TERMINAL_AREA_WIDTH: f32 = 320.0;
+const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.0;
 const TITLEBAR_HEIGHT: f32 = 38.0;
 const PANE_HEADER_HEIGHT: f32 = 29.0;
 const SPLIT_DIVIDER_SIZE: f32 = 4.0;
@@ -103,8 +112,8 @@ struct PaneDrag {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TabIdentityPresentation {
     label: String,
-    badge: &'static str,
-    detail: &'static str,
+    profile: TerminalProfile,
+    detail: String,
 }
 
 impl Render for PaneDrag {
@@ -231,57 +240,406 @@ struct SelectionDrag {
 struct CloseConfirmation {
     pane_id: Uuid,
     title: String,
+    leaves_workspace_empty: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceRenameEditor {
+    workspace_id: Uuid,
+    value: String,
+    replace_on_type: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceDeleteConfirmation {
+    workspace_id: Uuid,
+    title: String,
+    active_terminal_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SshConnectStep {
+enum WorkspaceCreationKind {
+    Local,
+    SystemSsh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceCreationStep {
+    Details,
+    ConfirmSsh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceCreationField {
+    Name,
     Destination,
-    Confirm,
+}
+
+impl WorkspaceCreationField {
+    const fn index(self) -> usize {
+        match self {
+            Self::Name => 0,
+            Self::Destination => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DialogTextEditor {
+    text: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+    marked_range: Option<Range<usize>>,
+}
+
+impl DialogTextEditor {
+    fn with_text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let end = text.len();
+        Self {
+            text,
+            selected_range: end..end,
+            selection_reversed: false,
+            marked_range: None,
+        }
+    }
+
+    fn cursor_offset(&self) -> usize {
+        if self.selection_reversed {
+            self.selected_range.start
+        } else {
+            self.selected_range.end
+        }
+    }
+
+    fn offset_from_utf16(&self, offset: usize) -> usize {
+        let mut utf8_offset = 0;
+        let mut utf16_count = 0;
+        for character in self.text.chars() {
+            if utf16_count >= offset {
+                break;
+            }
+            utf16_count += character.len_utf16();
+            utf8_offset += character.len_utf8();
+        }
+        utf8_offset.min(self.text.len())
+    }
+
+    fn offset_to_utf16(&self, offset: usize) -> usize {
+        let mut utf16_offset = 0;
+        let mut utf8_count = 0;
+        for character in self.text.chars() {
+            if utf8_count >= offset {
+                break;
+            }
+            utf8_count += character.len_utf8();
+            utf16_offset += character.len_utf16();
+        }
+        utf16_offset
+    }
+
+    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+    }
+
+    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    fn previous_boundary(&self, offset: usize) -> usize {
+        self.text[..offset.min(self.text.len())]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index)
+    }
+
+    fn next_boundary(&self, offset: usize) -> usize {
+        let offset = offset.min(self.text.len());
+        self.text[offset..]
+            .char_indices()
+            .nth(1)
+            .map_or(self.text.len(), |(index, _)| offset + index)
+    }
+
+    fn move_to(&mut self, offset: usize) {
+        let offset = offset.min(self.text.len());
+        self.selected_range = offset..offset;
+        self.selection_reversed = false;
+        self.marked_range = None;
+    }
+
+    fn select_to(&mut self, offset: usize) {
+        let offset = offset.min(self.text.len());
+        if self.selection_reversed {
+            self.selected_range.start = offset;
+        } else {
+            self.selected_range.end = offset;
+        }
+        if self.selected_range.end < self.selected_range.start {
+            self.selection_reversed = !self.selection_reversed;
+            self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+        self.marked_range = None;
+    }
+
+    fn move_left(&mut self, selecting: bool) {
+        let target = if !selecting && !self.selected_range.is_empty() {
+            self.selected_range.start
+        } else {
+            self.previous_boundary(self.cursor_offset())
+        };
+        if selecting {
+            self.select_to(target);
+        } else {
+            self.move_to(target);
+        }
+    }
+
+    fn move_right(&mut self, selecting: bool) {
+        let target = if !selecting && !self.selected_range.is_empty() {
+            self.selected_range.end
+        } else {
+            self.next_boundary(self.cursor_offset())
+        };
+        if selecting {
+            self.select_to(target);
+        } else {
+            self.move_to(target);
+        }
+    }
+
+    fn move_home(&mut self, selecting: bool) {
+        if selecting {
+            self.select_to(0);
+        } else {
+            self.move_to(0);
+        }
+    }
+
+    fn move_end(&mut self, selecting: bool) {
+        if selecting {
+            self.select_to(self.text.len());
+        } else {
+            self.move_to(self.text.len());
+        }
+    }
+
+    fn select_all(&mut self) {
+        self.selected_range = 0..self.text.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        (!self.selected_range.is_empty()).then(|| &self.text[self.selected_range.clone()])
+    }
+
+    fn replacement_range(&self, range_utf16: Option<&Range<usize>>) -> Range<usize> {
+        range_utf16
+            .map(|range| self.range_from_utf16(range))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selected_range.clone())
+    }
+
+    fn replace(
+        &mut self,
+        range_utf16: Option<&Range<usize>>,
+        new_text: &str,
+        maximum: usize,
+        limit_is_bytes: bool,
+        mark: bool,
+        marked_selection_utf16: Option<&Range<usize>>,
+    ) {
+        let range = self.replacement_range(range_utf16);
+        let mut insertion: String = new_text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        loop {
+            let result_len = if limit_is_bytes {
+                self.text.len() - range.len() + insertion.len()
+            } else {
+                self.text[..range.start].chars().count()
+                    + insertion.chars().count()
+                    + self.text[range.end..].chars().count()
+            };
+            if result_len <= maximum || insertion.is_empty() {
+                break;
+            }
+            insertion.pop();
+        }
+
+        self.text.replace_range(range.clone(), &insertion);
+        let inserted = range.start..range.start + insertion.len();
+        self.marked_range = mark
+            .then(|| inserted.clone())
+            .filter(|range| !range.is_empty());
+        if mark {
+            if let Some(selection) = marked_selection_utf16 {
+                let relative_start = Self::utf16_offset_in(&insertion, selection.start);
+                let relative_end = Self::utf16_offset_in(&insertion, selection.end);
+                self.selected_range = range.start + relative_start..range.start + relative_end;
+            } else {
+                self.selected_range = inserted.end..inserted.end;
+            }
+        } else {
+            self.selected_range = inserted.end..inserted.end;
+        }
+        self.selection_reversed = false;
+    }
+
+    fn utf16_offset_in(text: &str, offset: usize) -> usize {
+        let mut utf8_offset = 0;
+        let mut utf16_count = 0;
+        for character in text.chars() {
+            if utf16_count >= offset {
+                break;
+            }
+            utf16_count += character.len_utf16();
+            utf8_offset += character.len_utf8();
+        }
+        utf8_offset.min(text.len())
+    }
+
+    fn delete_backward(&mut self) {
+        if self.selected_range.is_empty() {
+            let cursor = self.cursor_offset();
+            self.selected_range = self.previous_boundary(cursor)..cursor;
+        }
+        self.replace(None, "", usize::MAX, true, false, None);
+    }
+
+    fn delete_forward(&mut self) {
+        if self.selected_range.is_empty() {
+            let cursor = self.cursor_offset();
+            self.selected_range = cursor..self.next_boundary(cursor);
+        }
+        self.replace(None, "", usize::MAX, true, false, None);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SshConnectDialog {
-    target_pane: Uuid,
-    host: String,
-    step: SshConnectStep,
+struct WorkspaceCreationDialog {
+    kind: WorkspaceCreationKind,
+    name: DialogTextEditor,
+    destination: DialogTextEditor,
+    field: WorkspaceCreationField,
+    step: WorkspaceCreationStep,
     error: Option<String>,
 }
 
-impl SshConnectDialog {
-    fn new(target_pane: Uuid) -> Self {
+impl WorkspaceCreationDialog {
+    fn new() -> Self {
         Self {
-            target_pane,
-            host: String::new(),
-            step: SshConnectStep::Destination,
+            kind: WorkspaceCreationKind::Local,
+            name: DialogTextEditor::default(),
+            destination: DialogTextEditor::default(),
+            field: WorkspaceCreationField::Name,
+            step: WorkspaceCreationStep::Details,
             error: None,
         }
     }
 
     fn review(&mut self) {
-        match validate_ssh_host(&self.host) {
-            Ok(()) => {
-                self.step = SshConnectStep::Confirm;
+        match normalize_ssh_input(&self.destination.text) {
+            Ok(destination) => {
+                self.destination = DialogTextEditor::with_text(destination);
+                self.step = WorkspaceCreationStep::ConfirmSsh;
                 self.error = None;
             }
             Err(message) => self.error = Some(message.to_owned()),
         }
     }
 
+    fn active_editor(&self) -> &DialogTextEditor {
+        match self.field {
+            WorkspaceCreationField::Name => &self.name,
+            WorkspaceCreationField::Destination => &self.destination,
+        }
+    }
+
+    fn active_editor_mut(&mut self) -> &mut DialogTextEditor {
+        match self.field {
+            WorkspaceCreationField::Name => &mut self.name,
+            WorkspaceCreationField::Destination => &mut self.destination,
+        }
+    }
+
+    fn replace_text(
+        &mut self,
+        range_utf16: Option<&Range<usize>>,
+        text: &str,
+        mark: bool,
+        marked_selection_utf16: Option<&Range<usize>>,
+    ) {
+        let (maximum, limit_is_bytes) = match self.field {
+            WorkspaceCreationField::Name => (80, false),
+            WorkspaceCreationField::Destination => (MAX_SSH_INPUT_LEN, true),
+        };
+        self.active_editor_mut().replace(
+            range_utf16,
+            text,
+            maximum,
+            limit_is_bytes,
+            mark,
+            marked_selection_utf16,
+        );
+        self.error = None;
+    }
+
+    fn paste(&mut self, text: &str) {
+        self.replace_text(None, text, false, None);
+    }
+
+    fn backspace(&mut self) {
+        self.active_editor_mut().delete_backward();
+        self.error = None;
+    }
+
+    fn delete(&mut self) {
+        self.active_editor_mut().delete_forward();
+        self.error = None;
+    }
+
     fn approved_request(&self) -> Option<ClientRequest> {
-        (self.step == SshConnectStep::Confirm && validate_ssh_host(&self.host).is_ok()).then(|| {
-            ClientRequest::ConnectSsh {
-                target_pane: self.target_pane,
-                host: self.host.clone(),
+        let title = (!self.name.text.trim().is_empty()).then(|| self.name.text.trim().to_owned());
+        match self.kind {
+            WorkspaceCreationKind::Local if self.step == WorkspaceCreationStep::Details => {
+                Some(ClientRequest::CreateWorkspace { title })
             }
-        })
+            WorkspaceCreationKind::SystemSsh
+                if self.step == WorkspaceCreationStep::ConfirmSsh
+                    && validate_ssh_host(&self.destination.text).is_ok() =>
+            {
+                Some(ClientRequest::CreateSshWorkspace {
+                    title,
+                    destination: self.destination.text.clone(),
+                })
+            }
+            WorkspaceCreationKind::Local | WorkspaceCreationKind::SystemSsh => None,
+        }
     }
 }
 
+fn route_workspace_creation_paste(
+    dialog: Option<&mut WorkspaceCreationDialog>,
+    text: &str,
+) -> bool {
+    let Some(dialog) = dialog else {
+        return false;
+    };
+    if dialog.step == WorkspaceCreationStep::Details {
+        dialog.paste(text);
+    }
+    true
+}
+
 impl CloseConfirmation {
-    fn for_pane(pane: &Pane) -> Self {
+    fn for_pane(pane: &Pane, leaves_workspace_empty: bool) -> Self {
         Self {
             pane_id: pane.id,
             title: pane.title.clone(),
+            leaves_workspace_empty,
         }
     }
 
@@ -392,6 +750,10 @@ struct RustMux {
     zoomed_pane: Option<Uuid>,
     command_palette: Option<CommandPaletteState>,
     resizing: Option<ResizeDrag>,
+    resizing_sidebar: bool,
+    ui_state_store: Option<UiStateStore>,
+    preferred_sidebar_width: f32,
+    sidebar_pixels: f32,
     last_sizes: HashMap<Uuid, (u16, u16)>,
     workspace_pixels: (f32, f32),
     connection_error: Option<String>,
@@ -404,13 +766,17 @@ struct RustMux {
     history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
     rename_editor: Option<RenameEditor>,
+    workspace_rename_editor: Option<WorkspaceRenameEditor>,
     search_editor: Option<SearchEditor>,
     close_confirmation: Option<CloseConfirmation>,
-    ssh_connect: Option<SshConnectDialog>,
+    workspace_delete_confirmation: Option<WorkspaceDeleteConfirmation>,
+    workspace_creation: Option<WorkspaceCreationDialog>,
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
     selection_drag: Option<SelectionDrag>,
     ime_preedit: String,
+    workspace_input_layouts: [Option<ShapedLine>; 2],
+    workspace_input_bounds: [Option<Bounds<Pixels>>; 2],
 }
 
 impl RustMux {
@@ -418,6 +784,23 @@ impl RustMux {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         let terminal_font = TerminalFontProfile::resolve(cx.text_system());
+        let ui_state_store = match UiStateStore::from_default_path() {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("Rust Mux UI state unavailable: {error:#}");
+                None
+            }
+        };
+        let preferred_sidebar_width = ui_state_store
+            .as_ref()
+            .and_then(|store| match store.load_workspace_sidebar_width() {
+                Ok(width) => width,
+                Err(error) => {
+                    eprintln!("Rust Mux UI state ignored: {error:#}");
+                    None
+                }
+            })
+            .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
         let mut app = Self {
             focus_handle,
             terminal_font,
@@ -433,6 +816,10 @@ impl RustMux {
             zoomed_pane: None,
             command_palette: None,
             resizing: None,
+            resizing_sidebar: false,
+            ui_state_store,
+            preferred_sidebar_width,
+            sidebar_pixels: DEFAULT_SIDEBAR_WIDTH,
             last_sizes: HashMap::new(),
             workspace_pixels: (0.0, 0.0),
             connection_error: None,
@@ -445,13 +832,17 @@ impl RustMux {
             history_clear_confirmation: None,
             color_picker: None,
             rename_editor: None,
+            workspace_rename_editor: None,
             search_editor: None,
             close_confirmation: None,
-            ssh_connect: None,
+            workspace_delete_confirmation: None,
+            workspace_creation: None,
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
             selection_drag: None,
             ime_preedit: String::new(),
+            workspace_input_layouts: [None, None],
+            workspace_input_bounds: [None, None],
         };
         app.update_window_geometry(window);
         app.refresh_state();
@@ -552,13 +943,16 @@ impl RustMux {
                 {
                     snapshot_changed = self.snapshot.as_ref() != Some(&snapshot);
                     if self.active_workspace.is_none()
-                        || !snapshot
+                        || !snapshot.workspaces.iter().any(|workspace| {
+                            Some(workspace.id) == self.active_workspace
+                                && workspace_is_selectable(workspace)
+                        })
+                    {
+                        self.active_workspace = snapshot
                             .workspaces
                             .iter()
-                            .any(|workspace| Some(workspace.id) == self.active_workspace)
-                    {
-                        self.active_workspace =
-                            snapshot.workspaces.first().map(|workspace| workspace.id);
+                            .find(|workspace| workspace_is_selectable(workspace))
+                            .map(|workspace| workspace.id);
                     }
                     let visible = self
                         .active_workspace_in(&snapshot)
@@ -954,27 +1348,36 @@ impl RustMux {
     }
 
     fn new_workspace(&mut self, cx: &mut Context<Self>) {
-        match request(ClientRequest::CreateWorkspace { title: None }) {
-            Ok(ServiceResponse::WorkspaceCreated {
-                workspace_id,
-                pane_id,
-            }) => {
-                self.active_workspace = Some(workspace_id);
-                self.focus_pane_with_snapshot(pane_id);
-                self.refresh_state();
-            }
-            Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"))
-            }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
-        }
-        cx.notify();
+        self.begin_workspace_creation(cx);
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(target_pane) = self.focused_pane {
             self.new_tab_at(target_pane, cx);
+        } else if let Some(workspace_id) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| self.active_workspace_in(snapshot))
+            .filter(|workspace| workspace.tabs.is_empty())
+            .map(|workspace| workspace.id)
+        {
+            self.open_workspace_terminal(workspace_id, cx);
         }
+    }
+
+    fn open_workspace_terminal(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        match request(ClientRequest::CreateWorkspaceTerminal { workspace_id }) {
+            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                self.focus_pane_with_snapshot(pane_id);
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
+        self.refresh_state();
+        self.last_sizes.clear();
+        cx.notify();
     }
 
     fn new_tab_at(&mut self, target_pane: Uuid, cx: &mut Context<Self>) {
@@ -1102,18 +1505,6 @@ impl RustMux {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.active_workspace = Some(workspace_id);
-        let pane_id = self.snapshot.as_ref().and_then(|snapshot| {
-            snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == workspace_id)
-                .and_then(|workspace| workspace.tabs.first())
-                .and_then(|tab| visible_panes(&tab.layout).first().copied())
-        });
-        if let Some(pane_id) = pane_id {
-            self.focus_pane_with_snapshot(pane_id);
-        }
         self.workspace_menu = Some(WorkspaceMenu {
             workspace_id,
             position,
@@ -1167,7 +1558,18 @@ impl RustMux {
     fn begin_close(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
         self.focus_pane_with_snapshot(pane_id);
         if let Some(pane) = self.pane_metadata(pane_id) {
-            self.close_confirmation = Some(CloseConfirmation::for_pane(&pane));
+            let leaves_workspace_empty = self.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.workspaces.iter().any(|workspace| {
+                    let panes = workspace
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| visible_panes(&tab.layout))
+                        .collect::<Vec<_>>();
+                    panes.len() == 1 && panes[0] == pane_id
+                })
+            });
+            self.close_confirmation =
+                Some(CloseConfirmation::for_pane(&pane, leaves_workspace_empty));
             self.tab_menu = None;
             cx.notify();
         }
@@ -1182,49 +1584,192 @@ impl RustMux {
         cx.notify();
     }
 
-    fn begin_ssh_connect(&mut self, cx: &mut Context<Self>) {
-        let Some(target_pane) = self.focused_pane else {
-            return;
-        };
-        self.ssh_connect = Some(SshConnectDialog::new(target_pane));
+    fn begin_workspace_creation(&mut self, cx: &mut Context<Self>) {
+        self.workspace_creation = Some(WorkspaceCreationDialog::new());
+        self.workspace_input_layouts = [None, None];
+        self.workspace_input_bounds = [None, None];
         self.tab_menu = None;
+        self.workspace_menu = None;
         self.rename_editor = None;
         self.close_confirmation = None;
         cx.notify();
     }
 
-    fn review_ssh_connect(&mut self, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.ssh_connect.as_mut() {
-            dialog.review();
-            cx.notify();
+    fn focus_workspace_creation_field(
+        &mut self,
+        field: WorkspaceCreationField,
+        position: Option<Point<Pixels>>,
+        extend_selection: bool,
+    ) {
+        let index = field.index();
+        let offset = position.and_then(|position| {
+            let line = self.workspace_input_layouts[index].as_ref()?;
+            let bounds = self.workspace_input_bounds[index]?;
+            Some(line.closest_index_for_x(position.x - bounds.left()))
+        });
+        let Some(dialog) = self.workspace_creation.as_mut() else {
+            return;
+        };
+        dialog.field = field;
+        let editor = dialog.active_editor_mut();
+        match offset {
+            Some(offset) if extend_selection => editor.select_to(offset),
+            Some(offset) => editor.move_to(offset),
+            None => editor.move_end(false),
         }
     }
 
-    fn confirm_ssh_connect(&mut self, cx: &mut Context<Self>) {
+    fn submit_workspace_creation(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.workspace_creation.as_mut() else {
+            return;
+        };
+        if dialog.kind == WorkspaceCreationKind::SystemSsh
+            && dialog.step == WorkspaceCreationStep::Details
+        {
+            dialog.review();
+            cx.notify();
+            return;
+        }
         let Some(request_message) = self
-            .ssh_connect
+            .workspace_creation
             .as_ref()
-            .and_then(SshConnectDialog::approved_request)
+            .and_then(WorkspaceCreationDialog::approved_request)
         else {
             return;
         };
         match request(request_message) {
-            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+            Ok(ServiceResponse::WorkspaceCreated {
+                workspace_id,
+                pane_id,
+            }) => {
+                self.active_workspace = Some(workspace_id);
                 self.focus_pane_with_snapshot(pane_id);
-                self.ssh_connect = None;
+                self.workspace_creation = None;
                 self.refresh_state();
             }
             Ok(response) => {
-                if let Some(dialog) = self.ssh_connect.as_mut() {
+                if let Some(dialog) = self.workspace_creation.as_mut() {
                     dialog.error = Some(format!("unexpected response: {response:?}"));
                 }
             }
             Err(error) => {
-                if let Some(dialog) = self.ssh_connect.as_mut() {
+                if let Some(dialog) = self.workspace_creation.as_mut() {
                     dialog.error = Some(format!("{error:#}"));
                 }
             }
         }
+        cx.notify();
+    }
+
+    fn begin_workspace_rename(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        let workspace = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+        });
+        if let Some(workspace) = workspace {
+            self.workspace_rename_editor = Some(WorkspaceRenameEditor {
+                workspace_id,
+                value: workspace.title.clone(),
+                replace_on_type: true,
+            });
+            self.workspace_menu = None;
+            cx.notify();
+        }
+    }
+
+    fn submit_workspace_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.workspace_rename_editor.take() else {
+            return;
+        };
+        self.send(ClientRequest::RenameWorkspace {
+            workspace_id: editor.workspace_id,
+            title: editor.value,
+        });
+        cx.notify();
+    }
+
+    fn set_workspace_pinned(&mut self, workspace_id: Uuid, pinned: bool, cx: &mut Context<Self>) {
+        self.send(ClientRequest::SetWorkspacePinned {
+            workspace_id,
+            pinned,
+        });
+        self.workspace_menu = None;
+        cx.notify();
+    }
+
+    fn move_pinned_workspace(
+        &mut self,
+        workspace_id: Uuid,
+        direction: WorkspacePinMove,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(ClientRequest::MovePinnedWorkspace {
+            workspace_id,
+            direction,
+        });
+        self.workspace_menu = None;
+        cx.notify();
+    }
+
+    fn disconnect_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        self.send_control(ClientRequest::DisconnectWorkspace { workspace_id });
+        if self.connection_error.is_none() && self.active_workspace == Some(workspace_id) {
+            self.active_workspace = None;
+            self.focused_pane = None;
+        }
+        self.refresh_state();
+        cx.notify();
+    }
+
+    fn reconnect_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        match request(ClientRequest::ReconnectWorkspace { workspace_id }) {
+            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                self.active_workspace = Some(workspace_id);
+                self.focus_pane_with_snapshot(pane_id);
+                self.refresh_state();
+            }
+            Ok(response) => {
+                self.connection_error = Some(format!("unexpected response: {response:?}"));
+            }
+            Err(error) => self.connection_error = Some(format!("{error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn begin_workspace_delete(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        let workspace = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+        });
+        if let Some(workspace) = workspace {
+            self.workspace_delete_confirmation = Some(WorkspaceDeleteConfirmation {
+                workspace_id,
+                title: workspace.title.clone(),
+                active_terminal_count: workspace.active_terminal_count,
+            });
+            self.workspace_menu = None;
+            cx.notify();
+        }
+    }
+
+    fn confirm_workspace_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(confirmation) = self.workspace_delete_confirmation.take() else {
+            return;
+        };
+        self.send_control(ClientRequest::DeleteWorkspace {
+            workspace_id: confirmation.workspace_id,
+        });
+        if self.connection_error.is_none()
+            && self.active_workspace == Some(confirmation.workspace_id)
+        {
+            self.active_workspace = None;
+            self.focused_pane = None;
+        }
+        self.refresh_state();
         cx.notify();
     }
 
@@ -1368,6 +1913,15 @@ impl RustMux {
     }
 
     fn copy_terminal(&mut self, _: &CopyTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self
+            .workspace_creation
+            .as_ref()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+            .and_then(|dialog| dialog.active_editor().selected_text())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+            return;
+        }
         let Some(pane_id) = self.focused_pane else {
             return;
         };
@@ -1386,10 +1940,14 @@ impl RustMux {
     }
 
     fn paste_terminal(&mut self, _: &PasteTerminal, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(pane_id) = self.focused_pane else {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        if route_workspace_creation_paste(self.workspace_creation.as_mut(), &text) {
+            cx.notify();
+            return;
+        }
+        let Some(pane_id) = self.focused_pane else {
             return;
         };
         let bracketed = self
@@ -1518,6 +2076,25 @@ impl RustMux {
                 .extend(text.chars().filter(char::is_ascii_digit).take(remaining));
             editor.replace_on_type = false;
             editor.invalid = false;
+            cx.notify();
+            return;
+        }
+        if let Some(dialog) = self.workspace_creation.as_mut() {
+            if dialog.step == WorkspaceCreationStep::Details {
+                dialog.replace_text(None, text, false, None);
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(editor) = self.workspace_rename_editor.as_mut() {
+            if editor.replace_on_type {
+                editor.value.clear();
+            }
+            let remaining = 80_usize.saturating_sub(editor.value.chars().count());
+            editor
+                .value
+                .extend(text.chars().filter(|c| !c.is_control()).take(remaining));
+            editor.replace_on_type = false;
             cx.notify();
             return;
         }
@@ -1857,37 +2434,132 @@ impl RustMux {
             cx.stop_propagation();
             return;
         }
-        if self.ssh_connect.is_some() {
-            let step = self.ssh_connect.as_ref().map(|dialog| dialog.step);
-            match keystroke.key.as_str() {
-                "enter" if step == Some(SshConnectStep::Destination) => {
-                    self.review_ssh_connect(cx);
-                }
-                "enter" => self.confirm_ssh_connect(cx),
-                "escape" => {
-                    self.ssh_connect = None;
+        if self.workspace_creation.is_some() {
+            let step = self.workspace_creation.as_ref().map(|dialog| dialog.step);
+            if step == Some(WorkspaceCreationStep::Details)
+                && keystroke.modifiers.platform
+                && keystroke.key.eq_ignore_ascii_case("a")
+            {
+                if let Some(dialog) = self.workspace_creation.as_mut() {
+                    dialog.active_editor_mut().select_all();
                     cx.notify();
                 }
-                "backspace" if step == Some(SshConnectStep::Destination) => {
-                    if let Some(dialog) = self.ssh_connect.as_mut() {
-                        dialog.host.pop();
-                        dialog.error = None;
+                cx.stop_propagation();
+                return;
+            }
+            if step == Some(WorkspaceCreationStep::Details)
+                && keystroke.modifiers.platform
+                && keystroke.key.eq_ignore_ascii_case("x")
+            {
+                if let Some(dialog) = self.workspace_creation.as_mut()
+                    && let Some(text) = dialog.active_editor().selected_text().map(str::to_owned)
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    dialog.replace_text(None, "", false, None);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
+            match keystroke.key.as_str() {
+                "enter" => self.submit_workspace_creation(cx),
+                "escape" => {
+                    self.workspace_creation = None;
+                    cx.notify();
+                }
+                "tab" if step == Some(WorkspaceCreationStep::Details) => {
+                    if let Some(dialog) = self.workspace_creation.as_mut() {
+                        dialog.field = match (dialog.kind, dialog.field) {
+                            (WorkspaceCreationKind::SystemSsh, WorkspaceCreationField::Name) => {
+                                WorkspaceCreationField::Destination
+                            }
+                            _ => WorkspaceCreationField::Name,
+                        };
                         cx.notify();
                     }
                 }
-                _ if step == Some(SshConnectStep::Destination)
-                    && !keystroke.modifiers.platform
-                    && !keystroke.modifiers.control =>
-                {
-                    if let Some(text) = &keystroke.key_char
-                        && let Some(dialog) = self.ssh_connect.as_mut()
-                        && dialog.host.len() + text.len() <= MAX_SSH_HOST_LEN
-                        && !text.chars().any(char::is_control)
-                    {
-                        dialog.host.push_str(text);
-                        dialog.error = None;
+                "backspace" if step == Some(WorkspaceCreationStep::Details) => {
+                    if let Some(dialog) = self.workspace_creation.as_mut() {
+                        dialog.backspace();
                         cx.notify();
                     }
+                }
+                "delete" if step == Some(WorkspaceCreationStep::Details) => {
+                    if let Some(dialog) = self.workspace_creation.as_mut() {
+                        dialog.delete();
+                        cx.notify();
+                    }
+                }
+                "left" if step == Some(WorkspaceCreationStep::Details) => {
+                    if let Some(dialog) = self.workspace_creation.as_mut() {
+                        if keystroke.modifiers.platform {
+                            dialog
+                                .active_editor_mut()
+                                .move_home(keystroke.modifiers.shift);
+                        } else {
+                            dialog
+                                .active_editor_mut()
+                                .move_left(keystroke.modifiers.shift);
+                        }
+                        cx.notify();
+                    }
+                }
+                "right" if step == Some(WorkspaceCreationStep::Details) => {
+                    if let Some(dialog) = self.workspace_creation.as_mut() {
+                        if keystroke.modifiers.platform {
+                            dialog
+                                .active_editor_mut()
+                                .move_end(keystroke.modifiers.shift);
+                        } else {
+                            dialog
+                                .active_editor_mut()
+                                .move_right(keystroke.modifiers.shift);
+                        }
+                        cx.notify();
+                    }
+                }
+                "home" if step == Some(WorkspaceCreationStep::Details) => {
+                    if let Some(dialog) = self.workspace_creation.as_mut() {
+                        dialog
+                            .active_editor_mut()
+                            .move_home(keystroke.modifiers.shift);
+                        cx.notify();
+                    }
+                }
+                "end" if step == Some(WorkspaceCreationStep::Details) => {
+                    if let Some(dialog) = self.workspace_creation.as_mut() {
+                        dialog
+                            .active_editor_mut()
+                            .move_end(keystroke.modifiers.shift);
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(editor) = self.workspace_rename_editor.as_mut() {
+            if keystroke.modifiers.platform && keystroke.key.eq_ignore_ascii_case("a") {
+                editor.replace_on_type = true;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            match keystroke.key.as_str() {
+                "enter" => self.submit_workspace_rename(cx),
+                "escape" => {
+                    self.workspace_rename_editor = None;
+                    cx.notify();
+                }
+                "backspace" => {
+                    if editor.replace_on_type {
+                        editor.value.clear();
+                    } else {
+                        editor.value.pop();
+                    }
+                    editor.replace_on_type = false;
+                    cx.notify();
                 }
                 _ => {}
             }
@@ -1946,6 +2618,18 @@ impl RustMux {
             cx.stop_propagation();
             return;
         }
+        if self.workspace_delete_confirmation.is_some() {
+            match keystroke.key.as_str() {
+                "enter" => self.confirm_workspace_delete(cx),
+                "escape" => {
+                    self.workspace_delete_confirmation = None;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.close_confirmation.is_some() {
             match keystroke.key.as_str() {
                 "enter" => self.confirm_close(cx),
@@ -1992,6 +2676,18 @@ impl RustMux {
     }
 
     fn handle_resize(&mut self, event: &MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
+        if self.resizing_sidebar {
+            let window_width = f32::from(window.bounds().size.width);
+            let next = constrained_sidebar_width(f32::from(event.position.x), window_width);
+            if (self.preferred_sidebar_width - next).abs() > f32::EPSILON {
+                self.preferred_sidebar_width = next;
+                self.update_window_geometry(window);
+                self.last_sizes.clear();
+                self.sync_pty_sizes();
+                cx.notify();
+            }
+            return;
+        }
         let Some(drag) = self.resizing else { return };
         self.update_window_geometry(window);
         let Some(snapshot) = self.snapshot.as_ref() else {
@@ -2013,7 +2709,7 @@ impl RustMux {
         let Some(split) = find_split_rect(layout, drag.split_id, root, &self.split_ratios) else {
             return;
         };
-        let workspace_x = f32::from(event.position.x) - SIDEBAR_WIDTH;
+        let workspace_x = f32::from(event.position.x) - self.sidebar_pixels;
         let workspace_y = f32::from(event.position.y) - TITLEBAR_HEIGHT;
         let ratio = match drag.axis {
             SplitAxis::Horizontal => (workspace_x - split.x) / split.width.max(1.0),
@@ -2029,16 +2725,36 @@ impl RustMux {
     }
 
     fn update_window_geometry(&mut self, window: &Window) -> bool {
+        let window_width = f32::from(window.bounds().size.width);
+        let sidebar_pixels = constrained_sidebar_width(self.preferred_sidebar_width, window_width);
         let next = workspace_pixel_size(
-            f32::from(window.bounds().size.width),
+            window_width,
             f32::from(window.bounds().size.height),
+            sidebar_pixels,
         );
-        if self.workspace_pixels == next {
+        if self.workspace_pixels == next
+            && (self.sidebar_pixels - sidebar_pixels).abs() < f32::EPSILON
+        {
             return false;
         }
+        self.sidebar_pixels = sidebar_pixels;
         self.workspace_pixels = next;
         self.last_sizes.clear();
         true
+    }
+
+    fn finish_resize(&mut self, cx: &mut Context<Self>) {
+        if self.resizing_sidebar
+            && let Some(store) = &self.ui_state_store
+            && let Err(error) = store.save_workspace_sidebar_width(self.preferred_sidebar_width)
+        {
+            eprintln!("Rust Mux sidebar width was not persisted: {error:#}");
+        }
+        self.resizing_sidebar = false;
+        self.resizing = None;
+        self.dragging_pane = None;
+        self.drag_hover.clear();
+        cx.notify();
     }
 
     fn sync_pty_sizes(&mut self) {
@@ -2086,17 +2802,27 @@ impl RustMux {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let workspaces = self
+        let mut workspaces = self
             .snapshot
             .as_ref()
             .map(|snapshot| snapshot.workspaces.clone())
             .unwrap_or_default();
+        workspaces.sort_by_key(|workspace| {
+            (
+                !workspace.pinned,
+                if workspace.pinned {
+                    workspace.pin_order
+                } else {
+                    u32::MAX
+                },
+            )
+        });
         let history_needs_attention = self
             .history_status
             .as_ref()
             .is_some_and(|status| status.warning.is_some());
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_pixels - SIDEBAR_RESIZE_HANDLE_WIDTH))
             .h_full()
             .flex_none()
             .bg(rgb(THEME.sidebar))
@@ -2184,12 +2910,53 @@ impl RustMux {
                     .map(|(index, workspace)| {
                         let active = Some(workspace.id) == self.active_workspace;
                         let workspace_id = workspace.id;
+                        let offline = matches!(
+                            workspace.connection,
+                            WorkspaceConnection::SystemSsh {
+                                status: WorkspaceConnectionStatus::Offline,
+                                ..
+                            }
+                        );
+                        let connected = matches!(
+                            workspace.connection,
+                            WorkspaceConnection::SystemSsh {
+                                status: WorkspaceConnectionStatus::Connected,
+                                ..
+                            }
+                        );
+                        let pinned = workspace.pinned;
+                        let workspace_title = workspace.title.clone();
+                        let first_pane = workspace
+                            .tabs
+                            .first()
+                            .and_then(|tab| visible_panes(&tab.layout).first().copied());
                         let workspace_color = self.workspace_color(workspace_id).as_rgb();
-                        let active_text = readable_text_color(workspace_color);
+                        let card_color = if connected {
+                            0x234b38
+                        } else if offline {
+                            0x40252a
+                        } else {
+                            workspace_color
+                        };
+                        let active_text = readable_text_color(card_color);
                         let pane_count = workspace
                             .tabs
                             .first()
                             .map_or(0, |tab| visible_panes(&tab.layout).len());
+                        let status = match &workspace.connection {
+                            WorkspaceConnection::Local => format!(
+                                "local · {pane_count} pane{}",
+                                if pane_count == 1 { "" } else { "s" }
+                            ),
+                            WorkspaceConnection::SystemSsh {
+                                destination,
+                                status: WorkspaceConnectionStatus::Connected,
+                            } => format!("connected · {destination}"),
+                            WorkspaceConnection::SystemSsh {
+                                destination,
+                                status: WorkspaceConnectionStatus::Offline,
+                            } => format!("offline · {destination}"),
+                        };
                         div()
                             .id(("workspace", element_key(workspace.id)))
                             .mx(px(7.0))
@@ -2197,27 +2964,28 @@ impl RustMux {
                             .px(px(10.0))
                             .py(px(8.0))
                             .rounded(px(6.0))
-                            .cursor_pointer()
-                            .when(active, |element| element.bg(rgb(workspace_color)))
+                            .when(!offline || pane_count == 0, |element| {
+                                element.cursor_pointer()
+                            })
+                            .when(offline, |element| element.bg(rgb(card_color)))
+                            .when(active || connected, |element| element.bg(rgb(card_color)))
                             .hover(|element| {
-                                if active {
+                                if active || connected || offline {
                                     element
                                 } else {
                                     element.bg(rgb(THEME.surface))
                                 }
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.active_workspace = Some(workspace_id);
-                                let pane_id = workspace
-                                    .tabs
-                                    .first()
-                                    .and_then(|tab| visible_panes(&tab.layout).first().copied());
-                                if let Some(pane_id) = pane_id {
-                                    this.focus_pane_with_snapshot(pane_id);
-                                }
-                                this.last_sizes.clear();
-                                cx.notify();
-                            }))
+                            .when(!offline || pane_count == 0, |element| {
+                                element.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.active_workspace = Some(workspace_id);
+                                    if let Some(pane_id) = first_pane {
+                                        this.focus_pane_with_snapshot(pane_id);
+                                    }
+                                    this.last_sizes.clear();
+                                    cx.notify();
+                                }))
+                            })
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -2230,35 +2998,115 @@ impl RustMux {
                             .gap(px(3.0))
                             .child(
                                 div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(if active {
-                                        rgb(active_text)
-                                    } else {
-                                        rgb(THEME.foreground)
-                                    })
-                                    .child(format!("{}  {}", index + 1, workspace.title)),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(if active || connected || offline {
+                                                rgb(active_text)
+                                            } else {
+                                                rgb(THEME.foreground)
+                                            })
+                                            .child(format!("{}  {workspace_title}", index + 1)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("pin-workspace", element_key(workspace_id)))
+                                            .cursor_pointer()
+                                            .font_family("SF Mono")
+                                            .text_xs()
+                                            .text_color(rgb(if pinned {
+                                                THEME.ansi[3]
+                                            } else {
+                                                THEME.muted
+                                            }))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.set_workspace_pinned(
+                                                    workspace_id,
+                                                    !pinned,
+                                                    cx,
+                                                );
+                                                cx.stop_propagation();
+                                            }))
+                                            .child(if pinned { "◆" } else { "◇" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("delete-workspace", element_key(workspace_id)))
+                                            .cursor_pointer()
+                                            .font_family("SF Mono")
+                                            .text_xs()
+                                            .text_color(rgb(THEME.danger))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.begin_workspace_delete(workspace_id, cx);
+                                                cx.stop_propagation();
+                                            }))
+                                            .child("×"),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .font_family("SF Mono")
-                                    .text_xs()
-                                    .text_color(if active {
-                                        rgb(active_text)
-                                    } else {
-                                        rgb(THEME.dim)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_sm()
+                                            .font_family("SF Mono")
+                                            .text_xs()
+                                            .text_color(if active || connected || offline {
+                                                rgb(active_text)
+                                            } else {
+                                                rgb(THEME.dim)
+                                            })
+                                            .child(status),
+                                    )
+                                    .when(connected, |element| {
+                                        element.child(
+                                            div()
+                                                .id((
+                                                    "disconnect-workspace",
+                                                    element_key(workspace_id),
+                                                ))
+                                                .cursor_pointer()
+                                                .text_xs()
+                                                .text_color(rgb(THEME.foreground))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.disconnect_workspace(workspace_id, cx);
+                                                    cx.stop_propagation();
+                                                }))
+                                                .child("Disconnect"),
+                                        )
                                     })
-                                    .child(format!(
-                                        "local · {pane_count} pane{}",
-                                        if pane_count == 1 { "" } else { "s" }
-                                    )),
+                                    .when(offline, |element| {
+                                        element.child(
+                                            div()
+                                                .id((
+                                                    "reconnect-workspace",
+                                                    element_key(workspace_id),
+                                                ))
+                                                .cursor_pointer()
+                                                .text_xs()
+                                                .text_color(rgb(THEME.ansi[2]))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.reconnect_workspace(workspace_id, cx);
+                                                    cx.stop_propagation();
+                                                }))
+                                                .child("Reconnect"),
+                                        )
+                                    }),
                             )
                     }),
             )
             .child(div().flex_1())
             .child(
                 div()
-                    .id("connect-ssh")
+                    .id("new-workspace-bottom")
                     .mx(px(9.0))
                     .mb(px(8.0))
                     .px(px(10.0))
@@ -2272,8 +3120,11 @@ impl RustMux {
                     .text_sm()
                     .text_color(rgb(THEME.foreground))
                     .hover(|element| element.border_color(rgb(THEME.accent)))
-                    .on_click(cx.listener(|this, _, _, cx| this.begin_ssh_connect(cx)))
-                    .child("Connect with SSH…"),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_click(cx.listener(|this, _, _, cx| this.new_workspace(cx)))
+                    .child("＋ New Workspace"),
             )
             .child(
                 div()
@@ -2284,6 +3135,31 @@ impl RustMux {
                     .text_color(rgb(THEME.dim))
                     .child("⌘N new workspace"),
             )
+            .into_any_element()
+    }
+
+    fn render_sidebar_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("workspace-sidebar-resize-handle")
+            .relative()
+            .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
+            .h_full()
+            .flex_none()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .flex()
+            .justify_center()
+            .bg(rgba(0x00000000))
+            .hover(|element| element.bg(rgba(0xffffff0c)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.resizing = None;
+                    this.resizing_sidebar = true;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(div().w(px(1.0)).h_full().bg(rgb(THEME.border_strong)))
             .into_any_element()
     }
 
@@ -2337,7 +3213,7 @@ impl RustMux {
                     .children(panes.into_iter().map(|pane| {
                         let pane_id = pane.id;
                         let identity = tab_identity_presentation(&pane);
-                        let identity_detail = identity.detail;
+                        let identity_detail = identity.detail.clone();
                         let selected = pane_id == active;
                         let pane_accent = pane
                             .color
@@ -2390,34 +3266,26 @@ impl RustMux {
                                 div()
                                     .id(("identity-badge", element_key(pane_id)))
                                     .flex_none()
-                                    .min_w(px(18.0))
-                                    .h(px(15.0))
-                                    .px(px(3.0))
-                                    .rounded(px(4.0))
-                                    .border_1()
-                                    .border_color(if selected {
-                                        rgb(pane_accent)
-                                    } else {
-                                        rgb(THEME.muted)
-                                    })
+                                    .w(px(IDENTITY_MARK_SIZE))
+                                    .h(px(IDENTITY_MARK_SIZE))
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .font_family("SF Mono")
-                                    .text_size(px(8.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(if selected {
-                                        rgb(THEME.foreground)
-                                    } else {
-                                        rgb(THEME.muted)
-                                    })
                                     .tooltip(move |_, cx| {
                                         cx.new(|_| TooltipView {
-                                            text: identity_detail.to_owned(),
+                                            text: identity_detail.clone(),
                                         })
                                         .into()
                                     })
-                                    .child(identity.badge),
+                                    .child(render_terminal_profile_mark(
+                                        identity.profile,
+                                        if selected {
+                                            THEME.foreground
+                                        } else {
+                                            THEME.muted
+                                        },
+                                        if selected { pane_accent } else { THEME.muted },
+                                    )),
                             )
                             .child(
                                 div()
@@ -3174,12 +4042,9 @@ impl RustMux {
             .pane_metadata(pane_id)
             .and_then(|pane| pane.profile_override);
         let choices = std::iter::once(("Auto".to_owned(), None)).chain(
-            TerminalProfile::ALL.into_iter().map(|profile| {
-                (
-                    format!("{} {}", profile.badge(), profile.display_name()),
-                    Some(profile),
-                )
-            }),
+            TerminalProfile::ALL
+                .into_iter()
+                .map(|profile| (profile.display_name().to_owned(), Some(profile))),
         );
         div()
             .mx(px(8.0))
@@ -3206,8 +4071,11 @@ impl RustMux {
                     } else {
                         rgb(THEME.surface)
                     })
-                    .font_family("SF Mono")
-                    .text_size(px(9.5))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .font_family(".SystemUIFont")
+                    .text_xs()
                     .text_color(if active {
                         rgb(THEME.foreground)
                     } else {
@@ -3217,6 +4085,17 @@ impl RustMux {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_pane_profile(pane_id, profile, cx)
                     }))
+                    .children(profile.map(|profile| {
+                        render_terminal_profile_mark(
+                            profile,
+                            if active {
+                                THEME.foreground
+                            } else {
+                                THEME.muted
+                            },
+                            if active { THEME.accent } else { THEME.muted },
+                        )
+                    }))
                     .child(label)
             }))
             .into_any_element()
@@ -3224,6 +4103,14 @@ impl RustMux {
 
     fn render_workspace_menu(&self, menu: WorkspaceMenu, cx: &mut Context<Self>) -> AnyElement {
         let workspace_id = menu.workspace_id;
+        let workspace = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+        });
+        let pinned = workspace.is_some_and(|workspace| workspace.pinned);
+        let connection = workspace.map(|workspace| workspace.connection.clone());
         div()
             .absolute()
             .left(menu.position.x)
@@ -3236,6 +4123,124 @@ impl RustMux {
             .border_color(rgb(THEME.border_strong))
             .shadow_lg()
             .occlude()
+            .child(
+                div()
+                    .id(("rename-workspace-menu", element_key(workspace_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.begin_workspace_rename(workspace_id, cx)
+                    }))
+                    .child("Rename workspace…"),
+            )
+            .child(
+                div()
+                    .id(("pin-workspace-menu", element_key(workspace_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_workspace_pinned(workspace_id, !pinned, cx)
+                    }))
+                    .child(if pinned {
+                        "Unpin workspace"
+                    } else {
+                        "Pin workspace"
+                    }),
+            )
+            .when(pinned, |element| {
+                element
+                    .child(
+                        div()
+                            .id(("move-workspace-up", element_key(workspace_id)))
+                            .mx(px(5.0))
+                            .px(px(9.0))
+                            .py(px(7.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.foreground))
+                            .hover(|item| item.bg(rgb(THEME.accent_soft)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.move_pinned_workspace(workspace_id, WorkspacePinMove::Up, cx)
+                            }))
+                            .child("Move pinned workspace up"),
+                    )
+                    .child(
+                        div()
+                            .id(("move-workspace-down", element_key(workspace_id)))
+                            .mx(px(5.0))
+                            .px(px(9.0))
+                            .py(px(7.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.foreground))
+                            .hover(|item| item.bg(rgb(THEME.accent_soft)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.move_pinned_workspace(workspace_id, WorkspacePinMove::Down, cx)
+                            }))
+                            .child("Move pinned workspace down"),
+                    )
+            })
+            .when_some(connection, |element, connection| match connection {
+                WorkspaceConnection::Local => element,
+                WorkspaceConnection::SystemSsh {
+                    status: WorkspaceConnectionStatus::Connected,
+                    ..
+                } => element.child(
+                    div()
+                        .id(("disconnect-workspace-menu", element_key(workspace_id)))
+                        .mx(px(5.0))
+                        .px(px(9.0))
+                        .py(px(7.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.foreground))
+                        .hover(|item| item.bg(rgb(THEME.accent_soft)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.disconnect_workspace(workspace_id, cx)
+                        }))
+                        .child("Disconnect and keep workspace"),
+                ),
+                WorkspaceConnection::SystemSsh {
+                    status: WorkspaceConnectionStatus::Offline,
+                    ..
+                } => element.child(
+                    div()
+                        .id(("reconnect-workspace-menu", element_key(workspace_id)))
+                        .mx(px(5.0))
+                        .px(px(9.0))
+                        .py(px(7.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.ansi[2]))
+                        .hover(|item| item.bg(rgb(THEME.accent_soft)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.reconnect_workspace(workspace_id, cx)
+                        }))
+                        .child("Reconnect with system OpenSSH"),
+                ),
+            })
             .child(
                 div()
                     .mx(px(9.0))
@@ -3283,6 +4288,24 @@ impl RustMux {
                         this.open_color_picker(ColorTarget::Workspace(workspace_id), cx)
                     }))
                     .child("Pick color…"),
+            )
+            .child(
+                div()
+                    .id(("delete-workspace-menu", element_key(workspace_id)))
+                    .mx(px(5.0))
+                    .mt(px(4.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.danger))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.begin_workspace_delete(workspace_id, cx)
+                    }))
+                    .child("Delete workspace…"),
             )
             .into_any_element()
     }
@@ -4112,11 +5135,17 @@ impl RustMux {
             .into_any_element()
     }
 
-    fn render_ssh_dialog(&self, dialog: &SshConnectDialog, cx: &mut Context<Self>) -> AnyElement {
-        let host = dialog.host.clone();
+    fn render_workspace_creation_dialog(
+        &self,
+        dialog: &WorkspaceCreationDialog,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let kind = dialog.kind;
+        let field = dialog.field;
+        let destination = dialog.destination.text.clone();
         let error = dialog.error.clone();
         let content = match dialog.step {
-            SshConnectStep::Destination => div()
+            WorkspaceCreationStep::Details => div()
                 .flex()
                 .flex_col()
                 .gap(px(12.0))
@@ -4125,33 +5154,171 @@ impl RustMux {
                         .font_family(".SystemUIFont")
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(rgb(THEME.foreground))
-                        .child("Connect with system OpenSSH"),
+                        .child("New Workspace"),
                 )
                 .child(
                     div()
-                        .font_family(".SystemUIFont")
-                        .text_sm()
-                        .text_color(rgb(THEME.muted))
+                        .flex()
+                        .gap(px(8.0))
                         .child(
-                            "Enter one host or alias. OpenSSH will resolve your existing SSH config, agent, keys, proxies, and known_hosts. No connection starts until you confirm the next screen.",
+                            div()
+                                .id("new-workspace-local")
+                                .px(px(12.0))
+                                .py(px(7.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(rgb(if kind == WorkspaceCreationKind::Local {
+                                    THEME.accent
+                                } else {
+                                    THEME.border_strong
+                                }))
+                                .bg(rgb(if kind == WorkspaceCreationKind::Local {
+                                    THEME.accent_soft
+                                } else {
+                                    THEME.surface
+                                }))
+                                .text_sm()
+                                .text_color(rgb(THEME.foreground))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(dialog) = this.workspace_creation.as_mut() {
+                                        dialog.kind = WorkspaceCreationKind::Local;
+                                        dialog.field = WorkspaceCreationField::Name;
+                                        dialog.error = None;
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("Local shell"),
+                        )
+                        .child(
+                            div()
+                                .id("new-workspace-ssh")
+                                .px(px(12.0))
+                                .py(px(7.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(rgb(if kind == WorkspaceCreationKind::SystemSsh {
+                                    THEME.accent
+                                } else {
+                                    THEME.border_strong
+                                }))
+                                .bg(rgb(if kind == WorkspaceCreationKind::SystemSsh {
+                                    THEME.accent_soft
+                                } else {
+                                    THEME.surface
+                                }))
+                                .text_sm()
+                                .text_color(rgb(THEME.foreground))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(dialog) = this.workspace_creation.as_mut() {
+                                        dialog.kind = WorkspaceCreationKind::SystemSsh;
+                                        dialog.field = WorkspaceCreationField::Destination;
+                                        dialog.error = None;
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("System SSH"),
                         ),
                 )
                 .child(
                     div()
+                        .font_family(".SystemUIFont")
+                        .text_xs()
+                        .text_color(rgb(THEME.dim))
+                        .child("Workspace name (optional)"),
+                )
+                .child(
+                    div()
+                        .id("workspace-name-input")
                         .h(px(36.0))
                         .px(px(10.0))
                         .rounded(px(6.0))
                         .bg(rgb(THEME.terminal))
                         .border_1()
-                        .border_color(rgb(THEME.accent))
+                        .border_color(rgb(if field == WorkspaceCreationField::Name {
+                            THEME.accent
+                        } else {
+                            THEME.border_strong
+                        }))
+                        .overflow_hidden()
+                        .cursor_pointer()
                         .flex()
                         .items_center()
-                        .font_family("SF Mono")
+                        .font_family(".SystemUIFont")
                         .text_sm()
                         .text_color(rgb(THEME.foreground))
-                        .child(host)
-                        .child("│"),
+                        .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                            this.focus_workspace_creation_field(
+                                WorkspaceCreationField::Name,
+                                event.mouse_position(),
+                                event.modifiers().shift,
+                            );
+                            cx.notify();
+                        }))
+                        .child(WorkspaceTextInputElement {
+                            input: cx.entity(),
+                            field: WorkspaceCreationField::Name,
+                            placeholder: "Workspace name",
+                        }),
                 )
+                .when(kind == WorkspaceCreationKind::SystemSsh, |element| {
+                    element
+                        .child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .text_xs()
+                                .text_color(rgb(THEME.dim))
+                                .child("SSH destination or exact ssh command"),
+                        )
+                        .child(
+                            div()
+                                .id("workspace-ssh-input")
+                                .h(px(36.0))
+                                .px(px(10.0))
+                                .rounded(px(6.0))
+                                .bg(rgb(THEME.terminal))
+                                .border_1()
+                                .border_color(rgb(
+                                    if field == WorkspaceCreationField::Destination {
+                                        THEME.accent
+                                    } else {
+                                        THEME.border_strong
+                                    },
+                                ))
+                                .overflow_hidden()
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .font_family("SF Mono")
+                                .text_sm()
+                                .text_color(rgb(THEME.foreground))
+                                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                    this.focus_workspace_creation_field(
+                                        WorkspaceCreationField::Destination,
+                                        event.mouse_position(),
+                                        event.modifiers().shift,
+                                    );
+                                    cx.notify();
+                                }))
+                                .child(WorkspaceTextInputElement {
+                                    input: cx.entity(),
+                                    field: WorkspaceCreationField::Destination,
+                                    placeholder: "ssh user@host-or-alias",
+                                }),
+                        )
+                })
+                .when(kind == WorkspaceCreationKind::SystemSsh, |element| {
+                    element.child(
+                        div()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.muted))
+                        .child(
+                            "The workspace connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Rust Mux stores no credentials or SSH config contents.",
+                        ),
+                    )
+                })
                 .when_some(error, |element, message| {
                     element.child(
                         div()
@@ -4168,7 +5335,7 @@ impl RustMux {
                         .gap(px(8.0))
                         .child(
                             div()
-                                .id("cancel-ssh")
+                                .id("cancel-workspace-create")
                                 .px(px(12.0))
                                 .py(px(7.0))
                                 .rounded(px(5.0))
@@ -4176,14 +5343,14 @@ impl RustMux {
                                 .text_sm()
                                 .text_color(rgb(THEME.muted))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.ssh_connect = None;
+                                    this.workspace_creation = None;
                                     cx.notify();
                                 }))
                                 .child("Cancel"),
                         )
                         .child(
                             div()
-                                .id("review-ssh")
+                                .id("submit-workspace-create")
                                 .px(px(12.0))
                                 .py(px(7.0))
                                 .rounded(px(5.0))
@@ -4192,13 +5359,17 @@ impl RustMux {
                                 .text_sm()
                                 .text_color(rgb(0xffffff))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.review_ssh_connect(cx)
+                                    this.submit_workspace_creation(cx)
                                 }))
-                                .child("Review"),
+                                .child(if kind == WorkspaceCreationKind::SystemSsh {
+                                    "Review connection"
+                                } else {
+                                    "Create workspace"
+                                }),
                         ),
                 )
                 .into_any_element(),
-            SshConnectStep::Confirm => div()
+            WorkspaceCreationStep::ConfirmSsh => div()
                 .flex()
                 .flex_col()
                 .gap(px(12.0))
@@ -4207,7 +5378,7 @@ impl RustMux {
                         .font_family(".SystemUIFont")
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(rgb(THEME.foreground))
-                        .child(format!("Connect to {host}?")),
+                        .child(format!("Connect and save {destination}?")),
                 )
                 .child(
                     div()
@@ -4215,7 +5386,7 @@ impl RustMux {
                         .text_sm()
                         .text_color(rgb(THEME.muted))
                         .child(
-                            "This explicit action starts the installed OpenSSH client in a new managed terminal. Rust Mux will not answer password or host-key prompts, forward an agent automatically, or change host-key policy.",
+                            "This starts the installed OpenSSH client now and saves safe workspace metadata locally for later reconnect. Rust Mux adds no SSH options, stores no credentials, and does not change your config, agent, forwarding, or host-key policy.",
                         ),
                 )
                 .when_some(error, |element, message| {
@@ -4234,7 +5405,7 @@ impl RustMux {
                         .gap(px(8.0))
                         .child(
                             div()
-                                .id("back-ssh")
+                                .id("back-workspace-create")
                                 .px(px(12.0))
                                 .py(px(7.0))
                                 .rounded(px(5.0))
@@ -4242,8 +5413,8 @@ impl RustMux {
                                 .text_sm()
                                 .text_color(rgb(THEME.muted))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(dialog) = this.ssh_connect.as_mut() {
-                                        dialog.step = SshConnectStep::Destination;
+                                    if let Some(dialog) = this.workspace_creation.as_mut() {
+                                        dialog.step = WorkspaceCreationStep::Details;
                                         dialog.error = None;
                                     }
                                     cx.notify();
@@ -4252,7 +5423,7 @@ impl RustMux {
                         )
                         .child(
                             div()
-                                .id("confirm-ssh")
+                                .id("confirm-workspace-create")
                                 .px(px(12.0))
                                 .py(px(7.0))
                                 .rounded(px(5.0))
@@ -4261,9 +5432,9 @@ impl RustMux {
                                 .text_sm()
                                 .text_color(rgb(0xffffff))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.confirm_ssh_connect(cx)
+                                    this.submit_workspace_creation(cx)
                                 }))
-                                .child("Connect with OpenSSH"),
+                                .child("Connect and save"),
                         ),
                 )
                 .into_any_element(),
@@ -4281,7 +5452,7 @@ impl RustMux {
             .occlude()
             .child(
                 div()
-                    .w(px(480.0))
+                    .w(px(520.0))
                     .p(px(18.0))
                     .rounded(px(10.0))
                     .bg(rgb(THEME.elevated))
@@ -4289,6 +5460,182 @@ impl RustMux {
                     .border_color(rgb(THEME.border_strong))
                     .shadow_lg()
                     .child(content),
+            )
+            .into_any_element()
+    }
+
+    fn render_workspace_rename_dialog(
+        &self,
+        editor: &WorkspaceRenameEditor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(rgba(0x090b0f88))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(390.0))
+                    .p(px(18.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(THEME.elevated))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child("Rename workspace"),
+                    )
+                    .child(
+                        div()
+                            .h(px(36.0))
+                            .px(px(10.0))
+                            .rounded(px(6.0))
+                            .bg(rgb(THEME.terminal))
+                            .border_1()
+                            .border_color(rgb(THEME.accent))
+                            .flex()
+                            .items_center()
+                            .text_sm()
+                            .text_color(rgb(THEME.foreground))
+                            .child(editor.value.clone())
+                            .child("│"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("cancel-workspace-rename")
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(THEME.muted))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.workspace_rename_editor = None;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id("save-workspace-rename")
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .bg(rgb(THEME.accent))
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_workspace_rename(cx)
+                                    }))
+                                    .child("Rename"),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_workspace_delete_dialog(
+        &self,
+        confirmation: &WorkspaceDeleteConfirmation,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let message = if confirmation.active_terminal_count == 0 {
+            "This removes the saved workspace metadata from this machine. No active terminal process will be ended.".to_owned()
+        } else {
+            format!(
+                "This permanently removes the workspace and ends {} active terminal process{}. Disconnecting is the non-destructive choice for a saved SSH workspace.",
+                confirmation.active_terminal_count,
+                if confirmation.active_terminal_count == 1 {
+                    ""
+                } else {
+                    "es"
+                }
+            )
+        };
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(rgba(0x090b0f88))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(440.0))
+                    .p(px(18.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(THEME.elevated))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child(format!("Delete {}?", confirmation.title)),
+                    )
+                    .child(div().text_sm().text_color(rgb(THEME.muted)).child(message))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("cancel-workspace-delete")
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(THEME.muted))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.workspace_delete_confirmation = None;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-workspace-delete")
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .bg(rgb(THEME.danger))
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_workspace_delete(cx)
+                                    }))
+                                    .child("Delete workspace"),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -4332,9 +5679,11 @@ impl RustMux {
                             .font_family(".SystemUIFont")
                             .text_sm()
                             .text_color(rgb(THEME.muted))
-                            .child(
-                                "This will terminate this terminal and its running shell process. Other terminal tabs stay open.",
-                            ),
+                            .child(if confirmation.leaves_workspace_empty {
+                                "This will terminate the last terminal and leave the saved workspace empty. You can open a new terminal from its empty state."
+                            } else {
+                                "This will terminate this terminal and its running shell process. Other terminal tabs stay open."
+                            }),
                     )
                     .child(
                         div()
@@ -4598,6 +5947,10 @@ impl RustMux {
         let Some(workspace) = self.active_workspace_in(snapshot) else {
             return div().size_full().bg(rgb(THEME.terminal)).into_any_element();
         };
+        let workspace_id = workspace.id;
+        let empty_workspace_uses_ssh =
+            matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. });
+        let open_terminal_binding = self.binding_label(AppCommand::NewTab);
         let workspace_color = self.workspace_color(workspace.id).as_rgb();
         let canonical_layout = workspace.tabs.first().map(|tab| tab.layout.clone());
         let layout = canonical_layout.as_ref().map(|layout| {
@@ -4605,6 +5958,83 @@ impl RustMux {
                 .and_then(|pane_id| zoom_projection(layout, pane_id))
                 .unwrap_or_else(|| layout.clone())
         });
+        let workspace_content = if let Some(layout) = layout {
+            self.render_layout(layout, self.workspace_pixels.0, self.workspace_pixels.1, cx)
+        } else {
+            div()
+                .size_full()
+                .bg(rgb(THEME.terminal))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(420.0))
+                        .p(px(24.0))
+                        .rounded(px(10.0))
+                        .border_1()
+                        .border_color(rgb(THEME.border_strong))
+                        .bg(rgb(THEME.surface))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .font_family("SF Mono")
+                                .text_lg()
+                                .text_color(rgb(THEME.foreground))
+                                .child(">_"),
+                        )
+                        .child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(THEME.foreground))
+                                .child("No terminals open"),
+                        )
+                        .child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .text_sm()
+                                .text_color(rgb(THEME.muted))
+                                .text_center()
+                                .child(if empty_workspace_uses_ssh {
+                                    "Open a fresh remote terminal with this workspace's saved system OpenSSH destination."
+                                } else {
+                                    "This workspace is saved and ready when you want another local shell."
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("open-empty-workspace-terminal")
+                                .mt(px(4.0))
+                                .px(px(16.0))
+                                .py(px(9.0))
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .bg(rgb(THEME.accent))
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(0xffffff))
+                                .hover(|element| element.bg(rgb(THEME.ansi[4])))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_workspace_terminal(workspace_id, cx)
+                                }))
+                                .child("Open Terminal"),
+                        )
+                        .child(
+                            div()
+                                .font_family("SF Mono")
+                                .text_xs()
+                                .text_color(rgb(THEME.dim))
+                                .child(format!(
+                                    "Press {open_terminal_binding} to open a terminal"
+                                )),
+                        ),
+                )
+                .into_any_element()
+        };
         div()
             .min_w(px(0.0))
             .h_full()
@@ -4655,12 +6085,7 @@ impl RustMux {
                             )),
                     ),
             )
-            .child(div().min_h(px(0.0)).flex_1().child(layout.map_or_else(
-                || div().size_full().bg(rgb(THEME.terminal)).into_any_element(),
-                |layout| {
-                    self.render_layout(layout, self.workspace_pixels.0, self.workspace_pixels.1, cx)
-                },
-            )))
+            .child(div().min_h(px(0.0)).flex_1().child(workspace_content))
             .into_any_element()
     }
 }
@@ -4697,12 +6122,7 @@ impl Render for RustMux {
             ))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.resizing = None;
-                    this.dragging_pane = None;
-                    this.drag_hover.clear();
-                    cx.notify();
-                }),
+                cx.listener(|this, _, _, cx| this.finish_resize(cx)),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -4775,6 +6195,7 @@ impl Render for RustMux {
                     .child(TerminalInputElement { input: cx.entity() }),
             )
             .child(self.render_sidebar(cx))
+            .child(self.render_sidebar_resize_handle(cx))
             .child(self.render_workspace(cx))
             .when_some(self.tab_menu, |element, menu| {
                 element.child(self.render_tab_menu(menu, cx))
@@ -4785,14 +6206,23 @@ impl Render for RustMux {
             .when_some(self.rename_editor.as_ref(), |element, editor| {
                 element.child(self.render_rename_dialog(editor, cx))
             })
+            .when_some(self.workspace_rename_editor.as_ref(), |element, editor| {
+                element.child(self.render_workspace_rename_dialog(editor, cx))
+            })
             .when_some(self.close_confirmation.as_ref(), |element, confirmation| {
                 element.child(self.render_close_dialog(confirmation, cx))
             })
+            .when_some(
+                self.workspace_delete_confirmation.as_ref(),
+                |element, confirmation| {
+                    element.child(self.render_workspace_delete_dialog(confirmation, cx))
+                },
+            )
             .when_some(self.command_palette.as_ref(), |element, palette| {
                 element.child(self.render_command_palette(palette, cx))
             })
-            .when_some(self.ssh_connect.as_ref(), |element, dialog| {
-                element.child(self.render_ssh_dialog(dialog, cx))
+            .when_some(self.workspace_creation.as_ref(), |element, dialog| {
+                element.child(self.render_workspace_creation_dialog(dialog, cx))
             })
             .when(self.appearance_settings_open, |element| {
                 element.child(self.render_appearance_settings(cx))
@@ -4806,11 +6236,21 @@ impl Render for RustMux {
 impl EntityInputHandler for RustMux {
     fn text_for_range(
         &mut self,
-        _: Range<usize>,
+        range: Range<usize>,
         actual_range: &mut Option<Range<usize>>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
+        if let Some(dialog) = self
+            .workspace_creation
+            .as_ref()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+        {
+            let editor = dialog.active_editor();
+            let byte_range = editor.range_from_utf16(&range);
+            actual_range.replace(editor.range_to_utf16(&byte_range));
+            return Some(editor.text[byte_range].to_owned());
+        }
         actual_range.replace(0..self.ime_preedit.encode_utf16().count());
         Some(self.ime_preedit.clone())
     }
@@ -4821,6 +6261,17 @@ impl EntityInputHandler for RustMux {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if let Some(dialog) = self
+            .workspace_creation
+            .as_ref()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+        {
+            let editor = dialog.active_editor();
+            return Some(UTF16Selection {
+                range: editor.range_to_utf16(&editor.selected_range),
+                reversed: editor.selection_reversed,
+            });
+        }
         let end = self.ime_preedit.encode_utf16().count();
         Some(UTF16Selection {
             range: end..end,
@@ -4829,44 +6280,106 @@ impl EntityInputHandler for RustMux {
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        if let Some(dialog) = self
+            .workspace_creation
+            .as_ref()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+        {
+            let editor = dialog.active_editor();
+            return editor
+                .marked_range
+                .as_ref()
+                .map(|range| editor.range_to_utf16(range));
+        }
         (!self.ime_preedit.is_empty()).then(|| 0..self.ime_preedit.encode_utf16().count())
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = self
+            .workspace_creation
+            .as_mut()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+        {
+            dialog.active_editor_mut().marked_range = None;
+            cx.notify();
+            return;
+        }
         self.ime_preedit.clear();
         cx.notify();
     }
 
     fn replace_text_in_range(
         &mut self,
-        _: Option<Range<usize>>,
+        range: Option<Range<usize>>,
         text: &str,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(dialog) = self
+            .workspace_creation
+            .as_mut()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+        {
+            dialog.replace_text(range.as_ref(), text, false, None);
+            cx.notify();
+            return;
+        }
         self.ime_preedit.clear();
         self.commit_text(text, cx);
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
-        _: Option<Range<usize>>,
+        range: Option<Range<usize>>,
         text: &str,
-        _: Option<Range<usize>>,
+        selected_range: Option<Range<usize>>,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(dialog) = self
+            .workspace_creation
+            .as_mut()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+        {
+            dialog.replace_text(range.as_ref(), text, true, selected_range.as_ref());
+            cx.notify();
+            return;
+        }
         text.clone_into(&mut self.ime_preedit);
         cx.notify();
     }
 
     fn bounds_for_range(
         &mut self,
-        _: Range<usize>,
+        range: Range<usize>,
         bounds: Bounds<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(dialog) = self
+            .workspace_creation
+            .as_ref()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+        {
+            let index = dialog.field.index();
+            let (Some(line), Some(input_bounds)) = (
+                self.workspace_input_layouts[index].as_ref(),
+                self.workspace_input_bounds[index],
+            ) else {
+                return None;
+            };
+            let byte_range = dialog.active_editor().range_from_utf16(&range);
+            return Some(Bounds::from_corners(
+                point(
+                    input_bounds.left() + line.x_for_index(byte_range.start),
+                    input_bounds.top(),
+                ),
+                point(
+                    input_bounds.left() + line.x_for_index(byte_range.end),
+                    input_bounds.bottom(),
+                ),
+            ));
+        }
         Some(Bounds::new(
             bounds.bottom_left(),
             size(px(1.0), px(self.terminal_font.metrics.line_height)),
@@ -4875,11 +6388,232 @@ impl EntityInputHandler for RustMux {
 
     fn character_index_for_point(
         &mut self,
-        _: Point<Pixels>,
+        point: Point<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
+        if let Some(dialog) = self
+            .workspace_creation
+            .as_ref()
+            .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
+        {
+            let index = dialog.field.index();
+            let (Some(line), Some(bounds)) = (
+                self.workspace_input_layouts[index].as_ref(),
+                self.workspace_input_bounds[index],
+            ) else {
+                return None;
+            };
+            let byte_index = line.closest_index_for_x(point.x - bounds.left());
+            return Some(dialog.active_editor().offset_to_utf16(byte_index));
+        }
         Some(0)
+    }
+}
+
+struct WorkspaceTextInputElement {
+    input: Entity<RustMux>,
+    field: WorkspaceCreationField,
+    placeholder: &'static str,
+}
+
+struct WorkspaceTextPrepaintState {
+    line: ShapedLine,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+    text_bounds: Bounds<Pixels>,
+    active: bool,
+}
+
+impl IntoElement for WorkspaceTextInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for WorkspaceTextInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = WorkspaceTextPrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let app = self.input.read(cx);
+        let dialog = app.workspace_creation.as_ref();
+        let active = dialog.is_some_and(|dialog| {
+            dialog.step == WorkspaceCreationStep::Details && dialog.field == self.field
+        });
+        let editor = dialog.map(|dialog| match self.field {
+            WorkspaceCreationField::Name => &dialog.name,
+            WorkspaceCreationField::Destination => &dialog.destination,
+        });
+        let content = editor.map_or("", |editor| editor.text.as_str());
+        let display_text = if content.is_empty() {
+            self.placeholder
+        } else {
+            content
+        };
+        let style = window.text_style();
+        let base_run = TextRun {
+            len: display_text.len(),
+            font: style.font(),
+            color: if content.is_empty() {
+                rgb(THEME.dim).into()
+            } else {
+                style.color
+            },
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs =
+            if let Some(marked_range) = editor.and_then(|editor| editor.marked_range.as_ref()) {
+                vec![
+                    TextRun {
+                        len: marked_range.start,
+                        ..base_run.clone()
+                    },
+                    TextRun {
+                        len: marked_range.len(),
+                        underline: Some(UnderlineStyle {
+                            color: Some(base_run.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        }),
+                        ..base_run.clone()
+                    },
+                    TextRun {
+                        len: content.len().saturating_sub(marked_range.end),
+                        ..base_run
+                    },
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect()
+            } else {
+                vec![base_run]
+            };
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line =
+            window
+                .text_system()
+                .shape_line(display_text.to_owned().into(), font_size, &runs, None);
+        let selected_range = editor.map_or(0..0, |editor| editor.selected_range.clone());
+        let cursor_offset = editor.map_or(0, DialogTextEditor::cursor_offset);
+        let cursor_x = line.x_for_index(cursor_offset);
+        let scroll_x = if active {
+            (cursor_x - (bounds.size.width - px(2.0))).max(px(0.0))
+        } else {
+            px(0.0)
+        };
+        let text_bounds = Bounds::new(point(bounds.left() - scroll_x, bounds.top()), bounds.size);
+        let (selection, cursor) = if active && !selected_range.is_empty() {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(
+                            text_bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.top(),
+                        ),
+                        point(
+                            text_bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.bottom(),
+                        ),
+                    ),
+                    rgba(0x62adff40),
+                )),
+                None,
+            )
+        } else if active {
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(
+                            text_bounds.left() + line.x_for_index(cursor_offset),
+                            bounds.top(),
+                        ),
+                        size(px(1.5), bounds.bottom() - bounds.top()),
+                    ),
+                    rgb(THEME.accent),
+                )),
+            )
+        } else {
+            (None, None)
+        };
+
+        WorkspaceTextPrepaintState {
+            line,
+            cursor,
+            selection,
+            text_bounds,
+            active,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        state: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if state.active {
+            let focus_handle = self.input.read(cx).focus_handle.clone();
+            window.handle_input(
+                &focus_handle,
+                ElementInputHandler::new(bounds, self.input.clone()),
+                cx,
+            );
+        }
+        if let Some(selection) = state.selection.take() {
+            window.paint_quad(selection);
+        }
+        state
+            .line
+            .paint(state.text_bounds.origin, window.line_height(), window, cx)
+            .expect("workspace input text should paint");
+        if let Some(cursor) = state.cursor.take() {
+            window.paint_quad(cursor);
+        }
+        let line = state.line.clone();
+        let field_index = self.field.index();
+        self.input.update(cx, |app, _| {
+            app.workspace_input_layouts[field_index] = Some(line);
+            app.workspace_input_bounds[field_index] = Some(state.text_bounds);
+        });
     }
 }
 
@@ -5383,7 +7117,7 @@ fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
 }
 
 fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
-    let detail = match pane.identity.source {
+    let detection_detail = match pane.identity.source {
         rust_mux_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
         rust_mux_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
         rust_mux_protocol::TerminalIdentitySource::TerminalTitle => {
@@ -5394,11 +7128,99 @@ fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
         }
         rust_mux_protocol::TerminalIdentitySource::Fallback => "Ordinary terminal",
     };
+    let definition = agent_icon_definition(pane.identity.profile);
+    let asset_detail = if definition.asset.is_some() {
+        "Bundled official artwork is shown unchanged for referential identification only; no affiliation or endorsement is implied"
+    } else if pane.identity.profile == TerminalProfile::GitHubCopilot {
+        "The official CLI package exposes no standalone icon asset, so Rust Mux uses the neutral terminal glyph"
+    } else {
+        "Rust Mux uses the neutral terminal glyph"
+    };
     TabIdentityPresentation {
         label: pane.title.clone(),
-        badge: pane.identity.profile.badge(),
-        detail,
+        profile: pane.identity.profile,
+        detail: format!(
+            "{} — {detection_detail}. {asset_detail}.",
+            definition.accessible_name
+        ),
     }
+}
+
+const IDENTITY_MARK_SIZE: f32 = 22.0;
+const OFFICIAL_IDENTITY_ICON_SIZE: f32 = 20.0;
+const FALLBACK_IDENTITY_ICON_SIZE: f32 = 14.0;
+const FALLBACK_IDENTITY_FRAME_SIZE: f32 = 18.0;
+
+fn terminal_profile_icon_is_framed(profile: TerminalProfile) -> bool {
+    agent_icon_definition(profile).asset.is_none()
+}
+
+fn terminal_profile_icon_size(profile: TerminalProfile) -> f32 {
+    if terminal_profile_icon_is_framed(profile) {
+        FALLBACK_IDENTITY_ICON_SIZE
+    } else {
+        OFFICIAL_IDENTITY_ICON_SIZE
+    }
+}
+
+fn render_terminal_profile_mark(
+    profile: TerminalProfile,
+    fallback_color: u32,
+    fallback_border_color: u32,
+) -> AnyElement {
+    let icon =
+        render_terminal_profile_icon(profile, fallback_color, terminal_profile_icon_size(profile));
+    if terminal_profile_icon_is_framed(profile) {
+        div()
+            .w(px(FALLBACK_IDENTITY_FRAME_SIZE))
+            .h(px(FALLBACK_IDENTITY_FRAME_SIZE))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgb(fallback_border_color))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon)
+            .into_any_element()
+    } else {
+        icon
+    }
+}
+
+fn render_terminal_profile_icon(
+    profile: TerminalProfile,
+    fallback_color: u32,
+    icon_size: f32,
+) -> AnyElement {
+    let definition = agent_icon_definition(profile);
+    let icon = match definition.asset {
+        Some(asset) if asset.format == AgentIconFormat::Svg => svg()
+            .path(asset.path)
+            .w(px(icon_size))
+            .h(px(icon_size))
+            .text_color(rgb(fallback_color))
+            .into_any_element(),
+        Some(asset) => img(asset.path)
+            .w(px(icon_size))
+            .h(px(icon_size))
+            .object_fit(gpui::ObjectFit::Contain)
+            .into_any_element(),
+        None => div()
+            .font_family("SF Mono")
+            .text_size(px(7.5))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(fallback_color))
+            .child(profile.fallback_glyph())
+            .into_any_element(),
+    };
+    div()
+        .w(px(icon_size))
+        .h(px(icon_size))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(icon)
+        .into_any_element()
 }
 
 fn resolved_terminal_accent(snapshot: &SessionSnapshot, pane_id: Uuid) -> AppearanceColor {
@@ -5418,6 +7240,17 @@ fn resolved_workspace_color(snapshot: &SessionSnapshot, workspace_id: Uuid) -> A
         .find(|workspace| workspace.id == workspace_id)
         .and_then(|workspace| workspace.color)
         .unwrap_or(snapshot.appearance.default_workspace_color)
+}
+
+fn workspace_is_selectable(workspace: &Workspace) -> bool {
+    workspace.tabs.is_empty()
+        || !matches!(
+            workspace.connection,
+            WorkspaceConnection::SystemSsh {
+                status: WorkspaceConnectionStatus::Offline,
+                ..
+            }
+        )
 }
 
 fn stable_representative_pane(layout: &PaneLayout) -> Uuid {
@@ -5467,9 +7300,20 @@ fn apply_layout_control_mutation(
     }
 }
 
-fn workspace_pixel_size(window_width: f32, window_height: f32) -> (f32, f32) {
+fn constrained_sidebar_width(preferred_width: f32, window_width: f32) -> f32 {
+    let preferred_width = if preferred_width.is_finite() {
+        preferred_width
+    } else {
+        DEFAULT_SIDEBAR_WIDTH
+    };
+    let maximum_for_window =
+        (window_width - MIN_TERMINAL_AREA_WIDTH).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    preferred_width.clamp(MIN_SIDEBAR_WIDTH, maximum_for_window)
+}
+
+fn workspace_pixel_size(window_width: f32, window_height: f32, sidebar_width: f32) -> (f32, f32) {
     (
-        (window_width - SIDEBAR_WIDTH).max(1.0),
+        (window_width - sidebar_width).max(1.0),
         (window_height - TITLEBAR_HEIGHT).max(1.0),
     )
 }
@@ -5724,50 +7568,51 @@ fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let keymap = match AppConfig::load().and_then(|config| config.resolve_keymap()) {
-            Ok(keymap) => keymap,
-            Err(error) => {
-                eprintln!("Rust Mux config ignored: {error}");
-                AppConfig::default()
-                    .resolve_keymap()
-                    .expect("built-in keymap must be valid")
-            }
-        };
-        let mut bindings = keymap.bindings.iter().map(gpui_binding).collect::<Vec<_>>();
-        bindings.extend(
-            keymap
-                .chord_prefixes
-                .iter()
-                .map(|prefix| KeyBinding::new(prefix, ConsumeChordPrefix, Some(ROOT_KEY_CONTEXT))),
-        );
-        bindings.extend([
-            KeyBinding::new("cmd-c", CopyTerminal, Some(ROOT_KEY_CONTEXT)),
-            KeyBinding::new("cmd-v", PasteTerminal, Some(ROOT_KEY_CONTEXT)),
-            KeyBinding::new("cmd-f", FindTerminal, Some(ROOT_KEY_CONTEXT)),
-            KeyBinding::new("cmd-g", FindNextTerminal, Some(ROOT_KEY_CONTEXT)),
-            KeyBinding::new("ctrl-shift-c", CopyTerminal, Some(ROOT_KEY_CONTEXT)),
-            KeyBinding::new("ctrl-shift-v", PasteTerminal, Some(ROOT_KEY_CONTEXT)),
-            KeyBinding::new("ctrl-shift-f", FindTerminal, Some(ROOT_KEY_CONTEXT)),
-        ]);
-        cx.bind_keys(bindings);
-        let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Rust Mux".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(13.0), px(13.0))),
+    Application::new()
+        .with_assets(AgentIconAssets)
+        .run(|cx: &mut App| {
+            let keymap = match AppConfig::load().and_then(|config| config.resolve_keymap()) {
+                Ok(keymap) => keymap,
+                Err(error) => {
+                    eprintln!("Rust Mux config ignored: {error}");
+                    AppConfig::default()
+                        .resolve_keymap()
+                        .expect("built-in keymap must be valid")
+                }
+            };
+            let mut bindings = keymap.bindings.iter().map(gpui_binding).collect::<Vec<_>>();
+            bindings.extend(
+                keymap.chord_prefixes.iter().map(|prefix| {
+                    KeyBinding::new(prefix, ConsumeChordPrefix, Some(ROOT_KEY_CONTEXT))
                 }),
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(720.0), px(460.0))),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| RustMux::new(window, keymap.clone(), cx)),
-        )
-        .expect("open Rust Mux window");
-        cx.activate(true);
-    });
+            );
+            bindings.extend([
+                KeyBinding::new("cmd-c", CopyTerminal, Some(ROOT_KEY_CONTEXT)),
+                KeyBinding::new("cmd-v", PasteTerminal, Some(ROOT_KEY_CONTEXT)),
+                KeyBinding::new("cmd-f", FindTerminal, Some(ROOT_KEY_CONTEXT)),
+                KeyBinding::new("cmd-g", FindNextTerminal, Some(ROOT_KEY_CONTEXT)),
+                KeyBinding::new("ctrl-shift-c", CopyTerminal, Some(ROOT_KEY_CONTEXT)),
+                KeyBinding::new("ctrl-shift-v", PasteTerminal, Some(ROOT_KEY_CONTEXT)),
+                KeyBinding::new("ctrl-shift-f", FindTerminal, Some(ROOT_KEY_CONTEXT)),
+            ]);
+            cx.bind_keys(bindings);
+            let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Rust Mux".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(13.0), px(13.0))),
+                    }),
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(720.0), px(460.0))),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| RustMux::new(window, keymap.clone(), cx)),
+            )
+            .expect("open Rust Mux window");
+            cx.activate(true);
+        });
 }
 
 #[cfg(test)]
@@ -5786,10 +7631,11 @@ mod tests {
             profile_override: None,
         };
 
-        let confirmation = CloseConfirmation::for_pane(&pane);
+        let confirmation = CloseConfirmation::for_pane(&pane, true);
 
         assert_eq!(confirmation.pane_id, pane.id);
         assert_eq!(confirmation.title, "build");
+        assert!(confirmation.leaves_workspace_empty);
         assert_eq!(
             confirmation.request(),
             ClientRequest::ClosePane { pane_id: pane.id }
@@ -5797,14 +7643,36 @@ mod tests {
     }
 
     #[test]
-    fn native_tab_identity_label_and_neutral_badge_smoke_test() {
+    fn empty_offline_ssh_workspace_is_selectable_only_for_its_reopen_affordance() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let workspace = &mut snapshot.workspaces[0];
+        workspace.connection = WorkspaceConnection::SystemSsh {
+            destination: "tailnet-host".to_owned(),
+            status: WorkspaceConnectionStatus::Offline,
+        };
+        assert!(!workspace_is_selectable(workspace));
+
+        workspace.tabs.clear();
+
+        assert!(workspace_is_selectable(workspace));
+    }
+
+    #[test]
+    fn native_tab_identity_label_and_icon_registry_smoke_test() {
         let cases = [
-            (TerminalProfile::Terminal, "Terminal", ">_"),
-            (TerminalProfile::Hermes, "Hermes", "H"),
-            (TerminalProfile::Codex, "Codex", "CX"),
-            (TerminalProfile::Claude, "Claude", "CL"),
+            (TerminalProfile::Terminal, false),
+            (TerminalProfile::Hermes, true),
+            (TerminalProfile::Codex, true),
+            (TerminalProfile::Claude, true),
+            (TerminalProfile::KiloCode, true),
+            (TerminalProfile::Cursor, true),
+            (TerminalProfile::OpenCode, true),
+            (TerminalProfile::Aider, true),
+            (TerminalProfile::GitHubCopilot, false),
+            (TerminalProfile::Gemini, true),
         ];
-        for (profile, label, badge) in cases {
+        for (profile, has_official_asset) in cases {
+            let label = profile.display_name();
             let pane = Pane {
                 id: Uuid::new_v4(),
                 title: label.to_owned(),
@@ -5824,8 +7692,22 @@ mod tests {
 
             let presentation = tab_identity_presentation(&pane);
             assert_eq!(presentation.label, label);
-            assert_eq!(presentation.badge, badge);
-            assert!(presentation.detail.contains("terminal") || label == "Terminal");
+            assert_eq!(presentation.profile, profile);
+            assert!(presentation.detail.contains(label));
+            assert_eq!(
+                agent_icon_definition(profile).asset.is_some(),
+                has_official_asset
+            );
+            assert_eq!(
+                terminal_profile_icon_is_framed(profile),
+                !has_official_asset
+            );
+            let expected_size = if has_official_asset {
+                OFFICIAL_IDENTITY_ICON_SIZE
+            } else {
+                FALLBACK_IDENTITY_ICON_SIZE
+            };
+            assert!((terminal_profile_icon_size(profile) - expected_size).abs() < f32::EPSILON);
         }
     }
 
@@ -5890,33 +7772,173 @@ mod tests {
     }
 
     #[test]
-    fn ssh_draft_cannot_create_a_network_action_before_review_and_confirmation() {
-        let target_pane = Uuid::from_u128(7);
-        let mut dialog = SshConnectDialog::new(target_pane);
-        dialog.host = "prod-east".to_owned();
+    fn ssh_workspace_cannot_create_a_network_action_before_review_and_confirmation() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.kind = WorkspaceCreationKind::SystemSsh;
+        dialog.destination = DialogTextEditor::with_text("prod-east");
 
         assert_eq!(dialog.approved_request(), None);
 
         dialog.review();
 
-        assert_eq!(dialog.step, SshConnectStep::Confirm);
+        assert_eq!(dialog.step, WorkspaceCreationStep::ConfirmSsh);
         assert_eq!(
             dialog.approved_request(),
-            Some(ClientRequest::ConnectSsh {
-                target_pane,
-                host: "prod-east".to_owned(),
+            Some(ClientRequest::CreateSshWorkspace {
+                title: None,
+                destination: "prod-east".to_owned(),
             })
         );
     }
 
     #[test]
-    fn ssh_review_keeps_invalid_input_out_of_the_network_action_boundary() {
-        let mut dialog = SshConnectDialog::new(Uuid::from_u128(8));
-        dialog.host = "-oProxyCommand=bad".to_owned();
+    fn workspace_dialog_editor_inserts_and_deletes_at_the_visible_caret() {
+        let mut editor = DialogTextEditor::with_text("Rust Mux");
+        editor.move_home(false);
+        for _ in 0..4 {
+            editor.move_right(false);
+        }
+
+        editor.replace(None, "-", 80, false, false, None);
+        assert_eq!(editor.text, "Rust- Mux");
+        assert_eq!(editor.selected_range, 5..5);
+
+        editor.delete_backward();
+        assert_eq!(editor.text, "Rust Mux");
+        assert_eq!(editor.selected_range, 4..4);
+
+        editor.delete_forward();
+        assert_eq!(editor.text, "RustMux");
+        assert_eq!(editor.selected_range, 4..4);
+    }
+
+    #[test]
+    fn workspace_dialog_selection_replacement_supports_normal_editing() {
+        let mut editor = DialogTextEditor::with_text("tailscale-old");
+        for _ in 0..3 {
+            editor.move_left(true);
+        }
+        assert_eq!(editor.selected_text(), Some("old"));
+
+        editor.replace(None, "node", MAX_SSH_INPUT_LEN, true, false, None);
+
+        assert_eq!(editor.text, "tailscale-node");
+        assert_eq!(editor.selected_range, editor.text.len()..editor.text.len());
+    }
+
+    #[test]
+    fn workspace_dialog_uses_utf16_ranges_without_splitting_unicode_text() {
+        let mut editor = DialogTextEditor::with_text("box😀x");
+        assert_eq!(editor.range_to_utf16(&(3..7)), 3..5);
+
+        editor.replace(Some(&(3..5)), "🌐", 80, false, false, None);
+
+        assert_eq!(editor.text, "box🌐x");
+        assert_eq!(editor.range_to_utf16(&editor.selected_range), 5..5);
+        editor.delete_backward();
+        assert_eq!(editor.text, "boxx");
+    }
+
+    #[test]
+    fn workspace_dialog_fields_keep_independent_cursors_and_selection() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.name = DialogTextEditor::with_text("Build box");
+        dialog.name.select_all();
+        dialog.destination = DialogTextEditor::with_text("admin@node");
+        dialog.field = WorkspaceCreationField::Name;
+        dialog.replace_text(None, "Tailscale", false, None);
+        dialog.field = WorkspaceCreationField::Destination;
+        dialog.backspace();
+
+        assert_eq!(dialog.name.text, "Tailscale");
+        assert_eq!(dialog.destination.text, "admin@nod");
+        assert_eq!(dialog.name.selected_range, 9..9);
+        assert_eq!(dialog.destination.selected_range, 9..9);
+    }
+
+    #[test]
+    fn workspace_dialog_marked_text_tracks_gpui_relative_utf16_selection() {
+        let mut editor = DialogTextEditor::with_text("host");
+        editor.move_home(false);
+        editor.replace(None, "候補", 80, false, true, Some(&(1..1)));
+
+        assert_eq!(editor.text, "候補host");
+        assert_eq!(editor.marked_range, Some(0..6));
+        assert_eq!(editor.selected_range, 3..3);
+        assert_eq!(editor.range_to_utf16(&editor.selected_range), 1..1);
+    }
+
+    #[test]
+    fn pasted_ssh_command_is_normalized_before_confirmation() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.kind = WorkspaceCreationKind::SystemSsh;
+        dialog.field = WorkspaceCreationField::Destination;
+        dialog.name = DialogTextEditor::with_text("Build box");
+
+        dialog.paste("ssh tailscale_user@build-node\n");
+        assert_eq!(dialog.destination.text, "ssh tailscale_user@build-node");
+        assert_eq!(dialog.approved_request(), None);
 
         dialog.review();
 
-        assert_eq!(dialog.step, SshConnectStep::Destination);
+        assert_eq!(dialog.step, WorkspaceCreationStep::ConfirmSsh);
+        assert_eq!(dialog.destination.text, "tailscale_user@build-node");
+        assert_eq!(
+            dialog.approved_request(),
+            Some(ClientRequest::CreateSshWorkspace {
+                title: Some("Build box".to_owned()),
+                destination: "tailscale_user@build-node".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn pasted_ssh_options_never_cross_the_confirmation_boundary() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.kind = WorkspaceCreationKind::SystemSsh;
+        dialog.field = WorkspaceCreationField::Destination;
+        dialog.paste("ssh -A build-node");
+
+        dialog.review();
+
+        assert_eq!(dialog.step, WorkspaceCreationStep::Details);
+        assert!(dialog.error.is_some());
+        assert_eq!(dialog.approved_request(), None);
+    }
+
+    #[test]
+    fn workspace_creation_modal_consumes_paste_instead_of_leaking_it_to_the_terminal() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.kind = WorkspaceCreationKind::SystemSsh;
+        dialog.field = WorkspaceCreationField::Destination;
+        assert!(route_workspace_creation_paste(
+            Some(&mut dialog),
+            "ssh admin@tailscale-node"
+        ));
+        assert_eq!(dialog.destination.text, "ssh admin@tailscale-node");
+
+        dialog.review();
+        assert!(route_workspace_creation_paste(
+            Some(&mut dialog),
+            "ssh other-node"
+        ));
+        assert_eq!(dialog.destination.text, "admin@tailscale-node");
+
+        assert!(!route_workspace_creation_paste(
+            None,
+            "ordinary terminal paste"
+        ));
+    }
+
+    #[test]
+    fn ssh_review_keeps_invalid_input_out_of_the_network_action_boundary() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.kind = WorkspaceCreationKind::SystemSsh;
+        dialog.destination = DialogTextEditor::with_text("-oProxyCommand=bad");
+
+        dialog.review();
+
+        assert_eq!(dialog.step, WorkspaceCreationStep::Details);
         assert!(dialog.error.is_some());
         assert_eq!(dialog.approved_request(), None);
     }
@@ -6119,7 +8141,8 @@ mod tests {
         let dimensions = [(720.0, 460.0), (1280.0, 820.0), (1800.0, 1000.0)]
             .into_iter()
             .map(|(window_width, window_height)| {
-                let workspace = workspace_pixel_size(window_width, window_height);
+                let workspace =
+                    workspace_pixel_size(window_width, window_height, DEFAULT_SIDEBAR_WIDTH);
                 let mut sizes = Vec::new();
                 collect_pane_sizes(
                     &layout,
@@ -6141,6 +8164,32 @@ mod tests {
                 .windows(2)
                 .all(|pair| { pair[0].1 < pair[1].1 && pair[0].2 < pair[1].2 })
         );
+    }
+
+    #[test]
+    fn sidebar_width_is_bounded_without_forgetting_a_wider_preference() {
+        assert!((constrained_sidebar_width(80.0, 1280.0) - 150.0).abs() < 0.0001);
+        assert!((constrained_sidebar_width(900.0, 1280.0) - 420.0).abs() < 0.0001);
+
+        let preferred = 390.0;
+        let compact = constrained_sidebar_width(preferred, 640.0);
+        assert!((compact - 320.0).abs() < 0.0001);
+        assert!((workspace_pixel_size(640.0, 460.0, compact).0 - 320.0).abs() < 0.0001);
+        assert!((constrained_sidebar_width(preferred, 1280.0) - preferred).abs() < 0.0001);
+    }
+
+    #[test]
+    fn widest_sidebar_still_leaves_two_constrained_split_panes_in_the_minimum_window() {
+        let sidebar = constrained_sidebar_width(MAX_SIDEBAR_WIDTH, 720.0);
+        let workspace = workspace_pixel_size(720.0, 460.0, sidebar);
+        let ratio = effective_split_ratio(SplitAxis::Horizontal, workspace.0, workspace.1, 0.95);
+        let (first_width, _, second_width, _) =
+            split_child_dimensions(SplitAxis::Horizontal, workspace.0, workspace.1, ratio);
+
+        assert!((sidebar - 400.0).abs() < 0.0001);
+        assert!((workspace.0 - MIN_TERMINAL_AREA_WIDTH).abs() < 0.0001);
+        assert!(first_width >= MIN_PANE_WIDTH);
+        assert!(second_width >= MIN_PANE_WIDTH);
     }
 
     #[test]
@@ -6179,7 +8228,7 @@ mod tests {
             baseline: 13.0,
             line_height: 19.0,
         };
-        let workspace = workspace_pixel_size(1280.0, 820.0);
+        let workspace = workspace_pixel_size(1280.0, 820.0, DEFAULT_SIDEBAR_WIDTH);
         let mut sizes = Vec::new();
         collect_pane_sizes(
             &layout,

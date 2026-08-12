@@ -1,6 +1,8 @@
 # Automatic terminal identity
 
-Rust Mux gives ordinary terminal tabs a small, local identity hint without becoming an agent harness. Known Hermes, Codex/ChatGPT, and Claude Code sessions use a clear text label plus an original neutral badge. Everything else remains an ordinary `Terminal` with a `>_` badge.
+Rust Mux gives ordinary terminal tabs a small, local identity hint without becoming an agent harness. Codex CLI, Claude Code, Hermes Agent, Kilo Code, Cursor, OpenCode, Aider, GitHub Copilot CLI, and Gemini CLI have full product labels and exact local process detection. Where an official redistributable or installed product asset is available, the unchanged icon appears beside the label. Everything else uses a neutral `>_` terminal glyph.
+
+GitHub Copilot CLI currently uses the neutral glyph because its official public CLI repository and npm package expose no standalone icon asset. Rust Mux does not substitute a third-party logo or a lookalike.
 
 ## Precedence and correction
 
@@ -8,29 +10,45 @@ Identity resolution is deterministic:
 
 1. An explicit user rename wins.
 2. A user-selected terminal profile wins over detection.
-3. A bounded, recognized OSC terminal-title signal wins over command detection.
-4. A recognized local child-process basename is used when available.
+3. A verified exact OSC terminal-title token can win over command detection.
+4. A recognized local child-process executable basename is used when available.
 5. Unknown tools use the generic terminal fallback.
 
-The existing tab context menu exposes Rename, Automatic, Terminal, Hermes, Codex, Claude, and “Reset name and identity.” Choosing a profile is an explicit correction and clears an older free-form name. Reset clears both persisted overrides and returns the tab to automatic detection.
+The current registry deliberately has no terminal-title tokens: none of the reviewed upstream or installed sources established a stable exact OSC title contract. The resolver remains bounded and ready for a later verified token without broad or fuzzy matching.
+
+The tab context menu exposes Automatic, Terminal, and every supported product profile. Choosing a profile is an explicit correction and clears an older free-form name. Reset clears both persisted overrides and returns the tab to automatic detection.
+
+## Exact local detection
+
+The process registry recognizes only these executable basenames (case-insensitive, with an optional Windows `.exe` suffix):
+
+| Product | Exact basenames |
+| --- | --- |
+| Hermes Agent | `hermes`, `hermes-agent` |
+| Codex CLI | `codex` |
+| Claude Code | `claude` |
+| Kilo Code | `kilo`, `kilocode` |
+| Cursor | `cursor-agent` |
+| OpenCode | `opencode` |
+| Aider | `aider` |
+| GitHub Copilot CLI | `copilot` |
+| Gemini CLI | `gemini` |
+
+Generic aliases such as `agent`, related product names such as `chatgpt`, and partial or decorated strings are intentionally not recognized. Command names were checked against official package manifests, installer scripts, repositories, or installed executables on 2026-08-11.
 
 ## Privacy and performance boundary
 
 - Rust Mux never scans terminal grid text, scrollback, prompts, agent messages, or conversation output to infer identity.
-- OSC title metadata is capped at 80 visible, non-control characters and matched only against the registry’s exact safe titles. Raw titles are ephemeral and are not logged or persisted.
-- Command discovery reads only local process basenames. It never reads argv, environment variables, files, credentials, or terminal content.
+- OSC title metadata is capped at 80 visible, non-control characters and can match only exact registry tokens. Raw titles are ephemeral and are not logged or persisted.
+- Command discovery reads only local process executable basenames. It never reads argv, environment variables, files, credentials, shell history, current working directories, or terminal content.
 - Discovery runs no more than once every two seconds, skips a system with more than 4,096 visible processes, and inspects at most 64 descendants across four levels per pane.
 - Live detection is memory-only. Desired-state recovery stores only the explicit custom name and selected profile in the existing owner-only atomic snapshot.
-- The feature adds no socket, network request, upload, analytics, or telemetry.
+- Icons are compile-time embedded local assets. The feature adds no socket, network request, upload, analytics, or telemetry.
 
 PTY ownership, input, output parsing, resizing, and child lifetime stay in the session service exactly as before.
 
-## Branding and asset decision
+## Branding and assets
 
-Assessment recorded 2026-08-11:
+The icons are secondary UI identifiers placed directly beside the complete product name. They are not endorsements, sponsorship claims, or Rust Mux branding. Artwork is stored byte-for-byte from the documented official source, is not recolored or redrawn, and is never fetched at runtime.
 
-- [OpenAI’s official brand guidelines](https://openai.com/brand/) require exact supplied marks, constrain presentation, and allow OpenAI to revise or terminate mark permission.
-- No public Anthropic material reviewed for this change established a sufficiently clear standalone license for redistributing Claude logo artwork in this open-source local application.
-- The [Hermes Agent repository license](https://github.com/NousResearch/hermes-agent/blob/main/LICENSE) covers the software under MIT, but it does not expressly grant a separate trademark or logo-art license.
-
-Rust Mux therefore ships no OpenAI, ChatGPT, Anthropic, Claude, Hermes, CMUX, or Ghostty logo assets. The local registry uses original neutral text badges: `H`, `CX`, `CL`, and `>_`. Product names appear only as descriptive terminal labels and do not imply affiliation or endorsement.
+Exact source revisions, file hashes, license copies, brand-policy links, and the Copilot fallback decision are recorded in [Third-party notices](../THIRD_PARTY_NOTICES.md). Product names and marks remain the property of their respective owners.

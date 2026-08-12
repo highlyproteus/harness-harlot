@@ -8,12 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use rust_mux_protocol::{
     AppearanceColor, AppearanceSettings, Pane, PaneLayout, SessionSnapshot, SplitAxis, Tab,
-    TerminalIdentity, TerminalProfile, Workspace,
+    TerminalIdentity, TerminalProfile, Workspace, WorkspaceConnection, WorkspaceConnectionStatus,
+    validate_ssh_host,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 2;
+const SCHEMA_VERSION: u16 = 3;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 const MAX_WORKSPACES: usize = 16;
@@ -28,6 +29,7 @@ const MAX_RECENT_COLORS: usize = 8;
 pub(crate) struct RecoveredState {
     pub snapshot: SessionSnapshot,
     pub cwd_by_pane: HashMap<Uuid, PathBuf>,
+    pub offline_panes: HashSet<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +254,12 @@ struct DesiredWorkspace {
     title: String,
     #[serde(default)]
     color: Option<AppearanceColor>,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    pin_order: u32,
+    #[serde(default)]
+    connection: WorkspaceConnection,
     tabs: Vec<DesiredTab>,
 }
 
@@ -294,7 +302,7 @@ struct DesiredPane {
     custom_title: Option<String>,
     #[serde(default)]
     profile_override: Option<TerminalProfile>,
-    local_cwd: PathBuf,
+    local_cwd: Option<PathBuf>,
 }
 
 impl DesiredState {
@@ -306,10 +314,23 @@ impl DesiredState {
             .workspaces
             .iter()
             .map(|workspace| {
+                let allow_offline =
+                    matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. });
                 Ok(DesiredWorkspace {
                     id: workspace.id,
                     title: workspace.title.clone(),
                     color: workspace.color,
+                    pinned: workspace.pinned,
+                    pin_order: workspace.pin_order,
+                    connection: match &workspace.connection {
+                        WorkspaceConnection::Local => WorkspaceConnection::Local,
+                        WorkspaceConnection::SystemSsh { destination, .. } => {
+                            WorkspaceConnection::SystemSsh {
+                                destination: destination.clone(),
+                                status: WorkspaceConnectionStatus::Offline,
+                            }
+                        }
+                    },
                     tabs: workspace
                         .tabs
                         .iter()
@@ -317,7 +338,11 @@ impl DesiredState {
                             Ok(DesiredTab {
                                 id: tab.id,
                                 title: tab.title.clone(),
-                                layout: DesiredLayout::from_runtime(&tab.layout, cwd_by_pane)?,
+                                layout: DesiredLayout::from_runtime(
+                                    &tab.layout,
+                                    cwd_by_pane,
+                                    allow_offline,
+                                )?,
                             })
                         })
                         .collect::<Result<_>>()?,
@@ -334,6 +359,7 @@ impl DesiredState {
 
     fn into_runtime(self) -> RecoveredState {
         let mut cwd_by_pane = HashMap::new();
+        let mut offline_panes = HashSet::new();
         let workspaces = self
             .workspaces
             .into_iter()
@@ -341,13 +367,27 @@ impl DesiredState {
                 id: workspace.id,
                 title: workspace.title,
                 color: workspace.color,
+                pinned: workspace.pinned,
+                pin_order: workspace.pin_order,
+                active_terminal_count: 0,
+                connection: match workspace.connection {
+                    WorkspaceConnection::Local => WorkspaceConnection::Local,
+                    WorkspaceConnection::SystemSsh { destination, .. } => {
+                        WorkspaceConnection::SystemSsh {
+                            destination,
+                            status: WorkspaceConnectionStatus::Offline,
+                        }
+                    }
+                },
                 tabs: workspace
                     .tabs
                     .into_iter()
                     .map(|tab| Tab {
                         id: tab.id,
                         title: tab.title,
-                        layout: tab.layout.into_runtime(&mut cwd_by_pane),
+                        layout: tab
+                            .layout
+                            .into_runtime(&mut cwd_by_pane, &mut offline_panes),
                     })
                     .collect(),
             })
@@ -359,6 +399,7 @@ impl DesiredState {
                 workspaces,
             },
             cwd_by_pane,
+            offline_panes,
         }
     }
 
@@ -380,8 +421,14 @@ impl DesiredState {
         for workspace in &self.workspaces {
             validate_id(workspace.id, &mut ids)?;
             validate_title(&workspace.title, "workspace")?;
-            if workspace.tabs.is_empty() || workspace.tabs.len() > MAX_TABS_PER_WORKSPACE {
-                bail!("workspace must contain 1 to {MAX_TABS_PER_WORKSPACE} tabs");
+            match &workspace.connection {
+                WorkspaceConnection::SystemSsh { destination, .. } => {
+                    validate_ssh_host(destination).map_err(|message| anyhow::anyhow!(message))?;
+                }
+                WorkspaceConnection::Local => {}
+            }
+            if workspace.tabs.len() > MAX_TABS_PER_WORKSPACE {
+                bail!("workspace must contain at most {MAX_TABS_PER_WORKSPACE} tabs");
             }
             for tab in &workspace.tabs {
                 validate_id(tab.id, &mut ids)?;
@@ -389,23 +436,27 @@ impl DesiredState {
                 tab.layout.validate(1, &mut ids, &mut panes)?;
             }
         }
-        if panes == 0 || panes > MAX_PANES {
-            bail!("snapshot must contain 1 to {MAX_PANES} panes");
+        if panes > MAX_PANES {
+            bail!("snapshot must contain at most {MAX_PANES} panes");
         }
         Ok(())
     }
 }
 
 impl DesiredLayout {
-    fn from_runtime(layout: &PaneLayout, cwd_by_pane: &HashMap<Uuid, PathBuf>) -> Result<Self> {
+    fn from_runtime(
+        layout: &PaneLayout,
+        cwd_by_pane: &HashMap<Uuid, PathBuf>,
+        allow_offline: bool,
+    ) -> Result<Self> {
         Ok(match layout {
             PaneLayout::Leaf { pane } => Self::Leaf {
-                pane: DesiredPane::from_runtime(pane, cwd_by_pane)?,
+                pane: DesiredPane::from_runtime(pane, cwd_by_pane, allow_offline)?,
             },
             PaneLayout::Stack { panes, active } => Self::Stack {
                 panes: panes
                     .iter()
-                    .map(|pane| DesiredPane::from_runtime(pane, cwd_by_pane))
+                    .map(|pane| DesiredPane::from_runtime(pane, cwd_by_pane, allow_offline))
                     .collect::<Result<_>>()?,
                 active: *active,
             },
@@ -417,21 +468,25 @@ impl DesiredLayout {
             } => Self::Split {
                 axis: *axis,
                 ratio: *ratio,
-                first: Box::new(Self::from_runtime(first, cwd_by_pane)?),
-                second: Box::new(Self::from_runtime(second, cwd_by_pane)?),
+                first: Box::new(Self::from_runtime(first, cwd_by_pane, allow_offline)?),
+                second: Box::new(Self::from_runtime(second, cwd_by_pane, allow_offline)?),
             },
         })
     }
 
-    fn into_runtime(self, cwd_by_pane: &mut HashMap<Uuid, PathBuf>) -> PaneLayout {
+    fn into_runtime(
+        self,
+        cwd_by_pane: &mut HashMap<Uuid, PathBuf>,
+        offline_panes: &mut HashSet<Uuid>,
+    ) -> PaneLayout {
         match self {
             Self::Leaf { pane } => PaneLayout::Leaf {
-                pane: pane.into_runtime(cwd_by_pane),
+                pane: pane.into_runtime(cwd_by_pane, offline_panes),
             },
             Self::Stack { panes, active } => PaneLayout::Stack {
                 panes: panes
                     .into_iter()
-                    .map(|pane| pane.into_runtime(cwd_by_pane))
+                    .map(|pane| pane.into_runtime(cwd_by_pane, offline_panes))
                     .collect(),
                 active,
             },
@@ -443,8 +498,8 @@ impl DesiredLayout {
             } => PaneLayout::Split {
                 axis,
                 ratio,
-                first: Box::new(first.into_runtime(cwd_by_pane)),
-                second: Box::new(second.into_runtime(cwd_by_pane)),
+                first: Box::new(first.into_runtime(cwd_by_pane, offline_panes)),
+                second: Box::new(second.into_runtime(cwd_by_pane, offline_panes)),
             },
         }
     }
@@ -489,7 +544,15 @@ impl DesiredLayout {
 }
 
 impl DesiredPane {
-    fn from_runtime(pane: &Pane, cwd_by_pane: &HashMap<Uuid, PathBuf>) -> Result<Self> {
+    fn from_runtime(
+        pane: &Pane,
+        cwd_by_pane: &HashMap<Uuid, PathBuf>,
+        allow_offline: bool,
+    ) -> Result<Self> {
+        let local_cwd = cwd_by_pane.get(&pane.id).cloned();
+        if local_cwd.is_none() && !allow_offline {
+            bail!("pane {} has no safe local CWD metadata", pane.id);
+        }
         Ok(Self {
             id: pane.id,
             title: pane
@@ -499,15 +562,20 @@ impl DesiredPane {
             color: pane.color,
             custom_title: pane.custom_title.clone(),
             profile_override: pane.profile_override,
-            local_cwd: cwd_by_pane
-                .get(&pane.id)
-                .cloned()
-                .with_context(|| format!("pane {} has no safe local CWD metadata", pane.id))?,
+            local_cwd,
         })
     }
 
-    fn into_runtime(self, cwd_by_pane: &mut HashMap<Uuid, PathBuf>) -> Pane {
-        cwd_by_pane.insert(self.id, self.local_cwd);
+    fn into_runtime(
+        self,
+        cwd_by_pane: &mut HashMap<Uuid, PathBuf>,
+        offline_panes: &mut HashSet<Uuid>,
+    ) -> Pane {
+        if let Some(local_cwd) = self.local_cwd {
+            cwd_by_pane.insert(self.id, local_cwd);
+        } else {
+            offline_panes.insert(self.id);
+        }
         let custom_title = self
             .custom_title
             .or_else(|| legacy_custom_title(&self.title));
@@ -535,11 +603,13 @@ impl DesiredPane {
         if let Some(custom_title) = &self.custom_title {
             validate_title(custom_title, "custom terminal")?;
         }
-        if !self.local_cwd.is_absolute() {
-            bail!("local CWD must be absolute");
-        }
-        if self.local_cwd.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
-            bail!("local CWD exceeds {MAX_PATH_BYTES} bytes");
+        if let Some(local_cwd) = &self.local_cwd {
+            if !local_cwd.is_absolute() {
+                bail!("local CWD must be absolute");
+            }
+            if local_cwd.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
+                bail!("local CWD exceeds {MAX_PATH_BYTES} bytes");
+            }
         }
         *pane_count += 1;
         if *pane_count > MAX_PANES {
@@ -627,6 +697,98 @@ mod tests {
     }
 
     #[test]
+    fn deliberately_empty_local_workspace_round_trips_without_creating_a_terminal() {
+        let directory = test_directory("empty-local");
+        let store = SnapshotStore::new(directory.join("sessions.json"));
+        let mut snapshot = SessionSnapshot::seeded();
+        snapshot.workspaces[0].tabs.clear();
+        snapshot.workspaces[0].active_terminal_count = 0;
+
+        store.save(&snapshot, &HashMap::new()).unwrap();
+        let recovered = store.load().unwrap();
+
+        assert_eq!(recovered.snapshot.workspaces.len(), 1);
+        assert!(recovered.snapshot.workspaces[0].tabs.is_empty());
+        assert!(recovered.cwd_by_pane.is_empty());
+        assert!(recovered.offline_panes.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ssh_workspace_layout_recovers_offline_without_runtime_or_secret_material() {
+        let directory = test_directory("ssh-layout");
+        let path = directory.join("sessions.json");
+        let store = SnapshotStore::new(path.clone());
+        let mut snapshot = SessionSnapshot::seeded();
+        let workspace = &mut snapshot.workspaces[0];
+        let first = match &workspace.tabs[0].layout {
+            PaneLayout::Leaf { pane } => pane.clone(),
+            _ => panic!("seeded snapshot should contain one leaf"),
+        };
+        let second = Pane {
+            id: Uuid::new_v4(),
+            title: "Remote two".to_owned(),
+            shell: "ssh".to_owned(),
+            color: None,
+            identity: TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+        };
+        let first_id = first.id;
+        let second_id = second.id;
+        workspace.title = "Tailnet build".to_owned();
+        workspace.pinned = true;
+        workspace.pin_order = 1;
+        workspace.connection = WorkspaceConnection::SystemSsh {
+            destination: "admin@build-node".to_owned(),
+            status: WorkspaceConnectionStatus::Connected,
+        };
+        workspace.tabs[0].layout = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.4,
+            first: Box::new(PaneLayout::Leaf { pane: first }),
+            second: Box::new(PaneLayout::Leaf {
+                pane: second.clone(),
+            }),
+        };
+
+        store.save(&snapshot, &HashMap::new()).unwrap();
+        let recovered = store.load_or_quarantine().unwrap().unwrap();
+        let recovered_workspace = &recovered.snapshot.workspaces[0];
+
+        assert_eq!(recovered_workspace.title, "Tailnet build");
+        assert!(recovered_workspace.pinned);
+        assert_eq!(recovered_workspace.pin_order, 1);
+        let PaneLayout::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = &recovered_workspace.tabs[0].layout
+        else {
+            panic!("saved SSH layout did not retain its split shape");
+        };
+        assert_eq!(*axis, SplitAxis::Horizontal);
+        assert!((*ratio - 0.4).abs() < f32::EPSILON);
+        assert!(matches!(first.as_ref(), PaneLayout::Leaf { pane } if pane.id == first_id));
+        assert!(matches!(second.as_ref(), PaneLayout::Leaf { pane } if pane.id == second_id));
+        assert_eq!(
+            recovered_workspace.connection,
+            WorkspaceConnection::SystemSsh {
+                destination: "admin@build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Offline,
+            }
+        );
+        assert_eq!(recovered.offline_panes.len(), 2);
+        assert!(recovered.offline_panes.contains(&second_id));
+        let text = fs::read_to_string(path).unwrap();
+        for forbidden in ["password", "private_key", "agent_material", "known_hosts"] {
+            assert!(!text.contains(forbidden));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn failed_replace_preserves_last_complete_snapshot() {
         let directory = test_directory("atomic-fault");
         let path = directory.join("sessions.json");
@@ -670,7 +832,7 @@ mod tests {
             source: rust_mux_protocol::TerminalIdentitySource::Command,
         };
         pane.custom_title = Some("Release shell".to_owned());
-        pane.profile_override = Some(TerminalProfile::Hermes);
+        pane.profile_override = Some(TerminalProfile::Gemini);
 
         store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
         let recovered = store.load().unwrap().snapshot;
@@ -694,7 +856,7 @@ mod tests {
         );
         assert_eq!(
             recovered_pane.profile_override,
-            Some(TerminalProfile::Hermes)
+            Some(TerminalProfile::Gemini)
         );
         assert_eq!(recovered_pane.identity, TerminalIdentity::default());
 
