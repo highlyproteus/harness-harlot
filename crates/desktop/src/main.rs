@@ -35,8 +35,9 @@ use nah_protocol::{
     ServiceResponse, SessionSnapshot, SplitAxis, StreamDiagnostics, TerminalAttributes,
     TerminalColor, TerminalHistoryPage, TerminalLine, TerminalModes, TerminalModifiers,
     TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalRun,
-    TerminalScreen, TerminalSelection, TerminalSelectionKind, Workspace, WorkspaceConnection,
-    WorkspaceConnectionStatus, WorkspacePinMove, normalize_ssh_input, validate_ssh_host,
+    TerminalScreen, TerminalSelection, TerminalSelectionKind, TmuxScanScope, TmuxSession,
+    Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove,
+    normalize_ssh_input, validate_ssh_host,
 };
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
@@ -334,6 +335,16 @@ struct WorkspaceDisconnectConfirmation {
     workspace_id: Uuid,
     title: String,
     destination: String,
+}
+
+#[derive(Clone, Debug)]
+struct TmuxSessionPicker {
+    workspace_id: Uuid,
+    scope: TmuxScanScope,
+    sessions: Vec<TmuxSession>,
+    no_server: bool,
+    selected_session_id: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -962,6 +973,7 @@ struct NahApp {
     workspace_delete_confirmation: Option<WorkspaceDeleteConfirmation>,
     workspace_connection_info: Option<WorkspaceConnectionInfo>,
     workspace_disconnect_confirmation: Option<WorkspaceDisconnectConfirmation>,
+    tmux_session_picker: Option<TmuxSessionPicker>,
     workspace_creation: Option<WorkspaceCreationDialog>,
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
@@ -1047,6 +1059,7 @@ impl NahApp {
             workspace_delete_confirmation: None,
             workspace_connection_info: None,
             workspace_disconnect_confirmation: None,
+            tmux_session_picker: None,
             workspace_creation: None,
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
@@ -2153,6 +2166,92 @@ impl NahApp {
         }
     }
 
+    fn scan_tmux_sessions(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        self.workspace_menu = None;
+        self.workspace_connection_info = None;
+        match request(ClientRequest::ScanTmuxSessions { workspace_id }) {
+            Ok(ServiceResponse::TmuxSessions {
+                scope,
+                sessions,
+                no_server,
+            }) => {
+                self.tmux_session_picker = Some(TmuxSessionPicker {
+                    workspace_id,
+                    scope,
+                    sessions,
+                    no_server,
+                    selected_session_id: None,
+                    error: None,
+                });
+                self.connection_error = None;
+            }
+            Ok(response) => {
+                self.tmux_session_picker = Some(TmuxSessionPicker {
+                    workspace_id,
+                    scope: TmuxScanScope::Local,
+                    sessions: Vec::new(),
+                    no_server: false,
+                    selected_session_id: None,
+                    error: Some(format!("unexpected scan response: {response:?}")),
+                });
+            }
+            Err(error) => {
+                self.tmux_session_picker = Some(TmuxSessionPicker {
+                    workspace_id,
+                    scope: TmuxScanScope::Local,
+                    sessions: Vec::new(),
+                    no_server: false,
+                    selected_session_id: None,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn select_tmux_session(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if let Some(picker) = self.tmux_session_picker.as_mut() {
+            picker.selected_session_id = Some(session_id);
+            picker.error = None;
+            cx.notify();
+        }
+    }
+
+    fn open_selected_tmux_session(&mut self, cx: &mut Context<Self>) {
+        let Some((workspace_id, session_id)) =
+            self.tmux_session_picker.as_ref().and_then(|picker| {
+                picker
+                    .selected_session_id
+                    .as_ref()
+                    .map(|session_id| (picker.workspace_id, session_id.clone()))
+            })
+        else {
+            return;
+        };
+        match request(ClientRequest::AttachTmuxSession {
+            workspace_id,
+            session_id,
+        }) {
+            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                self.active_workspace = Some(workspace_id);
+                self.focus_pane_with_snapshot(pane_id);
+                self.tmux_session_picker = None;
+                self.refresh_state();
+            }
+            Ok(response) => {
+                if let Some(picker) = self.tmux_session_picker.as_mut() {
+                    picker.error = Some(format!("unexpected tmux open response: {response:?}"));
+                }
+            }
+            Err(error) => {
+                if let Some(picker) = self.tmux_session_picker.as_mut() {
+                    picker.error = Some(error.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn confirm_workspace_delete(&mut self, cx: &mut Context<Self>) {
         let Some(confirmation) = self.workspace_delete_confirmation.take() else {
             return;
@@ -3074,6 +3173,18 @@ impl NahApp {
                 "enter" => self.confirm_workspace_delete(cx),
                 "escape" => {
                     self.workspace_delete_confirmation = None;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.tmux_session_picker.is_some() {
+            match keystroke.key.as_str() {
+                "enter" => self.open_selected_tmux_session(cx),
+                "escape" => {
+                    self.tmux_session_picker = None;
                     cx.notify();
                 }
                 _ => {}
@@ -5265,6 +5376,23 @@ impl NahApp {
         });
         let pinned = workspace.is_some_and(|workspace| workspace.pinned);
         let connection = workspace.map(|workspace| workspace.connection.clone());
+        let tmux_scan_available = matches!(
+            connection.as_ref(),
+            Some(
+                WorkspaceConnection::Local
+                    | WorkspaceConnection::SystemSsh {
+                        status: WorkspaceConnectionStatus::Connected,
+                        ..
+                    }
+            )
+        );
+        let tmux_reconnect_required = matches!(
+            connection.as_ref(),
+            Some(WorkspaceConnection::SystemSsh {
+                status: WorkspaceConnectionStatus::Offline,
+                ..
+            })
+        );
         let inline_color_picker = self
             .color_picker
             .as_ref()
@@ -5399,6 +5527,44 @@ impl NahApp {
                         }))
                         .child("Reconnect with system OpenSSH"),
                 ),
+            })
+            .when(tmux_scan_available, |element| {
+                element.child(
+                    div()
+                        .id(("scan-tmux-sessions-menu", element_key(workspace_id)))
+                        .mx(px(5.0))
+                        .px(px(9.0))
+                        .py(px(7.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.foreground))
+                        .hover(|item| item.bg(rgb(THEME.accent_soft)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scan_tmux_sessions(workspace_id, cx)
+                        }))
+                        .child("Scan tmux sessions…"),
+                )
+            })
+            .when(tmux_reconnect_required, |element| {
+                element.child(
+                    div()
+                        .id(("reconnect-tmux-sessions-menu", element_key(workspace_id)))
+                        .mx(px(5.0))
+                        .px(px(9.0))
+                        .py(px(7.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.ansi[2]))
+                        .hover(|item| item.bg(rgb(THEME.accent_soft)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.reconnect_workspace(workspace_id, cx)
+                        }))
+                        .child("Reconnect to scan tmux…"),
+                )
             })
             .child(
                 div()
@@ -7025,6 +7191,150 @@ impl NahApp {
             .into_any_element()
     }
 
+    fn render_tmux_session_picker(
+        &self,
+        picker: &TmuxSessionPicker,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scope = match &picker.scope {
+            TmuxScanScope::Local => "this Mac".to_owned(),
+            TmuxScanScope::SystemSsh { destination } => format!("SSH workstation {destination}"),
+        };
+        let selected = picker.selected_session_id.clone();
+        let can_open = selected.is_some();
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(rgba(0x090b0f88))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(460.0))
+                    .max_h(px(520.0))
+                    .p(px(18.0))
+                    .rounded(px(9.0))
+                    .bg(rgb(THEME.elevated))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child("Open an existing tmux session"),
+                    )
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.muted))
+                            .child(format!(
+                                "Scanned metadata only on {scope}. Opening a result creates one runtime-only terminal tab; tmux remains responsible for its own windows, panes, layout, and status."
+                            )),
+                    )
+                    .when(picker.no_server, |element| {
+                        element.child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .text_sm()
+                                .text_color(rgb(THEME.muted))
+                                .child("No tmux server is running for this scope."),
+                        )
+                    })
+                    .when_some(picker.error.clone(), |element, error| {
+                        element.child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .text_sm()
+                                .text_color(rgb(THEME.danger))
+                                .child(error),
+                        )
+                    })
+                    .children(picker.sessions.iter().enumerate().map(|(index, session)| {
+                        let session_id = session.id.clone();
+                        let is_selected = selected.as_deref() == Some(session.id.as_str());
+                        let attached = if session.attached_clients == 0 {
+                            "detached".to_owned()
+                        } else {
+                            format!("{} attached", session.attached_clients)
+                        };
+                        div()
+                            .id(("tmux-session", index))
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(if is_selected { THEME.accent } else { THEME.border_strong }))
+                            .bg(rgb(if is_selected { THEME.accent_soft } else { THEME.surface }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_tmux_session(session_id.clone(), cx)
+                            }))
+                            .child(
+                                div()
+                                    .font_family(".SystemUIFont")
+                                    .text_sm()
+                                    .text_color(rgb(THEME.foreground))
+                                    .child(session.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .font_family(".SystemUIFont")
+                                    .text_xs()
+                                    .text_color(rgb(THEME.muted))
+                                    .child(format!("{} window(s) · {attached}", session.windows)),
+                            )
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("cancel-tmux-session-picker")
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(THEME.muted))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tmux_session_picker = None;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id("open-selected-tmux-session")
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .bg(rgb(if can_open { THEME.accent } else { THEME.border_strong }))
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_selected_tmux_session(cx)
+                                    }))
+                                    .child("Open in tmux"),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_workspace_disconnect_dialog(
         &self,
         confirmation: &WorkspaceDisconnectConfirmation,
@@ -7707,6 +8017,9 @@ impl Render for NahApp {
                     element.child(self.render_workspace_disconnect_dialog(confirmation, cx))
                 },
             )
+            .when_some(self.tmux_session_picker.as_ref(), |element, picker| {
+                element.child(self.render_tmux_session_picker(picker, cx))
+            })
             .when_some(self.command_palette.as_ref(), |element, palette| {
                 element.child(self.render_command_palette(palette, cx))
             })

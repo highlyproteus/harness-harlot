@@ -128,6 +128,25 @@ pub struct Workspace {
     pub tabs: Vec<Tab>,
 }
 
+/// Ephemeral metadata returned by an explicit tmux scan.
+///
+/// This is deliberately not part of the desired-state snapshot: a tmux server
+/// and its opaque IDs belong to the host running tmux, not to Not a Harness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TmuxSession {
+    pub id: String,
+    pub name: String,
+    pub windows: u32,
+    pub attached_clients: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TmuxScanScope {
+    Local,
+    SystemSsh { destination: String },
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceConnection {
@@ -720,6 +739,15 @@ pub enum ClientRequest {
         target_pane: Uuid,
         host: String,
     },
+    /// Explicitly reads bounded tmux session metadata for one workstation.
+    ScanTmuxSessions {
+        workspace_id: Uuid,
+    },
+    /// Opens one runtime-only tab attached to an existing tmux session.
+    AttachTmuxSession {
+        workspace_id: Uuid,
+        session_id: String,
+    },
     ActivateTab {
         pane_id: Uuid,
     },
@@ -964,6 +992,11 @@ pub enum ServiceResponse {
     WorkspaceCreated {
         workspace_id: Uuid,
         pane_id: Uuid,
+    },
+    TmuxSessions {
+        scope: TmuxScanScope,
+        sessions: Vec<TmuxSession>,
+        no_server: bool,
     },
     Ack,
     SelectionText {
