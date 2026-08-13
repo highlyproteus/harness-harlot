@@ -343,8 +343,37 @@ struct TmuxSessionPicker {
     scope: TmuxScanScope,
     sessions: Vec<TmuxSession>,
     no_server: bool,
-    selected_session_id: Option<String>,
+    selected_session_ids: HashSet<String>,
+    status: Option<String>,
     error: Option<String>,
+}
+
+impl TmuxSessionPicker {
+    fn toggle_session(&mut self, session_id: &str) {
+        if !self.selected_session_ids.insert(session_id.to_owned()) {
+            self.selected_session_ids.remove(session_id);
+        }
+    }
+
+    fn select_all(&mut self) {
+        self.selected_session_ids = self
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+    }
+
+    fn clear_all(&mut self) {
+        self.selected_session_ids.clear();
+    }
+
+    fn selected_session_ids_in_scan_order(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|session| self.selected_session_ids.contains(&session.id))
+            .map(|session| session.id.clone())
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2180,7 +2209,8 @@ impl NahApp {
                     scope,
                     sessions,
                     no_server,
-                    selected_session_id: None,
+                    selected_session_ids: HashSet::new(),
+                    status: None,
                     error: None,
                 });
                 self.connection_error = None;
@@ -2191,7 +2221,8 @@ impl NahApp {
                     scope: TmuxScanScope::Local,
                     sessions: Vec::new(),
                     no_server: false,
-                    selected_session_id: None,
+                    selected_session_ids: HashSet::new(),
+                    status: None,
                     error: Some(format!("unexpected scan response: {response:?}")),
                 });
             }
@@ -2201,7 +2232,8 @@ impl NahApp {
                     scope: TmuxScanScope::Local,
                     sessions: Vec::new(),
                     no_server: false,
-                    selected_session_id: None,
+                    selected_session_ids: HashSet::new(),
+                    status: None,
                     error: Some(error.to_string()),
                 });
             }
@@ -2209,33 +2241,74 @@ impl NahApp {
         cx.notify();
     }
 
-    fn select_tmux_session(&mut self, session_id: String, cx: &mut Context<Self>) {
+    fn select_tmux_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
         if let Some(picker) = self.tmux_session_picker.as_mut() {
-            picker.selected_session_id = Some(session_id);
+            picker.toggle_session(session_id);
+            picker.status = None;
             picker.error = None;
             cx.notify();
         }
     }
 
-    fn open_selected_tmux_session(&mut self, cx: &mut Context<Self>) {
-        let Some((workspace_id, session_id)) =
-            self.tmux_session_picker.as_ref().and_then(|picker| {
-                picker
-                    .selected_session_id
-                    .as_ref()
-                    .map(|session_id| (picker.workspace_id, session_id.clone()))
-            })
-        else {
+    fn select_all_tmux_sessions(&mut self, cx: &mut Context<Self>) {
+        if let Some(picker) = self.tmux_session_picker.as_mut() {
+            picker.select_all();
+            picker.status = None;
+            picker.error = None;
+            cx.notify();
+        }
+    }
+
+    fn clear_all_tmux_sessions(&mut self, cx: &mut Context<Self>) {
+        if let Some(picker) = self.tmux_session_picker.as_mut() {
+            picker.clear_all();
+            picker.status = None;
+            picker.error = None;
+            cx.notify();
+        }
+    }
+
+    fn open_selected_tmux_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some((workspace_id, session_ids)) = self.tmux_session_picker.as_ref().map(|picker| {
+            (
+                picker.workspace_id,
+                picker.selected_session_ids_in_scan_order(),
+            )
+        }) else {
             return;
         };
-        match request(ClientRequest::AttachTmuxSession {
+        if session_ids.is_empty() {
+            return;
+        }
+        match request(ClientRequest::AttachTmuxSessions {
             workspace_id,
-            session_id,
+            session_ids,
         }) {
-            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+            Ok(ServiceResponse::TmuxSessionsAttached { pane_ids, skipped }) => {
+                let opened = pane_ids.len();
                 self.active_workspace = Some(workspace_id);
-                self.focus_pane_with_snapshot(pane_id);
-                self.tmux_session_picker = None;
+                if let Some(pane_id) = pane_ids.last().copied() {
+                    self.focus_pane_with_snapshot(pane_id);
+                }
+                if skipped.is_empty() {
+                    self.tmux_session_picker = None;
+                } else if let Some(picker) = self.tmux_session_picker.as_mut() {
+                    picker.selected_session_ids = skipped
+                        .iter()
+                        .map(|issue| issue.session_id.clone())
+                        .collect();
+                    let detail = skipped
+                        .iter()
+                        .map(|issue| format!("{} ({})", issue.session_id, issue.message))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    picker.status = Some(if opened == 0 {
+                        format!("No tmux tabs opened. Skipped: {detail}")
+                    } else {
+                        format!("Opened {opened} tmux tab(s). Skipped: {detail}")
+                    });
+                    picker.error = None;
+                }
                 self.refresh_state();
             }
             Ok(response) => {
@@ -3182,7 +3255,7 @@ impl NahApp {
         }
         if self.tmux_session_picker.is_some() {
             match keystroke.key.as_str() {
-                "enter" => self.open_selected_tmux_session(cx),
+                "enter" => self.open_selected_tmux_sessions(cx),
                 "escape" => {
                     self.tmux_session_picker = None;
                     cx.notify();
@@ -7200,8 +7273,9 @@ impl NahApp {
             TmuxScanScope::Local => "this Mac".to_owned(),
             TmuxScanScope::SystemSsh { destination } => format!("SSH workstation {destination}"),
         };
-        let selected = picker.selected_session_id.clone();
-        let can_open = selected.is_some();
+        let selected = &picker.selected_session_ids;
+        let selected_count = selected.len();
+        let can_open = selected_count > 0;
         div()
             .absolute()
             .top(px(0.0))
@@ -7250,18 +7324,71 @@ impl NahApp {
                                 .child("No tmux server is running for this scope."),
                         )
                     })
+                    .when_some(picker.status.clone(), |element, status| {
+                        element.child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .text_sm()
+                                .text_color(rgb(THEME.muted))
+                                .child(status),
+                        )
+                    })
                     .when_some(picker.error.clone(), |element, error| {
                         element.child(
                             div()
                                 .font_family(".SystemUIFont")
                                 .text_sm()
                                 .text_color(rgb(THEME.danger))
-                                .child(error),
+                            .child(error),
+                        )
+                    })
+                    .when(!picker.sessions.is_empty(), |element| {
+                        element.child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .font_family(".SystemUIFont")
+                                        .text_xs()
+                                        .text_color(rgb(THEME.muted))
+                                        .child(format!("{selected_count} selected")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .id("select-all-tmux-sessions")
+                                                .cursor_pointer()
+                                                .font_family(".SystemUIFont")
+                                                .text_xs()
+                                                .text_color(rgb(THEME.accent))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.select_all_tmux_sessions(cx)
+                                                }))
+                                                .child("Select All"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("clear-all-tmux-sessions")
+                                                .cursor_pointer()
+                                                .font_family(".SystemUIFont")
+                                                .text_xs()
+                                                .text_color(rgb(THEME.accent))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.clear_all_tmux_sessions(cx)
+                                                }))
+                                                .child("Clear All"),
+                                        ),
+                                ),
                         )
                     })
                     .children(picker.sessions.iter().enumerate().map(|(index, session)| {
                         let session_id = session.id.clone();
-                        let is_selected = selected.as_deref() == Some(session.id.as_str());
+                        let is_selected = selected.contains(&session.id);
                         let attached = if session.attached_clients == 0 {
                             "detached".to_owned()
                         } else {
@@ -7277,14 +7404,18 @@ impl NahApp {
                             .border_color(rgb(if is_selected { THEME.accent } else { THEME.border_strong }))
                             .bg(rgb(if is_selected { THEME.accent_soft } else { THEME.surface }))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_tmux_session(session_id.clone(), cx)
+                                this.select_tmux_session(&session_id, cx)
                             }))
                             .child(
                                 div()
                                     .font_family(".SystemUIFont")
                                     .text_sm()
                                     .text_color(rgb(THEME.foreground))
-                                    .child(session.name.clone()),
+                                    .child(format!(
+                                        "{}{}",
+                                        if is_selected { "✓ " } else { "" },
+                                        session.name
+                                    )),
                             )
                             .child(
                                 div()
@@ -7326,9 +7457,9 @@ impl NahApp {
                                     .text_sm()
                                     .text_color(rgb(0xffffff))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_selected_tmux_session(cx)
+                                        this.open_selected_tmux_sessions(cx)
                                     }))
-                                    .child("Open in tmux"),
+                                    .child(format!("Open {selected_count} selected in tmux")),
                             ),
                     ),
             )
@@ -10583,6 +10714,41 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn tmux_picker_supports_multi_select_select_all_and_clear_all_in_scan_order() {
+        let sessions = ["$1", "$2", "$3"]
+            .into_iter()
+            .map(|id| TmuxSession {
+                id: id.to_owned(),
+                name: format!("session-{id}"),
+                windows: 1,
+                attached_clients: 0,
+            })
+            .collect();
+        let mut picker = TmuxSessionPicker {
+            workspace_id: Uuid::nil(),
+            scope: TmuxScanScope::Local,
+            sessions,
+            no_server: false,
+            selected_session_ids: HashSet::new(),
+            status: None,
+            error: None,
+        };
+        picker.toggle_session("$3");
+        picker.toggle_session("$1");
+        assert_eq!(
+            picker.selected_session_ids_in_scan_order(),
+            vec!["$1", "$3"]
+        );
+        picker.select_all();
+        assert_eq!(
+            picker.selected_session_ids_in_scan_order(),
+            vec!["$1", "$2", "$3"]
+        );
+        picker.clear_all();
+        assert!(picker.selected_session_ids_in_scan_order().is_empty());
     }
 
     #[test]
