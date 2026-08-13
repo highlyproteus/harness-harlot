@@ -8,6 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -20,8 +21,8 @@ use nah_protocol::{
     PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionSnapshot, SplitAxis,
     StreamDiagnostics, Tab, TerminalHistoryPage, TerminalIdentity, TerminalIdentitySource,
     TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
-    TerminalProfile, TerminalScreen, TerminalSelectionKind, Workspace, WorkspaceConnection,
-    WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
+    TerminalProfile, TerminalScreen, TerminalSelectionKind, TmuxScanScope, TmuxSession, Workspace,
+    WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
     terminal_profile_for_executable, terminal_profile_for_title, validate_ssh_host,
 };
 use nah_terminal_model::TerminalModel;
@@ -48,6 +49,12 @@ const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_DISCOVERY_PROCESSES: usize = 4_096;
 const MAX_DISCOVERY_DESCENDANTS_PER_PANE: usize = 64;
 const MAX_DISCOVERY_DEPTH: usize = 4;
+const TMUX_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const TMUX_PROBE_MAX_BYTES: usize = 64 * 1024;
+const TMUX_PROBE_MAX_SESSIONS: usize = 64;
+const TMUX_LIST_FORMAT: &str =
+    "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}";
+const TMUX_REMOTE_LIST_COMMAND: &str = "exec tmux list-sessions -F '#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}'";
 #[cfg(debug_assertions)]
 const LOCAL_SSH_TEST_SEAM_ENV: &str = "NAH_TEST_LOCAL_SSH_SEAM";
 
@@ -119,6 +126,37 @@ impl PtySession {
             workspace_id,
             system_ssh_command(pane_id, host)?,
             "system OpenSSH",
+            archive,
+        )
+    }
+
+    fn spawn_tmux_local(
+        pane_id: Uuid,
+        workspace_id: Uuid,
+        session_id: &str,
+        archive: &HistoryArchive,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_command(
+            pane_id,
+            workspace_id,
+            tmux_local_attach_command(pane_id, session_id)?,
+            "tmux session attach",
+            archive,
+        )
+    }
+
+    fn spawn_tmux_ssh(
+        pane_id: Uuid,
+        workspace_id: Uuid,
+        host: &str,
+        session_id: &str,
+        archive: &HistoryArchive,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_command(
+            pane_id,
+            workspace_id,
+            tmux_ssh_attach_command(pane_id, host, session_id)?,
+            "system OpenSSH tmux session attach",
             archive,
         )
     }
@@ -395,6 +433,8 @@ struct SshWorkspaceIds {
 enum RuntimePaneKind {
     Local,
     SystemSsh { host: String },
+    TmuxLocal,
+    TmuxSystemSsh { host: String },
 }
 
 impl RuntimePaneKind {
@@ -402,10 +442,15 @@ impl RuntimePaneKind {
         matches!(self, Self::Local)
     }
 
+    fn is_runtime_only(&self) -> bool {
+        matches!(self, Self::TmuxLocal | Self::TmuxSystemSsh { .. })
+    }
+
     fn shell_label(&self) -> String {
         match self {
             Self::Local => shell_title(),
             Self::SystemSsh { host } => format!("ssh {host}"),
+            Self::TmuxLocal | Self::TmuxSystemSsh { .. } => "tmux".to_owned(),
         }
     }
 }
@@ -2077,6 +2122,134 @@ impl SessionRegistry {
         Ok(self.pane(pane_id)?.process_id())
     }
 
+    /// Performs an explicit bounded metadata-only scan of the default tmux
+    /// server for one workstation. It never starts tmux, reconnects a saved
+    /// SSH workstation, or writes scan output to terminal history.
+    pub fn scan_tmux_sessions(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<(TmuxScanScope, Vec<TmuxSession>, bool)> {
+        let connection = self.workspace_connection(workspace_id)?;
+        let (scope, probe) = match connection {
+            WorkspaceConnection::Local => (TmuxScanScope::Local, tmux_local_probe_command()),
+            WorkspaceConnection::SystemSsh {
+                destination,
+                status: WorkspaceConnectionStatus::Connected,
+            } => (
+                TmuxScanScope::SystemSsh {
+                    destination: destination.clone(),
+                },
+                tmux_ssh_probe_command(&destination)?,
+            ),
+            WorkspaceConnection::SystemSsh {
+                status: WorkspaceConnectionStatus::Offline,
+                ..
+            } => bail!("reconnect this SSH workstation before scanning tmux sessions"),
+        };
+        let output = run_tmux_probe(probe)?;
+        if !output.success {
+            if output.stderr.contains("no server running") {
+                return Ok((scope, Vec::new(), true));
+            }
+            bail!("tmux scan failed: {}", probe_error_summary(&output.stderr));
+        }
+        Ok((scope, parse_tmux_sessions(&output.stdout)?, false))
+    }
+
+    /// Opens exactly one tab attached to an existing tmux session. The tab is
+    /// deliberately runtime-only: desired-state persistence omits it so a
+    /// daemon restart never auto-attaches or stores an opaque tmux target.
+    pub fn attach_tmux_session(&self, workspace_id: Uuid, session_id: &str) -> Result<Uuid> {
+        validate_tmux_session_id(session_id)?;
+        let connection = self.workspace_connection(workspace_id)?;
+        let pane_id = Uuid::new_v4();
+        let (session, kind) = match &connection {
+            WorkspaceConnection::Local => (
+                PtySession::spawn_tmux_local(pane_id, workspace_id, session_id, &self.history)?,
+                RuntimePaneKind::TmuxLocal,
+            ),
+            WorkspaceConnection::SystemSsh {
+                destination,
+                status: WorkspaceConnectionStatus::Connected,
+            } => (
+                PtySession::spawn_tmux_ssh(
+                    pane_id,
+                    workspace_id,
+                    destination,
+                    session_id,
+                    &self.history,
+                )?,
+                RuntimePaneKind::TmuxSystemSsh {
+                    host: destination.clone(),
+                },
+            ),
+            WorkspaceConnection::SystemSsh {
+                status: WorkspaceConnectionStatus::Offline,
+                ..
+            } => bail!("reconnect this SSH workstation before opening tmux"),
+        };
+        let result = (|| {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+            let still_connected = matches!(
+                workspace.connection,
+                WorkspaceConnection::Local
+                    | WorkspaceConnection::SystemSsh {
+                        status: WorkspaceConnectionStatus::Connected,
+                        ..
+                    }
+            );
+            if !still_connected {
+                bail!("workstation went offline before opening tmux");
+            }
+            workspace.tabs.push(Tab {
+                id: Uuid::new_v4(),
+                title: "tmux".to_owned(),
+                layout: PaneLayout::Leaf {
+                    pane: Pane {
+                        id: pane_id,
+                        title: format!("tmux {session_id}"),
+                        shell: "tmux".to_owned(),
+                        color: None,
+                        identity: TerminalIdentity::default(),
+                        custom_title: None,
+                        profile_override: None,
+                    },
+                },
+            });
+            workspace.active_terminal_count = workspace.active_terminal_count.saturating_add(1);
+            state.panes.insert(
+                pane_id,
+                RuntimePane {
+                    session: Arc::clone(&session),
+                    last_valid_cwd: fallback_cwd()?,
+                    kind,
+                    recovered: false,
+                    exit_status: None,
+                    detected_command_profile: None,
+                },
+            );
+            state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+            persist_state(&state)?;
+            Ok(pane_id)
+        })();
+        if result.is_err() {
+            let _ = session.terminate_and_wait();
+        }
+        result
+    }
+
     fn pane(&self, pane_id: Uuid) -> Result<Arc<PtySession>> {
         self.state
             .read()
@@ -2099,7 +2272,9 @@ impl SessionRegistry {
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         match &runtime.kind {
             RuntimePaneKind::Local => Ok(runtime.last_valid_cwd.clone()),
-            RuntimePaneKind::SystemSsh { .. } => fallback_cwd(),
+            RuntimePaneKind::SystemSsh { .. }
+            | RuntimePaneKind::TmuxLocal
+            | RuntimePaneKind::TmuxSystemSsh { .. } => fallback_cwd(),
         }
     }
 
@@ -2139,6 +2314,9 @@ impl SessionRegistry {
             }
             RuntimePaneKind::SystemSsh { host } => {
                 PtySession::spawn_ssh(pane_id, workspace_id, host, &self.history)?
+            }
+            RuntimePaneKind::TmuxLocal | RuntimePaneKind::TmuxSystemSsh { .. } => {
+                unreachable!("workspace connection cannot resolve to a runtime-only tmux pane")
             }
         };
         Ok((session, kind))
@@ -2181,7 +2359,21 @@ fn persist_state(state: &RegistryState) -> Result<()> {
     let Some(store) = &state.store else {
         return Ok(());
     };
-    let snapshot = state.snapshot.clone();
+    let mut snapshot = state.snapshot.clone();
+    let runtime_only_panes = state
+        .panes
+        .iter()
+        .filter_map(|(pane_id, runtime)| runtime.kind.is_runtime_only().then_some(*pane_id))
+        .collect::<HashSet<_>>();
+    if !runtime_only_panes.is_empty() {
+        for workspace in &mut snapshot.workspaces {
+            workspace.tabs.retain(|tab| {
+                !runtime_only_panes
+                    .iter()
+                    .any(|pane_id| layout_contains(&tab.layout, *pane_id))
+            });
+        }
+    }
     let cwd_by_pane = state
         .panes
         .iter()
@@ -2595,6 +2787,54 @@ fn system_ssh_command_with(
     ))
 }
 
+fn validate_tmux_session_id(session_id: &str) -> Result<()> {
+    if session_id.len() < 2
+        || session_id.len() > 32
+        || !session_id.starts_with('$')
+        || !session_id[1..].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!("tmux session target must be an opaque numeric session ID");
+    }
+    Ok(())
+}
+
+fn tmux_local_attach_command(pane_id: Uuid, session_id: &str) -> Result<CommandBuilder> {
+    validate_tmux_session_id(session_id)?;
+    Ok(command_with_terminal_env(
+        [
+            OsString::from("tmux"),
+            OsString::from("attach-session"),
+            OsString::from("-t"),
+            OsString::from(session_id),
+        ],
+        pane_id,
+    ))
+}
+
+fn tmux_remote_attach_command(session_id: &str) -> Result<OsString> {
+    validate_tmux_session_id(session_id)?;
+    // The opaque ID is constrained above to `$` plus ASCII digits, then kept
+    // inside fixed single quotes for the remote POSIX shell. No label or other
+    // server-provided text ever becomes a remote command argument.
+    Ok(OsString::from(format!(
+        "exec tmux attach-session -t '{session_id}'"
+    )))
+}
+
+fn tmux_ssh_attach_command(pane_id: Uuid, host: &str, session_id: &str) -> Result<CommandBuilder> {
+    validate_ssh_host(host).map_err(|message| anyhow!(message))?;
+    let remote_command = tmux_remote_attach_command(session_id)?;
+    Ok(command_with_terminal_env(
+        [
+            system_ssh_binary()?.into_os_string(),
+            OsString::from("--"),
+            OsString::from(host),
+            remote_command,
+        ],
+        pane_id,
+    ))
+}
+
 fn command_with_terminal_env(
     argv: impl IntoIterator<Item = OsString>,
     pane_id: Uuid,
@@ -2630,6 +2870,159 @@ fn system_ssh_binary() -> Result<PathBuf> {
 fn is_executable_file(path: &Path) -> bool {
     path.metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[derive(Debug)]
+struct TmuxProbeOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn tmux_local_probe_command() -> Command {
+    let mut command = Command::new("tmux");
+    command
+        .args(["list-sessions", "-F", TMUX_LIST_FORMAT])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn tmux_ssh_probe_command(destination: &str) -> Result<Command> {
+    validate_ssh_host(destination).map_err(|message| anyhow!(message))?;
+    let mut command = Command::new(system_ssh_binary()?);
+    // This is intentionally a single fixed remote command, not an arbitrary
+    // user string. With piped stdout, OpenSSH does not allocate a tty.
+    command
+        .arg("--")
+        .arg(destination)
+        .arg(TMUX_REMOTE_LIST_COMMAND)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    Ok(command)
+}
+
+fn run_tmux_probe(command: Command) -> Result<TmuxProbeOutput> {
+    run_tmux_probe_with_timeout(command, TMUX_PROBE_TIMEOUT)
+}
+
+fn run_tmux_probe_with_timeout(mut command: Command, timeout: Duration) -> Result<TmuxProbeOutput> {
+    let mut child = command.spawn().context("start explicit tmux scan")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("tmux scan stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("tmux scan stderr was not piped")?;
+    let stdout_reader = thread::spawn(move || read_limited_probe_output(stdout));
+    let stderr_reader = thread::spawn(move || read_limited_probe_output(stderr));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("observe tmux scan")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("tmux scan timed out after {} seconds", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = join_probe_reader(stdout_reader, "stdout")?;
+    let stderr = join_probe_reader(stderr_reader, "stderr")?;
+    Ok(TmuxProbeOutput {
+        success: status.success(),
+        stdout: String::from_utf8(stdout).context("tmux scan output was not UTF-8")?,
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+fn read_limited_probe_output(mut reader: impl Read) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut overflow = false;
+    loop {
+        let read = reader.read(&mut buffer).context("read tmux scan output")?;
+        if read == 0 {
+            break;
+        }
+        if output.len().saturating_add(read) <= TMUX_PROBE_MAX_BYTES {
+            output.extend_from_slice(&buffer[..read]);
+        } else {
+            overflow = true;
+        }
+    }
+    if overflow {
+        bail!("tmux scan output exceeded {TMUX_PROBE_MAX_BYTES} bytes");
+    }
+    Ok(output)
+}
+
+fn join_probe_reader(reader: thread::JoinHandle<Result<Vec<u8>>>, stream: &str) -> Result<Vec<u8>> {
+    let output = reader
+        .join()
+        .map_err(|_| anyhow!("tmux scan {stream} reader panicked"))??;
+    Ok(output)
+}
+
+fn parse_tmux_sessions(output: &str) -> Result<Vec<TmuxSession>> {
+    let mut sessions = Vec::new();
+    for line in output.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if sessions.len() >= TMUX_PROBE_MAX_SESSIONS {
+            bail!("tmux scan returned more than {TMUX_PROBE_MAX_SESSIONS} sessions");
+        }
+        let mut fields = line.split('\t');
+        let (Some(id), Some(name), Some(windows), Some(attached), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            bail!("tmux scan returned malformed metadata");
+        };
+        validate_tmux_session_id(id)?;
+        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+            bail!("tmux scan returned an unsafe session label");
+        }
+        let windows = windows
+            .parse::<u32>()
+            .context("tmux session window count was invalid")?;
+        let attached_clients = attached
+            .parse::<u32>()
+            .context("tmux session attached-client count was invalid")?;
+        if sessions
+            .iter()
+            .any(|session: &TmuxSession| session.id == id)
+        {
+            bail!("tmux scan returned a duplicate session ID");
+        }
+        sessions.push(TmuxSession {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            windows,
+            attached_clients,
+        });
+    }
+    Ok(sessions)
+}
+
+fn probe_error_summary(stderr: &str) -> String {
+    let message = stderr.lines().next().unwrap_or("unknown error");
+    message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect()
 }
 
 fn shell_title() -> String {
@@ -3065,12 +3458,16 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
     if is_identity_request(&request) {
         return handle_identity_request(sessions, request);
     }
+    if let Some(response) = handle_tmux_scan_request(sessions, &request)? {
+        return Ok(response);
+    }
     if matches!(
         &request,
         ClientRequest::CreatePane { .. }
             | ClientRequest::CreateTab { .. }
             | ClientRequest::CreateWorkspaceTerminal { .. }
             | ClientRequest::ConnectSsh { .. }
+            | ClientRequest::AttachTmuxSession { .. }
     ) {
         return handle_pane_creation_request(sessions, request);
     }
@@ -3112,6 +3509,7 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         | ClientRequest::CreateTab { .. }
         | ClientRequest::CreateWorkspaceTerminal { .. }
         | ClientRequest::ConnectSsh { .. }
+        | ClientRequest::AttachTmuxSession { .. }
         | ClientRequest::ActivateTab { .. }
         | ClientRequest::SwapPanes { .. }
         | ClientRequest::MovePaneToSplit { .. }
@@ -3130,11 +3528,27 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         | ClientRequest::SetHistorySettings { .. }
         | ClientRequest::ClearHistory { .. }
         | ClientRequest::LoadHistoryPage { .. }
-        | ClientRequest::SearchArchivedHistory { .. } => unreachable!("handled above"),
+        | ClientRequest::SearchArchivedHistory { .. }
+        | ClientRequest::ScanTmuxSessions { .. } => unreachable!("handled above"),
         ClientRequest::Hello { .. } => Ok(ServiceResponse::Error {
             message: "hello was already completed".to_owned(),
         }),
     }
+}
+
+fn handle_tmux_scan_request(
+    sessions: &SessionRegistry,
+    request: &ClientRequest,
+) -> Result<Option<ServiceResponse>> {
+    let ClientRequest::ScanTmuxSessions { workspace_id } = request else {
+        return Ok(None);
+    };
+    let (scope, sessions_found, no_server) = sessions.scan_tmux_sessions(*workspace_id)?;
+    Ok(Some(ServiceResponse::TmuxSessions {
+        scope,
+        sessions: sessions_found,
+        no_server,
+    }))
 }
 
 fn is_layout_request(request: &ClientRequest) -> bool {
@@ -3239,6 +3653,10 @@ fn handle_pane_creation_request(
         ClientRequest::ConnectSsh { target_pane, host } => {
             sessions.connect_ssh(target_pane, &host)?
         }
+        ClientRequest::AttachTmuxSession {
+            workspace_id,
+            session_id,
+        } => sessions.attach_tmux_session(workspace_id, &session_id)?,
         _ => unreachable!("only pane creation requests are routed here"),
     };
     Ok(ServiceResponse::PaneCreated { pane_id })
@@ -3518,6 +3936,68 @@ mod tests {
                 "host: {host:?}"
             );
         }
+    }
+
+    #[test]
+    fn tmux_attach_uses_only_fixed_structured_commands() {
+        let local = tmux_local_attach_command(Uuid::nil(), "$42").unwrap();
+        assert_eq!(
+            local.get_argv(),
+            &[
+                OsString::from("tmux"),
+                OsString::from("attach-session"),
+                OsString::from("-t"),
+                OsString::from("$42"),
+            ]
+        );
+
+        let remote = tmux_remote_attach_command("$42").unwrap();
+        assert_eq!(remote, OsString::from("exec tmux attach-session -t '$42'"));
+        for target in ["name", "$42;bad", "$4 2", "$-1", "42", "$42'bad"] {
+            assert!(
+                validate_tmux_session_id(target).is_err(),
+                "target: {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tmux_scan_parser_bounds_and_rejects_malicious_metadata() {
+        let sessions = parse_tmux_sessions("$1\tbuild\t3\t1\n$2\tresearch\t1\t0\n").unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "$1");
+        assert_eq!(sessions[1].attached_clients, 0);
+
+        for output in [
+            "build\tname\t1\t0\n",
+            "$1\tname\t1\t0\textra\n",
+            "$1\tbad\u{0007}name\t1\t0\n",
+            "$1;bad\tname\t1\t0\n",
+            "$1\tname\tnot-a-number\t0\n",
+        ] {
+            assert!(parse_tmux_sessions(output).is_err(), "output: {output:?}");
+        }
+    }
+
+    #[test]
+    fn remote_tmux_probe_is_a_fixed_command_not_a_user_command() {
+        let command = tmux_ssh_probe_command("admin@build-node").unwrap();
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(args[0], OsStr::new("--"));
+        assert_eq!(args[1], OsStr::new("admin@build-node"));
+        assert_eq!(args[2], OsStr::new(TMUX_REMOTE_LIST_COMMAND));
+        assert!(tmux_ssh_probe_command("build;whoami").is_err());
+    }
+
+    #[test]
+    fn tmux_probe_timeout_is_bounded_and_reports_an_error() {
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let error = run_tmux_probe_with_timeout(command, Duration::from_millis(20)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]
