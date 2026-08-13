@@ -9,8 +9,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,11 +22,12 @@ use nah_protocol::{
     StreamDiagnostics, Tab, TerminalHistoryPage, TerminalIdentity, TerminalIdentitySource,
     TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
     TerminalProfile, TerminalScreen, TerminalSelectionKind, TmuxScanScope, TmuxSession,
-    TmuxSessionAttachIssue, Workspace, WorkspaceConnection, WorkspaceConnectionStatus,
-    WorkspacePinMove, terminal_profile_for_command, terminal_profile_for_executable,
-    terminal_profile_for_title, validate_ssh_host,
+    TmuxSessionAttachIssue, TmuxSessionId, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
+    terminal_profile_for_executable, terminal_profile_for_title, validate_ssh_host,
 };
 use nah_terminal_model::TerminalModel;
+use parking_lot::{Mutex, RwLock};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -55,9 +56,9 @@ const TMUX_PROBE_MAX_BYTES: usize = 64 * 1024;
 const TMUX_PROBE_MAX_SESSIONS: usize = 64;
 const MAX_TMUX_ATTACH_SESSIONS: usize = 32;
 const TMUX_ATTACH_STARTUP_GRACE: Duration = Duration::from_millis(75);
-const TMUX_LIST_FORMAT: &str =
-    "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}";
-const TMUX_REMOTE_LIST_COMMAND: &str = "exec tmux list-sessions -F '#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}'";
+const TMUX_SESSION_LIST_FORMAT: &str =
+    "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}";
+const TMUX_REMOTE_LIST_COMMAND: &str = "exec tmux list-sessions -F 'S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}'";
 #[cfg(debug_assertions)]
 const LOCAL_SSH_TEST_SEAM_ENV: &str = "NAH_TEST_LOCAL_SSH_SEAM";
 
@@ -82,16 +83,12 @@ impl std::fmt::Debug for PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        let Ok(child) = self.child.get_mut() else {
-            return;
-        };
+        let child = self.child.get_mut();
         if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
         }
         let _ = child.wait();
-        if let Ok(reader) = self.reader.get_mut()
-            && let Some(reader) = reader.take()
-        {
+        if let Some(reader) = self.reader.get_mut().take() {
             let _ = reader.join();
         }
     }
@@ -136,13 +133,13 @@ impl PtySession {
     fn spawn_tmux_local(
         pane_id: Uuid,
         workspace_id: Uuid,
-        session_id: &str,
+        session_id: &TmuxSessionId,
         archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         Self::spawn_command(
             pane_id,
             workspace_id,
-            tmux_local_attach_command(pane_id, session_id)?,
+            tmux_local_attach_command(pane_id, session_id),
             "tmux session attach",
             archive,
         )
@@ -152,7 +149,7 @@ impl PtySession {
         pane_id: Uuid,
         workspace_id: Uuid,
         host: &str,
-        session_id: &str,
+        session_id: &TmuxSessionId,
         archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         Self::spawn_command(
@@ -208,12 +205,9 @@ impl PtySession {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(read) => {
-                            if let Ok(mut terminal) = reader_terminal.lock() {
-                                terminal.process_output(&buffer[..read]);
-                                reader_revision.fetch_add(1, Ordering::Release);
-                            } else {
-                                break;
-                            }
+                            let mut terminal = reader_terminal.lock();
+                            terminal.process_output(&buffer[..read]);
+                            reader_revision.fetch_add(1, Ordering::Release);
                             reader_history.record(&buffer[..read]);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -238,10 +232,7 @@ impl PtySession {
         if bytes.len() > MAX_INPUT_FRAME {
             bail!("terminal input exceeds {MAX_INPUT_FRAME} bytes");
         }
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| anyhow!("PTY writer lock was poisoned"))?;
+        let mut writer = self.writer.lock();
         writer.write_all(bytes).context("write terminal input")?;
         writer.flush().context("flush terminal input")?;
         Ok(())
@@ -252,7 +243,6 @@ impl PtySession {
         let rows = rows.max(1);
         self.master
             .lock()
-            .map_err(|_| anyhow!("PTY master lock was poisoned"))?
             .resize(PtySize {
                 rows,
                 cols: columns,
@@ -262,17 +252,13 @@ impl PtySession {
             .context("resize PTY")?;
         self.terminal
             .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
             .resize(usize::from(columns), usize::from(rows));
         self.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     fn screen(&self, pane_id: Uuid) -> Result<TerminalScreen> {
-        let terminal = self
-            .terminal
-            .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?;
+        let terminal = self.terminal.lock();
         let (columns, rows) = terminal.dimensions();
         let mut mode_bits = 0;
         for (enabled, mode) in [
@@ -301,59 +287,35 @@ impl PtySession {
         })
     }
 
-    fn begin_selection(&self, point: TerminalPoint, kind: TerminalSelectionKind) -> Result<()> {
-        self.terminal
-            .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
-            .begin_selection(point, kind);
+    fn begin_selection(&self, point: TerminalPoint, kind: TerminalSelectionKind) {
+        self.terminal.lock().begin_selection(point, kind);
         self.revision.fetch_add(1, Ordering::Release);
-        Ok(())
     }
 
-    fn update_selection(&self, point: TerminalPoint) -> Result<()> {
-        self.terminal
-            .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
-            .update_selection(point);
+    fn update_selection(&self, point: TerminalPoint) {
+        self.terminal.lock().update_selection(point);
         self.revision.fetch_add(1, Ordering::Release);
-        Ok(())
     }
 
-    fn clear_selection(&self) -> Result<()> {
-        self.terminal
-            .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
-            .clear_selection();
+    fn clear_selection(&self) {
+        self.terminal.lock().clear_selection();
         self.revision.fetch_add(1, Ordering::Release);
-        Ok(())
     }
 
-    fn selected_text(&self) -> Result<Option<String>> {
-        Ok(self
-            .terminal
-            .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
-            .selected_text())
+    fn selected_text(&self) -> Option<String> {
+        self.terminal.lock().selected_text()
     }
 
-    fn scroll(&self, lines: i32) -> Result<()> {
-        self.terminal
-            .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
-            .scroll(lines.clamp(-10_000, 10_000));
+    fn scroll(&self, lines: i32) {
+        self.terminal.lock().scroll(lines.clamp(-10_000, 10_000));
         self.revision.fetch_add(1, Ordering::Release);
-        Ok(())
     }
 
     fn search_literal(&self, query: &str, forward: bool) -> Result<bool> {
         if query.chars().count() > 256 || query.chars().any(char::is_control) {
             bail!("terminal search must be at most 256 visible characters");
         }
-        let found = self
-            .terminal
-            .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
-            .search_literal(query, forward);
+        let found = self.terminal.lock().search_literal(query, forward);
         if found {
             self.revision.fetch_add(1, Ordering::Release);
         }
@@ -370,7 +332,6 @@ impl PtySession {
         let report = self
             .terminal
             .lock()
-            .map_err(|_| anyhow!("terminal grid lock was poisoned"))?
             .mouse_report(point, button, action, modifiers);
         if let Some(report) = report {
             self.write_input(&report)?;
@@ -379,10 +340,7 @@ impl PtySession {
     }
 
     fn terminate_and_wait(&self) -> Result<()> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| anyhow!("PTY child lock was poisoned"))?;
+        let mut child = self.child.lock();
         if child
             .try_wait()
             .context("observe PTY child before close")?
@@ -397,7 +355,6 @@ impl PtySession {
     fn exit_status(&self) -> Result<Option<String>> {
         self.child
             .lock()
-            .map_err(|_| anyhow!("PTY child lock was poisoned"))?
             .try_wait()
             .map(|status| status.map(|status| status.to_string()))
             .context("observe PTY child exit")
@@ -420,14 +377,11 @@ impl PtySession {
     }
 
     fn process_id(&self) -> Option<u32> {
-        self.child.lock().ok().and_then(|child| child.process_id())
+        self.child.lock().process_id()
     }
 
     fn terminal_title(&self) -> Option<String> {
-        self.terminal
-            .lock()
-            .ok()
-            .and_then(|terminal| terminal.terminal_title())
+        self.terminal.lock().terminal_title()
     }
 }
 
@@ -451,9 +405,16 @@ struct SshWorkspaceIds {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimePaneKind {
     Local,
-    SystemSsh { host: String },
-    TmuxLocal { session_id: String },
-    TmuxSystemSsh { host: String, session_id: String },
+    SystemSsh {
+        host: String,
+    },
+    TmuxLocal {
+        session_id: TmuxSessionId,
+    },
+    TmuxSystemSsh {
+        host: String,
+        session_id: TmuxSessionId,
+    },
 }
 
 impl RuntimePaneKind {
@@ -465,7 +426,13 @@ impl RuntimePaneKind {
         matches!(self, Self::TmuxLocal { .. } | Self::TmuxSystemSsh { .. })
     }
 
-    fn tmux_session_id(&self) -> Option<&str> {
+    /// Runs over the workstation's SSH transport, so its liveness reflects
+    /// whether that workstation is still reachable.
+    fn is_remote(&self) -> bool {
+        matches!(self, Self::SystemSsh { .. } | Self::TmuxSystemSsh { .. })
+    }
+
+    fn tmux_session_id(&self) -> Option<&TmuxSessionId> {
         match self {
             Self::TmuxLocal { session_id } | Self::TmuxSystemSsh { session_id, .. } => {
                 Some(session_id)
@@ -485,7 +452,7 @@ impl RuntimePaneKind {
 
 #[derive(Debug, Eq, PartialEq)]
 struct TmuxAttachmentPlan {
-    launch: Vec<String>,
+    launch: Vec<TmuxSession>,
     skipped: Vec<TmuxSessionAttachIssue>,
 }
 
@@ -493,6 +460,14 @@ struct TmuxAttachmentPlan {
 pub struct TmuxAttachmentResult {
     pub pane_ids: Vec<Uuid>,
     pub skipped: Vec<TmuxSessionAttachIssue>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct TmuxScanResult {
+    pub scope: TmuxScanScope,
+    pub sessions: Vec<TmuxSession>,
+    pub open_session_ids: Vec<TmuxSessionId>,
+    pub no_server: bool,
 }
 
 fn runtime_kind_for_workspace(connection: &WorkspaceConnection) -> RuntimePaneKind {
@@ -509,7 +484,7 @@ struct RegistryState {
     snapshot: SessionSnapshot,
     panes: HashMap<Uuid, RuntimePane>,
     next_terminal_number: u32,
-    store: Option<SnapshotStore>,
+    system: System,
     last_identity_refresh: Option<Instant>,
 }
 
@@ -533,6 +508,7 @@ impl RegistryState {
 pub struct SessionRegistry {
     state: Arc<RwLock<RegistryState>>,
     diagnostics_sampler: Arc<Mutex<DiagnosticsSampler>>,
+    store: Option<SnapshotStore>,
     history: HistoryArchive,
 }
 
@@ -635,10 +611,11 @@ impl SessionRegistry {
                 snapshot: recovered.snapshot,
                 panes,
                 next_terminal_number,
-                store: Some(store),
                 last_identity_refresh: None,
+                system: System::new(),
             })),
             diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
+            store: Some(store),
             history,
         };
         registry.persist()?;
@@ -669,29 +646,24 @@ impl SessionRegistry {
                     },
                 )]),
                 next_terminal_number: 2,
-                store,
                 last_identity_refresh: None,
+                system: System::new(),
             })),
             diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
+            store,
             history,
         })
     }
 
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
-        refresh_runtime_metadata(&mut state)?;
+        let mut state = self.state.write();
+        refresh_runtime_metadata(&mut state, false)?;
         Ok(state.snapshot.clone())
     }
 
     pub fn state(&self) -> Result<(SessionSnapshot, Vec<TerminalScreen>)> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
-        refresh_runtime_metadata(&mut state)?;
+        let mut state = self.state.write();
+        refresh_runtime_metadata(&mut state, false)?;
         let snapshot = state.snapshot.clone();
         let screens = state
             .panes
@@ -704,11 +676,17 @@ impl SessionRegistry {
     /// Builds one coalesced receiver update without serializing unchanged or
     /// unsubscribed terminal screens. PTY reader threads continue advancing
     /// terminal models independently of this method.
+    ///
+    /// `measure_bytes` opts into the `snapshot_bytes`/`screen_bytes`
+    /// diagnostics, each of which costs a full extra serialization of the
+    /// payload. The socket path leaves it off; tests that assert on payload
+    /// size turn it on.
     pub fn pane_updates(
         &self,
         snapshot_revision: Option<u64>,
         pane_revisions: &[PaneRevisionCursor],
         subscribed_panes: &[Uuid],
+        measure_bytes: bool,
     ) -> Result<PaneUpdateBatch> {
         let started = Instant::now();
         let known_revisions = pane_revisions
@@ -716,10 +694,7 @@ impl SessionRegistry {
             .map(|cursor| (cursor.pane_id, cursor.revision))
             .collect::<HashMap<_, _>>();
         let subscribed = subscribed_panes.iter().copied().collect::<HashSet<_>>();
-        let state = self
-            .state
-            .read()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let state = self.state.read();
 
         let session_revision = state.snapshot.revision;
         let snapshot =
@@ -750,21 +725,30 @@ impl SessionRegistry {
                 revision,
                 subscribed,
                 dirty: !delivered && known_revision != Some(revision),
+                exited: runtime.exit_status.is_some(),
             });
         }
         drop(state);
 
         pane_states.sort_unstable_by_key(|pane| pane.pane_id);
         screens.sort_unstable_by_key(|screen| screen.pane_id);
-        let snapshot_bytes = snapshot
-            .as_ref()
-            .map(serialized_len)
-            .transpose()?
-            .unwrap_or(0);
-        let screen_bytes = screens.iter().try_fold(0_u64, |total, screen| {
-            Ok::<_, anyhow::Error>(total.saturating_add(serialized_len(screen)?))
-        })?;
-        let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics()?;
+        let snapshot_bytes = if measure_bytes {
+            snapshot
+                .as_ref()
+                .map(serialized_len)
+                .transpose()?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let screen_bytes = if measure_bytes {
+            screens.iter().try_fold(0_u64, |total, screen| {
+                Ok::<_, anyhow::Error>(total.saturating_add(serialized_len(screen)?))
+            })?
+        } else {
+            0
+        };
+        let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics();
         let diagnostics = StreamDiagnostics {
             panes_considered: u32::try_from(pane_states.len()).unwrap_or(u32::MAX),
             panes_subscribed: u32::try_from(
@@ -795,7 +779,7 @@ impl SessionRegistry {
         let started = Instant::now();
         let screen = self.pane(pane_id)?.screen(pane_id)?;
         let screen_bytes = serialized_len(&screen)?;
-        let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics()?;
+        let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics();
         Ok((
             screen,
             StreamDiagnostics {
@@ -813,12 +797,9 @@ impl SessionRegistry {
         ))
     }
 
-    fn service_metrics(&self) -> Result<(u32, u64)> {
+    fn service_metrics(&self) -> (u32, u64) {
         let pid = Pid::from_u32(std::process::id());
-        let mut sampler = self
-            .diagnostics_sampler
-            .lock()
-            .map_err(|_| anyhow!("diagnostics system lock was poisoned"))?;
+        let mut sampler = self.diagnostics_sampler.lock();
         let now = Instant::now();
         let should_refresh = sampler
             .last_refresh
@@ -838,19 +819,25 @@ impl SessionRegistry {
             }
             sampler.last_refresh = Some(now);
         }
-        Ok((sampler.cpu_milli_percent, sampler.memory_bytes))
+        (sampler.cpu_milli_percent, sampler.memory_bytes)
     }
 
     pub fn persist(&self) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
-        refresh_runtime_metadata(&mut state)?;
-        persist_state(&state)
+        let bytes = {
+            let mut state = self.state.write();
+            refresh_runtime_metadata(&mut state, true)?;
+            encode_desired_state(&state)?
+        };
+        self.write_snapshot(&bytes)
     }
 
-    pub fn history_status(&self) -> Result<HistoryArchiveStatus> {
+    fn write_snapshot(&self, bytes: &[u8]) -> Result<()> {
+        self.store
+            .as_ref()
+            .map_or(Ok(()), |store| store.write_snapshot(bytes))
+    }
+
+    pub fn history_status(&self) -> HistoryArchiveStatus {
         self.history.status()
     }
 
@@ -864,10 +851,7 @@ impl SessionRegistry {
                 self.pane(pane_id)?;
             }
             HistoryClearScope::Workspace { workspace_id } => {
-                let state = self
-                    .state
-                    .read()
-                    .map_err(|_| anyhow!("session state lock was poisoned"))?;
+                let state = self.state.read();
                 if !state
                     .snapshot
                     .workspaces
@@ -907,10 +891,7 @@ impl SessionRegistry {
         let cwd = self.cwd_for_pane(target_pane)?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
         let (session, kind) = self.spawn_pane_for_workspace(new_id, workspace_id, &cwd)?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
@@ -939,7 +920,11 @@ impl SessionRegistry {
             },
         );
         state.snapshot.revision += 1;
-        persist_state(&state)?;
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+        };
         Ok(new_id)
     }
 
@@ -948,10 +933,7 @@ impl SessionRegistry {
         let cwd = self.cwd_for_pane(target_pane)?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
         let (session, kind) = self.spawn_pane_for_workspace(new_id, workspace_id, &cwd)?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
@@ -980,7 +962,11 @@ impl SessionRegistry {
             },
         );
         state.snapshot.revision += 1;
-        persist_state(&state)?;
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+        };
         Ok(new_id)
     }
 
@@ -989,10 +975,7 @@ impl SessionRegistry {
     /// retried request cannot create duplicate terminals.
     pub fn create_workspace_terminal(&self, workspace_id: Uuid) -> Result<Uuid> {
         let connection = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let state = self.state.read();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
@@ -1030,10 +1013,7 @@ impl SessionRegistry {
         };
 
         let result = (|| {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
@@ -1076,7 +1056,11 @@ impl SessionRegistry {
                 },
             );
             state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-            persist_state(&state)?;
+            {
+                let bytes = encode_desired_state(&state)?;
+                drop(state);
+                self.write_snapshot(&bytes)?;
+            };
             Ok(pane_id)
         })();
         if result.is_err() {
@@ -1090,10 +1074,7 @@ impl SessionRegistry {
     pub fn connect_ssh(&self, target_pane: Uuid, host: &str) -> Result<Uuid> {
         validate_ssh_host(host).map_err(|message| anyhow!(message))?;
         {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let state = self.state.read();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
@@ -1113,10 +1094,7 @@ impl SessionRegistry {
         let workspace_id = self.workspace_for_pane(target_pane)?;
         let session = PtySession::spawn_ssh(pane_id, workspace_id, host, &self.history)?;
         let result = (|| {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
@@ -1161,10 +1139,7 @@ impl SessionRegistry {
     }
 
     pub fn activate_tab(&self, pane_id: Uuid) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let did_activate = state.snapshot.workspaces.iter_mut().any(|workspace| {
             workspace
                 .tabs
@@ -1175,7 +1150,11 @@ impl SessionRegistry {
             bail!("pane tab {pane_id} does not exist");
         }
         state.snapshot.revision += 1;
-        persist_state(&state)?;
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+        };
         Ok(())
     }
 
@@ -1183,10 +1162,7 @@ impl SessionRegistry {
         if source_pane == target_pane {
             return Ok(());
         }
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         if !state.panes.contains_key(&source_pane) || !state.panes.contains_key(&target_pane) {
             bail!("both panes must exist before they can be rearranged");
         }
@@ -1209,7 +1185,11 @@ impl SessionRegistry {
             bail!("panes can only be rearranged inside the same workstation layout");
         }
         state.snapshot.revision += 1;
-        persist_state(&state)?;
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+        };
         Ok(())
     }
 
@@ -1222,10 +1202,7 @@ impl SessionRegistry {
         if source_pane == target_pane {
             return self.split_lone_pane_with_replacement(source_pane, placement);
         }
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let did_move = state.snapshot.workspaces.iter_mut().any(|workspace| {
             workspace.tabs.iter_mut().any(|tab| {
                 move_existing_pane_to_split(&mut tab.layout, source_pane, target_pane, placement)
@@ -1235,7 +1212,11 @@ impl SessionRegistry {
             bail!("source and target terminals must exist in the same workstation layout");
         }
         state.snapshot.revision += 1;
-        persist_state(&state)?;
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+        };
         Ok(())
     }
 
@@ -1250,10 +1231,7 @@ impl SessionRegistry {
         let replacement_session =
             PtySession::spawn_local(replacement_id, workspace_id, &cwd, &self.history)?;
         let result = (|| {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
@@ -1283,7 +1261,11 @@ impl SessionRegistry {
                 },
             );
             state.snapshot.revision += 1;
-            persist_state(&state)?;
+            {
+                let bytes = encode_desired_state(&state)?;
+                drop(state);
+                self.write_snapshot(&bytes)?;
+            };
             Ok(())
         })();
         if result.is_err() {
@@ -1296,10 +1278,7 @@ impl SessionRegistry {
         if source_pane == target_pane {
             return self.activate_tab(source_pane);
         }
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         if !state.panes.contains_key(&source_pane) || !state.panes.contains_key(&target_pane) {
             bail!("both terminals must exist before they can be merged");
         }
@@ -1313,7 +1292,11 @@ impl SessionRegistry {
             bail!("source and target terminals must exist in the same workstation layout");
         }
         state.snapshot.revision += 1;
-        persist_state(&state)?;
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+        };
         Ok(())
     }
 
@@ -1322,24 +1305,22 @@ impl SessionRegistry {
         if title.is_empty() || title.chars().count() > 80 || title.chars().any(char::is_control) {
             bail!("terminal name must be 1 to 80 visible characters");
         }
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         pane.custom_title = Some(title.to_owned());
         resolve_pane_identity(pane, None, None);
         state.snapshot.revision += 1;
-        persist_state(&state)?;
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+        };
         Ok(())
     }
 
     pub fn set_pane_profile(&self, pane_id: Uuid, profile: Option<TerminalProfile>) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let (title_signal, command_profile) = state
             .panes
             .get(&pane_id)
@@ -1359,14 +1340,15 @@ impl SessionRegistry {
         pane.profile_override = profile;
         resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn reset_pane_identity(&self, pane_id: Uuid) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let (title_signal, command_profile) = state
             .panes
             .get(&pane_id)
@@ -1383,15 +1365,16 @@ impl SessionRegistry {
         pane.profile_override = None;
         resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn close_pane(&self, pane_id: Uuid) -> Result<()> {
         let session = {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let mut state = self.state.write();
             let pane_exists = state.snapshot.workspaces.iter().any(|workspace| {
                 workspace
                     .tabs
@@ -1415,15 +1398,16 @@ impl SessionRegistry {
                 &shell_label,
             );
             state.snapshot.revision += 1;
-            persist_state(&state)?;
+            {
+                let bytes = encode_desired_state(&state)?;
+                drop(state);
+                self.write_snapshot(&bytes)?;
+            };
             session
         };
         session.terminate_and_wait()?;
 
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let mut did_close = false;
         for workspace in &mut state.snapshot.workspaces {
             let Some(tab_index) = workspace
@@ -1440,49 +1424,115 @@ impl SessionRegistry {
                 workspace.tabs.remove(tab_index);
             }
             workspace.active_terminal_count = workspace.active_terminal_count.saturating_sub(1);
-            if workspace.tabs.is_empty()
-                && let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection
-            {
-                *status = WorkspaceConnectionStatus::Offline;
-            }
+            // Closing terminals is not a disconnect: an SSH workstation with
+            // zero tabs stays connected so the next terminal just opens.
             did_close = true;
             break;
         }
         if !did_close {
             bail!("pane {pane_id} disappeared while waiting for process exit");
         }
-        state.panes.remove(&pane_id);
+        let removed = state.panes.remove(&pane_id);
         state.snapshot.revision += 1;
-        persist_state(&state)
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        drop(removed);
+        self.write_snapshot(&bytes)
+    }
+
+    /// Respawns one pane whose process exited, in place, keeping its tab,
+    /// layout position, and pane ID.
+    ///
+    /// This is the recovery path for a transport that died under a live tab —
+    /// an SSH drop leaves `tmux attach` dead with a frozen screen that ignores
+    /// input. A tmux pane is re-attached with the same plain `attach-session`,
+    /// so nothing is ever created or changed on the user's tmux server. A tmux
+    /// session that no longer exists fails here instead of registering a fake
+    /// live tab.
+    pub fn reattach_pane(&self, pane_id: Uuid) -> Result<()> {
+        let (kind, cwd, workspace_id) = {
+            let state = self.state.read();
+            let runtime = state
+                .panes
+                .get(&pane_id)
+                .with_context(|| format!("pane {pane_id} does not exist"))?;
+            if runtime.exit_status.is_none() {
+                bail!("this terminal is still live");
+            }
+            let workspace_id = workspace_id_for_pane(&state.snapshot, pane_id)
+                .with_context(|| format!("pane {pane_id} has no workstation"))?;
+            (
+                runtime.kind.clone(),
+                runtime.last_valid_cwd.clone(),
+                workspace_id,
+            )
+        };
+        let session = match &kind {
+            RuntimePaneKind::Local => {
+                PtySession::spawn_local(pane_id, workspace_id, &cwd, &self.history)?
+            }
+            RuntimePaneKind::SystemSsh { host } => {
+                PtySession::spawn_ssh(pane_id, workspace_id, host, &self.history)?
+            }
+            RuntimePaneKind::TmuxLocal { session_id } => {
+                PtySession::spawn_tmux_local(pane_id, workspace_id, session_id, &self.history)?
+            }
+            RuntimePaneKind::TmuxSystemSsh { host, session_id } => {
+                PtySession::spawn_tmux_ssh(pane_id, workspace_id, host, session_id, &self.history)?
+            }
+        };
+        if kind.is_runtime_only()
+            && let Err(error) = session.confirm_live_for_tmux_attach()
+        {
+            let _ = session.terminate_and_wait();
+            return Err(error);
+        }
+        let mut state = self.state.write();
+        let Some(runtime) = state.panes.get_mut(&pane_id) else {
+            let _ = session.terminate_and_wait();
+            bail!("pane {pane_id} disappeared while reattaching");
+        };
+        let previous = std::mem::replace(&mut runtime.session, session);
+        runtime.exit_status = None;
+        runtime.recovered = false;
+        let shell_label = kind.shell_label();
+        let _ = previous.terminate_and_wait();
+        drop(previous);
+        set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, &shell_label);
+        refresh_workspace_activity(&mut state);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn set_default_terminal_accent(&self, color: AppearanceColor) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         state.snapshot.appearance.default_terminal_accent = color;
         remember_recent_color(&mut state.snapshot, color);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
-
     pub fn set_default_workspace_color(&self, color: AppearanceColor) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         state.snapshot.appearance.default_workspace_color = color;
         remember_recent_color(&mut state.snapshot, color);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn set_pane_color(&self, pane_id: Uuid, color: Option<AppearanceColor>) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         pane.color = color;
@@ -1490,7 +1540,11 @@ impl SessionRegistry {
             remember_recent_color(&mut state.snapshot, color);
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn set_workspace_color(
@@ -1498,10 +1552,7 @@ impl SessionRegistry {
         workspace_id: Uuid,
         color: Option<AppearanceColor>,
     ) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let workspace = state
             .snapshot
             .workspaces
@@ -1513,16 +1564,17 @@ impl SessionRegistry {
             remember_recent_color(&mut state.snapshot, color);
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn create_workspace(&self, title: Option<&str>) -> Result<(Uuid, Uuid)> {
         let title = normalize_workspace_title(title)?;
         {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let state = self.state.read();
             if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
                 bail!("workstation limit of {MAX_WORKSPACES} reached");
             }
@@ -1535,50 +1587,53 @@ impl SessionRegistry {
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
         let session = PtySession::spawn_local(pane_id, workspace_id, &cwd, &self.history)?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
-        if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+        let result = (|| {
+            let mut state = self.state.write();
+            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+                bail!("workstation limit of {MAX_WORKSPACES} reached");
+            }
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            let number = state.snapshot.workspaces.len() + 1;
+            let order = next_workspace_order(&state.snapshot.workspaces, false);
+            let pane = state.new_pane(pane_id);
+            state.snapshot.workspaces.push(Workspace {
+                id: workspace_id,
+                title: title.unwrap_or_else(|| format!("Workstation {number}")),
+                color: None,
+                pinned: false,
+                pin_order: 0,
+                order,
+                active_terminal_count: 1,
+                connection: WorkspaceConnection::Local,
+                tabs: vec![Tab {
+                    id: tab_id,
+                    title: "Terminals".to_owned(),
+                    layout: PaneLayout::Leaf { pane },
+                }],
+            });
+            state.panes.insert(
+                pane_id,
+                RuntimePane {
+                    session: Arc::clone(&session),
+                    last_valid_cwd: cwd,
+                    kind: RuntimePaneKind::Local,
+                    recovered: false,
+                    exit_status: None,
+                    detected_command_profile: None,
+                },
+            );
+            state.snapshot.revision += 1;
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+            Ok((workspace_id, pane_id))
+        })();
+        if result.is_err() {
             let _ = session.terminate_and_wait();
-            bail!("workstation limit of {MAX_WORKSPACES} reached");
         }
-        if state.panes.len() >= MAX_PANES {
-            let _ = session.terminate_and_wait();
-            bail!("pane limit of {MAX_PANES} reached");
-        }
-        let number = state.snapshot.workspaces.len() + 1;
-        let order = next_workspace_order(&state.snapshot.workspaces, false);
-        let pane = state.new_pane(pane_id);
-        state.snapshot.workspaces.push(Workspace {
-            id: workspace_id,
-            title: title.unwrap_or_else(|| format!("Workstation {number}")),
-            color: None,
-            pinned: false,
-            pin_order: 0,
-            order,
-            active_terminal_count: 1,
-            connection: WorkspaceConnection::Local,
-            tabs: vec![Tab {
-                id: tab_id,
-                title: "Terminals".to_owned(),
-                layout: PaneLayout::Leaf { pane },
-            }],
-        });
-        state.panes.insert(
-            pane_id,
-            RuntimePane {
-                session,
-                last_valid_cwd: cwd,
-                kind: RuntimePaneKind::Local,
-                recovered: false,
-                exit_status: None,
-                detected_command_profile: None,
-            },
-        );
-        state.snapshot.revision += 1;
-        persist_state(&state)?;
-        Ok((workspace_id, pane_id))
+        result
     }
 
     pub fn create_ssh_workspace(
@@ -1609,10 +1664,7 @@ impl SessionRegistry {
         destination: &str,
         ids: SshWorkspaceIds,
     ) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
             bail!("workstation limit of {MAX_WORKSPACES} reached");
         }
@@ -1649,7 +1701,11 @@ impl SessionRegistry {
             }],
         });
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     fn attach_ssh_workspace(
@@ -1659,10 +1715,7 @@ impl SessionRegistry {
         cwd: PathBuf,
         session: Arc<PtySession>,
     ) -> Result<(Uuid, Uuid)> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
@@ -1691,7 +1744,11 @@ impl SessionRegistry {
             },
         );
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)?;
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
+        };
         Ok((ids.workspace, ids.pane))
     }
 
@@ -1721,10 +1778,7 @@ impl SessionRegistry {
     pub fn rename_workspace(&self, workspace_id: Uuid, title: &str) -> Result<()> {
         let title =
             normalize_workspace_title(Some(title))?.context("workstation name cannot be empty")?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let workspace = state
             .snapshot
             .workspaces
@@ -1733,14 +1787,15 @@ impl SessionRegistry {
             .with_context(|| format!("workstation {workspace_id} does not exist"))?;
         workspace.title = title;
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn set_workspace_pinned(&self, workspace_id: Uuid, pinned: bool) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let next_order = state
             .snapshot
             .workspaces
@@ -1764,7 +1819,11 @@ impl SessionRegistry {
         }
         normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn move_pinned_workspace(
@@ -1772,10 +1831,7 @@ impl SessionRegistry {
         workspace_id: Uuid,
         direction: WorkspacePinMove,
     ) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         normalize_workspace_orders(&mut state.snapshot.workspaces);
         let mut pinned = state
             .snapshot
@@ -1807,7 +1863,11 @@ impl SessionRegistry {
         }
         normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn reorder_workspace(
@@ -1816,10 +1876,7 @@ impl SessionRegistry {
         target_workspace_id: Uuid,
         after: bool,
     ) -> Result<()> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let source_pinned = state
             .snapshot
             .workspaces
@@ -1867,15 +1924,16 @@ impl SessionRegistry {
         }
         normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     pub fn disconnect_workspace(&self, workspace_id: Uuid) -> Result<()> {
         let sessions = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let state = self.state.read();
             let workspace = state
                 .snapshot
                 .workspaces
@@ -1896,13 +1954,10 @@ impl SessionRegistry {
                 .collect::<Vec<_>>()
         };
         for (_, session) in &sessions {
-            session.terminate_and_wait()?;
+            let _ = session.terminate_and_wait();
         }
 
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let workspace = state
             .snapshot
             .workspaces
@@ -1931,16 +1986,17 @@ impl SessionRegistry {
             );
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        {
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)
+        }
     }
 
     #[allow(clippy::too_many_lines)]
     pub fn reconnect_workspace(&self, workspace_id: Uuid) -> Result<Uuid> {
         let (destination, mut pane_ids) = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let state = self.state.read();
             let workspace = state
                 .snapshot
                 .workspaces
@@ -1986,10 +2042,7 @@ impl SessionRegistry {
             }
         }
         let result = (|| {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let mut state = self.state.write();
             let workspace = state
                 .snapshot
                 .workspaces
@@ -2050,7 +2103,11 @@ impl SessionRegistry {
                 );
             }
             state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-            persist_state(&state)?;
+            {
+                let bytes = encode_desired_state(&state)?;
+                drop(state);
+                self.write_snapshot(&bytes)?;
+            };
             Ok(pane_ids[0])
         })();
         if result.is_err() {
@@ -2063,10 +2120,7 @@ impl SessionRegistry {
 
     pub fn delete_workspace(&self, workspace_id: Uuid) -> Result<()> {
         let sessions = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let state = self.state.read();
             if state.snapshot.workspaces.len() <= 1 {
                 bail!("the last workstation cannot be deleted");
             }
@@ -2087,12 +2141,9 @@ impl SessionRegistry {
                 .collect::<Vec<_>>()
         };
         for (_, session) in &sessions {
-            session.terminate_and_wait()?;
+            let _ = session.terminate_and_wait();
         }
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let mut state = self.state.write();
         let before = state.snapshot.workspaces.len();
         state
             .snapshot
@@ -2101,12 +2152,16 @@ impl SessionRegistry {
         if state.snapshot.workspaces.len() == before {
             bail!("workstation {workspace_id} disappeared while deleting");
         }
-        for (pane_id, _) in sessions {
-            state.panes.remove(&pane_id);
-        }
+        let removed = sessions
+            .into_iter()
+            .filter_map(|(pane_id, _)| state.panes.remove(&pane_id))
+            .collect::<Vec<_>>();
         normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        persist_state(&state)
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        drop(removed);
+        self.write_snapshot(&bytes)
     }
 
     pub fn write_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<()> {
@@ -2119,23 +2174,27 @@ impl SessionRegistry {
         point: TerminalPoint,
         kind: TerminalSelectionKind,
     ) -> Result<()> {
-        self.pane(pane_id)?.begin_selection(point, kind)
+        self.pane(pane_id)?.begin_selection(point, kind);
+        Ok(())
     }
 
     pub fn update_selection(&self, pane_id: Uuid, point: TerminalPoint) -> Result<()> {
-        self.pane(pane_id)?.update_selection(point)
+        self.pane(pane_id)?.update_selection(point);
+        Ok(())
     }
 
     pub fn clear_selection(&self, pane_id: Uuid) -> Result<()> {
-        self.pane(pane_id)?.clear_selection()
+        self.pane(pane_id)?.clear_selection();
+        Ok(())
     }
 
     pub fn selected_text(&self, pane_id: Uuid) -> Result<Option<String>> {
-        self.pane(pane_id)?.selected_text()
+        Ok(self.pane(pane_id)?.selected_text())
     }
 
     pub fn scroll_pane(&self, pane_id: Uuid, lines: i32) -> Result<()> {
-        self.pane(pane_id)?.scroll(lines)
+        self.pane(pane_id)?.scroll(lines);
+        Ok(())
     }
 
     pub fn search_pane(&self, pane_id: Uuid, query: &str, forward: bool) -> Result<bool> {
@@ -2165,10 +2224,7 @@ impl SessionRegistry {
     /// Performs an explicit bounded metadata-only scan of the default tmux
     /// server for one workstation. It never starts tmux, reconnects a saved
     /// SSH workstation, or writes scan output to terminal history.
-    pub fn scan_tmux_sessions(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<(TmuxScanScope, Vec<TmuxSession>, bool)> {
+    pub fn scan_tmux_sessions(&self, workspace_id: Uuid) -> Result<TmuxScanResult> {
         let connection = self.workspace_connection(workspace_id)?;
         let (scope, probe) = match connection {
             WorkspaceConnection::Local => (TmuxScanScope::Local, tmux_local_probe_command()),
@@ -2186,29 +2242,30 @@ impl SessionRegistry {
                 ..
             } => bail!("reconnect this SSH workstation before scanning tmux sessions"),
         };
+        let open_session_ids = self.open_tmux_session_ids(workspace_id)?;
         let output = run_tmux_probe(probe)?;
         if !output.success {
-            if output.stderr.contains("no server running") {
-                return Ok((scope, Vec::new(), true));
+            if tmux_reports_no_server(&output.stderr) {
+                return Ok(TmuxScanResult {
+                    scope,
+                    sessions: Vec::new(),
+                    open_session_ids: Vec::new(),
+                    no_server: true,
+                });
             }
             bail!("tmux scan failed: {}", probe_error_summary(&output.stderr));
         }
-        Ok((scope, parse_tmux_sessions(&output.stdout)?, false))
-    }
-
-    /// Opens exactly one tab attached to an existing tmux session. The tab is
-    /// deliberately runtime-only: desired-state persistence omits it so a
-    /// daemon restart never auto-attaches or stores an opaque tmux target.
-    pub fn attach_tmux_session(&self, workspace_id: Uuid, session_id: &str) -> Result<Uuid> {
-        let result = self.attach_tmux_sessions(workspace_id, &[session_id.to_owned()])?;
-        result.pane_ids.into_iter().next().with_context(|| {
-            let detail = result
-                .skipped
-                .first()
-                .map_or("tmux session was not opened", |issue| {
-                    issue.message.as_str()
-                });
-            format!("tmux session {session_id} was not opened: {detail}")
+        let sessions = parse_tmux_scan(&output.stdout)?;
+        let open_session_ids = sessions
+            .iter()
+            .filter(|session| open_session_ids.contains(&session.id))
+            .map(|session| session.id.clone())
+            .collect();
+        Ok(TmuxScanResult {
+            scope,
+            sessions,
+            open_session_ids,
+            no_server: false,
         })
     }
 
@@ -2218,9 +2275,18 @@ impl SessionRegistry {
     pub fn attach_tmux_sessions(
         &self,
         workspace_id: Uuid,
-        session_ids: &[String],
+        session_ids: &[TmuxSessionId],
     ) -> Result<TmuxAttachmentResult> {
-        let connection = self.workspace_connection(workspace_id)?;
+        let connection = {
+            let state = self.state.read();
+            state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .map(|workspace| workspace.connection.clone())
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?
+        };
         if matches!(
             connection,
             WorkspaceConnection::SystemSsh {
@@ -2230,17 +2296,37 @@ impl SessionRegistry {
         ) {
             bail!("reconnect this SSH workstation before opening tmux");
         }
+        let probe = match &connection {
+            WorkspaceConnection::Local => tmux_local_probe_command(),
+            WorkspaceConnection::SystemSsh {
+                destination,
+                status: WorkspaceConnectionStatus::Connected,
+            } => tmux_ssh_probe_command(destination)?,
+            WorkspaceConnection::SystemSsh {
+                status: WorkspaceConnectionStatus::Offline,
+                ..
+            } => unreachable!("offline connection rejected above"),
+        };
+        let output = run_tmux_probe(probe)?;
+        if !output.success {
+            bail!("tmux scan failed: {}", probe_error_summary(&output.stderr));
+        }
+        let sessions = parse_tmux_scan(&output.stdout)?;
+        let known_sessions = sessions
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect::<HashMap<_, _>>();
         let already_open = self.open_tmux_session_ids(workspace_id)?;
-        let plan = plan_tmux_session_attachments(session_ids, &already_open)?;
+        let plan = plan_tmux_session_attachments(session_ids, &already_open, &known_sessions)?;
         let mut result = TmuxAttachmentResult {
             pane_ids: Vec::new(),
             skipped: plan.skipped,
         };
-        for session_id in plan.launch {
-            match self.attach_tmux_session_one(workspace_id, &session_id, &connection) {
+        for session in plan.launch {
+            match self.attach_tmux_session_one(workspace_id, &session, &connection) {
                 Ok(pane_id) => result.pane_ids.push(pane_id),
                 Err(error) => result.skipped.push(TmuxSessionAttachIssue {
-                    session_id,
+                    session_id: session.id,
                     message: error.to_string(),
                 }),
             }
@@ -2248,11 +2334,11 @@ impl SessionRegistry {
         Ok(result)
     }
 
-    fn open_tmux_session_ids(&self, workspace_id: Uuid) -> Result<HashSet<String>> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+    /// Sessions this workstation currently shows in a *live* tab. A tab whose
+    /// attach died must not keep its session hostage: the picker has to offer
+    /// it again so the user can reopen it.
+    fn open_tmux_session_ids(&self, workspace_id: Uuid) -> Result<HashSet<TmuxSessionId>> {
+        let state = self.state.read();
         let workspace = state
             .snapshot
             .workspaces
@@ -2262,23 +2348,28 @@ impl SessionRegistry {
         Ok(pane_ids_for_workspace(workspace)
             .into_iter()
             .filter_map(|pane_id| state.panes.get(&pane_id))
-            .filter_map(|runtime| runtime.kind.tmux_session_id().map(str::to_owned))
+            .filter(|runtime| runtime.exit_status.is_none())
+            .filter_map(|runtime| runtime.kind.tmux_session_id().cloned())
             .collect())
     }
 
     fn attach_tmux_session_one(
         &self,
         workspace_id: Uuid,
-        session_id: &str,
+        tmux_session: &TmuxSession,
         connection: &WorkspaceConnection,
     ) -> Result<Uuid> {
-        validate_tmux_session_id(session_id)?;
         let pane_id = Uuid::new_v4();
         let (session, kind) = match connection {
             WorkspaceConnection::Local => (
-                PtySession::spawn_tmux_local(pane_id, workspace_id, session_id, &self.history)?,
+                PtySession::spawn_tmux_local(
+                    pane_id,
+                    workspace_id,
+                    &tmux_session.id,
+                    &self.history,
+                )?,
                 RuntimePaneKind::TmuxLocal {
-                    session_id: session_id.to_owned(),
+                    session_id: tmux_session.id.clone(),
                 },
             ),
             WorkspaceConnection::SystemSsh {
@@ -2289,12 +2380,12 @@ impl SessionRegistry {
                     pane_id,
                     workspace_id,
                     destination,
-                    session_id,
+                    &tmux_session.id,
                     &self.history,
                 )?,
                 RuntimePaneKind::TmuxSystemSsh {
                     host: destination.clone(),
-                    session_id: session_id.to_owned(),
+                    session_id: tmux_session.id.clone(),
                 },
             ),
             WorkspaceConnection::SystemSsh {
@@ -2302,14 +2393,14 @@ impl SessionRegistry {
                 ..
             } => bail!("reconnect this SSH workstation before opening tmux"),
         };
-        self.register_live_tmux_tab(workspace_id, pane_id, session_id, &session, kind)
+        self.register_live_tmux_tab(workspace_id, pane_id, tmux_session, &session, kind)
     }
 
     fn register_live_tmux_tab(
         &self,
         workspace_id: Uuid,
         pane_id: Uuid,
-        session_id: &str,
+        tmux_session: &TmuxSession,
         session: &Arc<PtySession>,
         kind: RuntimePaneKind,
     ) -> Result<Uuid> {
@@ -2318,10 +2409,7 @@ impl SessionRegistry {
             return Err(error);
         }
         let result = (|| {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| anyhow!("session state lock was poisoned"))?;
+            let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
@@ -2334,8 +2422,9 @@ impl SessionRegistry {
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|pane_id| state.panes.get(&pane_id))
+                .filter(|runtime| runtime.exit_status.is_none())
                 .filter_map(|runtime| runtime.kind.tmux_session_id())
-                .any(|existing| existing == session_id);
+                .any(|existing| existing == &tmux_session.id);
             if already_open {
                 bail!("already open in this workstation");
             }
@@ -2358,11 +2447,11 @@ impl SessionRegistry {
             }
             workspace.tabs.push(Tab {
                 id: Uuid::new_v4(),
-                title: "tmux".to_owned(),
+                title: tmux_session.name.clone(),
                 layout: PaneLayout::Leaf {
                     pane: Pane {
                         id: pane_id,
-                        title: format!("tmux {session_id}"),
+                        title: format!("tmux {}", tmux_session.name),
                         shell: "tmux".to_owned(),
                         color: None,
                         identity: TerminalIdentity::default(),
@@ -2384,7 +2473,11 @@ impl SessionRegistry {
                 },
             );
             state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-            persist_state(&state)?;
+            {
+                let bytes = encode_desired_state(&state)?;
+                drop(state);
+                self.write_snapshot(&bytes)?;
+            };
             Ok(pane_id)
         })();
         if result.is_err() {
@@ -2396,19 +2489,14 @@ impl SessionRegistry {
     fn pane(&self, pane_id: Uuid) -> Result<Arc<PtySession>> {
         self.state
             .read()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?
             .panes
             .get(&pane_id)
             .map(|runtime| Arc::clone(&runtime.session))
             .with_context(|| format!("pane {pane_id} does not exist"))
     }
-
     fn cwd_for_pane(&self, pane_id: Uuid) -> Result<PathBuf> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
-        refresh_runtime_metadata(&mut state)?;
+        let mut state = self.state.write();
+        refresh_runtime_metadata(&mut state, false)?;
         let runtime = state
             .panes
             .get(&pane_id)
@@ -2420,21 +2508,14 @@ impl SessionRegistry {
             | RuntimePaneKind::TmuxSystemSsh { .. } => fallback_cwd(),
         }
     }
-
     fn workspace_for_pane(&self, pane_id: Uuid) -> Result<Uuid> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let state = self.state.read();
         workspace_id_for_pane(&state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} has no workspace"))
     }
 
     fn workspace_connection(&self, workspace_id: Uuid) -> Result<WorkspaceConnection> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let state = self.state.read();
         state
             .snapshot
             .workspaces
@@ -2472,9 +2553,25 @@ impl Default for SessionRegistry {
     }
 }
 
+struct CountingWriter(u64);
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn serialized_len(value: &impl Serialize) -> Result<u64> {
-    let bytes = serde_json::to_vec(value).context("measure protocol payload")?;
-    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, value).context("measure protocol payload")?;
+    Ok(counter.0)
 }
 
 #[allow(
@@ -2498,10 +2595,7 @@ fn remember_recent_color(snapshot: &mut SessionSnapshot, color: AppearanceColor)
         .truncate(MAX_RECENT_COLORS);
 }
 
-fn persist_state(state: &RegistryState) -> Result<()> {
-    let Some(store) = &state.store else {
-        return Ok(());
-    };
+fn encode_desired_state(state: &RegistryState) -> Result<Vec<u8>> {
     let mut snapshot = state.snapshot.clone();
     let runtime_only_panes = state
         .panes
@@ -2523,10 +2617,10 @@ fn persist_state(state: &RegistryState) -> Result<()> {
         .filter(|(_, runtime)| runtime.kind.is_local())
         .map(|(pane_id, runtime)| (*pane_id, runtime.last_valid_cwd.clone()))
         .collect();
-    store.save(&snapshot, &cwd_by_pane)
+    SnapshotStore::encode(&snapshot, &cwd_by_pane)
 }
 
-fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
+fn refresh_runtime_metadata(state: &mut RegistryState, force_process_refresh: bool) -> Result<()> {
     let pids = state
         .panes
         .iter()
@@ -2537,24 +2631,24 @@ fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
                 .map(|process_id| (*pane_id, Pid::from_u32(process_id)))
         })
         .collect::<Vec<_>>();
-    let mut system = System::new();
-    if !pids.is_empty() {
-        let process_ids = pids.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&process_ids),
-            ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
-        );
-    }
-
-    let refresh_identity = state.last_identity_refresh.is_none_or(|last| {
-        Instant::now().saturating_duration_since(last) >= IDENTITY_REFRESH_INTERVAL
-    });
+    let refresh_identity = force_process_refresh
+        || state.last_identity_refresh.is_none_or(|last| {
+            Instant::now().saturating_duration_since(last) >= IDENTITY_REFRESH_INTERVAL
+        });
     if refresh_identity {
+        if !pids.is_empty() {
+            let process_ids = pids.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
+            state.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&process_ids),
+                ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
+            );
+        }
         refresh_command_profiles(state);
         state.last_identity_refresh = Some(Instant::now());
     }
 
     let mut labels = Vec::new();
+    let system = &state.system;
     for (pane_id, runtime) in &mut state.panes {
         if runtime.kind.is_local()
             && runtime.exit_status.is_none()
@@ -2615,6 +2709,12 @@ fn refresh_runtime_metadata(state: &mut RegistryState) -> Result<()> {
     Ok(())
 }
 
+/// Recomputes per-workstation terminal counts and SSH reachability.
+///
+/// An SSH workstation goes offline only when every remote pane it still owns
+/// has died — a real transport failure. Deliberately closing terminals is not
+/// a disconnect, so a workstation with zero tabs stays connected and its next
+/// terminal simply opens.
 fn refresh_workspace_activity(state: &mut RegistryState) -> bool {
     let workspace_activity = state
         .snapshot
@@ -2622,23 +2722,31 @@ fn refresh_workspace_activity(state: &mut RegistryState) -> bool {
         .iter()
         .map(|workspace| {
             let mut active = 0_u32;
-            let mut ssh_active = false;
+            let mut remote_panes = 0_u32;
+            let mut remote_live = 0_u32;
             for pane_id in pane_ids_for_workspace(workspace) {
-                if let Some(runtime) = state.panes.get(&pane_id)
-                    && runtime.exit_status.is_none()
-                {
+                let Some(runtime) = state.panes.get(&pane_id) else {
+                    continue;
+                };
+                let live = runtime.exit_status.is_none();
+                if live {
                     active = active.saturating_add(1);
-                    ssh_active |= matches!(runtime.kind, RuntimePaneKind::SystemSsh { .. });
+                }
+                if runtime.kind.is_remote() {
+                    remote_panes = remote_panes.saturating_add(1);
+                    if live {
+                        remote_live = remote_live.saturating_add(1);
+                    }
                 }
             }
-            (workspace.id, active, ssh_active)
+            (workspace.id, active, remote_panes, remote_live)
         })
         .collect::<Vec<_>>();
     let mut workspace_changed = false;
     for workspace in &mut state.snapshot.workspaces {
-        let Some((_, active, ssh_active)) = workspace_activity
+        let Some((_, active, remote_panes, remote_live)) = workspace_activity
             .iter()
-            .find(|(workspace_id, _, _)| *workspace_id == workspace.id)
+            .find(|(workspace_id, _, _, _)| *workspace_id == workspace.id)
         else {
             continue;
         };
@@ -2647,12 +2755,16 @@ fn refresh_workspace_activity(state: &mut RegistryState) -> bool {
             workspace_changed = true;
         }
         if let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection {
-            let next = if *ssh_active {
-                WorkspaceConnectionStatus::Connected
+            let next = if *remote_live > 0 {
+                Some(WorkspaceConnectionStatus::Connected)
+            } else if *remote_panes > 0 {
+                Some(WorkspaceConnectionStatus::Offline)
             } else {
-                WorkspaceConnectionStatus::Offline
+                None
             };
-            if *status != next {
+            if let Some(next) = next
+                && *status != next
+            {
                 *status = next;
                 workspace_changed = true;
             }
@@ -2910,7 +3022,6 @@ fn local_shell_command(pane_id: Uuid, cwd: &Path) -> CommandBuilder {
 }
 
 fn system_ssh_command(pane_id: Uuid, host: &str) -> Result<CommandBuilder> {
-    validate_ssh_host(host).map_err(|message| anyhow!(message))?;
     system_ssh_command_with(system_ssh_binary()?, pane_id, host)
 }
 
@@ -2930,20 +3041,10 @@ fn system_ssh_command_with(
     ))
 }
 
-fn validate_tmux_session_id(session_id: &str) -> Result<()> {
-    if session_id.len() < 2
-        || session_id.len() > 32
-        || !session_id.starts_with('$')
-        || !session_id[1..].bytes().all(|byte| byte.is_ascii_digit())
-    {
-        bail!("tmux session target must be an opaque numeric session ID");
-    }
-    Ok(())
-}
-
 fn plan_tmux_session_attachments(
-    session_ids: &[String],
-    already_open: &HashSet<String>,
+    session_ids: &[TmuxSessionId],
+    already_open: &HashSet<TmuxSessionId>,
+    known_sessions: &HashMap<TmuxSessionId, TmuxSession>,
 ) -> Result<TmuxAttachmentPlan> {
     if session_ids.is_empty() {
         bail!("select at least one tmux session to open");
@@ -2957,50 +3058,53 @@ fn plan_tmux_session_attachments(
         skipped: Vec::new(),
     };
     for session_id in session_ids {
-        validate_tmux_session_id(session_id)?;
-        if !seen.insert(session_id.clone()) {
-            plan.skipped.push(TmuxSessionAttachIssue {
-                session_id: session_id.clone(),
-                message: "selected more than once".to_owned(),
-            });
+        let message = if !seen.insert(session_id.clone()) {
+            Some("selected more than once")
         } else if already_open.contains(session_id) {
+            Some("already open in this workstation")
+        } else if !known_sessions.contains_key(session_id) {
+            Some("session no longer exists")
+        } else {
+            None
+        };
+        if let Some(message) = message {
             plan.skipped.push(TmuxSessionAttachIssue {
                 session_id: session_id.clone(),
-                message: "already open in this workstation".to_owned(),
+                message: message.to_owned(),
             });
-        } else {
-            plan.launch.push(session_id.clone());
+        } else if let Some(session) = known_sessions.get(session_id) {
+            plan.launch.push(session.clone());
         }
     }
     Ok(plan)
 }
 
-fn tmux_local_attach_command(pane_id: Uuid, session_id: &str) -> Result<CommandBuilder> {
-    validate_tmux_session_id(session_id)?;
-    Ok(command_with_terminal_env(
+/// Attaches exactly the way the user would by hand. This deliberately creates
+/// no helper session and sets no option: every `set-option` reachable from a
+/// directly attached session would persist on the user's own tmux server.
+fn tmux_local_attach_command(pane_id: Uuid, session_id: &TmuxSessionId) -> CommandBuilder {
+    command_with_terminal_env(
         [
             OsString::from("tmux"),
             OsString::from("attach-session"),
             OsString::from("-t"),
-            OsString::from(session_id),
+            OsString::from(session_id.as_str()),
         ],
         pane_id,
-    ))
+    )
 }
 
-fn tmux_remote_attach_command(session_id: &str) -> Result<OsString> {
-    validate_tmux_session_id(session_id)?;
-    // The opaque ID is constrained above to `$` plus ASCII digits, then kept
-    // inside fixed single quotes for the remote POSIX shell. No label or other
-    // server-provided text ever becomes a remote command argument.
-    Ok(OsString::from(format!(
-        "exec tmux attach-session -t '{session_id}'"
-    )))
+/// Single-quoting is safe because `TmuxSessionId` is `$` + ASCII digits.
+fn tmux_remote_attach_command(session_id: &TmuxSessionId) -> OsString {
+    OsString::from(format!("exec tmux attach-session -t '{session_id}'"))
 }
 
-fn tmux_ssh_attach_command(pane_id: Uuid, host: &str, session_id: &str) -> Result<CommandBuilder> {
+fn tmux_ssh_attach_command(
+    pane_id: Uuid,
+    host: &str,
+    session_id: &TmuxSessionId,
+) -> Result<CommandBuilder> {
     validate_ssh_host(host).map_err(|message| anyhow!(message))?;
-    let remote_command = tmux_remote_attach_command(session_id)?;
     // OpenSSH does not allocate a remote PTY for a supplied command by
     // default. tmux attach requires one, while the metadata-only scan does
     // not, so force it only for this fixed attach path.
@@ -3010,7 +3114,7 @@ fn tmux_ssh_attach_command(pane_id: Uuid, host: &str, session_id: &str) -> Resul
             OsString::from("-tt"),
             OsString::from("--"),
             OsString::from(host),
-            remote_command,
+            tmux_remote_attach_command(session_id),
         ],
         pane_id,
     ))
@@ -3063,7 +3167,7 @@ struct TmuxProbeOutput {
 fn tmux_local_probe_command() -> Command {
     let mut command = Command::new("tmux");
     command
-        .args(["list-sessions", "-F", TMUX_LIST_FORMAT])
+        .args(["list-sessions", "-F", TMUX_SESSION_LIST_FORMAT])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3156,49 +3260,62 @@ fn join_probe_reader(reader: thread::JoinHandle<Result<Vec<u8>>>, stream: &str) 
     Ok(output)
 }
 
-fn parse_tmux_sessions(output: &str) -> Result<Vec<TmuxSession>> {
+fn parse_tmux_scan(output: &str) -> Result<Vec<TmuxSession>> {
     let mut sessions = Vec::new();
     for line in output.lines() {
         if line.is_empty() {
             continue;
         }
-        if sessions.len() >= TMUX_PROBE_MAX_SESSIONS {
-            bail!("tmux scan returned more than {TMUX_PROBE_MAX_SESSIONS} sessions");
-        }
         let mut fields = line.split('\t');
-        let (Some(id), Some(name), Some(windows), Some(attached), None) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) else {
-            bail!("tmux scan returned malformed metadata");
-        };
-        validate_tmux_session_id(id)?;
-        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
-            bail!("tmux scan returned an unsafe session label");
+        match fields.next() {
+            Some("S") => {
+                if sessions.len() >= TMUX_PROBE_MAX_SESSIONS {
+                    bail!("tmux scan returned more than {TMUX_PROBE_MAX_SESSIONS} sessions");
+                }
+                let (Some(id), Some(name), Some(window_count), Some(attached), None) = (
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                ) else {
+                    bail!("tmux scan returned malformed metadata");
+                };
+                let id =
+                    TmuxSessionId::try_from(id.to_owned()).map_err(|message| anyhow!(message))?;
+                if name.is_empty()
+                    || name.chars().count() > 80
+                    || name.chars().any(char::is_control)
+                {
+                    bail!("tmux scan returned an unsafe session label");
+                }
+                let window_count = window_count
+                    .parse::<u32>()
+                    .context("tmux session window count was invalid")?;
+                let attached_clients = attached
+                    .parse::<u32>()
+                    .context("tmux session attached-client count was invalid")?;
+                if sessions
+                    .iter()
+                    .any(|session: &TmuxSession| session.id == id)
+                {
+                    bail!("tmux scan returned a duplicate session ID");
+                }
+                sessions.push(TmuxSession {
+                    id,
+                    name: name.to_owned(),
+                    windows: window_count,
+                    attached_clients,
+                });
+            }
+            _ => bail!("tmux scan returned malformed metadata"),
         }
-        let windows = windows
-            .parse::<u32>()
-            .context("tmux session window count was invalid")?;
-        let attached_clients = attached
-            .parse::<u32>()
-            .context("tmux session attached-client count was invalid")?;
-        if sessions
-            .iter()
-            .any(|session: &TmuxSession| session.id == id)
-        {
-            bail!("tmux scan returned a duplicate session ID");
-        }
-        sessions.push(TmuxSession {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            windows,
-            attached_clients,
-        });
     }
     Ok(sessions)
+}
+
+fn tmux_reports_no_server(stderr: &str) -> bool {
+    stderr.contains("no server running") || stderr.contains("error connecting to")
 }
 
 fn probe_error_summary(stderr: &str) -> String {
@@ -3608,62 +3725,40 @@ pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry
             Err(nah_protocol::WireError::Closed) => return Ok(()),
             Err(error) => return Err(error).context("read client request"),
         };
+        let one_way = request_is_one_way(&request);
 
-        let response =
-            handle_request(sessions, request).unwrap_or_else(|error| ServiceResponse::Error {
+        let sessions = sessions.clone();
+        let response = tokio::task::spawn_blocking(move || handle_request(&sessions, request))
+            .await
+            .context("join blocking request handler")?
+            .unwrap_or_else(|error| ServiceResponse::Error {
                 message: format!("{error:#}"),
             });
+        if one_way {
+            continue;
+        }
         write_message(&mut stream, &response)
             .await
             .context("write service response")?;
     }
 }
 
+/// Terminal input and selection updates are one-way: the desktop never waits
+/// for them, and a queued response nobody reads would eventually block this
+/// connection's writer.
+fn request_is_one_way(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::WriteInput { .. } | ClientRequest::UpdateSelection { .. }
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<ServiceResponse> {
-    if matches!(
-        &request,
-        ClientRequest::WriteInput { .. }
-            | ClientRequest::ResizePane { .. }
-            | ClientRequest::BeginSelection { .. }
-            | ClientRequest::UpdateSelection { .. }
-            | ClientRequest::ClearSelection { .. }
-            | ClientRequest::CopySelection { .. }
-            | ClientRequest::ScrollPane { .. }
-            | ClientRequest::SearchPane { .. }
-            | ClientRequest::MouseInput { .. }
-    ) {
-        return handle_terminal_interaction_request(sessions, request);
-    }
-    if is_appearance_request(&request) {
-        return handle_appearance_request(sessions, &request);
-    }
-    if is_history_request(&request) {
-        return handle_history_request(sessions, request);
-    }
-    if is_identity_request(&request) {
-        return handle_identity_request(sessions, request);
-    }
-    if let Some(response) = handle_tmux_scan_request(sessions, &request)? {
-        return Ok(response);
-    }
-    if let Some(response) = handle_tmux_attach_request(sessions, &request)? {
-        return Ok(response);
-    }
-    if matches!(
-        &request,
-        ClientRequest::CreatePane { .. }
-            | ClientRequest::CreateTab { .. }
-            | ClientRequest::CreateWorkspaceTerminal { .. }
-            | ClientRequest::ConnectSsh { .. }
-            | ClientRequest::AttachTmuxSession { .. }
-    ) {
-        return handle_pane_creation_request(sessions, request);
-    }
-    if is_layout_request(&request) {
-        return handle_layout_request(sessions, request);
-    }
     match request {
+        ClientRequest::Hello { .. } => Ok(ServiceResponse::Error {
+            message: "hello was already completed".to_owned(),
+        }),
         ClientRequest::GetSnapshot => Ok(ServiceResponse::Snapshot {
             snapshot: sessions.snapshot()?,
         }),
@@ -3678,345 +3773,161 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
             &subscribed_panes,
         ),
         ClientRequest::GetPaneSnapshot { pane_id } => handle_get_pane_snapshot(sessions, pane_id),
-        ClientRequest::WriteInput { .. }
-        | ClientRequest::ResizePane { .. }
-        | ClientRequest::BeginSelection { .. }
-        | ClientRequest::UpdateSelection { .. }
-        | ClientRequest::ClearSelection { .. }
-        | ClientRequest::CopySelection { .. }
-        | ClientRequest::ScrollPane { .. }
-        | ClientRequest::SearchPane { .. }
-        | ClientRequest::MouseInput { .. }
-        | ClientRequest::RenamePane { .. }
-        | ClientRequest::SetPaneProfile { .. }
-        | ClientRequest::ResetPaneIdentity { .. }
-        | ClientRequest::SetDefaultTerminalAccent { .. }
-        | ClientRequest::SetDefaultWorkspaceColor { .. }
-        | ClientRequest::SetPaneColor { .. }
-        | ClientRequest::SetWorkspaceColor { .. }
-        | ClientRequest::CreatePane { .. }
-        | ClientRequest::CreateTab { .. }
-        | ClientRequest::CreateWorkspaceTerminal { .. }
-        | ClientRequest::ConnectSsh { .. }
-        | ClientRequest::AttachTmuxSession { .. }
-        | ClientRequest::AttachTmuxSessions { .. }
-        | ClientRequest::ActivateTab { .. }
-        | ClientRequest::SwapPanes { .. }
-        | ClientRequest::MovePaneToSplit { .. }
-        | ClientRequest::MovePaneToTab { .. }
-        | ClientRequest::ClosePane { .. }
-        | ClientRequest::CreateWorkspace { .. }
-        | ClientRequest::CreateSshWorkspace { .. }
-        | ClientRequest::RenameWorkspace { .. }
-        | ClientRequest::SetWorkspacePinned { .. }
-        | ClientRequest::MovePinnedWorkspace { .. }
-        | ClientRequest::ReorderWorkspace { .. }
-        | ClientRequest::DisconnectWorkspace { .. }
-        | ClientRequest::ReconnectWorkspace { .. }
-        | ClientRequest::DeleteWorkspace { .. }
-        | ClientRequest::GetHistoryStatus
-        | ClientRequest::SetHistorySettings { .. }
-        | ClientRequest::ClearHistory { .. }
-        | ClientRequest::LoadHistoryPage { .. }
-        | ClientRequest::SearchArchivedHistory { .. }
-        | ClientRequest::ScanTmuxSessions { .. } => unreachable!("handled above"),
-        ClientRequest::Hello { .. } => Ok(ServiceResponse::Error {
-            message: "hello was already completed".to_owned(),
+        ClientRequest::CreatePane { target_pane, axis } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_pane(target_pane, axis)?,
         }),
-    }
-}
-
-fn handle_tmux_scan_request(
-    sessions: &SessionRegistry,
-    request: &ClientRequest,
-) -> Result<Option<ServiceResponse>> {
-    let ClientRequest::ScanTmuxSessions { workspace_id } = request else {
-        return Ok(None);
-    };
-    let (scope, sessions_found, no_server) = sessions.scan_tmux_sessions(*workspace_id)?;
-    Ok(Some(ServiceResponse::TmuxSessions {
-        scope,
-        sessions: sessions_found,
-        no_server,
-    }))
-}
-
-fn handle_tmux_attach_request(
-    sessions: &SessionRegistry,
-    request: &ClientRequest,
-) -> Result<Option<ServiceResponse>> {
-    let ClientRequest::AttachTmuxSessions {
-        workspace_id,
-        session_ids,
-    } = request
-    else {
-        return Ok(None);
-    };
-    let result = sessions.attach_tmux_sessions(*workspace_id, session_ids)?;
-    Ok(Some(ServiceResponse::TmuxSessionsAttached {
-        pane_ids: result.pane_ids,
-        skipped: result.skipped,
-    }))
-}
-
-fn is_layout_request(request: &ClientRequest) -> bool {
-    matches!(
-        request,
-        ClientRequest::ActivateTab { .. }
-            | ClientRequest::SwapPanes { .. }
-            | ClientRequest::MovePaneToSplit { .. }
-            | ClientRequest::MovePaneToTab { .. }
-            | ClientRequest::ClosePane { .. }
-            | ClientRequest::CreateWorkspace { .. }
-            | ClientRequest::CreateSshWorkspace { .. }
-            | ClientRequest::RenameWorkspace { .. }
-            | ClientRequest::SetWorkspacePinned { .. }
-            | ClientRequest::MovePinnedWorkspace { .. }
-            | ClientRequest::ReorderWorkspace { .. }
-            | ClientRequest::DisconnectWorkspace { .. }
-            | ClientRequest::ReconnectWorkspace { .. }
-            | ClientRequest::DeleteWorkspace { .. }
-    )
-}
-
-fn handle_layout_request(
-    sessions: &SessionRegistry,
-    request: ClientRequest,
-) -> Result<ServiceResponse> {
-    match request {
-        ClientRequest::ActivateTab { pane_id } => sessions.activate_tab(pane_id)?,
+        ClientRequest::CreateTab { target_pane } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_tab(target_pane)?,
+        }),
+        ClientRequest::CreateWorkspaceTerminal { workspace_id } => {
+            Ok(ServiceResponse::PaneCreated {
+                pane_id: sessions.create_workspace_terminal(workspace_id)?,
+            })
+        }
+        ClientRequest::ConnectSsh { target_pane, host } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.connect_ssh(target_pane, &host)?,
+        }),
+        ClientRequest::ScanTmuxSessions { workspace_id } => {
+            let scan = sessions.scan_tmux_sessions(workspace_id)?;
+            Ok(ServiceResponse::TmuxSessions {
+                scope: scan.scope,
+                sessions: scan.sessions,
+                open_session_ids: scan.open_session_ids,
+                no_server: scan.no_server,
+            })
+        }
+        ClientRequest::AttachTmuxSessions {
+            workspace_id,
+            session_ids,
+        } => {
+            let result = sessions.attach_tmux_sessions(workspace_id, &session_ids)?;
+            Ok(ServiceResponse::TmuxSessionsAttached {
+                pane_ids: result.pane_ids,
+                skipped: result.skipped,
+            })
+        }
+        ClientRequest::ActivateTab { pane_id } => {
+            sessions.activate_tab(pane_id)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::SwapPanes {
             source_pane,
             target_pane,
-        } => sessions.swap_panes(source_pane, target_pane)?,
+        } => {
+            sessions.swap_panes(source_pane, target_pane)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::MovePaneToSplit {
             source_pane,
             target_pane,
             placement,
-        } => sessions.move_pane_to_split(source_pane, target_pane, placement)?,
+        } => {
+            sessions.move_pane_to_split(source_pane, target_pane, placement)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::MovePaneToTab {
             source_pane,
             target_pane,
-        } => sessions.move_pane_to_tab(source_pane, target_pane)?,
-        ClientRequest::ClosePane { pane_id } => sessions.close_pane(pane_id)?,
-        ClientRequest::CreateWorkspace { title } => {
-            let (workspace_id, pane_id) = sessions.create_workspace(title.as_deref())?;
-            return Ok(ServiceResponse::WorkspaceCreated {
-                workspace_id,
-                pane_id,
-            });
+        } => {
+            sessions.move_pane_to_tab(source_pane, target_pane)?;
+            Ok(ServiceResponse::Ack)
         }
-        ClientRequest::CreateSshWorkspace { title, destination } => {
-            let (workspace_id, pane_id) =
-                sessions.create_ssh_workspace(title.as_deref(), &destination)?;
-            return Ok(ServiceResponse::WorkspaceCreated {
-                workspace_id,
-                pane_id,
-            });
+        ClientRequest::RenamePane { pane_id, title } => {
+            sessions.rename_pane(pane_id, &title)?;
+            Ok(ServiceResponse::Ack)
         }
-        ClientRequest::RenameWorkspace {
-            workspace_id,
-            title,
-        } => sessions.rename_workspace(workspace_id, &title)?,
-        ClientRequest::SetWorkspacePinned {
-            workspace_id,
-            pinned,
-        } => sessions.set_workspace_pinned(workspace_id, pinned)?,
-        ClientRequest::MovePinnedWorkspace {
-            workspace_id,
-            direction,
-        } => sessions.move_pinned_workspace(workspace_id, direction)?,
-        ClientRequest::ReorderWorkspace {
-            workspace_id,
-            target_workspace_id,
-            after,
-        } => sessions.reorder_workspace(workspace_id, target_workspace_id, after)?,
-        ClientRequest::DisconnectWorkspace { workspace_id } => {
-            sessions.disconnect_workspace(workspace_id)?;
-        }
-        ClientRequest::ReconnectWorkspace { workspace_id } => {
-            let pane_id = sessions.reconnect_workspace(workspace_id)?;
-            return Ok(ServiceResponse::PaneCreated { pane_id });
-        }
-        ClientRequest::DeleteWorkspace { workspace_id } => {
-            sessions.delete_workspace(workspace_id)?;
-        }
-        _ => unreachable!("only layout requests are routed here"),
-    }
-    Ok(ServiceResponse::Ack)
-}
-
-fn handle_pane_creation_request(
-    sessions: &SessionRegistry,
-    request: ClientRequest,
-) -> Result<ServiceResponse> {
-    let pane_id = match request {
-        ClientRequest::CreatePane { target_pane, axis } => {
-            sessions.create_pane(target_pane, axis)?
-        }
-        ClientRequest::CreateTab { target_pane } => sessions.create_tab(target_pane)?,
-        ClientRequest::CreateWorkspaceTerminal { workspace_id } => {
-            sessions.create_workspace_terminal(workspace_id)?
-        }
-        ClientRequest::ConnectSsh { target_pane, host } => {
-            sessions.connect_ssh(target_pane, &host)?
-        }
-        ClientRequest::AttachTmuxSession {
-            workspace_id,
-            session_id,
-        } => sessions.attach_tmux_session(workspace_id, &session_id)?,
-        _ => unreachable!("only pane creation requests are routed here"),
-    };
-    Ok(ServiceResponse::PaneCreated { pane_id })
-}
-
-fn handle_get_updates(
-    sessions: &SessionRegistry,
-    snapshot_revision: Option<u64>,
-    pane_revisions: &[PaneRevisionCursor],
-    subscribed_panes: &[Uuid],
-) -> Result<ServiceResponse> {
-    let update = sessions.pane_updates(snapshot_revision, pane_revisions, subscribed_panes)?;
-    Ok(ServiceResponse::Updates {
-        session_revision: update.session_revision,
-        snapshot: update.snapshot,
-        screens: update.screens,
-        pane_states: update.pane_states,
-        diagnostics: update.diagnostics,
-    })
-}
-
-fn handle_get_pane_snapshot(sessions: &SessionRegistry, pane_id: Uuid) -> Result<ServiceResponse> {
-    let (screen, diagnostics) = sessions.pane_snapshot(pane_id)?;
-    Ok(ServiceResponse::PaneSnapshot {
-        screen,
-        diagnostics,
-    })
-}
-
-fn is_history_request(request: &ClientRequest) -> bool {
-    matches!(
-        request,
-        ClientRequest::GetHistoryStatus
-            | ClientRequest::SetHistorySettings { .. }
-            | ClientRequest::ClearHistory { .. }
-            | ClientRequest::LoadHistoryPage { .. }
-            | ClientRequest::SearchArchivedHistory { .. }
-    )
-}
-
-fn handle_history_request(
-    sessions: &SessionRegistry,
-    request: ClientRequest,
-) -> Result<ServiceResponse> {
-    match request {
-        ClientRequest::GetHistoryStatus => Ok(ServiceResponse::HistoryStatus {
-            status: sessions.history_status()?,
-        }),
-        ClientRequest::SetHistorySettings { settings } => {
-            sessions.set_history_settings(settings)?;
-            Ok(ServiceResponse::HistoryStatus {
-                status: sessions.history_status()?,
-            })
-        }
-        ClientRequest::ClearHistory { scope } => {
-            sessions.clear_history(scope)?;
-            Ok(ServiceResponse::HistoryStatus {
-                status: sessions.history_status()?,
-            })
-        }
-        ClientRequest::LoadHistoryPage {
-            pane_id,
-            cursor,
-            direction,
-        } => Ok(ServiceResponse::HistoryPage {
-            page: sessions.load_history_page(pane_id, cursor, direction)?,
-        }),
-        ClientRequest::SearchArchivedHistory {
-            pane_id,
-            query,
-            before,
-        } => Ok(ServiceResponse::HistorySearchResult {
-            page: sessions.search_archived_history(pane_id, &query, before)?,
-        }),
-        _ => unreachable!("only history requests are routed here"),
-    }
-}
-
-fn handle_identity_request(
-    sessions: &SessionRegistry,
-    request: ClientRequest,
-) -> Result<ServiceResponse> {
-    match request {
-        ClientRequest::RenamePane { pane_id, title } => sessions.rename_pane(pane_id, &title)?,
         ClientRequest::SetPaneProfile { pane_id, profile } => {
             sessions.set_pane_profile(pane_id, profile)?;
+            Ok(ServiceResponse::Ack)
         }
-        ClientRequest::ResetPaneIdentity { pane_id } => sessions.reset_pane_identity(pane_id)?,
-        _ => unreachable!("only identity requests are routed here"),
-    }
-    Ok(ServiceResponse::Ack)
-}
-
-fn is_identity_request(request: &ClientRequest) -> bool {
-    matches!(
-        request,
-        ClientRequest::RenamePane { .. }
-            | ClientRequest::SetPaneProfile { .. }
-            | ClientRequest::ResetPaneIdentity { .. }
-    )
-}
-
-fn handle_appearance_request(
-    sessions: &SessionRegistry,
-    request: &ClientRequest,
-) -> Result<ServiceResponse> {
-    match request {
+        ClientRequest::ResetPaneIdentity { pane_id } => {
+            sessions.reset_pane_identity(pane_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ClosePane { pane_id } => {
+            sessions.close_pane(pane_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ReattachPane { pane_id } => {
+            sessions.reattach_pane(pane_id)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::SetDefaultTerminalAccent { color } => {
-            sessions.set_default_terminal_accent(*color)?;
+            sessions.set_default_terminal_accent(color)?;
+            Ok(ServiceResponse::Ack)
         }
         ClientRequest::SetDefaultWorkspaceColor { color } => {
-            sessions.set_default_workspace_color(*color)?;
+            sessions.set_default_workspace_color(color)?;
+            Ok(ServiceResponse::Ack)
         }
         ClientRequest::SetPaneColor { pane_id, color } => {
-            sessions.set_pane_color(*pane_id, *color)?;
+            sessions.set_pane_color(pane_id, color)?;
+            Ok(ServiceResponse::Ack)
         }
         ClientRequest::SetWorkspaceColor {
             workspace_id,
             color,
         } => {
-            sessions.set_workspace_color(*workspace_id, *color)?;
-        }
-        _ => unreachable!("only appearance requests are routed here"),
-    }
-    Ok(ServiceResponse::Ack)
-}
-
-fn is_appearance_request(request: &ClientRequest) -> bool {
-    matches!(
-        request,
-        ClientRequest::SetDefaultTerminalAccent { .. }
-            | ClientRequest::SetDefaultWorkspaceColor { .. }
-            | ClientRequest::SetPaneColor { .. }
-            | ClientRequest::SetWorkspaceColor { .. }
-    )
-}
-
-fn handle_terminal_interaction_request(
-    sessions: &SessionRegistry,
-    request: ClientRequest,
-) -> Result<ServiceResponse> {
-    match request {
-        ClientRequest::WriteInput { pane_id, bytes } => {
-            sessions.write_input(pane_id, &bytes)?;
+            sessions.set_workspace_color(workspace_id, color)?;
             Ok(ServiceResponse::Ack)
         }
-        ClientRequest::ResizePane {
-            pane_id,
-            columns,
-            rows,
+        ClientRequest::CreateWorkspace { title } => {
+            let (workspace_id, pane_id) = sessions.create_workspace(title.as_deref())?;
+            Ok(ServiceResponse::WorkspaceCreated {
+                workspace_id,
+                pane_id,
+            })
+        }
+        ClientRequest::CreateSshWorkspace { title, destination } => {
+            let (workspace_id, pane_id) =
+                sessions.create_ssh_workspace(title.as_deref(), &destination)?;
+            Ok(ServiceResponse::WorkspaceCreated {
+                workspace_id,
+                pane_id,
+            })
+        }
+        ClientRequest::RenameWorkspace {
+            workspace_id,
+            title,
         } => {
-            sessions.resize_pane(pane_id, columns, rows)?;
+            sessions.rename_workspace(workspace_id, &title)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::SetWorkspacePinned {
+            workspace_id,
+            pinned,
+        } => {
+            sessions.set_workspace_pinned(workspace_id, pinned)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::MovePinnedWorkspace {
+            workspace_id,
+            direction,
+        } => {
+            sessions.move_pinned_workspace(workspace_id, direction)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ReorderWorkspace {
+            workspace_id,
+            target_workspace_id,
+            after,
+        } => {
+            sessions.reorder_workspace(workspace_id, target_workspace_id, after)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::DisconnectWorkspace { workspace_id } => {
+            sessions.disconnect_workspace(workspace_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ReconnectWorkspace { workspace_id } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.reconnect_workspace(workspace_id)?,
+        }),
+        ClientRequest::DeleteWorkspace { workspace_id } => {
+            sessions.delete_workspace(workspace_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::WriteInput { pane_id, bytes } => {
+            sessions.write_input(pane_id, &bytes)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::BeginSelection {
@@ -4059,22 +3970,77 @@ fn handle_terminal_interaction_request(
             sessions.mouse_input(pane_id, point, button, action, modifiers)?;
             Ok(ServiceResponse::Ack)
         }
-        _ => unreachable!("only terminal interactions are routed here"),
+        ClientRequest::ResizePane {
+            pane_id,
+            columns,
+            rows,
+        } => {
+            sessions.resize_pane(pane_id, columns, rows)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::GetHistoryStatus => Ok(ServiceResponse::HistoryStatus {
+            status: sessions.history_status(),
+        }),
+        ClientRequest::SetHistorySettings { settings } => {
+            sessions.set_history_settings(settings)?;
+            Ok(ServiceResponse::HistoryStatus {
+                status: sessions.history_status(),
+            })
+        }
+        ClientRequest::ClearHistory { scope } => {
+            sessions.clear_history(scope)?;
+            Ok(ServiceResponse::HistoryStatus {
+                status: sessions.history_status(),
+            })
+        }
+        ClientRequest::LoadHistoryPage {
+            pane_id,
+            cursor,
+            direction,
+        } => Ok(ServiceResponse::HistoryPage {
+            page: sessions.load_history_page(pane_id, cursor, direction)?,
+        }),
+        ClientRequest::SearchArchivedHistory {
+            pane_id,
+            query,
+            before,
+        } => Ok(ServiceResponse::HistorySearchResult {
+            page: sessions.search_archived_history(pane_id, &query, before)?,
+        }),
     }
+}
+
+fn handle_get_updates(
+    sessions: &SessionRegistry,
+    snapshot_revision: Option<u64>,
+    pane_revisions: &[PaneRevisionCursor],
+    subscribed_panes: &[Uuid],
+) -> Result<ServiceResponse> {
+    let update =
+        sessions.pane_updates(snapshot_revision, pane_revisions, subscribed_panes, false)?;
+    Ok(ServiceResponse::Updates {
+        session_revision: update.session_revision,
+        snapshot: update.snapshot,
+        screens: update.screens,
+        pane_states: update.pane_states,
+        diagnostics: update.diagnostics,
+    })
+}
+
+fn handle_get_pane_snapshot(sessions: &SessionRegistry, pane_id: Uuid) -> Result<ServiceResponse> {
+    let (screen, diagnostics) = sessions.pane_snapshot(pane_id)?;
+    Ok(ServiceResponse::PaneSnapshot {
+        screen,
+        diagnostics,
+    })
 }
 
 async fn write_message<T: Serialize>(
     stream: &mut UnixStream,
     message: &T,
 ) -> Result<(), nah_protocol::WireError> {
-    let payload = serde_json::to_vec(message)?;
-    if payload.len() > MAX_FRAME_SIZE {
-        return Err(nah_protocol::WireError::FrameTooLarge(payload.len()));
-    }
-    let length = u32::try_from(payload.len())
-        .map_err(|_| nah_protocol::WireError::FrameTooLarge(payload.len()))?;
-    stream.write_u32(length).await?;
-    stream.write_all(&payload).await?;
+    let frame = nah_protocol::encode_frame(message)?;
+    stream.write_all(&frame).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -4082,19 +4048,21 @@ async fn write_message<T: Serialize>(
 async fn read_message<T: DeserializeOwned>(
     stream: &mut UnixStream,
 ) -> Result<T, nah_protocol::WireError> {
-    let length = match stream.read_u32().await {
-        Ok(length) => length as usize,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(nah_protocol::WireError::Closed);
-        }
-        Err(error) => return Err(nah_protocol::WireError::Io(error)),
-    };
+    let mut length = [0_u8; 4];
+    if let Err(error) = stream.read_exact(&mut length).await {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            Err(nah_protocol::WireError::Closed)
+        } else {
+            Err(nah_protocol::WireError::Io(error))
+        };
+    }
+    let length = u32::from_be_bytes(length) as usize;
     if length > MAX_FRAME_SIZE {
         return Err(nah_protocol::WireError::FrameTooLarge(length));
     }
     let mut payload = vec![0_u8; length];
     stream.read_exact(&mut payload).await?;
-    Ok(serde_json::from_slice(&payload)?)
+    nah_protocol::decode_frame(&payload)
 }
 
 #[cfg(test)]
@@ -4148,7 +4116,9 @@ mod tests {
 
     #[test]
     fn tmux_attach_uses_only_fixed_structured_commands() {
-        let local = tmux_local_attach_command(Uuid::nil(), "$42").unwrap();
+        let target = TmuxSessionId::try_from("$42".to_owned()).unwrap();
+        let pane_id = Uuid::nil();
+        let local = tmux_local_attach_command(pane_id, &target);
         assert_eq!(
             local.get_argv(),
             &[
@@ -4158,10 +4128,24 @@ mod tests {
                 OsString::from("$42"),
             ]
         );
+        // Attaching must never mutate the user's own tmux server: no option is
+        // set and no session is created, only a plain attach.
+        for mutation in [
+            "set-option",
+            "new-session",
+            "window-size",
+            "aggressive-resize",
+        ] {
+            assert!(
+                !local.get_argv().contains(&OsString::from(mutation)),
+                "local attach mutates the user's tmux server: {mutation}"
+            );
+        }
 
-        let remote = tmux_remote_attach_command("$42").unwrap();
-        assert_eq!(remote, OsString::from("exec tmux attach-session -t '$42'"));
-        let remote_ssh = tmux_ssh_attach_command(Uuid::nil(), "admin@build-node", "$42").unwrap();
+        let expected_remote = "exec tmux attach-session -t '$42'";
+        let remote = tmux_remote_attach_command(&target);
+        assert_eq!(remote, OsString::from(expected_remote));
+        let remote_ssh = tmux_ssh_attach_command(pane_id, "admin@build-node", &target).unwrap();
         assert_eq!(
             remote_ssh.get_argv(),
             &[
@@ -4169,40 +4153,65 @@ mod tests {
                 OsString::from("-tt"),
                 OsString::from("--"),
                 OsString::from("admin@build-node"),
-                OsString::from("exec tmux attach-session -t '$42'"),
+                OsString::from(expected_remote),
             ]
         );
         for target in ["name", "$42;bad", "$4 2", "$-1", "42", "$42'bad"] {
             assert!(
-                validate_tmux_session_id(target).is_err(),
+                TmuxSessionId::try_from(target.to_owned()).is_err(),
                 "target: {target:?}"
             );
         }
     }
 
+    fn tmux_session(id: &str, name: &str) -> TmuxSession {
+        TmuxSession {
+            id: TmuxSessionId::try_from(id.to_owned()).unwrap(),
+            name: name.to_owned(),
+            windows: 1,
+            attached_clients: 0,
+        }
+    }
+
     #[test]
-    fn tmux_attachment_plan_opens_each_unique_selection_and_skips_existing_tabs() {
-        let already_open = HashSet::from(["$2".to_owned()]);
+    fn tmux_attachment_plan_opens_each_unique_selection_and_skips_invalid_targets() {
+        let first = tmux_session("$1", "editor");
+        let second = tmux_session("$2", "server");
+        let missing = TmuxSessionId::try_from("$3".to_owned()).unwrap();
+        let already_open = HashSet::from([second.id.clone()]);
+        let known_sessions = HashMap::from([
+            (first.id.clone(), first.clone()),
+            (second.id.clone(), second.clone()),
+        ]);
         let plan = plan_tmux_session_attachments(
-            &["$1".to_owned(), "$2".to_owned(), "$1".to_owned()],
+            &[
+                first.id.clone(),
+                second.id.clone(),
+                first.id.clone(),
+                missing.clone(),
+            ],
             &already_open,
+            &known_sessions,
         )
         .unwrap();
-        assert_eq!(plan.launch, vec!["$1"]);
+        assert_eq!(plan.launch, vec![first.clone()]);
         assert_eq!(
             plan.skipped,
             vec![
                 TmuxSessionAttachIssue {
-                    session_id: "$2".to_owned(),
+                    session_id: second.id,
                     message: "already open in this workstation".to_owned(),
                 },
                 TmuxSessionAttachIssue {
-                    session_id: "$1".to_owned(),
+                    session_id: first.id,
                     message: "selected more than once".to_owned(),
+                },
+                TmuxSessionAttachIssue {
+                    session_id: missing,
+                    message: "session no longer exists".to_owned(),
                 },
             ]
         );
-        assert!(plan_tmux_session_attachments(&["$1;bad".to_owned()], &already_open).is_err());
     }
 
     #[test]
@@ -4222,15 +4231,16 @@ mod tests {
             &registry.history,
         )
         .unwrap();
+        let tmux_session = tmux_session("$9", "editor");
 
         let attached = registry
             .register_live_tmux_tab(
                 workspace_id,
                 pane_id,
-                "$9",
+                &tmux_session,
                 &session,
                 RuntimePaneKind::TmuxLocal {
-                    session_id: "$9".to_owned(),
+                    session_id: tmux_session.id.clone(),
                 },
             )
             .unwrap();
@@ -4259,15 +4269,16 @@ mod tests {
             &registry.history,
         )
         .unwrap();
+        let tmux_session = tmux_session("$10", "logs");
 
         let error = registry
             .register_live_tmux_tab(
                 workspace_id,
                 pane_id,
-                "$10",
+                &tmux_session,
                 &session,
                 RuntimePaneKind::TmuxLocal {
-                    session_id: "$10".to_owned(),
+                    session_id: tmux_session.id.clone(),
                 },
             )
             .unwrap_err();
@@ -4281,20 +4292,28 @@ mod tests {
 
     #[test]
     fn tmux_scan_parser_bounds_and_rejects_malicious_metadata() {
-        let sessions = parse_tmux_sessions("$1\tbuild\t3\t1\n$2\tresearch\t1\t0\n").unwrap();
+        let sessions = parse_tmux_scan("S\t$1\tbuild\t2\t1\nS\t$2\tresearch\t1\t0\n").unwrap();
         assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].id, "$1");
+        assert_eq!(sessions[0].id.as_str(), "$1");
+        assert_eq!(sessions[0].windows, 2);
+        assert_eq!(sessions[1].name, "research");
         assert_eq!(sessions[1].attached_clients, 0);
 
         for output in [
             "build\tname\t1\t0\n",
-            "$1\tname\t1\t0\textra\n",
-            "$1\tbad\u{0007}name\t1\t0\n",
-            "$1;bad\tname\t1\t0\n",
-            "$1\tname\tnot-a-number\t0\n",
+            "S\t$1\tname\t1\t0\textra\n",
+            "S\t$1\tbad\u{0007}name\t1\t0\n",
+            "S\t$1;bad\tname\t1\t0\n",
+            "S\t$1\tname\tnot-a-number\t0\n",
+            "S\t$1\tname\t1\t0\nS\t$1\tother\t1\t0\n",
+            "S\t$1\tname\t1\t0\nW\t$1\t@1\t0\teditor\t1\t1\n",
         ] {
-            assert!(parse_tmux_sessions(output).is_err(), "output: {output:?}");
+            assert!(parse_tmux_scan(output).is_err(), "output: {output:?}");
         }
+        assert!(tmux_reports_no_server("no server running on /tmp/tmux"));
+        assert!(tmux_reports_no_server(
+            "error connecting to /tmp/tmux (No such file or directory)"
+        ));
     }
 
     #[test]
@@ -4354,7 +4373,7 @@ mod tests {
             .unwrap();
 
         let update = registry
-            .pane_updates(Some(before.revision), &[], &[])
+            .pane_updates(Some(before.revision), &[], &[], true)
             .unwrap();
         let delivered = update
             .snapshot
@@ -4653,7 +4672,7 @@ mod tests {
         let pane_id = first_pane_id(&snapshot).unwrap();
         let expected_panes = pane_ids_for_workspace(&snapshot.workspaces[0]);
         {
-            let mut state = registry.state.write().unwrap();
+            let mut state = registry.state.write();
             state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
                 destination: "build-node".to_owned(),
                 status: WorkspaceConnectionStatus::Connected,
@@ -4677,7 +4696,189 @@ mod tests {
                 status: WorkspaceConnectionStatus::Offline,
             }
         );
-        assert!(registry.state.read().unwrap().panes.contains_key(&pane_id));
+        assert!(registry.state.read().panes.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn closing_the_last_terminal_keeps_an_ssh_workstation_connected() {
+        let registry = SessionRegistry::new().unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let pane_id = first_pane_id(&snapshot).unwrap();
+        {
+            let mut state = registry.state.write();
+            state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
+                destination: "build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Connected,
+            };
+            state.panes.get_mut(&pane_id).unwrap().kind = RuntimePaneKind::SystemSsh {
+                host: "build-node".to_owned(),
+            };
+        }
+
+        registry.close_pane(pane_id).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let workspace = &snapshot.workspaces[0];
+
+        // Zero terminals is an empty workstation, not a disconnect: the next
+        // terminal must open instead of demanding a reconnect.
+        assert!(workspace.tabs.is_empty());
+        assert_eq!(workspace.active_terminal_count, 0);
+        assert_eq!(
+            workspace.connection,
+            WorkspaceConnection::SystemSsh {
+                destination: "build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Connected,
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_remote_tmux_tab_keeps_its_workstation_connected_and_a_dead_one_does_not() {
+        let registry = SessionRegistry::new().unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let pane_id = first_pane_id(&snapshot).unwrap();
+        {
+            let mut state = registry.state.write();
+            state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
+                destination: "build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Offline,
+            };
+            // Only a tmux attach remains, exactly what survives closing the
+            // initial SSH tab.
+            state.panes.get_mut(&pane_id).unwrap().kind = RuntimePaneKind::TmuxSystemSsh {
+                host: "build-node".to_owned(),
+                session_id: TmuxSessionId::try_from("$3".to_owned()).unwrap(),
+            };
+            assert!(refresh_workspace_activity(&mut state));
+            assert_eq!(
+                state.snapshot.workspaces[0].connection,
+                WorkspaceConnection::SystemSsh {
+                    destination: "build-node".to_owned(),
+                    status: WorkspaceConnectionStatus::Connected,
+                }
+            );
+
+            state.panes.get_mut(&pane_id).unwrap().exit_status =
+                Some("Exited with code 255".to_owned());
+            assert!(refresh_workspace_activity(&mut state));
+            assert_eq!(
+                state.snapshot.workspaces[0].connection,
+                WorkspaceConnection::SystemSsh {
+                    destination: "build-node".to_owned(),
+                    status: WorkspaceConnectionStatus::Offline,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_tmux_tab_releases_its_session_back_to_the_picker() {
+        let registry = SessionRegistry::new().unwrap();
+        let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+        let pane_id = Uuid::new_v4();
+        let session = PtySession::spawn_command(
+            pane_id,
+            workspace_id,
+            CommandBuilder::from_argv(vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("printf fixture; sleep 5"),
+            ]),
+            "live tmux fixture",
+            &registry.history,
+        )
+        .unwrap();
+        let tmux_session = tmux_session("$9", "editor");
+        registry
+            .register_live_tmux_tab(
+                workspace_id,
+                pane_id,
+                &tmux_session,
+                &session,
+                RuntimePaneKind::TmuxLocal {
+                    session_id: tmux_session.id.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.open_tmux_session_ids(workspace_id).unwrap(),
+            HashSet::from([tmux_session.id.clone()])
+        );
+
+        registry
+            .state
+            .write()
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .exit_status = Some("Exited with code 255".to_owned());
+
+        // The frozen tab must not reserve the session, or the picker offers
+        // nothing to reopen after an SSH drop killed every attach.
+        assert!(
+            registry
+                .open_tmux_session_ids(workspace_id)
+                .unwrap()
+                .is_empty()
+        );
+        let plan = plan_tmux_session_attachments(
+            std::slice::from_ref(&tmux_session.id),
+            &registry.open_tmux_session_ids(workspace_id).unwrap(),
+            &HashMap::from([(tmux_session.id.clone(), tmux_session.clone())]),
+        )
+        .unwrap();
+        assert_eq!(plan.launch, vec![tmux_session]);
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn reattach_respawns_an_exited_pane_in_place_and_refuses_a_live_one() {
+        let registry = SessionRegistry::new().unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let pane_id = first_pane_id(&snapshot).unwrap();
+        let tab_ids = snapshot.workspaces[0]
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+
+        let error = registry.reattach_pane(pane_id).unwrap_err();
+        assert!(error.to_string().contains("still live"));
+
+        let dead_session = {
+            let mut state = registry.state.write();
+            let runtime = state.panes.get_mut(&pane_id).unwrap();
+            runtime.exit_status = Some("Exited with code 255".to_owned());
+            Arc::clone(&runtime.session)
+        };
+        dead_session.terminate_and_wait().unwrap();
+
+        registry.reattach_pane(pane_id).unwrap();
+
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(
+            snapshot.workspaces[0]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            tab_ids
+        );
+        assert!(pane_ids_for_workspace(&snapshot.workspaces[0]).contains(&pane_id));
+        assert_eq!(
+            registry
+                .state
+                .read()
+                .panes
+                .get(&pane_id)
+                .map(|runtime| runtime.exit_status.clone()),
+            Some(None)
+        );
+        let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
+        assert!(!pane.shell.contains("exited"), "shell: {}", pane.shell);
+        registry
+            .write_input(pane_id, b"printf 'REATTACHED\\n'\r")
+            .unwrap();
     }
 
     #[test]

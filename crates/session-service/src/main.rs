@@ -69,13 +69,22 @@ async fn main() -> Result<()> {
             }
             signal = tokio::signal::ctrl_c() => {
                 signal.context("install or await shutdown signal")?;
-                sessions.persist().context("persist sessions before service shutdown")?;
+                let sessions = sessions.clone();
+                tokio::task::spawn_blocking(move || sessions.persist())
+                    .await
+                    .context("join shutdown persistence task")?
+                    .context("persist sessions before service shutdown")?;
                 break;
             }
             _ = persistence_tick.tick() => {
-                if let Err(error) = sessions.persist() {
-                    eprintln!("failed to persist session recovery state: {error:#}");
-                }
+                let sessions = sessions.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = sessions.persist() {
+                        eprintln!("failed to persist session recovery state: {error:#}");
+                    }
+                })
+                .await
+                .context("join periodic persistence task")?;
             }
         }
     }

@@ -4,11 +4,13 @@ use objc2::AnyThread as _;
 use objc2_app_kit::{NSApplication, NSImage};
 use objc2_foundation::{NSBundle, NSString, ns_string};
 
+// SAFETY: `NSApp` is AppKit's process-global application pointer.
+#[allow(unsafe_code)]
 unsafe extern "C" {
     static NSApp: Option<&'static NSApplication>;
 }
 
-/// Loads the selected packaged ICNS and assigns it to the live AppKit application.
+/// Loads the selected packaged ICNS and assigns it to the live `AppKit` application.
 pub fn install_dock_icon(development_build: bool) {
     let icon_name = if development_build {
         "Not-a-Harness-Dev"
@@ -28,6 +30,7 @@ pub fn install_dock_icon(development_build: bool) {
     };
 
     // SAFETY: AppKit owns the shared application instance and retains the image.
+    #[allow(unsafe_code)]
     unsafe {
         let Some(app) = NSApp else {
             eprintln!("Not a Harness could not access the macOS application instance");

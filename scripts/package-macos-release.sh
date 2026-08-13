@@ -28,6 +28,10 @@ if [ "$workspace_version" != "$version" ]; then
   echo "VERSION $version does not match workspace version $workspace_version" >&2
   exit 2
 fi
+protocol_version=$(awk '/^pub const PROTOCOL_VERSION/ { gsub(/[^0-9]/, "", $NF); print $NF; exit }' crates/protocol/src/lib.rs)
+case "$protocol_version" in
+  '' | *[!0-9]*) echo "could not read PROTOCOL_VERSION from crates/protocol/src/lib.rs" >&2; exit 2 ;;
+esac
 
 case "$(uname -m)" in
   arm64) architecture=arm64 ;;
@@ -102,7 +106,7 @@ cat > "$manifest" <<EOF
   "build": $build,
   "minimum_macos": "13.0",
   "session_service": {
-    "protocol_version": 11,
+    "protocol_version": $protocol_version,
     "requires_quiescent_service": true
   },
   "artifacts": [

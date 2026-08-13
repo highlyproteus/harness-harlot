@@ -14,7 +14,7 @@ use nah_protocol::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 3;
+const SCHEMA_VERSION: u16 = 4;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 const MAX_WORKSPACES: usize = 16;
@@ -108,18 +108,20 @@ impl SnapshotStore {
         Ok(desired.into_runtime())
     }
 
-    pub(crate) fn save(
-        &self,
+    pub(crate) fn encode(
         snapshot: &SessionSnapshot,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         let desired = DesiredState::from_runtime(snapshot, cwd_by_pane)?;
         desired.validate()?;
         let bytes = serde_json::to_vec(&desired).context("encode recovery snapshot")?;
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
             bail!("encoded snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes");
         }
+        Ok(bytes)
+    }
 
+    pub(crate) fn write_snapshot(&self, bytes: &[u8]) -> Result<()> {
         let parent = self
             .path
             .parent()
@@ -138,7 +140,7 @@ impl SnapshotStore {
                 .mode(0o600)
                 .open(&temporary)
                 .with_context(|| format!("create temporary snapshot {}", temporary.display()))?;
-            file.write_all(&bytes).context("write recovery snapshot")?;
+            file.write_all(bytes).context("write recovery snapshot")?;
             file.sync_all().context("sync recovery snapshot contents")?;
 
             #[cfg(test)]
@@ -165,6 +167,12 @@ impl SnapshotStore {
             let _ = fs::remove_file(&temporary);
         }
         write_result
+    }
+
+    #[cfg(test)]
+    fn save(&self, snapshot: &SessionSnapshot, cwd_by_pane: &HashMap<Uuid, PathBuf>) -> Result<()> {
+        let bytes = Self::encode(snapshot, cwd_by_pane)?;
+        self.write_snapshot(&bytes)
     }
 
     fn quarantine(&self) -> Result<PathBuf> {
@@ -226,6 +234,14 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Retained only so a snapshot written before the tmux status-bar setting was
+/// removed still parses under `deny_unknown_fields`. Never written back.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct RetiredTmuxSettings {
+    #[serde(default)]
+    hide_status_bar: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DesiredState {
@@ -233,6 +249,9 @@ struct DesiredState {
     revision: u64,
     #[serde(default)]
     appearance: AppearanceSettings,
+    #[serde(default, skip_serializing)]
+    #[expect(dead_code, reason = "parsed only so pre-removal snapshots still load")]
+    tmux: RetiredTmuxSettings,
     workspaces: Vec<DesiredWorkspace>,
 }
 
@@ -345,6 +364,7 @@ impl DesiredState {
             schema_version: SCHEMA_VERSION,
             revision: snapshot.revision,
             appearance: snapshot.appearance.clone(),
+            tmux: RetiredTmuxSettings::default(),
             workspaces,
         })
     }
@@ -920,6 +940,45 @@ mod tests {
         };
         assert_eq!(pane.custom_title.as_deref(), Some("Deploy console"));
         assert_eq!(pane.title, "Deploy console");
+    }
+
+    #[test]
+    fn schema_v4_snapshot_with_retired_tmux_setting_loads_and_stops_being_written() {
+        let stored: DesiredState = serde_json::from_str(
+            r#"{
+                "schema_version": 4,
+                "revision": 7,
+                "tmux": {"hide_status_bar": true},
+                "workspaces": [{
+                    "id": "00000000-0000-0000-0000-000000000031",
+                    "title": "Workstation",
+                    "tabs": [{
+                        "id": "00000000-0000-0000-0000-000000000032",
+                        "title": "Terminals",
+                        "layout": {
+                            "kind": "leaf",
+                            "pane": {
+                                "id": "00000000-0000-0000-0000-000000000033",
+                                "title": "Terminal 1",
+                                "local_cwd": "/tmp"
+                            }
+                        }
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        stored.validate().unwrap();
+
+        let recovered = stored.into_runtime();
+        assert_eq!(recovered.snapshot.workspaces[0].title, "Workstation");
+
+        let rewritten =
+            DesiredState::from_runtime(&recovered.snapshot, &recovered.cwd_by_pane).unwrap();
+        let encoded = serde_json::to_string(&rewritten).unwrap();
+        assert!(!encoded.contains("tmux"), "encoded: {encoded}");
+        assert!(!encoded.contains("hide_status_bar"), "encoded: {encoded}");
+        serde_json::from_str::<DesiredState>(&encoded).unwrap();
     }
 
     #[test]

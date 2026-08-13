@@ -27,7 +27,7 @@ use gpui::{
     WindowBounds, WindowOptions, actions, div, fill, img, point, prelude::*, px, relative, rgb,
     rgba, size, svg,
 };
-use nah_desktop::request;
+use nah_desktop::SessionClient;
 use nah_protocol::{
     AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryCleanupPolicy,
     HistoryClearScope, HistoryPageDirection, HistoryPageFlags, HistoryRetention, HistorySettings,
@@ -36,26 +36,57 @@ use nah_protocol::{
     TerminalColor, TerminalHistoryPage, TerminalLine, TerminalModes, TerminalModifiers,
     TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalRun,
     TerminalScreen, TerminalSelection, TerminalSelectionKind, TmuxScanScope, TmuxSession,
-    Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove,
+    TmuxSessionId, Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove,
     normalize_ssh_input, validate_ssh_host,
 };
+use parking_lot::Mutex;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 mod agent_icons;
 mod commands;
+mod helpers;
 mod theme;
 mod typography;
 mod ui_state;
+mod view_models;
 
 use agent_icons::{AgentIconAssets, AgentIconFormat, agent_icon_definition};
 use commands::{
     AppCommand, AppConfig, ROOT_KEY_CONTEXT, ResolvedBinding, ResolvedKeymap, descriptor,
     palette_matches,
 };
+use helpers::{
+    FocusResync, IDENTITY_MARK_SIZE, append_rename_text, apply_layout_control_mutation,
+    collect_pane_sizes, constrained_sidebar_width, default_sidebar_width, effective_split_ratio,
+    element_key, find_pane, find_split_rect, focus_resync_for, format_bytes, format_history_date,
+    gpui_binding, history_label, history_scope_key, history_warning_text, migrated_sidebar_width,
+    next_terminal_poll_delay_ms, paced_subscriptions, pane_update_requires_repaint,
+    parse_hex_color, plain_history_line, prepare_paste, product_name, readable_text_color,
+    render_sidebar_toggle_icon, render_terminal_profile_mark, resolved_terminal_accent,
+    resolved_workspace_color, selection_span, sidebar_width_for_visibility, split_child_dimensions,
+    split_control_id, split_element_key, split_placement_at, split_target_for_drag,
+    split_target_for_drag_ids, tab_identity_presentation, terminal_input_bytes, terminal_modifiers,
+    terminal_mouse_button, terminal_point_at, terminal_run_display_text, terminal_tab_count_label,
+    visible_panes, workspace_is_selectable, workspace_layout_for_focused_pane,
+    workspace_pixel_size, workspace_terminal_tabs, workspace_visible_panes,
+    workstation_banner_header_height, zoom_projection,
+};
 use theme::{AppTheme, BuiltInTheme};
 use typography::TerminalFontProfile;
 use ui_state::UiStateStore;
+use view_models::{
+    ArchivedView, CloseConfirmation, ColorPickerState, ColorTarget, CommandPaletteState,
+    DialogAction, DialogSpec, DialogTextEditor, DialogTone, DragDestination, DragHoverState,
+    HistoryEditField, HistoryEditor, LayoutControlMutation, Modal, PaneControlIcon, PaneDrag,
+    PixelRect, RenameEditor, ResizeDrag, SearchEditor, SelectionDrag, SidebarResizeLifecycle,
+    SidebarResizeMove, SplitControlId, TabIdentityPresentation, TabMenu, TerminalLineRender,
+    TmuxSelectionChange, TmuxSessionPicker, TooltipView, WorkspaceConnectionInfo,
+    WorkspaceCreationDialog, WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
+    WorkspaceDeleteConfirmation, WorkspaceDisconnectConfirmation, WorkspaceDrag,
+    WorkspaceDropPreview, WorkspaceMenu, WorkspaceRenameEditor, WorkstationGroupExpansion,
+    route_workspace_creation_paste,
+};
 
 actions!(
     nah_app,
@@ -72,6 +103,7 @@ actions!(
         ShowCommandPalette,
         TogglePaneZoom,
         EqualizePanes,
+        ReattachPane,
         ConsumeChordPrefix,
         CopyTerminal,
         PasteTerminal,
@@ -102,7 +134,15 @@ const COMMAND_PALETTE_LIMIT: usize = 32;
 const MAX_PASTE_BYTES: usize = 64 * 1024;
 const ACTIVE_TERMINAL_POLL_MS: u64 = 33;
 const IDLE_TERMINAL_POLL_MS: u64 = 250;
-const COLD_PANE_AFTER: Duration = Duration::from_mins(1);
+/// Polling cadence once nothing has produced output and nobody has typed for
+/// `DEEP_IDLE_AFTER`. Pane states still arrive at this rate, so the first byte
+/// of new output restores the active cadence within one poll.
+const DEEP_IDLE_POLL_MS: u64 = 2_000;
+const DEEP_IDLE_AFTER: Duration = Duration::from_hours(1);
+const PTY_RESIZE_DEBOUNCE_MS: u64 = 16;
+/// On-screen panes other than the focused one stream at this cadence so a
+/// four-way split cannot multiply the focused pane's payload every 33 ms.
+const SECONDARY_PANE_INTERVAL: Duration = Duration::from_millis(120);
 const STABLE_PRODUCT_NAME: &str = "Not a Harness";
 const DEVELOPMENT_PRODUCT_NAME: &str = "Not a Harness Dev";
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
@@ -117,855 +157,59 @@ const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
     AppearanceColor::new(0x9a, 0xa2, 0xaf),
 ];
 
-#[derive(Clone, Debug)]
-struct PaneDrag {
-    pane_id: Uuid,
-    title: String,
-    position: Point<Pixels>,
+type SharedSessionClient = Arc<Mutex<Option<SessionClient>>>;
+fn session_call(
+    client: &SharedSessionClient,
+    request: &ClientRequest,
+) -> anyhow::Result<ServiceResponse> {
+    let mut client = client.lock();
+    if client.is_none() {
+        *client = Some(SessionClient::connect()?);
+    }
+    let result = client
+        .as_mut()
+        .expect("session client initialized")
+        .call(request);
+    if result.is_err() {
+        *client = None;
+    }
+    result
 }
 
-#[derive(Clone, Debug)]
-struct WorkspaceDrag {
-    workspace_id: Uuid,
-    pinned: bool,
-    title: String,
-    position: Point<Pixels>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkspaceDropPreview {
-    target_workspace_id: Uuid,
-    after: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TabIdentityPresentation {
-    label: String,
-    profile: TerminalProfile,
-    detail: String,
-}
-
-impl Render for PaneDrag {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .absolute()
-            .left(self.position.x - px(70.0))
-            .top(self.position.y - px(14.0))
-            .w(px(140.0))
-            .h(px(28.0))
-            .bg(rgb(THEME.elevated))
-            .border_1()
-            .border_color(rgb(THEME.border_strong))
-            .flex()
-            .items_center()
-            .justify_center()
-            .font_family("SF Mono")
-            .text_xs()
-            .text_color(rgb(THEME.foreground))
-            .child(self.title.clone())
+fn session_notify(client: &SharedSessionClient, request: &ClientRequest) -> anyhow::Result<()> {
+    let mut client = client.lock();
+    if client.is_none() {
+        *client = Some(SessionClient::connect()?);
     }
-}
-
-impl Render for WorkspaceDrag {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .absolute()
-            .left(self.position.x - px(82.0))
-            .top(self.position.y - px(14.0))
-            .w(px(164.0))
-            .h(px(28.0))
-            .rounded(px(5.0))
-            .bg(rgb(THEME.elevated))
-            .border_1()
-            .border_color(rgb(THEME.accent))
-            .flex()
-            .items_center()
-            .justify_center()
-            .font_family(".SystemUIFont")
-            .text_sm()
-            .text_color(rgb(THEME.foreground))
-            .child(self.title.clone())
+    let result = client
+        .as_mut()
+        .expect("session client initialized")
+        .notify(request);
+    if result.is_err() {
+        *client = None;
     }
-}
-
-#[derive(Clone, Debug)]
-struct TooltipView {
-    text: String,
-}
-
-impl Render for TooltipView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px(px(8.0))
-            .py(px(5.0))
-            .rounded(px(5.0))
-            .bg(rgb(THEME.elevated))
-            .border_1()
-            .border_color(rgb(THEME.border_strong))
-            .font_family(".SystemUIFont")
-            .text_xs()
-            .text_color(rgb(THEME.foreground))
-            .child(self.text.clone())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TabMenu {
-    pane_id: Uuid,
-    position: Point<Pixels>,
-    identity_picker_open: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct WorkspaceMenu {
-    workspace_id: Uuid,
-    position: Point<Pixels>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ColorTarget {
-    DefaultTerminal,
-    DefaultWorkspace,
-    Pane(Uuid),
-    Workspace(Uuid),
-}
-
-#[derive(Clone, Debug)]
-struct ColorPickerState {
-    target: ColorTarget,
-    hex: String,
-    replace_on_type: bool,
-    invalid: bool,
-}
-
-#[derive(Clone, Debug)]
-struct RenameEditor {
-    pane_id: Uuid,
-    value: String,
-    replace_on_type: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct WorkstationGroupExpansion {
-    pinned: bool,
-    ordinary: bool,
-}
-
-impl Default for WorkstationGroupExpansion {
-    fn default() -> Self {
-        Self {
-            pinned: true,
-            ordinary: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct SearchEditor {
-    query: String,
-    no_match: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ArchivedView {
-    page: TerminalHistoryPage,
-    first_line: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HistoryEditField {
-    RetentionDays,
-    QuotaGib,
-}
-
-#[derive(Clone, Debug)]
-struct HistoryEditor {
-    field: HistoryEditField,
-    text: String,
-    replace_on_type: bool,
-    invalid: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TerminalLineRender {
-    row: usize,
-    cursor: Option<nah_protocol::TerminalCursor>,
-    focused: bool,
-    pane_id: Uuid,
-    columns: u16,
-    selection: Option<TerminalSelection>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SelectionDrag {
-    pane_id: Uuid,
-    anchor: TerminalPoint,
-    preserve_single_cell: bool,
-}
-
-#[derive(Clone, Debug)]
-struct CloseConfirmation {
-    pane_id: Uuid,
-    title: String,
-    leaves_workspace_empty: bool,
-}
-
-#[derive(Clone, Debug)]
-struct WorkspaceRenameEditor {
-    workspace_id: Uuid,
-    value: String,
-    replace_on_type: bool,
-}
-
-#[derive(Clone, Debug)]
-struct WorkspaceDeleteConfirmation {
-    workspace_id: Uuid,
-    title: String,
-    active_terminal_count: u32,
-}
-
-#[derive(Clone, Debug)]
-struct WorkspaceConnectionInfo {
-    workspace_id: Uuid,
-    position: Point<Pixels>,
-}
-
-#[derive(Clone, Debug)]
-struct WorkspaceDisconnectConfirmation {
-    workspace_id: Uuid,
-    title: String,
-    destination: String,
-}
-
-#[derive(Clone, Debug)]
-struct TmuxSessionPicker {
-    workspace_id: Uuid,
-    scope: TmuxScanScope,
-    sessions: Vec<TmuxSession>,
-    no_server: bool,
-    selected_session_ids: HashSet<String>,
-    status: Option<String>,
-    error: Option<String>,
-}
-
-impl TmuxSessionPicker {
-    fn toggle_session(&mut self, session_id: &str) {
-        if !self.selected_session_ids.insert(session_id.to_owned()) {
-            self.selected_session_ids.remove(session_id);
-        }
-    }
-
-    fn select_all(&mut self) {
-        self.selected_session_ids = self
-            .sessions
-            .iter()
-            .map(|session| session.id.clone())
-            .collect();
-    }
-
-    fn clear_all(&mut self) {
-        self.selected_session_ids.clear();
-    }
-
-    fn selected_session_ids_in_scan_order(&self) -> Vec<String> {
-        self.sessions
-            .iter()
-            .filter(|session| self.selected_session_ids.contains(&session.id))
-            .map(|session| session.id.clone())
-            .collect()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkspaceCreationKind {
-    Local,
-    SystemSsh,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkspaceCreationStep {
-    Details,
-    ConfirmSsh,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkspaceCreationField {
-    Name,
-    Destination,
-}
-
-impl WorkspaceCreationField {
-    const fn index(self) -> usize {
-        match self {
-            Self::Name => 0,
-            Self::Destination => 1,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct DialogTextEditor {
-    text: String,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-    marked_range: Option<Range<usize>>,
-}
-
-impl DialogTextEditor {
-    fn with_text(text: impl Into<String>) -> Self {
-        let text = text.into();
-        let end = text.len();
-        Self {
-            text,
-            selected_range: end..end,
-            selection_reversed: false,
-            marked_range: None,
-        }
-    }
-
-    fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
-            self.selected_range.start
-        } else {
-            self.selected_range.end
-        }
-    }
-
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for character in self.text.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += character.len_utf16();
-            utf8_offset += character.len_utf8();
-        }
-        utf8_offset.min(self.text.len())
-    }
-
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-        for character in self.text.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += character.len_utf8();
-            utf16_offset += character.len_utf16();
-        }
-        utf16_offset
-    }
-
-    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
-    }
-
-    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.text[..offset.min(self.text.len())]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(index, _)| index)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        let offset = offset.min(self.text.len());
-        self.text[offset..]
-            .char_indices()
-            .nth(1)
-            .map_or(self.text.len(), |(index, _)| offset + index)
-    }
-
-    fn move_to(&mut self, offset: usize) {
-        let offset = offset.min(self.text.len());
-        self.selected_range = offset..offset;
-        self.selection_reversed = false;
-        self.marked_range = None;
-    }
-
-    fn select_to(&mut self, offset: usize) {
-        let offset = offset.min(self.text.len());
-        if self.selection_reversed {
-            self.selected_range.start = offset;
-        } else {
-            self.selected_range.end = offset;
-        }
-        if self.selected_range.end < self.selected_range.start {
-            self.selection_reversed = !self.selection_reversed;
-            self.selected_range = self.selected_range.end..self.selected_range.start;
-        }
-        self.marked_range = None;
-    }
-
-    fn move_left(&mut self, selecting: bool) {
-        let target = if !selecting && !self.selected_range.is_empty() {
-            self.selected_range.start
-        } else {
-            self.previous_boundary(self.cursor_offset())
-        };
-        if selecting {
-            self.select_to(target);
-        } else {
-            self.move_to(target);
-        }
-    }
-
-    fn move_right(&mut self, selecting: bool) {
-        let target = if !selecting && !self.selected_range.is_empty() {
-            self.selected_range.end
-        } else {
-            self.next_boundary(self.cursor_offset())
-        };
-        if selecting {
-            self.select_to(target);
-        } else {
-            self.move_to(target);
-        }
-    }
-
-    fn move_home(&mut self, selecting: bool) {
-        if selecting {
-            self.select_to(0);
-        } else {
-            self.move_to(0);
-        }
-    }
-
-    fn move_end(&mut self, selecting: bool) {
-        if selecting {
-            self.select_to(self.text.len());
-        } else {
-            self.move_to(self.text.len());
-        }
-    }
-
-    fn select_all(&mut self) {
-        self.selected_range = 0..self.text.len();
-        self.selection_reversed = false;
-        self.marked_range = None;
-    }
-
-    /// Select the word under a double-click using the same practical
-    /// boundaries people expect in workstation names and SSH destinations.
-    /// Keep connection punctuation together so `user@build-node` is useful as
-    /// a single editable unit rather than a series of tiny selections.
-    fn select_word_at(&mut self, offset: usize) {
-        if self.text.is_empty() {
-            self.move_to(0);
-            return;
-        }
-
-        let mut cursor = offset.min(self.text.len());
-        if cursor == self.text.len() {
-            cursor = self.previous_boundary(cursor);
-        }
-        let is_word = |character: char| {
-            character.is_alphanumeric()
-                || matches!(character, '_' | '-' | '.' | '@' | '/' | ':' | '~')
-        };
-        let Some(character) = self.text[cursor..].chars().next() else {
-            self.move_to(cursor);
-            return;
-        };
-        let word = is_word(character);
-
-        let mut start = cursor;
-        while start > 0 {
-            let previous = self.previous_boundary(start);
-            let Some(previous_character) = self.text[previous..].chars().next() else {
-                break;
-            };
-            if is_word(previous_character) != word {
-                break;
-            }
-            start = previous;
-        }
-
-        let mut end = cursor + character.len_utf8();
-        while end < self.text.len() {
-            let Some(next_character) = self.text[end..].chars().next() else {
-                break;
-            };
-            if is_word(next_character) != word {
-                break;
-            }
-            end += next_character.len_utf8();
-        }
-        self.selected_range = start..end;
-        self.selection_reversed = false;
-        self.marked_range = None;
-    }
-
-    fn selected_text(&self) -> Option<&str> {
-        (!self.selected_range.is_empty()).then(|| &self.text[self.selected_range.clone()])
-    }
-
-    fn replacement_range(&self, range_utf16: Option<&Range<usize>>) -> Range<usize> {
-        range_utf16
-            .map(|range| self.range_from_utf16(range))
-            .or_else(|| self.marked_range.clone())
-            .unwrap_or_else(|| self.selected_range.clone())
-    }
-
-    fn replace(
-        &mut self,
-        range_utf16: Option<&Range<usize>>,
-        new_text: &str,
-        maximum: usize,
-        limit_is_bytes: bool,
-        mark: bool,
-        marked_selection_utf16: Option<&Range<usize>>,
-    ) {
-        let range = self.replacement_range(range_utf16);
-        let mut insertion: String = new_text
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect();
-        loop {
-            let result_len = if limit_is_bytes {
-                self.text.len() - range.len() + insertion.len()
-            } else {
-                self.text[..range.start].chars().count()
-                    + insertion.chars().count()
-                    + self.text[range.end..].chars().count()
-            };
-            if result_len <= maximum || insertion.is_empty() {
-                break;
-            }
-            insertion.pop();
-        }
-
-        self.text.replace_range(range.clone(), &insertion);
-        let inserted = range.start..range.start + insertion.len();
-        self.marked_range = mark
-            .then(|| inserted.clone())
-            .filter(|range| !range.is_empty());
-        if mark {
-            if let Some(selection) = marked_selection_utf16 {
-                let relative_start = Self::utf16_offset_in(&insertion, selection.start);
-                let relative_end = Self::utf16_offset_in(&insertion, selection.end);
-                self.selected_range = range.start + relative_start..range.start + relative_end;
-            } else {
-                self.selected_range = inserted.end..inserted.end;
-            }
-        } else {
-            self.selected_range = inserted.end..inserted.end;
-        }
-        self.selection_reversed = false;
-    }
-
-    fn utf16_offset_in(text: &str, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for character in text.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += character.len_utf16();
-            utf8_offset += character.len_utf8();
-        }
-        utf8_offset.min(text.len())
-    }
-
-    fn delete_backward(&mut self) {
-        if self.selected_range.is_empty() {
-            let cursor = self.cursor_offset();
-            self.selected_range = self.previous_boundary(cursor)..cursor;
-        }
-        self.replace(None, "", usize::MAX, true, false, None);
-    }
-
-    fn delete_forward(&mut self) {
-        if self.selected_range.is_empty() {
-            let cursor = self.cursor_offset();
-            self.selected_range = cursor..self.next_boundary(cursor);
-        }
-        self.replace(None, "", usize::MAX, true, false, None);
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct WorkspaceCreationDialog {
-    kind: WorkspaceCreationKind,
-    name: DialogTextEditor,
-    destination: DialogTextEditor,
-    field: WorkspaceCreationField,
-    step: WorkspaceCreationStep,
-    error: Option<String>,
-}
-
-impl WorkspaceCreationDialog {
-    fn new() -> Self {
-        Self {
-            kind: WorkspaceCreationKind::Local,
-            name: DialogTextEditor::default(),
-            destination: DialogTextEditor::default(),
-            field: WorkspaceCreationField::Name,
-            step: WorkspaceCreationStep::Details,
-            error: None,
-        }
-    }
-
-    fn review(&mut self) {
-        match normalize_ssh_input(&self.destination.text) {
-            Ok(destination) => {
-                self.destination = DialogTextEditor::with_text(destination);
-                self.step = WorkspaceCreationStep::ConfirmSsh;
-                self.error = None;
-            }
-            Err(message) => self.error = Some(message.to_owned()),
-        }
-    }
-
-    fn active_editor(&self) -> &DialogTextEditor {
-        match self.field {
-            WorkspaceCreationField::Name => &self.name,
-            WorkspaceCreationField::Destination => &self.destination,
-        }
-    }
-
-    fn active_editor_mut(&mut self) -> &mut DialogTextEditor {
-        match self.field {
-            WorkspaceCreationField::Name => &mut self.name,
-            WorkspaceCreationField::Destination => &mut self.destination,
-        }
-    }
-
-    fn replace_text(
-        &mut self,
-        range_utf16: Option<&Range<usize>>,
-        text: &str,
-        mark: bool,
-        marked_selection_utf16: Option<&Range<usize>>,
-    ) {
-        let (maximum, limit_is_bytes) = match self.field {
-            WorkspaceCreationField::Name => (80, false),
-            WorkspaceCreationField::Destination => (MAX_SSH_INPUT_LEN, true),
-        };
-        self.active_editor_mut().replace(
-            range_utf16,
-            text,
-            maximum,
-            limit_is_bytes,
-            mark,
-            marked_selection_utf16,
-        );
-        self.error = None;
-    }
-
-    fn paste(&mut self, text: &str) {
-        self.replace_text(None, text, false, None);
-    }
-
-    fn backspace(&mut self) {
-        self.active_editor_mut().delete_backward();
-        self.error = None;
-    }
-
-    fn delete(&mut self) {
-        self.active_editor_mut().delete_forward();
-        self.error = None;
-    }
-
-    fn approved_request(&self) -> Option<ClientRequest> {
-        let title = (!self.name.text.trim().is_empty()).then(|| self.name.text.trim().to_owned());
-        match self.kind {
-            WorkspaceCreationKind::Local if self.step == WorkspaceCreationStep::Details => {
-                Some(ClientRequest::CreateWorkspace { title })
-            }
-            WorkspaceCreationKind::SystemSsh
-                if self.step == WorkspaceCreationStep::ConfirmSsh
-                    && validate_ssh_host(&self.destination.text).is_ok() =>
-            {
-                Some(ClientRequest::CreateSshWorkspace {
-                    title,
-                    destination: self.destination.text.clone(),
-                })
-            }
-            WorkspaceCreationKind::Local | WorkspaceCreationKind::SystemSsh => None,
-        }
-    }
-}
-
-fn route_workspace_creation_paste(
-    dialog: Option<&mut WorkspaceCreationDialog>,
-    text: &str,
-) -> bool {
-    let Some(dialog) = dialog else {
-        return false;
-    };
-    if dialog.step == WorkspaceCreationStep::Details {
-        dialog.paste(text);
-    }
-    true
-}
-
-impl CloseConfirmation {
-    fn for_pane(pane: &Pane, leaves_workspace_empty: bool) -> Self {
-        Self {
-            pane_id: pane.id,
-            title: pane.title.clone(),
-            leaves_workspace_empty,
-        }
-    }
-
-    fn request(&self) -> ClientRequest {
-        ClientRequest::ClosePane {
-            pane_id: self.pane_id,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PaneControlIcon {
-    Add,
-    SplitRight,
-    SplitDown,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ResizeDrag {
-    split_id: SplitControlId,
-    axis: SplitAxis,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-enum SidebarResizeLifecycle {
-    #[default]
-    Idle,
-    Dragging {
-        initial_width: f32,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SidebarResizeMove {
-    Ignore,
-    Update,
-    Complete,
-}
-
-impl SidebarResizeLifecycle {
-    fn begin(&mut self, initial_width: f32) {
-        *self = Self::Dragging { initial_width };
-    }
-
-    fn pointer_move(&mut self, pressed_button: Option<MouseButton>) -> SidebarResizeMove {
-        match (*self, pressed_button) {
-            (Self::Idle, _) => SidebarResizeMove::Ignore,
-            (Self::Dragging { .. }, Some(MouseButton::Left)) => SidebarResizeMove::Update,
-            (Self::Dragging { .. }, _) => {
-                *self = Self::Idle;
-                SidebarResizeMove::Complete
-            }
-        }
-    }
-
-    fn finish(&mut self) -> bool {
-        if matches!(self, Self::Idle) {
-            return false;
-        }
-        *self = Self::Idle;
-        true
-    }
-
-    fn cancel(&mut self) -> Option<f32> {
-        let Self::Dragging { initial_width } = *self else {
-            return None;
-        };
-        *self = Self::Idle;
-        Some(initial_width)
-    }
-
-    fn is_active(self) -> bool {
-        matches!(self, Self::Dragging { .. })
-    }
-}
-
-/// Client-local split identity. The current protocol has no split IDs, so this
-/// wraps its deterministic compatibility key behind one boundary. A future
-/// protocol `SplitId` can replace the field without changing layout controls.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct SplitControlId {
-    first: Uuid,
-    second: Uuid,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LayoutControlMutation {
-    Equalize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct CommandPaletteState {
-    query: String,
-    selected: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct PixelRect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DragDestination {
-    Split {
-        target_pane: Uuid,
-        placement: DropPlacement,
-    },
-    Merge {
-        target_pane: Uuid,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DragHoverState {
-    destination: Option<DragDestination>,
-}
-
-impl DragHoverState {
-    fn enter(&mut self, destination: DragDestination) {
-        self.destination = Some(destination);
-    }
-
-    fn clear(&mut self) {
-        self.destination = None;
-    }
-
-    fn split_for(self, target_pane: Uuid) -> Option<DropPlacement> {
-        match self.destination {
-            Some(DragDestination::Split {
-                target_pane: target,
-                placement,
-            }) if target == target_pane => Some(placement),
-            _ => None,
-        }
-    }
-
-    fn merges_into(self, target_pane: Uuid) -> bool {
-        matches!(
-            self.destination,
-            Some(DragDestination::Merge { target_pane: target }) if target == target_pane
-        )
-    }
+    result
 }
 
 #[derive(Debug)]
 struct NahApp {
     focus_handle: FocusHandle,
+    /// Screen traffic only: pane updates, targeted pane snapshots, history
+    /// status. Kept separate so a keystroke never waits behind a screen payload.
+    stream_client: SharedSessionClient,
+    /// Everything else, including terminal input and selection updates.
+    control_client: SharedSessionClient,
     terminal_font: TerminalFontProfile,
     keymap: ResolvedKeymap,
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
     pane_states: HashMap<Uuid, PaneStreamState>,
-    pane_attention: HashMap<Uuid, Instant>,
+    /// When each pane's screen was last applied, used to pace on-screen panes
+    /// other than the focused one.
+    last_delivery: HashMap<Uuid, Instant>,
+    /// Last time output was delivered or the user acted, driving the deep-idle
+    /// polling tier.
+    last_activity: Instant,
     stream_diagnostics: StreamDiagnostics,
     active_workspace: Option<Uuid>,
     expanded_workspaces: HashSet<Uuid>,
@@ -973,7 +217,7 @@ struct NahApp {
     focused_pane: Option<Uuid>,
     split_ratios: HashMap<SplitControlId, f32>,
     zoomed_pane: Option<Uuid>,
-    command_palette: Option<CommandPaletteState>,
+    modal: Modal,
     resizing: Option<ResizeDrag>,
     sidebar_resize: SidebarResizeLifecycle,
     ui_state_store: Option<UiStateStore>,
@@ -985,25 +229,14 @@ struct NahApp {
     workspace_drop_preview: Option<WorkspaceDropPreview>,
     suppress_workspace_click: bool,
     last_sizes: HashMap<Uuid, (u16, u16)>,
+    resize_generation: u64,
     workspace_pixels: (f32, f32),
     connection_error: Option<String>,
-    tab_menu: Option<TabMenu>,
-    workspace_menu: Option<WorkspaceMenu>,
-    appearance_settings_open: bool,
     history_status: Option<HistoryArchiveStatus>,
     archived_views: HashMap<Uuid, ArchivedView>,
     history_editor: Option<HistoryEditor>,
     history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
-    rename_editor: Option<RenameEditor>,
-    workspace_rename_editor: Option<WorkspaceRenameEditor>,
-    search_editor: Option<SearchEditor>,
-    close_confirmation: Option<CloseConfirmation>,
-    workspace_delete_confirmation: Option<WorkspaceDeleteConfirmation>,
-    workspace_connection_info: Option<WorkspaceConnectionInfo>,
-    workspace_disconnect_confirmation: Option<WorkspaceDisconnectConfirmation>,
-    tmux_session_picker: Option<TmuxSessionPicker>,
-    workspace_creation: Option<WorkspaceCreationDialog>,
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
     selection_drag: Option<SelectionDrag>,
@@ -1044,14 +277,19 @@ impl NahApp {
         {
             eprintln!("Not a Harness sidebar default correction was not persisted: {error:#}");
         }
+        let stream_client = Arc::new(Mutex::new(SessionClient::connect().ok()));
+        let control_client = Arc::new(Mutex::new(SessionClient::connect().ok()));
         let mut app = Self {
             focus_handle,
+            stream_client,
+            control_client,
             terminal_font,
             keymap,
             snapshot: None,
             screens: HashMap::new(),
             pane_states: HashMap::new(),
-            pane_attention: HashMap::new(),
+            last_delivery: HashMap::new(),
+            last_activity: Instant::now(),
             stream_diagnostics: StreamDiagnostics::default(),
             active_workspace: None,
             expanded_workspaces: HashSet::new(),
@@ -1059,7 +297,7 @@ impl NahApp {
             focused_pane: None,
             split_ratios: HashMap::new(),
             zoomed_pane: None,
-            command_palette: None,
+            modal: Modal::None,
             resizing: None,
             sidebar_resize: SidebarResizeLifecycle::default(),
             ui_state_store,
@@ -1071,25 +309,14 @@ impl NahApp {
             workspace_drop_preview: None,
             suppress_workspace_click: false,
             last_sizes: HashMap::new(),
+            resize_generation: 0,
             workspace_pixels: (0.0, 0.0),
             connection_error: None,
-            tab_menu: None,
-            workspace_menu: None,
-            appearance_settings_open: false,
             history_status: None,
             archived_views: HashMap::new(),
             history_editor: None,
             history_clear_confirmation: None,
             color_picker: None,
-            rename_editor: None,
-            workspace_rename_editor: None,
-            search_editor: None,
-            close_confirmation: None,
-            workspace_delete_confirmation: None,
-            workspace_connection_info: None,
-            workspace_disconnect_confirmation: None,
-            tmux_session_picker: None,
-            workspace_creation: None,
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
             selection_drag: None,
@@ -1106,7 +333,7 @@ impl NahApp {
 
         cx.observe_window_bounds(window, |this, window, cx| {
             if this.update_window_geometry(window) {
-                this.sync_pty_sizes();
+                this.sync_pty_sizes(cx);
                 cx.notify();
             }
         })
@@ -1123,32 +350,47 @@ impl NahApp {
             let mut poll_delay_ms = ACTIVE_TERMINAL_POLL_MS;
             loop {
                 gpui::Timer::after(Duration::from_millis(poll_delay_ms)).await;
-                let Ok(update_request) = this.update(cx, |this, _| this.pane_update_request())
-                else {
-                    break;
-                };
-                let response = cx
-                    .background_spawn(async move { request(update_request) })
-                    .await;
-                let Ok(state_changed) = this.update(cx, |this, cx| {
-                    let state_changed = this.apply_update_result(response);
-                    this.sync_pty_sizes();
-                    if state_changed {
-                        cx.notify();
-                    }
-                    state_changed
+                let Ok((update_request, client)) = this.update(cx, |this, _| {
+                    (this.pane_update_request(), Arc::clone(&this.stream_client))
                 }) else {
                     break;
                 };
-                poll_delay_ms = next_terminal_poll_delay_ms(poll_delay_ms, state_changed);
+                let response = cx
+                    .background_spawn(async move { session_call(&client, &update_request) })
+                    .await;
+                let Ok((state_changed, deep_idle)) = this.update(cx, |this, cx| {
+                    let state_changed = this.apply_update_result(response);
+                    if state_changed {
+                        this.last_activity = Instant::now();
+                    }
+                    let deep_idle = Instant::now().saturating_duration_since(this.last_activity)
+                        >= DEEP_IDLE_AFTER;
+                    this.sync_pty_sizes(cx);
+                    if state_changed {
+                        cx.notify();
+                    }
+                    (state_changed, deep_idle)
+                }) else {
+                    break;
+                };
+                poll_delay_ms =
+                    next_terminal_poll_delay_ms(poll_delay_ms, state_changed, deep_idle);
             }
         })
         .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 gpui::Timer::after(Duration::from_secs(5)).await;
+                let Ok(client) = this.update(cx, |this, _| Arc::clone(&this.stream_client)) else {
+                    break;
+                };
+                let response = cx
+                    .background_spawn(async move {
+                        session_call(&client, &ClientRequest::GetHistoryStatus)
+                    })
+                    .await;
                 let Ok(()) = this.update(cx, |this, cx| {
-                    if this.refresh_history_status() {
+                    if this.apply_history_status_result(response) {
                         cx.notify();
                     }
                 }) else {
@@ -1159,9 +401,30 @@ impl NahApp {
         .detach();
         app
     }
+    /// Commands and terminal input: never blocked behind a screen payload.
+    fn call(&self, request: &ClientRequest) -> anyhow::Result<ServiceResponse> {
+        session_call(&self.control_client, request)
+    }
+
+    /// Screen traffic: pane updates, targeted pane snapshots, history status.
+    fn stream_call(&self, request: &ClientRequest) -> anyhow::Result<ServiceResponse> {
+        session_call(&self.stream_client, request)
+    }
+
+    fn notify(&self, request: &ClientRequest) -> anyhow::Result<()> {
+        session_notify(&self.control_client, request)
+    }
+
+    fn report(&mut self, error: &anyhow::Error) {
+        self.connection_error = Some(format!("{error:#}"));
+    }
+
+    fn report_unexpected(&mut self, response: &ServiceResponse) {
+        self.connection_error = Some(format!("unexpected response: {response:?}"));
+    }
 
     fn refresh_state(&mut self) -> bool {
-        self.apply_update_result(request(self.pane_update_request()))
+        self.apply_update_result(self.stream_call(&self.pane_update_request()))
     }
 
     fn pane_update_request(&self) -> ClientRequest {
@@ -1174,7 +437,13 @@ impl NahApp {
                 revision: screen.revision,
             })
             .collect();
-        let subscribed_panes = responsive_panes(now, self.focused_pane, &self.pane_attention);
+        let subscribed_panes = paced_subscriptions(
+            now,
+            &self.on_screen_panes(),
+            self.focused_pane,
+            &self.last_delivery,
+            SECONDARY_PANE_INTERVAL,
+        );
         ClientRequest::GetUpdates {
             snapshot_revision: self.snapshot.as_ref().map(|snapshot| snapshot.revision),
             pane_revisions,
@@ -1217,8 +486,7 @@ impl NahApp {
                     }
                     let visible = self
                         .active_workspace_in(&snapshot)
-                        .and_then(|workspace| workspace.tabs.first())
-                        .map(|tab| visible_panes(&tab.layout))
+                        .map(workspace_visible_panes)
                         .unwrap_or_default();
                     if self
                         .zoomed_pane
@@ -1227,22 +495,21 @@ impl NahApp {
                         self.zoomed_pane = None;
                         self.last_sizes.clear();
                     }
-                    if self.focused_pane.is_none()
-                        || !visible.iter().any(|pane| Some(*pane) == self.focused_pane)
-                    {
-                        focus_resync = visible.first().copied();
-                        if focus_resync.is_none() {
-                            self.focused_pane = None;
-                        }
+                    match focus_resync_for(&visible, self.focused_pane) {
+                        FocusResync::Keep => {}
+                        FocusResync::Switch(pane_id) => focus_resync = Some(pane_id),
+                        FocusResync::Clear => self.focused_pane = None,
                     }
                     self.snapshot = Some(snapshot);
                 }
+                let delivered_at = Instant::now();
                 for screen in screens {
                     let is_newer = self
                         .screens
                         .get(&screen.pane_id)
                         .is_none_or(|current| screen.revision > current.revision);
                     if is_newer {
+                        self.last_delivery.insert(screen.pane_id, delivered_at);
                         self.screens.insert(screen.pane_id, screen);
                         screens_applied += 1;
                     }
@@ -1254,8 +521,11 @@ impl NahApp {
                         .collect::<std::collections::HashSet<_>>();
                     self.screens
                         .retain(|pane_id, _| live_panes.contains(pane_id));
-                    self.pane_attention
+                    self.last_delivery
                         .retain(|pane_id, _| live_panes.contains(pane_id));
+                    self.split_ratios.retain(|id, _| {
+                        live_panes.contains(&id.first) && live_panes.contains(&id.second)
+                    });
                     self.pane_states = pane_states
                         .into_iter()
                         .map(|state| (state.pane_id, state))
@@ -1275,41 +545,33 @@ impl NahApp {
                 state_changed
             }
             Ok(response) => {
-                let error = format!("unexpected response: {response:?}");
-                let changed = self.connection_error.as_deref() != Some(error.as_str());
-                self.connection_error = Some(error);
-                changed
+                let previous = self.connection_error.clone();
+                self.report_unexpected(&response);
+                self.connection_error != previous
             }
             Err(error) => {
-                let error = format!("{error:#}");
-                let changed = self.connection_error.as_deref() != Some(error.as_str());
-                self.connection_error = Some(error);
-                changed
+                let previous = self.connection_error.clone();
+                self.report(&error);
+                self.connection_error != previous
             }
         }
     }
 
     fn focus_pane_with_snapshot(&mut self, pane_id: Uuid) -> bool {
         if self.focused_pane == Some(pane_id) {
-            self.pane_attention.insert(pane_id, Instant::now());
             return false;
         }
-        match request(ClientRequest::GetPaneSnapshot { pane_id }) {
+        match self.stream_call(&ClientRequest::GetPaneSnapshot { pane_id }) {
             Ok(ServiceResponse::PaneSnapshot {
                 screen,
                 diagnostics,
             }) => {
-                let attended_at = Instant::now();
+                let delivered_at = Instant::now();
                 let changed = self.focused_pane != Some(pane_id)
                     || self
                         .screens
                         .get(&pane_id)
                         .is_none_or(|current| current.revision != screen.revision);
-                if self.focused_pane != Some(pane_id)
-                    && let Some(previous) = self.focused_pane
-                {
-                    self.pane_attention.insert(previous, attended_at);
-                }
                 self.pane_states.insert(
                     pane_id,
                     PaneStreamState {
@@ -1317,21 +579,27 @@ impl NahApp {
                         revision: screen.revision,
                         subscribed: true,
                         dirty: false,
+                        // A focus snapshot says nothing about liveness; keep
+                        // whatever the last update round reported.
+                        exited: self
+                            .pane_states
+                            .get(&pane_id)
+                            .is_some_and(|state| state.exited),
                     },
                 );
                 self.screens.insert(pane_id, screen);
                 self.focused_pane = Some(pane_id);
-                self.pane_attention.insert(pane_id, attended_at);
+                self.last_delivery.insert(pane_id, delivered_at);
                 self.stream_diagnostics = diagnostics;
                 self.connection_error = None;
                 changed
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
                 false
             }
             Err(error) => {
-                self.connection_error = Some(format!("{error:#}"));
+                self.report(&error);
                 false
             }
         }
@@ -1343,6 +611,30 @@ impl NahApp {
             .workspaces
             .iter()
             .find(|workspace| workspace.id == active)
+    }
+
+    /// The layout the viewport is actually rendering: the tab holding the
+    /// focused pane, not blindly the workstation's first tab. Sizing, zoom,
+    /// and split geometry must agree with what is on screen.
+    fn active_layout<'a>(&self, snapshot: &'a SessionSnapshot) -> Option<&'a PaneLayout> {
+        self.active_workspace_in(snapshot)
+            .and_then(|workspace| workspace_layout_for_focused_pane(workspace, self.focused_pane))
+    }
+
+    /// Panes rendered right now: the tab holding the focused pane, zoom
+    /// applied. This is the same projection `sync_pty_sizes` resizes, so what
+    /// is sized is exactly what streams.
+    fn on_screen_panes(&self) -> Vec<Uuid> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let Some(layout) = self.active_layout(snapshot) else {
+            return Vec::new();
+        };
+        let projected = self
+            .zoomed_pane
+            .and_then(|pane_id| zoom_projection(layout, pane_id));
+        visible_panes(projected.as_ref().unwrap_or(layout))
     }
 
     fn terminal_accent(&self, pane_id: Uuid) -> AppearanceColor {
@@ -1415,9 +707,10 @@ impl NahApp {
             },
             (ColorTarget::DefaultTerminal | ColorTarget::DefaultWorkspace, None) => return,
         };
-        self.send(request);
-        self.tab_menu = None;
-        self.workspace_menu = None;
+        self.send(&request);
+        if matches!(self.modal, Modal::TabMenu(_) | Modal::WorkspaceMenu(_)) {
+            self.modal = Modal::None;
+        }
         self.color_picker = None;
         cx.notify();
     }
@@ -1431,8 +724,7 @@ impl NahApp {
             invalid: false,
         });
         if !matches!(target, ColorTarget::Pane(_) | ColorTarget::Workspace(_)) {
-            self.tab_menu = None;
-            self.workspace_menu = None;
+            self.modal = Modal::None;
         }
         cx.notify();
     }
@@ -1452,9 +744,7 @@ impl NahApp {
     }
 
     fn open_appearance_settings(&mut self, cx: &mut Context<Self>) {
-        self.appearance_settings_open = true;
-        self.tab_menu = None;
-        self.workspace_menu = None;
+        self.modal = Modal::AppearanceSettings;
         self.color_picker = None;
         self.history_editor = None;
         self.history_clear_confirmation = None;
@@ -1463,31 +753,36 @@ impl NahApp {
     }
 
     fn refresh_history_status(&mut self) -> bool {
+        let response = self.call(&ClientRequest::GetHistoryStatus);
+        self.apply_history_status_result(response)
+    }
+
+    fn apply_history_status_result(&mut self, response: anyhow::Result<ServiceResponse>) -> bool {
         let previous = self.history_status.clone();
-        match request(ClientRequest::GetHistoryStatus) {
+        match response {
             Ok(ServiceResponse::HistoryStatus { status }) => {
                 self.history_status = Some(status);
                 self.connection_error = None;
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         self.history_status != previous
     }
 
     fn apply_history_settings(&mut self, settings: HistorySettings, cx: &mut Context<Self>) {
-        match request(ClientRequest::SetHistorySettings { settings }) {
+        match self.call(&ClientRequest::SetHistorySettings { settings }) {
             Ok(ServiceResponse::HistoryStatus { status }) => {
                 self.history_status = Some(status);
                 self.history_editor = None;
                 self.connection_error = None;
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         cx.notify();
     }
@@ -1509,14 +804,13 @@ impl NahApp {
         update(&mut settings);
         self.apply_history_settings(settings, cx);
     }
-
     fn clear_history(&mut self, scope: HistoryClearScope, cx: &mut Context<Self>) {
         if self.history_clear_confirmation != Some(scope) {
             self.history_clear_confirmation = Some(scope);
             cx.notify();
             return;
         }
-        match request(ClientRequest::ClearHistory { scope }) {
+        match self.call(&ClientRequest::ClearHistory { scope }) {
             Ok(ServiceResponse::HistoryStatus { status }) => {
                 self.history_status = Some(status);
                 self.history_clear_confirmation = None;
@@ -1524,9 +818,9 @@ impl NahApp {
                 self.connection_error = None;
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         cx.notify();
     }
@@ -1599,14 +893,23 @@ impl NahApp {
         }
     }
 
-    fn send(&mut self, request_message: ClientRequest) {
+    fn send(&mut self, request_message: &ClientRequest) {
         self.send_control(request_message);
         self.refresh_state();
     }
 
-    fn send_control(&mut self, request_message: ClientRequest) {
-        if let Err(error) = request(request_message) {
-            self.connection_error = Some(format!("{error:#}"));
+    fn send_control(&mut self, request_message: &ClientRequest) {
+        self.last_activity = Instant::now();
+        let result = if matches!(
+            request_message,
+            ClientRequest::WriteInput { .. } | ClientRequest::UpdateSelection { .. }
+        ) {
+            self.notify(request_message)
+        } else {
+            self.call(request_message).map(|_| ())
+        };
+        if let Err(error) = result {
+            self.report(&error);
         }
     }
 
@@ -1617,7 +920,7 @@ impl NahApp {
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_visible = !self.sidebar_visible;
         if self.sidebar_resize.finish() {
-            self.persist_sidebar_width();
+            self.persist_sidebar_width(cx);
         }
         let window_width = self.workspace_pixels.0 + self.sidebar_pixels;
         self.sidebar_pixels = sidebar_width_for_visibility(
@@ -1627,7 +930,7 @@ impl NahApp {
         );
         self.workspace_pixels.0 = (window_width - self.sidebar_pixels).max(1.0);
         self.last_sizes.clear();
-        self.sync_pty_sizes();
+        self.sync_pty_sizes(cx);
         cx.notify();
     }
 
@@ -1710,14 +1013,14 @@ impl NahApp {
     }
 
     fn open_workspace_terminal(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        match request(ClientRequest::CreateWorkspaceTerminal { workspace_id }) {
+        match self.call(&ClientRequest::CreateWorkspaceTerminal { workspace_id }) {
             Ok(ServiceResponse::PaneCreated { pane_id }) => {
                 self.focus_pane_with_snapshot(pane_id);
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         self.refresh_state();
         self.last_sizes.clear();
@@ -1725,14 +1028,12 @@ impl NahApp {
     }
 
     fn new_tab_at(&mut self, target_pane: Uuid, cx: &mut Context<Self>) {
-        match request(ClientRequest::CreateTab { target_pane }) {
+        match self.call(&ClientRequest::CreateTab { target_pane }) {
             Ok(ServiceResponse::PaneCreated { pane_id }) => {
                 self.focus_pane_with_snapshot(pane_id);
             }
-            Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"))
-            }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Ok(response) => self.report_unexpected(&response),
+            Err(error) => self.report(&error),
         }
         self.refresh_state();
         cx.notify();
@@ -1746,14 +1047,12 @@ impl NahApp {
 
     fn split_at(&mut self, target_pane: Uuid, axis: SplitAxis, cx: &mut Context<Self>) {
         self.zoomed_pane = None;
-        match request(ClientRequest::CreatePane { target_pane, axis }) {
+        match self.call(&ClientRequest::CreatePane { target_pane, axis }) {
             Ok(ServiceResponse::PaneCreated { pane_id }) => {
                 self.focus_pane_with_snapshot(pane_id);
             }
-            Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"))
-            }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Ok(response) => self.report_unexpected(&response),
+            Err(error) => self.report(&error),
         }
         self.refresh_state();
         self.last_sizes.clear();
@@ -1761,15 +1060,15 @@ impl NahApp {
     }
 
     fn activate_tab(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        match request(ClientRequest::ActivateTab { pane_id }) {
+        match self.call(&ClientRequest::ActivateTab { pane_id }) {
             Ok(ServiceResponse::Ack) => {
                 self.focus_pane_with_snapshot(pane_id);
                 self.refresh_state();
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         cx.notify();
     }
@@ -1777,7 +1076,7 @@ impl NahApp {
     fn swap_panes(&mut self, source_pane: Uuid, target_pane: Uuid, cx: &mut Context<Self>) {
         if source_pane != target_pane {
             self.zoomed_pane = None;
-            self.send(ClientRequest::SwapPanes {
+            self.send(&ClientRequest::SwapPanes {
                 source_pane,
                 target_pane,
             });
@@ -1797,7 +1096,7 @@ impl NahApp {
         self.dragging_pane = None;
         self.drag_hover.clear();
         self.zoomed_pane = None;
-        self.send(ClientRequest::MovePaneToSplit {
+        self.send(&ClientRequest::MovePaneToSplit {
             source_pane,
             target_pane,
             placement,
@@ -1811,7 +1110,7 @@ impl NahApp {
         self.dragging_pane = None;
         self.drag_hover.clear();
         self.zoomed_pane = None;
-        self.send(ClientRequest::MovePaneToTab {
+        self.send(&ClientRequest::MovePaneToTab {
             source_pane,
             target_pane,
         });
@@ -1831,19 +1130,16 @@ impl NahApp {
     }
 
     fn open_tab_menu(&mut self, pane_id: Uuid, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if let Err(error) = request(ClientRequest::ActivateTab { pane_id }) {
-            self.connection_error = Some(format!("{error:#}"));
+        if let Err(error) = self.call(&ClientRequest::ActivateTab { pane_id }) {
+            self.report(&error);
         }
         self.focus_pane_with_snapshot(pane_id);
         self.refresh_state();
-        self.tab_menu = Some(TabMenu {
+        self.modal = Modal::TabMenu(TabMenu {
             pane_id,
             position,
             identity_picker_open: false,
         });
-        self.workspace_menu = None;
-        self.rename_editor = None;
-        self.close_confirmation = None;
         cx.notify();
     }
 
@@ -1853,12 +1149,10 @@ impl NahApp {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.workspace_menu = Some(WorkspaceMenu {
+        self.modal = Modal::WorkspaceMenu(WorkspaceMenu {
             workspace_id,
             position,
         });
-        self.tab_menu = None;
-        self.workspace_connection_info = None;
         self.last_sizes.clear();
         cx.notify();
     }
@@ -1866,21 +1160,18 @@ impl NahApp {
     fn begin_rename(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
         self.focus_pane_with_snapshot(pane_id);
         if let Some(pane) = self.pane_metadata(pane_id) {
-            self.rename_editor = Some(RenameEditor {
+            self.modal = Modal::PaneRename(RenameEditor {
                 pane_id,
                 value: pane.title,
                 replace_on_type: true,
             });
-            self.tab_menu = None;
             cx.notify();
         }
     }
 
     fn toggle_tab_identity_picker(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        if let Some(menu) = self
-            .tab_menu
-            .as_mut()
-            .filter(|menu| menu.pane_id == pane_id)
+        if let Modal::TabMenu(menu) = &mut self.modal
+            && menu.pane_id == pane_id
         {
             menu.identity_picker_open = !menu.identity_picker_open;
             self.color_picker = None;
@@ -1889,10 +1180,10 @@ impl NahApp {
     }
 
     fn submit_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.rename_editor.take() else {
+        let Modal::PaneRename(editor) = std::mem::take(&mut self.modal) else {
             return;
         };
-        self.send(ClientRequest::RenamePane {
+        self.send(&ClientRequest::RenamePane {
             pane_id: editor.pane_id,
             title: editor.value,
         });
@@ -1905,14 +1196,14 @@ impl NahApp {
         profile: Option<TerminalProfile>,
         cx: &mut Context<Self>,
     ) {
-        self.send(ClientRequest::SetPaneProfile { pane_id, profile });
-        self.tab_menu = None;
+        self.send(&ClientRequest::SetPaneProfile { pane_id, profile });
+        self.modal = Modal::None;
         cx.notify();
     }
 
     fn reset_pane_identity(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        self.send(ClientRequest::ResetPaneIdentity { pane_id });
-        self.tab_menu = None;
+        self.send(&ClientRequest::ResetPaneIdentity { pane_id });
+        self.modal = Modal::None;
         cx.notify();
     }
 
@@ -1929,30 +1220,24 @@ impl NahApp {
                     panes.len() == 1 && panes[0] == pane_id
                 })
             });
-            self.close_confirmation =
-                Some(CloseConfirmation::for_pane(&pane, leaves_workspace_empty));
-            self.tab_menu = None;
+            self.modal = Modal::Close(CloseConfirmation::for_pane(&pane, leaves_workspace_empty));
             cx.notify();
         }
     }
 
     fn confirm_close(&mut self, cx: &mut Context<Self>) {
-        let Some(confirmation) = self.close_confirmation.take() else {
+        let Modal::Close(confirmation) = std::mem::take(&mut self.modal) else {
             return;
         };
-        self.send(confirmation.request());
+        self.send(&confirmation.request());
         self.last_sizes.clear();
         cx.notify();
     }
 
     fn begin_workspace_creation(&mut self, cx: &mut Context<Self>) {
-        self.workspace_creation = Some(WorkspaceCreationDialog::new());
+        self.modal = Modal::WorkspaceCreation(WorkspaceCreationDialog::new());
         self.workspace_input_layouts = [None, None];
         self.workspace_input_bounds = [None, None];
-        self.tab_menu = None;
-        self.workspace_menu = None;
-        self.rename_editor = None;
-        self.close_confirmation = None;
         cx.notify();
     }
 
@@ -1970,7 +1255,7 @@ impl NahApp {
             let bounds = self.workspace_input_bounds[index]?;
             Some(line.closest_index_for_x(position.x - bounds.left()))
         });
-        let Some(dialog) = self.workspace_creation.as_mut() else {
+        let Some(dialog) = self.modal.workspace_creation_mut() else {
             return;
         };
         dialog.field = field;
@@ -1989,7 +1274,7 @@ impl NahApp {
     }
 
     fn submit_workspace_creation(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.workspace_creation.as_mut() else {
+        let Some(dialog) = self.modal.workspace_creation_mut() else {
             return;
         };
         if dialog.kind == WorkspaceCreationKind::SystemSsh
@@ -2000,13 +1285,13 @@ impl NahApp {
             return;
         }
         let Some(request_message) = self
-            .workspace_creation
-            .as_ref()
+            .modal
+            .workspace_creation()
             .and_then(WorkspaceCreationDialog::approved_request)
         else {
             return;
         };
-        match request(request_message) {
+        match self.call(&request_message) {
             Ok(ServiceResponse::WorkspaceCreated {
                 workspace_id,
                 pane_id,
@@ -2014,16 +1299,16 @@ impl NahApp {
                 self.active_workspace = Some(workspace_id);
                 self.expanded_workspaces.insert(workspace_id);
                 self.focus_pane_with_snapshot(pane_id);
-                self.workspace_creation = None;
+                self.modal = Modal::None;
                 self.refresh_state();
             }
             Ok(response) => {
-                if let Some(dialog) = self.workspace_creation.as_mut() {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
                     dialog.error = Some(format!("unexpected response: {response:?}"));
                 }
             }
             Err(error) => {
-                if let Some(dialog) = self.workspace_creation.as_mut() {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
                     dialog.error = Some(format!("{error:#}"));
                 }
             }
@@ -2039,21 +1324,20 @@ impl NahApp {
                 .find(|workspace| workspace.id == workspace_id)
         });
         if let Some(workspace) = workspace {
-            self.workspace_rename_editor = Some(WorkspaceRenameEditor {
+            self.modal = Modal::WorkspaceRename(WorkspaceRenameEditor {
                 workspace_id,
                 value: workspace.title.clone(),
                 replace_on_type: true,
             });
-            self.workspace_menu = None;
             cx.notify();
         }
     }
 
     fn submit_workspace_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.workspace_rename_editor.take() else {
+        let Modal::WorkspaceRename(editor) = std::mem::take(&mut self.modal) else {
             return;
         };
-        self.send(ClientRequest::RenameWorkspace {
+        self.send(&ClientRequest::RenameWorkspace {
             workspace_id: editor.workspace_id,
             title: editor.value,
         });
@@ -2061,11 +1345,11 @@ impl NahApp {
     }
 
     fn set_workspace_pinned(&mut self, workspace_id: Uuid, pinned: bool, cx: &mut Context<Self>) {
-        self.send(ClientRequest::SetWorkspacePinned {
+        self.send(&ClientRequest::SetWorkspacePinned {
             workspace_id,
             pinned,
         });
-        self.workspace_menu = None;
+        self.modal = Modal::None;
         cx.notify();
     }
 
@@ -2075,11 +1359,11 @@ impl NahApp {
         direction: WorkspacePinMove,
         cx: &mut Context<Self>,
     ) {
-        self.send(ClientRequest::MovePinnedWorkspace {
+        self.send(&ClientRequest::MovePinnedWorkspace {
             workspace_id,
             direction,
         });
-        self.workspace_menu = None;
+        self.modal = Modal::None;
         cx.notify();
     }
 
@@ -2090,7 +1374,7 @@ impl NahApp {
         after: bool,
         cx: &mut Context<Self>,
     ) {
-        self.send(ClientRequest::ReorderWorkspace {
+        self.send(&ClientRequest::ReorderWorkspace {
             workspace_id,
             target_workspace_id,
             after,
@@ -2102,7 +1386,7 @@ impl NahApp {
     }
 
     fn disconnect_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        self.send_control(ClientRequest::DisconnectWorkspace { workspace_id });
+        self.send_control(&ClientRequest::DisconnectWorkspace { workspace_id });
         if self.connection_error.is_none() && self.active_workspace == Some(workspace_id) {
             self.active_workspace = None;
             self.focused_pane = None;
@@ -2117,12 +1401,10 @@ impl NahApp {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.workspace_connection_info = Some(WorkspaceConnectionInfo {
+        self.modal = Modal::WorkspaceConnectionInfo(WorkspaceConnectionInfo {
             workspace_id,
             position,
         });
-        self.workspace_menu = None;
-        self.tab_menu = None;
         cx.notify();
     }
 
@@ -2145,34 +1427,32 @@ impl NahApp {
         else {
             return;
         };
-        self.workspace_disconnect_confirmation = Some(WorkspaceDisconnectConfirmation {
+        self.modal = Modal::WorkspaceDisconnect(WorkspaceDisconnectConfirmation {
             workspace_id,
             title: title.clone(),
             destination: destination.clone(),
         });
-        self.workspace_connection_info = None;
-        self.workspace_menu = None;
         cx.notify();
     }
 
     fn confirm_workspace_disconnect(&mut self, cx: &mut Context<Self>) {
-        let Some(confirmation) = self.workspace_disconnect_confirmation.take() else {
+        let Modal::WorkspaceDisconnect(confirmation) = std::mem::take(&mut self.modal) else {
             return;
         };
         self.disconnect_workspace(confirmation.workspace_id, cx);
     }
 
     fn reconnect_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        match request(ClientRequest::ReconnectWorkspace { workspace_id }) {
+        match self.call(&ClientRequest::ReconnectWorkspace { workspace_id }) {
             Ok(ServiceResponse::PaneCreated { pane_id }) => {
                 self.active_workspace = Some(workspace_id);
                 self.focus_pane_with_snapshot(pane_id);
                 self.refresh_state();
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         cx.notify();
     }
@@ -2185,29 +1465,29 @@ impl NahApp {
                 .find(|workspace| workspace.id == workspace_id)
         });
         if let Some(workspace) = workspace {
-            self.workspace_delete_confirmation = Some(WorkspaceDeleteConfirmation {
+            self.modal = Modal::WorkspaceDelete(WorkspaceDeleteConfirmation {
                 workspace_id,
                 title: workspace.title.clone(),
                 active_terminal_count: workspace.active_terminal_count,
             });
-            self.workspace_menu = None;
             cx.notify();
         }
     }
 
     fn scan_tmux_sessions(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        self.workspace_menu = None;
-        self.workspace_connection_info = None;
-        match request(ClientRequest::ScanTmuxSessions { workspace_id }) {
+        self.modal = Modal::None;
+        match self.call(&ClientRequest::ScanTmuxSessions { workspace_id }) {
             Ok(ServiceResponse::TmuxSessions {
                 scope,
                 sessions,
+                open_session_ids,
                 no_server,
             }) => {
-                self.tmux_session_picker = Some(TmuxSessionPicker {
+                self.modal = Modal::TmuxPicker(TmuxSessionPicker {
                     workspace_id,
                     scope,
                     sessions,
+                    open_session_ids: open_session_ids.into_iter().collect(),
                     no_server,
                     selected_session_ids: HashSet::new(),
                     status: None,
@@ -2216,10 +1496,11 @@ impl NahApp {
                 self.connection_error = None;
             }
             Ok(response) => {
-                self.tmux_session_picker = Some(TmuxSessionPicker {
+                self.modal = Modal::TmuxPicker(TmuxSessionPicker {
                     workspace_id,
                     scope: TmuxScanScope::Local,
                     sessions: Vec::new(),
+                    open_session_ids: HashSet::new(),
                     no_server: false,
                     selected_session_ids: HashSet::new(),
                     status: None,
@@ -2227,10 +1508,11 @@ impl NahApp {
                 });
             }
             Err(error) => {
-                self.tmux_session_picker = Some(TmuxSessionPicker {
+                self.modal = Modal::TmuxPicker(TmuxSessionPicker {
                     workspace_id,
                     scope: TmuxScanScope::Local,
                     sessions: Vec::new(),
+                    open_session_ids: HashSet::new(),
                     no_server: false,
                     selected_session_ids: HashSet::new(),
                     status: None,
@@ -2241,27 +1523,13 @@ impl NahApp {
         cx.notify();
     }
 
-    fn select_tmux_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
-        if let Some(picker) = self.tmux_session_picker.as_mut() {
-            picker.toggle_session(session_id);
-            picker.status = None;
-            picker.error = None;
-            cx.notify();
-        }
-    }
-
-    fn select_all_tmux_sessions(&mut self, cx: &mut Context<Self>) {
-        if let Some(picker) = self.tmux_session_picker.as_mut() {
-            picker.select_all();
-            picker.status = None;
-            picker.error = None;
-            cx.notify();
-        }
-    }
-
-    fn clear_all_tmux_sessions(&mut self, cx: &mut Context<Self>) {
-        if let Some(picker) = self.tmux_session_picker.as_mut() {
-            picker.clear_all();
+    fn mutate_tmux_selection(&mut self, change: TmuxSelectionChange, cx: &mut Context<Self>) {
+        if let Some(picker) = self.modal.tmux_picker_mut() {
+            match change {
+                TmuxSelectionChange::Session(session_id) => picker.toggle_session(&session_id),
+                TmuxSelectionChange::All => picker.select_all_sessions(),
+                TmuxSelectionChange::None => picker.clear_all_sessions(),
+            }
             picker.status = None;
             picker.error = None;
             cx.notify();
@@ -2269,7 +1537,7 @@ impl NahApp {
     }
 
     fn open_selected_tmux_sessions(&mut self, cx: &mut Context<Self>) {
-        let Some((workspace_id, session_ids)) = self.tmux_session_picker.as_ref().map(|picker| {
+        let Some((workspace_id, session_ids)) = self.modal.tmux_picker_mut().map(|picker| {
             (
                 picker.workspace_id,
                 picker.selected_session_ids_in_scan_order(),
@@ -2280,7 +1548,7 @@ impl NahApp {
         if session_ids.is_empty() {
             return;
         }
-        match request(ClientRequest::AttachTmuxSessions {
+        match self.call(&ClientRequest::AttachTmuxSessions {
             workspace_id,
             session_ids,
         }) {
@@ -2291,8 +1559,8 @@ impl NahApp {
                     self.focus_pane_with_snapshot(pane_id);
                 }
                 if skipped.is_empty() {
-                    self.tmux_session_picker = None;
-                } else if let Some(picker) = self.tmux_session_picker.as_mut() {
+                    self.modal = Modal::None;
+                } else if let Some(picker) = self.modal.tmux_picker_mut() {
                     picker.selected_session_ids = skipped
                         .iter()
                         .map(|issue| issue.session_id.clone())
@@ -2312,12 +1580,12 @@ impl NahApp {
                 self.refresh_state();
             }
             Ok(response) => {
-                if let Some(picker) = self.tmux_session_picker.as_mut() {
+                if let Some(picker) = self.modal.tmux_picker_mut() {
                     picker.error = Some(format!("unexpected tmux open response: {response:?}"));
                 }
             }
             Err(error) => {
-                if let Some(picker) = self.tmux_session_picker.as_mut() {
+                if let Some(picker) = self.modal.tmux_picker_mut() {
                     picker.error = Some(error.to_string());
                 }
             }
@@ -2326,10 +1594,10 @@ impl NahApp {
     }
 
     fn confirm_workspace_delete(&mut self, cx: &mut Context<Self>) {
-        let Some(confirmation) = self.workspace_delete_confirmation.take() else {
+        let Modal::WorkspaceDelete(confirmation) = std::mem::take(&mut self.modal) else {
             return;
         };
-        self.send_control(ClientRequest::DeleteWorkspace {
+        self.send_control(&ClientRequest::DeleteWorkspace {
             workspace_id: confirmation.workspace_id,
         });
         if self.connection_error.is_none()
@@ -2346,13 +1614,10 @@ impl NahApp {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let Some(workspace) = self.active_workspace_in(snapshot) else {
+        let Some(layout) = self.active_layout(snapshot) else {
             return;
         };
-        let Some(tab) = workspace.tabs.first() else {
-            return;
-        };
-        let panes = visible_panes(&tab.layout);
+        let panes = visible_panes(layout);
         let Some(current) = self.focused_pane else {
             return;
         };
@@ -2370,13 +1635,18 @@ impl NahApp {
         if self.zoomed_pane.is_some() {
             self.zoomed_pane = self.focused_pane;
             self.last_sizes.clear();
-            self.sync_pty_sizes();
+            self.sync_pty_sizes(cx);
         }
         cx.notify();
     }
 
     fn execute_command(&mut self, command: AppCommand, cx: &mut Context<Self>) {
-        self.command_palette = None;
+        if !matches!(self.modal, Modal::None | Modal::CommandPalette(_))
+            && command != AppCommand::ShowCommandPalette
+        {
+            return;
+        }
+        self.modal = Modal::None;
         match command {
             AppCommand::NewWorkspace => self.new_workspace(cx),
             AppCommand::ToggleSidebar => self.toggle_sidebar(cx),
@@ -2386,11 +1656,16 @@ impl NahApp {
             AppCommand::FocusLeft | AppCommand::FocusUp => self.focus_direction(false, cx),
             AppCommand::FocusRight | AppCommand::FocusDown => self.focus_direction(true, cx),
             AppCommand::ShowCommandPalette => {
-                self.command_palette = Some(CommandPaletteState::default());
+                self.modal = Modal::CommandPalette(CommandPaletteState::default());
                 cx.notify();
             }
             AppCommand::TogglePaneZoom => self.toggle_pane_zoom(cx),
             AppCommand::EqualizePanes => self.equalize_panes(cx),
+            AppCommand::ReattachPane => {
+                if let Some(pane_id) = self.focused_pane {
+                    self.reattach_pane(pane_id, cx);
+                }
+            }
         }
     }
 
@@ -2404,7 +1679,27 @@ impl NahApp {
             Some(focused)
         };
         self.last_sizes.clear();
-        self.sync_pty_sizes();
+        self.sync_pty_sizes(cx);
+        cx.notify();
+    }
+
+    /// Respawns an exited terminal in place. For a tmux tab this re-attaches
+    /// the same session; the PTY starts at the service's default size, so the
+    /// pane geometry must be pushed again for tmux to redraw at full size.
+    fn reattach_pane(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        match self.call(&ClientRequest::ReattachPane { pane_id }) {
+            Ok(ServiceResponse::Ack) => {
+                if let Some(state) = self.pane_states.get_mut(&pane_id) {
+                    state.exited = false;
+                }
+                self.focus_pane_with_snapshot(pane_id);
+                self.last_sizes.clear();
+                self.sync_pty_sizes(cx);
+                self.refresh_state();
+            }
+            Ok(response) => self.report_unexpected(&response),
+            Err(error) => self.report(&error),
+        }
         cx.notify();
     }
 
@@ -2412,11 +1707,7 @@ impl NahApp {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        let Some(layout) = self
-            .active_workspace_in(snapshot)
-            .and_then(|workspace| workspace.tabs.first())
-            .map(|tab| tab.layout.clone())
-        else {
+        let Some(layout) = self.active_layout(snapshot).cloned() else {
             return;
         };
         if apply_layout_control_mutation(
@@ -2426,7 +1717,7 @@ impl NahApp {
         ) > 0
         {
             self.last_sizes.clear();
-            self.sync_pty_sizes();
+            self.sync_pty_sizes(cx);
             cx.notify();
         }
     }
@@ -2435,7 +1726,7 @@ impl NahApp {
         let keystroke = &event.keystroke;
         let mut execute = None;
         let mut close = false;
-        if let Some(palette) = self.command_palette.as_mut() {
+        if let Some(palette) = self.modal.command_palette_mut() {
             let result_count = palette_matches(&palette.query, COMMAND_PALETTE_LIMIT).len();
             match keystroke.key.as_str() {
                 "escape" => close = true,
@@ -2473,7 +1764,7 @@ impl NahApp {
             }
         }
         if close {
-            self.command_palette = None;
+            self.modal = Modal::None;
             cx.notify();
         } else if let Some(command) = execute {
             self.execute_command(command, cx);
@@ -2484,8 +1775,8 @@ impl NahApp {
 
     fn copy_terminal(&mut self, _: &CopyTerminal, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self
-            .workspace_creation
-            .as_ref()
+            .modal
+            .workspace_creation()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
             .and_then(|dialog| dialog.active_editor().selected_text())
         {
@@ -2495,16 +1786,16 @@ impl NahApp {
         let Some(pane_id) = self.focused_pane else {
             return;
         };
-        match request(ClientRequest::CopySelection { pane_id }) {
+        match self.call(&ClientRequest::CopySelection { pane_id }) {
             Ok(ServiceResponse::SelectionText { text: Some(text) }) if !text.is_empty() => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.connection_error = None;
             }
             Ok(ServiceResponse::SelectionText { .. }) => {}
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         cx.notify();
     }
@@ -2513,7 +1804,7 @@ impl NahApp {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        if route_workspace_creation_paste(self.workspace_creation.as_mut(), &text) {
+        if route_workspace_creation_paste(self.modal.workspace_creation_mut(), &text) {
             cx.notify();
             return;
         }
@@ -2525,14 +1816,17 @@ impl NahApp {
             .get(&pane_id)
             .is_some_and(|screen| screen.modes.contains(TerminalModes::BRACKETED_PASTE));
         match prepare_paste(&text, bracketed) {
-            Ok(bytes) => self.send_control(ClientRequest::WriteInput { pane_id, bytes }),
+            Ok(bytes) => self.send_control(&ClientRequest::WriteInput { pane_id, bytes }),
             Err(message) => self.connection_error = Some(message.to_owned()),
         }
         cx.notify();
     }
 
     fn find_terminal(&mut self, _: &FindTerminal, _: &mut Window, cx: &mut Context<Self>) {
-        self.search_editor = Some(SearchEditor::default());
+        if !matches!(self.modal, Modal::None | Modal::Search(_)) {
+            return;
+        }
+        self.modal = Modal::Search(SearchEditor::default());
         self.ime_preedit.clear();
         cx.notify();
     }
@@ -2545,18 +1839,18 @@ impl NahApp {
         let Some(pane_id) = self.focused_pane else {
             return;
         };
-        let Some(editor) = self.search_editor.as_ref() else {
+        let Some(editor) = self.modal.search() else {
             return;
         };
         if editor.query.is_empty() {
-            if let Some(editor) = self.search_editor.as_mut() {
+            if let Some(editor) = self.modal.search_mut() {
                 editor.no_match = false;
             }
             cx.notify();
             return;
         }
         let query = editor.query.clone();
-        match request(ClientRequest::SearchPane {
+        match self.call(&ClientRequest::SearchPane {
             pane_id,
             query: query.clone(),
             forward,
@@ -2567,7 +1861,7 @@ impl NahApp {
                         .archived_views
                         .get(&pane_id)
                         .map(|view| view.page.cursor);
-                    match request(ClientRequest::SearchArchivedHistory {
+                    match self.call(&ClientRequest::SearchArchivedHistory {
                         pane_id,
                         query: query.clone(),
                         before,
@@ -2586,22 +1880,21 @@ impl NahApp {
                             self.archived_views.clear();
                             self.archived_views
                                 .insert(pane_id, ArchivedView { page, first_line });
-                            if let Some(editor) = self.search_editor.as_mut() {
+                            if let Some(editor) = self.modal.search_mut() {
                                 editor.no_match = false;
                             }
                         }
                         Ok(ServiceResponse::HistorySearchResult { page: None }) => {
-                            if let Some(editor) = self.search_editor.as_mut() {
+                            if let Some(editor) = self.modal.search_mut() {
                                 editor.no_match = true;
                             }
                         }
                         Ok(response) => {
-                            self.connection_error =
-                                Some(format!("unexpected response: {response:?}"));
+                            self.report_unexpected(&response);
                         }
-                        Err(error) => self.connection_error = Some(format!("{error:#}")),
+                        Err(error) => self.report(&error),
                     }
-                } else if let Some(editor) = self.search_editor.as_mut() {
+                } else if let Some(editor) = self.modal.search_mut() {
                     editor.no_match = false;
                     self.archived_views.remove(&pane_id);
                 }
@@ -2609,9 +1902,9 @@ impl NahApp {
                 self.refresh_state();
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         cx.notify();
     }
@@ -2649,24 +1942,24 @@ impl NahApp {
             cx.notify();
             return;
         }
-        if let Some(dialog) = self.workspace_creation.as_mut() {
+        if let Some(dialog) = self.modal.workspace_creation_mut() {
             if dialog.step == WorkspaceCreationStep::Details {
                 dialog.replace_text(None, text, false, None);
             }
             cx.notify();
             return;
         }
-        if let Some(editor) = self.workspace_rename_editor.as_mut() {
+        if let Some(editor) = self.modal.workspace_rename_mut() {
             append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
             cx.notify();
             return;
         }
-        if let Some(editor) = self.rename_editor.as_mut() {
+        if let Some(editor) = self.modal.pane_rename_mut() {
             append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
             cx.notify();
             return;
         }
-        if let Some(editor) = self.search_editor.as_mut() {
+        if let Some(editor) = self.modal.search_mut() {
             let remaining = 256_usize.saturating_sub(editor.query.chars().count());
             editor
                 .query
@@ -2676,7 +1969,7 @@ impl NahApp {
             return;
         }
         if let Some(pane_id) = self.focused_pane {
-            self.send_control(ClientRequest::WriteInput {
+            self.send_control(&ClientRequest::WriteInput {
                 pane_id,
                 bytes: text.as_bytes().to_vec(),
             });
@@ -2700,7 +1993,7 @@ impl NahApp {
             .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING));
         if mouse_reporting && !event.modifiers.shift {
             if let Some(button) = terminal_mouse_button(event.button) {
-                self.send_control(ClientRequest::MouseInput {
+                self.send_control(&ClientRequest::MouseInput {
                     pane_id,
                     point,
                     button,
@@ -2726,7 +2019,7 @@ impl NahApp {
                     TerminalSelectionKind::Semantic | TerminalSelectionKind::Lines
                 ),
             });
-            self.send_control(ClientRequest::BeginSelection {
+            self.send_control(&ClientRequest::BeginSelection {
                 pane_id,
                 point,
                 kind,
@@ -2748,7 +2041,7 @@ impl NahApp {
             .is_some_and(|selection| selection.pane_id == pane_id)
             && event.dragging()
         {
-            self.send_control(ClientRequest::UpdateSelection { pane_id, point });
+            self.send_control(&ClientRequest::UpdateSelection { pane_id, point });
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2758,7 +2051,7 @@ impl NahApp {
             .get(&pane_id)
             .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_MOTION));
         if mouse_motion && let Some(button) = event.pressed_button.and_then(terminal_mouse_button) {
-            self.send_control(ClientRequest::MouseInput {
+            self.send_control(&ClientRequest::MouseInput {
                 pane_id,
                 point,
                 button,
@@ -2782,9 +2075,9 @@ impl NahApp {
             .filter(|selection| selection.pane_id == pane_id)
         {
             if point == selection.anchor && !selection.preserve_single_cell {
-                self.send_control(ClientRequest::ClearSelection { pane_id });
+                self.send_control(&ClientRequest::ClearSelection { pane_id });
             } else {
-                self.send_control(ClientRequest::UpdateSelection { pane_id, point });
+                self.send_control(&ClientRequest::UpdateSelection { pane_id, point });
             }
         } else if self
             .screens
@@ -2793,7 +2086,7 @@ impl NahApp {
             && !event.modifiers.shift
             && let Some(button) = terminal_mouse_button(event.button)
         {
-            self.send_control(ClientRequest::MouseInput {
+            self.send_control(&ClientRequest::MouseInput {
                 pane_id,
                 point,
                 button,
@@ -2832,7 +2125,7 @@ impl NahApp {
             .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING))
             && !event.modifiers.shift
         {
-            self.send_control(ClientRequest::MouseInput {
+            self.send_control(&ClientRequest::MouseInput {
                 pane_id,
                 point,
                 button: if lines > 0 {
@@ -2850,7 +2143,7 @@ impl NahApp {
         {
             self.load_archived_page(pane_id, None, HistoryPageDirection::Older, cx);
         } else {
-            self.send_control(ClientRequest::ScrollPane { pane_id, lines });
+            self.send_control(&ClientRequest::ScrollPane { pane_id, lines });
         }
         cx.stop_propagation();
         cx.notify();
@@ -2863,7 +2156,7 @@ impl NahApp {
         direction: HistoryPageDirection,
         cx: &mut Context<Self>,
     ) {
-        match request(ClientRequest::LoadHistoryPage {
+        match self.call(&ClientRequest::LoadHistoryPage {
             pane_id,
             cursor,
             direction,
@@ -2888,9 +2181,9 @@ impl NahApp {
                 }
             }
             Ok(response) => {
-                self.connection_error = Some(format!("unexpected response: {response:?}"));
+                self.report_unexpected(&response);
             }
-            Err(error) => self.connection_error = Some(format!("{error:#}")),
+            Err(error) => self.report(&error),
         }
         cx.notify();
     }
@@ -2932,13 +2225,207 @@ impl NahApp {
         }
     }
 
+    fn handle_workspace_creation_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        cx: &mut Context<Self>,
+    ) {
+        let step = self.modal.workspace_creation().map(|dialog| dialog.step);
+        if step == Some(WorkspaceCreationStep::Details)
+            && keystroke.modifiers.platform
+            && keystroke.key.eq_ignore_ascii_case("a")
+        {
+            if let Some(dialog) = self.modal.workspace_creation_mut() {
+                dialog.active_editor_mut().select_all();
+                cx.notify();
+            }
+            return;
+        }
+        if step == Some(WorkspaceCreationStep::Details)
+            && keystroke.modifiers.platform
+            && keystroke.key.eq_ignore_ascii_case("x")
+        {
+            if let Some(dialog) = self.modal.workspace_creation_mut()
+                && let Some(text) = dialog.active_editor().selected_text().map(str::to_owned)
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                dialog.replace_text(None, "", false, None);
+                cx.notify();
+            }
+            return;
+        }
+        match keystroke.key.as_str() {
+            "enter" => self.submit_workspace_creation(cx),
+            "escape" => {
+                self.modal = Modal::None;
+                cx.notify();
+            }
+            "tab" if step == Some(WorkspaceCreationStep::Details) => {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
+                    dialog.field = match (dialog.kind, dialog.field) {
+                        (WorkspaceCreationKind::SystemSsh, WorkspaceCreationField::Name) => {
+                            WorkspaceCreationField::Destination
+                        }
+                        _ => WorkspaceCreationField::Name,
+                    };
+                    cx.notify();
+                }
+            }
+            "backspace" if step == Some(WorkspaceCreationStep::Details) => {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
+                    dialog.backspace();
+                    cx.notify();
+                }
+            }
+            "delete" if step == Some(WorkspaceCreationStep::Details) => {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
+                    dialog.delete();
+                    cx.notify();
+                }
+            }
+            "left" if step == Some(WorkspaceCreationStep::Details) => {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
+                    if keystroke.modifiers.platform {
+                        dialog
+                            .active_editor_mut()
+                            .move_home(keystroke.modifiers.shift);
+                    } else {
+                        dialog
+                            .active_editor_mut()
+                            .move_left(keystroke.modifiers.shift);
+                    }
+                    cx.notify();
+                }
+            }
+            "right" if step == Some(WorkspaceCreationStep::Details) => {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
+                    if keystroke.modifiers.platform {
+                        dialog
+                            .active_editor_mut()
+                            .move_end(keystroke.modifiers.shift);
+                    } else {
+                        dialog
+                            .active_editor_mut()
+                            .move_right(keystroke.modifiers.shift);
+                    }
+                    cx.notify();
+                }
+            }
+            "home" if step == Some(WorkspaceCreationStep::Details) => {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
+                    dialog
+                        .active_editor_mut()
+                        .move_home(keystroke.modifiers.shift);
+                    cx.notify();
+                }
+            }
+            "end" if step == Some(WorkspaceCreationStep::Details) => {
+                if let Some(dialog) = self.modal.workspace_creation_mut() {
+                    dialog
+                        .active_editor_mut()
+                        .move_end(keystroke.modifiers.shift);
+                    cx.notify();
+                }
+            }
+            _ if step == Some(WorkspaceCreationStep::Details)
+                && !keystroke.modifiers.platform
+                && !keystroke.modifiers.control
+                && !keystroke.modifiers.alt =>
+            {
+                if let Some(text) = &keystroke.key_char
+                    && !text.chars().any(char::is_control)
+                    && let Some(dialog) = self.modal.workspace_creation_mut()
+                {
+                    dialog.replace_text(None, text, false, None);
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_rename_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        workspace: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (value, replace_on_type) = match (&mut self.modal, workspace) {
+            (Modal::WorkspaceRename(editor), true) => {
+                (&mut editor.value, &mut editor.replace_on_type)
+            }
+            (Modal::PaneRename(editor), false) => (&mut editor.value, &mut editor.replace_on_type),
+            _ => return,
+        };
+        if keystroke.modifiers.platform && keystroke.key.eq_ignore_ascii_case("a") {
+            *replace_on_type = true;
+            cx.notify();
+            return;
+        }
+        match keystroke.key.as_str() {
+            "enter" if workspace => self.submit_workspace_rename(cx),
+            "enter" => self.submit_rename(cx),
+            "escape" => {
+                self.modal = Modal::None;
+                cx.notify();
+            }
+            "backspace" => {
+                if *replace_on_type {
+                    value.clear();
+                } else {
+                    value.pop();
+                }
+                *replace_on_type = false;
+                cx.notify();
+            }
+            _ if !keystroke.modifiers.platform
+                && !keystroke.modifiers.control
+                && !keystroke.modifiers.alt =>
+            {
+                if let Some(text) = &keystroke.key_char {
+                    append_rename_text(value, replace_on_type, text);
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_search_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+        match keystroke.key.as_str() {
+            "enter" => self.run_search(!keystroke.modifiers.shift, cx),
+            "escape" => {
+                self.modal = Modal::None;
+                self.ime_preedit.clear();
+                cx.notify();
+            }
+            "backspace" => {
+                let Some(editor) = self.modal.search_mut() else {
+                    return;
+                };
+                editor.query.pop();
+                editor.no_match = false;
+                let empty = editor.query.is_empty();
+                if empty {
+                    if let Some(pane_id) = self.focused_pane {
+                        self.send_control(&ClientRequest::ClearSelection { pane_id });
+                    }
+                } else {
+                    self.run_search(true, cx);
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
     fn handle_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" && self.sidebar_resize.is_active() {
             self.cancel_sidebar_resize(window, cx);
             cx.stop_propagation();
             return;
         }
-        if self.command_palette.is_some() {
+        if self.modal.command_palette().is_some() {
             self.handle_palette_key(event, cx);
             return;
         }
@@ -3006,306 +2493,96 @@ impl NahApp {
             cx.stop_propagation();
             return;
         }
-        if self.appearance_settings_open {
-            if keystroke.key == "escape" {
-                self.appearance_settings_open = false;
-                cx.notify();
+        match &self.modal {
+            Modal::None => {}
+            Modal::CommandPalette(_) => {
+                self.handle_palette_key(event, cx);
+                return;
             }
-            cx.stop_propagation();
-            return;
-        }
-        if self.workspace_creation.is_some() {
-            let step = self.workspace_creation.as_ref().map(|dialog| dialog.step);
-            if step == Some(WorkspaceCreationStep::Details)
-                && keystroke.modifiers.platform
-                && keystroke.key.eq_ignore_ascii_case("a")
-            {
-                if let Some(dialog) = self.workspace_creation.as_mut() {
-                    dialog.active_editor_mut().select_all();
+            Modal::AppearanceSettings => {
+                if keystroke.key == "escape" {
+                    self.modal = Modal::None;
                     cx.notify();
                 }
                 cx.stop_propagation();
                 return;
             }
-            if step == Some(WorkspaceCreationStep::Details)
-                && keystroke.modifiers.platform
-                && keystroke.key.eq_ignore_ascii_case("x")
-            {
-                if let Some(dialog) = self.workspace_creation.as_mut()
-                    && let Some(text) = dialog.active_editor().selected_text().map(str::to_owned)
-                {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    dialog.replace_text(None, "", false, None);
-                    cx.notify();
+            Modal::WorkspaceCreation(_) => {
+                self.handle_workspace_creation_key(keystroke, cx);
+                cx.stop_propagation();
+                return;
+            }
+            Modal::WorkspaceRename(_) => {
+                self.handle_rename_key(keystroke, true, cx);
+                cx.stop_propagation();
+                return;
+            }
+            Modal::PaneRename(_) => {
+                self.handle_rename_key(keystroke, false, cx);
+                cx.stop_propagation();
+                return;
+            }
+            Modal::Search(_) => {
+                self.handle_search_key(keystroke, cx);
+                cx.stop_propagation();
+                return;
+            }
+            Modal::WorkspaceDelete(_) => {
+                match keystroke.key.as_str() {
+                    "enter" => self.confirm_workspace_delete(cx),
+                    "escape" => {
+                        self.modal = Modal::None;
+                        cx.notify();
+                    }
+                    _ => {}
                 }
                 cx.stop_propagation();
                 return;
             }
-            match keystroke.key.as_str() {
-                "enter" => self.submit_workspace_creation(cx),
-                "escape" => {
-                    self.workspace_creation = None;
-                    cx.notify();
-                }
-                "tab" if step == Some(WorkspaceCreationStep::Details) => {
-                    if let Some(dialog) = self.workspace_creation.as_mut() {
-                        dialog.field = match (dialog.kind, dialog.field) {
-                            (WorkspaceCreationKind::SystemSsh, WorkspaceCreationField::Name) => {
-                                WorkspaceCreationField::Destination
-                            }
-                            _ => WorkspaceCreationField::Name,
-                        };
+            Modal::TmuxPicker(_) => {
+                match keystroke.key.as_str() {
+                    "enter" => self.open_selected_tmux_sessions(cx),
+                    "escape" => {
+                        self.modal = Modal::None;
                         cx.notify();
                     }
+                    _ => {}
                 }
-                "backspace" if step == Some(WorkspaceCreationStep::Details) => {
-                    if let Some(dialog) = self.workspace_creation.as_mut() {
-                        dialog.backspace();
-                        cx.notify();
-                    }
-                }
-                "delete" if step == Some(WorkspaceCreationStep::Details) => {
-                    if let Some(dialog) = self.workspace_creation.as_mut() {
-                        dialog.delete();
-                        cx.notify();
-                    }
-                }
-                "left" if step == Some(WorkspaceCreationStep::Details) => {
-                    if let Some(dialog) = self.workspace_creation.as_mut() {
-                        if keystroke.modifiers.platform {
-                            dialog
-                                .active_editor_mut()
-                                .move_home(keystroke.modifiers.shift);
-                        } else {
-                            dialog
-                                .active_editor_mut()
-                                .move_left(keystroke.modifiers.shift);
-                        }
-                        cx.notify();
-                    }
-                }
-                "right" if step == Some(WorkspaceCreationStep::Details) => {
-                    if let Some(dialog) = self.workspace_creation.as_mut() {
-                        if keystroke.modifiers.platform {
-                            dialog
-                                .active_editor_mut()
-                                .move_end(keystroke.modifiers.shift);
-                        } else {
-                            dialog
-                                .active_editor_mut()
-                                .move_right(keystroke.modifiers.shift);
-                        }
-                        cx.notify();
-                    }
-                }
-                "home" if step == Some(WorkspaceCreationStep::Details) => {
-                    if let Some(dialog) = self.workspace_creation.as_mut() {
-                        dialog
-                            .active_editor_mut()
-                            .move_home(keystroke.modifiers.shift);
-                        cx.notify();
-                    }
-                }
-                "end" if step == Some(WorkspaceCreationStep::Details) => {
-                    if let Some(dialog) = self.workspace_creation.as_mut() {
-                        dialog
-                            .active_editor_mut()
-                            .move_end(keystroke.modifiers.shift);
-                        cx.notify();
-                    }
-                }
-                _ if step == Some(WorkspaceCreationStep::Details)
-                    && !keystroke.modifiers.platform
-                    && !keystroke.modifiers.control
-                    && !keystroke.modifiers.alt =>
-                {
-                    // Most text arrives through EntityInputHandler, including
-                    // IME composition. Some native key paths, however, only
-                    // provide `key_char`; accept that ordinary text here so a
-                    // modal never looks focused while silently rejecting the
-                    // user's keyboard. This remains modal and cannot reach a
-                    // terminal behind the dialog.
-                    if let Some(text) = &keystroke.key_char
-                        && !text.chars().any(char::is_control)
-                        && let Some(dialog) = self.workspace_creation.as_mut()
-                    {
-                        dialog.replace_text(None, text, false, None);
-                        cx.notify();
-                    }
-                }
-                _ => {}
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if let Some(editor) = self.workspace_rename_editor.as_mut() {
-            if keystroke.modifiers.platform && keystroke.key.eq_ignore_ascii_case("a") {
-                editor.replace_on_type = true;
                 cx.stop_propagation();
-                cx.notify();
                 return;
             }
-            match keystroke.key.as_str() {
-                "enter" => self.submit_workspace_rename(cx),
-                "escape" => {
-                    self.workspace_rename_editor = None;
-                    cx.notify();
-                }
-                "backspace" => {
-                    if editor.replace_on_type {
-                        editor.value.clear();
-                    } else {
-                        editor.value.pop();
-                    }
-                    editor.replace_on_type = false;
-                    cx.notify();
-                }
-                _ if !keystroke.modifiers.platform
-                    && !keystroke.modifiers.control
-                    && !keystroke.modifiers.alt =>
-                {
-                    // macOS occasionally delivers printable keys to the
-                    // modal's key route without a matching text-input event.
-                    // Keep the rename field focused and accept those keys
-                    // instead of leaving a cleared editor unable to type.
-                    if let Some(text) = &keystroke.key_char {
-                        append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
+            Modal::WorkspaceDisconnect(_) => {
+                match keystroke.key.as_str() {
+                    "enter" => self.confirm_workspace_disconnect(cx),
+                    "escape" => {
+                        self.modal = Modal::None;
                         cx.notify();
                     }
+                    _ => {}
                 }
-                _ => {}
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if let Some(editor) = self.rename_editor.as_mut() {
-            if keystroke.modifiers.platform && keystroke.key.eq_ignore_ascii_case("a") {
-                editor.replace_on_type = true;
                 cx.stop_propagation();
-                cx.notify();
                 return;
             }
-            match keystroke.key.as_str() {
-                "enter" => self.submit_rename(cx),
-                "escape" => {
-                    self.rename_editor = None;
-                    cx.notify();
-                }
-                "backspace" => {
-                    if editor.replace_on_type {
-                        editor.value.clear();
-                    } else {
-                        editor.value.pop();
-                    }
-                    editor.replace_on_type = false;
-                    cx.notify();
-                }
-                _ if !keystroke.modifiers.platform
-                    && !keystroke.modifiers.control
-                    && !keystroke.modifiers.alt =>
-                {
-                    // See the workspace rename path above. This fallback is
-                    // deliberately modal, so text cannot leak to the PTY.
-                    if let Some(text) = &keystroke.key_char {
-                        append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
+            Modal::Close(_) => {
+                match keystroke.key.as_str() {
+                    "enter" => self.confirm_close(cx),
+                    "escape" => {
+                        self.modal = Modal::None;
                         cx.notify();
                     }
+                    _ => {}
                 }
-                _ => {}
+                cx.stop_propagation();
+                return;
             }
-            cx.stop_propagation();
-            return;
-        }
-        if let Some(editor) = self.search_editor.as_mut() {
-            match keystroke.key.as_str() {
-                "enter" => self.run_search(!keystroke.modifiers.shift, cx),
-                "escape" => {
-                    self.search_editor = None;
-                    self.ime_preedit.clear();
+            Modal::TabMenu(_) | Modal::WorkspaceMenu(_) | Modal::WorkspaceConnectionInfo(_) => {
+                if keystroke.key == "escape" {
+                    self.modal = Modal::None;
+                    cx.stop_propagation();
                     cx.notify();
+                    return;
                 }
-                "backspace" => {
-                    editor.query.pop();
-                    editor.no_match = false;
-                    if editor.query.is_empty() {
-                        if let Some(pane_id) = self.focused_pane {
-                            self.send_control(ClientRequest::ClearSelection { pane_id });
-                        }
-                    } else {
-                        self.run_search(true, cx);
-                    }
-                    cx.notify();
-                }
-                _ => {}
             }
-            cx.stop_propagation();
-            return;
-        }
-        if self.workspace_delete_confirmation.is_some() {
-            match keystroke.key.as_str() {
-                "enter" => self.confirm_workspace_delete(cx),
-                "escape" => {
-                    self.workspace_delete_confirmation = None;
-                    cx.notify();
-                }
-                _ => {}
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if self.tmux_session_picker.is_some() {
-            match keystroke.key.as_str() {
-                "enter" => self.open_selected_tmux_sessions(cx),
-                "escape" => {
-                    self.tmux_session_picker = None;
-                    cx.notify();
-                }
-                _ => {}
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if self.workspace_disconnect_confirmation.is_some() {
-            match keystroke.key.as_str() {
-                "enter" => self.confirm_workspace_disconnect(cx),
-                "escape" => {
-                    self.workspace_disconnect_confirmation = None;
-                    cx.notify();
-                }
-                _ => {}
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if self.close_confirmation.is_some() {
-            match keystroke.key.as_str() {
-                "enter" => self.confirm_close(cx),
-                "escape" => {
-                    self.close_confirmation = None;
-                    cx.notify();
-                }
-                _ => {}
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if self.tab_menu.is_some() && keystroke.key == "escape" {
-            self.tab_menu = None;
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if self.workspace_menu.is_some() && keystroke.key == "escape" {
-            self.workspace_menu = None;
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if self.workspace_connection_info.is_some() && keystroke.key == "escape" {
-            self.workspace_connection_info = None;
-            cx.stop_propagation();
-            cx.notify();
-            return;
         }
         if self.dragging_pane.is_some() && keystroke.key == "escape" {
             self.dragging_pane = None;
@@ -3322,7 +2599,7 @@ impl NahApp {
             keystroke.modifiers.platform,
         );
         if let (Some(pane_id), Some(bytes)) = (self.focused_pane, bytes) {
-            self.send_control(ClientRequest::WriteInput { pane_id, bytes });
+            self.send_control(&ClientRequest::WriteInput { pane_id, bytes });
             cx.stop_propagation();
             cx.notify();
         }
@@ -3338,13 +2615,13 @@ impl NahApp {
                     self.preferred_sidebar_width = next;
                     self.update_window_geometry(window);
                     self.last_sizes.clear();
-                    self.sync_pty_sizes();
+                    self.sync_pty_sizes(cx);
                     cx.notify();
                 }
                 return;
             }
             SidebarResizeMove::Complete => {
-                self.persist_sidebar_width();
+                self.persist_sidebar_width(cx);
                 cx.notify();
                 return;
             }
@@ -3359,11 +2636,7 @@ impl NahApp {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        let Some(layout) = self
-            .active_workspace_in(snapshot)
-            .and_then(|workspace| workspace.tabs.first())
-            .map(|tab| &tab.layout)
-        else {
+        let Some(layout) = self.active_layout(snapshot) else {
             return;
         };
         let root = PixelRect {
@@ -3386,7 +2659,7 @@ impl NahApp {
             effective_split_ratio(drag.axis, split.width, split.height, ratio),
         );
         self.last_sizes.clear();
-        self.sync_pty_sizes();
+        self.sync_pty_sizes(cx);
         cx.notify();
     }
 
@@ -3409,16 +2682,20 @@ impl NahApp {
         }
         self.sidebar_pixels = sidebar_pixels;
         self.workspace_pixels = next;
-        self.last_sizes.clear();
         true
     }
 
-    fn persist_sidebar_width(&self) {
-        if let Some(store) = &self.ui_state_store
-            && let Err(error) = store.save_workspace_sidebar_width(self.preferred_sidebar_width)
-        {
-            eprintln!("Not a Harness sidebar width was not persisted: {error:#}");
-        }
+    fn persist_sidebar_width(&self, cx: &mut Context<Self>) {
+        let Some(store) = self.ui_state_store.clone() else {
+            return;
+        };
+        let width = self.preferred_sidebar_width;
+        cx.background_spawn(async move {
+            if let Err(error) = store.save_workspace_sidebar_width(width) {
+                eprintln!("Not a Harness sidebar width was not persisted: {error:#}");
+            }
+        })
+        .detach();
     }
 
     fn cancel_sidebar_resize(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -3428,13 +2705,13 @@ impl NahApp {
         self.preferred_sidebar_width = initial_width;
         self.update_window_geometry(window);
         self.last_sizes.clear();
-        self.sync_pty_sizes();
+        self.sync_pty_sizes(cx);
         cx.notify();
     }
 
     fn finish_resize(&mut self, cx: &mut Context<Self>) {
         if self.sidebar_resize.finish() {
-            self.persist_sidebar_width();
+            self.persist_sidebar_width(cx);
         }
         self.resizing = None;
         self.dragging_pane = None;
@@ -3442,55 +2719,85 @@ impl NahApp {
         cx.notify();
     }
 
-    fn sync_pty_sizes(&mut self) {
-        let Some(snapshot) = self.snapshot.clone() else {
+    fn sync_pty_sizes(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        let Some(workspace) = self.active_workspace_in(&snapshot) else {
-            return;
-        };
-        let Some(tab) = workspace.tabs.first() else {
+        let Some(layout) = self.active_layout(snapshot) else {
             return;
         };
         let mut sizes = Vec::new();
         let projected = self
             .zoomed_pane
-            .and_then(|pane_id| zoom_projection(&tab.layout, pane_id));
+            .and_then(|pane_id| zoom_projection(layout, pane_id));
         collect_pane_sizes(
-            projected.as_ref().unwrap_or(&tab.layout),
+            projected.as_ref().unwrap_or(layout),
             self.workspace_pixels.0,
             self.workspace_pixels.1,
             self.terminal_font.metrics,
             &self.split_ratios,
             &mut sizes,
         );
-        for (pane_id, columns, rows) in sizes {
-            if self.last_sizes.get(&pane_id) == Some(&(columns, rows)) {
-                continue;
-            }
-            match request(ClientRequest::ResizePane {
-                pane_id,
-                columns,
-                rows,
-            }) {
-                Ok(ServiceResponse::Ack) => {
-                    self.last_sizes.insert(pane_id, (columns, rows));
-                }
-                Ok(response) => {
-                    self.connection_error = Some(format!(
-                        "unexpected resize response for {pane_id}: {response:?}"
-                    ));
-                }
-                Err(error) => self.connection_error = Some(format!("{error:#}")),
-            }
+        let changed = sizes.len() != self.last_sizes.len()
+            || sizes.iter().any(|(pane_id, columns, rows)| {
+                self.last_sizes.get(pane_id) != Some(&(*columns, *rows))
+            });
+        if !changed {
+            return;
         }
+        self.last_sizes.clear();
+        self.last_sizes.extend(
+            sizes
+                .iter()
+                .map(|(pane_id, columns, rows)| (*pane_id, (*columns, *rows))),
+        );
+        self.resize_generation = self.resize_generation.wrapping_add(1);
+        let generation = self.resize_generation;
+        let client = Arc::clone(&self.control_client);
+        cx.spawn(async move |this, cx| {
+            gpui::Timer::after(Duration::from_millis(PTY_RESIZE_DEBOUNCE_MS)).await;
+            let Ok(true) = this.update(cx, |this, _| this.resize_generation == generation) else {
+                return;
+            };
+            let result = cx
+                .background_spawn(async move {
+                    for (pane_id, columns, rows) in sizes {
+                        match session_call(
+                            &client,
+                            &ClientRequest::ResizePane {
+                                pane_id,
+                                columns,
+                                rows,
+                            },
+                        )? {
+                            ServiceResponse::Ack => {}
+                            response => {
+                                return Err(anyhow::anyhow!(
+                                    "unexpected resize response for {pane_id}: {response:?}"
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+            let _ = this.update(cx, |this, _| {
+                if let Err(error) = result
+                    && this.resize_generation == generation
+                {
+                    this.last_sizes.clear();
+                    this.report(&error);
+                }
+            });
+        })
+        .detach();
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut workspaces = self
             .snapshot
             .as_ref()
-            .map(|snapshot| snapshot.workspaces.clone())
+            .map(|snapshot| snapshot.workspaces.iter().collect::<Vec<_>>())
             .unwrap_or_default();
         workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
         let history_needs_attention = self
@@ -3646,21 +2953,21 @@ impl NahApp {
                         let active = Some(workspace.id) == self.active_workspace;
                         let workspace_id = workspace.id;
                         let offline = matches!(
-                            workspace.connection,
+                            &workspace.connection,
                             WorkspaceConnection::SystemSsh {
                                 status: WorkspaceConnectionStatus::Offline,
                                 ..
                             }
                         );
                         let connected = matches!(
-                            workspace.connection,
+                            &workspace.connection,
                             WorkspaceConnection::SystemSsh {
                                 status: WorkspaceConnectionStatus::Connected,
                                 ..
                             }
                         );
                         let workspace_title = workspace.title.clone();
-                        let terminal_tabs = workspace_terminal_tabs(&workspace)
+                        let terminal_tabs = workspace_terminal_tabs(workspace)
                             .into_iter()
                             .cloned()
                             .collect::<Vec<_>>();
@@ -4529,13 +3836,17 @@ impl NahApp {
     ) -> AnyElement {
         let focused = self.focused_pane == Some(active);
         let terminal_accent = self.terminal_accent(active).as_rgb();
-        let screen = self.screens.get(&active).cloned();
+        let screen = self.screens.get(&active);
         let archived = self.archived_views.get(&active);
+        let exited = self
+            .pane_states
+            .get(&active)
+            .is_some_and(|state| state.exited);
         let drop_target = self
             .dragging_pane
             .and_then(|source| split_target_for_drag(source, &panes, active));
         let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
-        let rendered_lines = if let (Some(view), Some(screen)) = (archived, screen.as_ref()) {
+        let rendered_lines = if let (Some(view), Some(screen)) = (archived, screen) {
             view.page
                 .lines
                 .iter()
@@ -4545,7 +3856,7 @@ impl NahApp {
                 .enumerate()
                 .map(|(row, line)| {
                     self.render_terminal_line(
-                        line,
+                        &line,
                         TerminalLineRender {
                             row,
                             cursor: None,
@@ -4560,12 +3871,10 @@ impl NahApp {
                 .collect::<Vec<_>>()
         } else {
             screen
-                .as_ref()
                 .map(|screen| {
                     screen
                         .lines
                         .iter()
-                        .cloned()
                         .enumerate()
                         .map(|(row, line)| {
                             self.render_terminal_line(
@@ -4667,11 +3976,11 @@ impl NahApp {
                     })
                     .when(
                         focused
-                            && self.search_editor.is_none()
-                            && self.rename_editor.is_none()
+                            && self.modal.search().is_none()
+                            && self.modal.pane_rename().is_none()
                             && !self.ime_preedit.is_empty(),
                         |element| {
-                            let cursor = screen.as_ref().and_then(|screen| screen.cursor);
+                            let cursor = screen.and_then(|screen| screen.cursor);
                             element.when_some(cursor, |element, cursor| {
                                 let span = self.terminal_font.metrics.span(cursor.column, 1);
                                 element.child(
@@ -4691,9 +4000,12 @@ impl NahApp {
                         },
                     )
                     .when_some(
-                        self.search_editor.as_ref().filter(|_| focused),
+                        self.modal.search().filter(|_| focused),
                         |element, editor| element.child(self.render_search_bar(editor)),
                     )
+                    .when(exited, |element| {
+                        element.child(self.render_pane_reattach_notice(active, cx))
+                    })
                     .when_some(drop_target, |element, target| {
                         element.child(self.render_drop_layer(target, cx))
                     }),
@@ -4701,9 +4013,52 @@ impl NahApp {
             .into_any_element()
     }
 
+    /// A pane whose process exited keeps its last frame but swallows every
+    /// keystroke, which is indistinguishable from a hung terminal. Say so, and
+    /// offer the one-click recovery.
+    fn render_pane_reattach_notice(&self, pane_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .absolute()
+            .bottom(px(8.0))
+            .left(px(8.0))
+            .right(px(8.0))
+            .px(px(10.0))
+            .py(px(7.0))
+            .rounded(px(6.0))
+            .bg(rgb(THEME.elevated))
+            .border_1()
+            .border_color(rgb(THEME.border_strong))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex_1()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.muted))
+                    .child("This terminal exited — input goes nowhere until it reattaches."),
+            )
+            .child(
+                div()
+                    .id(("reattach-pane", element_key(pane_id)))
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .bg(rgb(THEME.accent))
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(0xffffff))
+                    .on_click(cx.listener(move |this, _, _, cx| this.reattach_pane(pane_id, cx)))
+                    .child("Reattach"),
+            )
+            .into_any_element()
+    }
+
     fn render_terminal_line(
         &self,
-        line: TerminalLine,
+        line: &TerminalLine,
         render: TerminalLineRender,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -4718,12 +4073,9 @@ impl NahApp {
         let mut start_column = 0_u16;
         let styled_runs = line
             .runs
-            .into_iter()
-            .map(|mut style| {
-                let columns = terminal_run_columns(&style, start_column);
-                if style.text.contains('\t') {
-                    style.text = terminal_run_display_text(&style, start_column);
-                }
+            .iter()
+            .map(|style| {
+                let columns = style.columns;
                 let element = self.render_terminal_run(style, start_column, columns);
                 start_column = start_column.saturating_add(columns);
                 element
@@ -4836,7 +4188,7 @@ impl NahApp {
 
     fn render_terminal_run(
         &self,
-        style: TerminalRun,
+        style: &TerminalRun,
         start_column: u16,
         columns: u16,
     ) -> AnyElement {
@@ -4851,7 +4203,12 @@ impl NahApp {
         let span = metrics.span(start_column, columns);
         let glyph_top = (metrics.baseline - metrics.ascent).max(0.0);
         let glyph_height = metrics.ascent + metrics.descent;
-        let text_len = style.text.len();
+        let text = if style.text.contains('\t') {
+            terminal_run_display_text(style, start_column)
+        } else {
+            style.text.clone()
+        };
+        let text_len = text.len();
         div()
             .absolute()
             .left(px(span.x))
@@ -4874,7 +4231,7 @@ impl NahApp {
                     .font(self.terminal_font.font(bold, italic))
                     .text_size(px(metrics.font_size))
                     .line_height(px(glyph_height))
-                    .child(StyledText::new(style.text).with_runs(vec![TextRun {
+                    .child(StyledText::new(text).with_runs(vec![TextRun {
                         len: text_len,
                         font: self.terminal_font.font(bold, italic),
                         color: rgb(foreground).into(),
@@ -5208,7 +4565,7 @@ impl NahApp {
         let mut workspaces = self
             .snapshot
             .as_ref()
-            .map(|snapshot| snapshot.workspaces.clone())
+            .map(|snapshot| snapshot.workspaces.iter().collect::<Vec<_>>())
             .unwrap_or_default();
         workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
         let sidebar_visible = self.sidebar_visible;
@@ -5905,7 +5262,7 @@ impl NahApp {
                                     .text_color(rgb(THEME.foreground))
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.appearance_settings_open = false;
+                                this.modal = Modal::None;
                                 cx.notify();
                             }))
                             .child("×"),
@@ -6555,7 +5912,23 @@ impl NahApp {
             .into_any_element()
     }
 
-    fn render_rename_dialog(&self, editor: &RenameEditor, cx: &mut Context<Self>) -> AnyElement {
+    fn confirm_dialog(
+        &self,
+        body: AnyElement,
+        spec: DialogSpec,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let DialogSpec {
+            title,
+            confirm_label,
+            confirm_tone,
+            confirm_id,
+            action,
+        } = spec;
+        let confirm_background = match confirm_tone {
+            DialogTone::Accent => THEME.accent,
+            DialogTone::Danger => THEME.danger,
+        };
         div()
             .absolute()
             .top(px(0.0))
@@ -6568,7 +5941,7 @@ impl NahApp {
             .occlude()
             .child(
                 div()
-                    .w(px(390.0))
+                    .w(px(440.0))
                     .p(px(18.0))
                     .rounded(px(10.0))
                     .bg(rgb(THEME.elevated))
@@ -6583,39 +5956,9 @@ impl NahApp {
                             .font_family(".SystemUIFont")
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(THEME.foreground))
-                            .child("Rename terminal"),
+                            .child(title),
                     )
-                    .child(
-                        div()
-                            .id("terminal-rename-input")
-                            .track_focus(&self.focus_handle)
-                            .h(px(36.0))
-                            .px(px(10.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(THEME.terminal))
-                            .border_1()
-                            .border_color(rgb(THEME.accent))
-                            .flex()
-                            .items_center()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.focus_handle.focus(window);
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .child(
-                                div()
-                                    .when(editor.replace_on_type, |element| {
-                                        element.bg(rgb(THEME.selection))
-                                    })
-                                    .child(format!("{}{}", editor.value, self.ime_preedit)),
-                            )
-                            .child("│"),
-                    )
+                    .child(body)
                     .child(
                         div()
                             .flex()
@@ -6623,7 +5966,7 @@ impl NahApp {
                             .gap(px(8.0))
                             .child(
                                 div()
-                                    .id("cancel-rename")
+                                    .id("cancel-dialog")
                                     .px(px(12.0))
                                     .py(px(7.0))
                                     .rounded(px(5.0))
@@ -6632,27 +5975,83 @@ impl NahApp {
                                     .text_color(rgb(THEME.muted))
                                     .hover(|element| element.bg(rgb(THEME.surface)))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.rename_editor = None;
+                                        this.modal = Modal::None;
                                         cx.notify();
                                     }))
                                     .child("Cancel"),
                             )
                             .child(
                                 div()
-                                    .id("save-rename")
+                                    .id(confirm_id)
                                     .px(px(12.0))
                                     .py(px(7.0))
                                     .rounded(px(5.0))
                                     .cursor_pointer()
-                                    .bg(rgb(THEME.accent))
+                                    .bg(rgb(confirm_background))
                                     .text_sm()
                                     .text_color(rgb(0xffffff))
-                                    .on_click(cx.listener(|this, _, _, cx| this.submit_rename(cx)))
-                                    .child("Rename"),
+                                    .on_click(cx.listener(move |this, _, _, cx| match action {
+                                        DialogAction::RenamePane => this.submit_rename(cx),
+                                        DialogAction::RenameWorkspace => {
+                                            this.submit_workspace_rename(cx);
+                                        }
+                                        DialogAction::DeleteWorkspace => {
+                                            this.confirm_workspace_delete(cx);
+                                        }
+                                        DialogAction::DisconnectWorkspace => {
+                                            this.confirm_workspace_disconnect(cx);
+                                        }
+                                        DialogAction::ClosePane => this.confirm_close(cx),
+                                    }))
+                                    .child(confirm_label),
                             ),
                     ),
             )
             .into_any_element()
+    }
+
+    fn render_rename_dialog(&self, editor: &RenameEditor, cx: &mut Context<Self>) -> AnyElement {
+        let body = div()
+            .id("terminal-rename-input")
+            .track_focus(&self.focus_handle)
+            .h(px(36.0))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .bg(rgb(THEME.terminal))
+            .border_1()
+            .border_color(rgb(THEME.accent))
+            .flex()
+            .items_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_handle.focus(window);
+                    cx.stop_propagation();
+                }),
+            )
+            .font_family(".SystemUIFont")
+            .text_sm()
+            .text_color(rgb(THEME.foreground))
+            .child(
+                div()
+                    .when(editor.replace_on_type, |element| {
+                        element.bg(rgb(THEME.selection))
+                    })
+                    .child(format!("{}{}", editor.value, self.ime_preedit)),
+            )
+            .child("│")
+            .into_any_element();
+        self.confirm_dialog(
+            body,
+            DialogSpec {
+                title: "Rename terminal".to_owned(),
+                confirm_label: "Rename",
+                confirm_tone: DialogTone::Accent,
+                confirm_id: "save-rename",
+                action: DialogAction::RenamePane,
+            },
+            cx,
+        )
     }
 
     fn render_workspace_creation_dialog(
@@ -6670,7 +6069,6 @@ impl NahApp {
             self.workspace_input_focus[WorkspaceCreationField::Destination.index()].clone();
         let content = match dialog.step {
             WorkspaceCreationStep::Details => div()
-                .flex()
                 .flex_col()
                 .gap(px(12.0))
                 .child(
@@ -6705,7 +6103,7 @@ impl NahApp {
                                 .text_sm()
                                 .text_color(rgb(THEME.foreground))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(dialog) = this.workspace_creation.as_mut() {
+                                    if let Some(dialog) = this.modal.workspace_creation_mut() {
                                         dialog.kind = WorkspaceCreationKind::Local;
                                         dialog.field = WorkspaceCreationField::Name;
                                         dialog.error = None;
@@ -6735,7 +6133,7 @@ impl NahApp {
                                 .text_sm()
                                 .text_color(rgb(THEME.foreground))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(dialog) = this.workspace_creation.as_mut() {
+                                    if let Some(dialog) = this.modal.workspace_creation_mut() {
                                         dialog.kind = WorkspaceCreationKind::SystemSsh;
                                         dialog.field = WorkspaceCreationField::Destination;
                                         dialog.error = None;
@@ -6879,7 +6277,7 @@ impl NahApp {
                                 .text_sm()
                                 .text_color(rgb(THEME.muted))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.workspace_creation = None;
+                                    this.modal = Modal::None;
                                     cx.notify();
                                 }))
                                 .child("Cancel"),
@@ -6949,7 +6347,7 @@ impl NahApp {
                                 .text_sm()
                                 .text_color(rgb(THEME.muted))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(dialog) = this.workspace_creation.as_mut() {
+                                    if let Some(dialog) = this.modal.workspace_creation_mut() {
                                         dialog.step = WorkspaceCreationStep::Details;
                                         dialog.error = None;
                                     }
@@ -7005,88 +6403,31 @@ impl NahApp {
         editor: &WorkspaceRenameEditor,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-            .bg(rgba(0x090b0f88))
+        let body = div()
+            .h(px(36.0))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .bg(rgb(THEME.terminal))
+            .border_1()
+            .border_color(rgb(THEME.accent))
             .flex()
             .items_center()
-            .justify_center()
-            .occlude()
-            .child(
-                div()
-                    .w(px(390.0))
-                    .p(px(18.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(THEME.elevated))
-                    .border_1()
-                    .border_color(rgb(THEME.border_strong))
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.0))
-                    .child(
-                        div()
-                            .font_family(".SystemUIFont")
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child("Rename workstation"),
-                    )
-                    .child(
-                        div()
-                            .h(px(36.0))
-                            .px(px(10.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(THEME.terminal))
-                            .border_1()
-                            .border_color(rgb(THEME.accent))
-                            .flex()
-                            .items_center()
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .child(editor.value.clone())
-                            .child("│"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .id("cancel-workspace-rename")
-                                    .px(px(12.0))
-                                    .py(px(7.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(rgb(THEME.muted))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.workspace_rename_editor = None;
-                                        cx.notify();
-                                    }))
-                                    .child("Cancel"),
-                            )
-                            .child(
-                                div()
-                                    .id("save-workspace-rename")
-                                    .px(px(12.0))
-                                    .py(px(7.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .bg(rgb(THEME.accent))
-                                    .text_sm()
-                                    .text_color(rgb(0xffffff))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_workspace_rename(cx)
-                                    }))
-                                    .child("Rename"),
-                            ),
-                    ),
-            )
-            .into_any_element()
+            .text_sm()
+            .text_color(rgb(THEME.foreground))
+            .child(editor.value.clone())
+            .child("│")
+            .into_any_element();
+        self.confirm_dialog(
+            body,
+            DialogSpec {
+                title: "Rename workstation".to_owned(),
+                confirm_label: "Rename",
+                confirm_tone: DialogTone::Accent,
+                confirm_id: "save-workspace-rename",
+                action: DialogAction::RenameWorkspace,
+            },
+            cx,
+        )
     }
 
     fn render_workspace_delete_dialog(
@@ -7107,73 +6448,22 @@ impl NahApp {
                 }
             )
         };
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-            .bg(rgba(0x090b0f88))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
-            .child(
-                div()
-                    .w(px(440.0))
-                    .p(px(18.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(THEME.elevated))
-                    .border_1()
-                    .border_color(rgb(THEME.border_strong))
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child(format!("Delete workstation {}?", confirmation.title)),
-                    )
-                    .child(div().text_sm().text_color(rgb(THEME.muted)).child(message))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .id("cancel-workspace-delete")
-                                    .px(px(12.0))
-                                    .py(px(7.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(rgb(THEME.muted))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.workspace_delete_confirmation = None;
-                                        cx.notify();
-                                    }))
-                                    .child("Cancel"),
-                            )
-                            .child(
-                                div()
-                                    .id("confirm-workspace-delete")
-                                    .px(px(12.0))
-                                    .py(px(7.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .bg(rgb(THEME.danger))
-                                    .text_sm()
-                                    .text_color(rgb(0xffffff))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.confirm_workspace_delete(cx)
-                                    }))
-                                    .child("Delete workstation"),
-                            ),
-                    ),
-            )
-            .into_any_element()
+        let body = div()
+            .text_sm()
+            .text_color(rgb(THEME.muted))
+            .child(message)
+            .into_any_element();
+        self.confirm_dialog(
+            body,
+            DialogSpec {
+                title: format!("Delete workstation {}?", confirmation.title),
+                confirm_label: "Delete workstation",
+                confirm_tone: DialogTone::Danger,
+                confirm_id: "confirm-workspace-delete",
+                action: DialogAction::DeleteWorkspace,
+            },
+            cx,
+        )
     }
 
     fn render_workspace_connection_info(
@@ -7273,8 +6563,7 @@ impl NahApp {
             TmuxScanScope::Local => "this Mac".to_owned(),
             TmuxScanScope::SystemSsh { destination } => format!("SSH workstation {destination}"),
         };
-        let selected = &picker.selected_session_ids;
-        let selected_count = selected.len();
+        let selected_count = picker.selected_session_ids.len();
         let can_open = selected_count > 0;
         div()
             .absolute()
@@ -7304,7 +6593,7 @@ impl NahApp {
                             .font_family(".SystemUIFont")
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(THEME.foreground))
-                            .child("Open an existing tmux session"),
+                            .child("Open tmux sessions"),
                     )
                     .child(
                         div()
@@ -7312,7 +6601,7 @@ impl NahApp {
                             .text_sm()
                             .text_color(rgb(THEME.muted))
                             .child(format!(
-                                "Scanned metadata only on {scope}. Opening a result creates one runtime-only terminal tab; tmux remains responsible for its own windows, panes, layout, and status."
+                                "Scanned metadata only on {scope}. One tab is opened per selected session and attaches like `tmux attach`."
                             )),
                     )
                     .when(picker.no_server, |element| {
@@ -7339,7 +6628,7 @@ impl NahApp {
                                 .font_family(".SystemUIFont")
                                 .text_sm()
                                 .text_color(rgb(THEME.danger))
-                            .child(error),
+                                .child(error),
                         )
                     })
                     .when(!picker.sessions.is_empty(), |element| {
@@ -7353,7 +6642,7 @@ impl NahApp {
                                         .font_family(".SystemUIFont")
                                         .text_xs()
                                         .text_color(rgb(THEME.muted))
-                                        .child(format!("{selected_count} selected")),
+                                        .child(format!("{selected_count} session(s) selected")),
                                 )
                                 .child(
                                     div()
@@ -7367,7 +6656,10 @@ impl NahApp {
                                                 .text_xs()
                                                 .text_color(rgb(THEME.accent))
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.select_all_tmux_sessions(cx)
+                                                    this.mutate_tmux_selection(
+                                                        TmuxSelectionChange::All,
+                                                        cx,
+                                                    );
                                                 }))
                                                 .child("Select All"),
                                         )
@@ -7379,53 +6671,95 @@ impl NahApp {
                                                 .text_xs()
                                                 .text_color(rgb(THEME.accent))
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.clear_all_tmux_sessions(cx)
+                                                    this.mutate_tmux_selection(
+                                                        TmuxSelectionChange::None,
+                                                        cx,
+                                                    );
                                                 }))
                                                 .child("Clear All"),
                                         ),
                                 ),
                         )
                     })
-                    .children(picker.sessions.iter().enumerate().map(|(index, session)| {
-                        let session_id = session.id.clone();
-                        let is_selected = selected.contains(&session.id);
-                        let attached = if session.attached_clients == 0 {
-                            "detached".to_owned()
-                        } else {
-                            format!("{} attached", session.attached_clients)
-                        };
+                    .child(
                         div()
-                            .id(("tmux-session", index))
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(rgb(if is_selected { THEME.accent } else { THEME.border_strong }))
-                            .bg(rgb(if is_selected { THEME.accent_soft } else { THEME.surface }))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_tmux_session(&session_id, cx)
-                            }))
-                            .child(
+                            .id("tmux-session-list")
+                            .min_h(px(0.0))
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .children(picker.sessions.iter().enumerate().map(|(index, session)| {
+                                let session_id = session.id.clone();
+                                let is_open = picker.is_open(&session.id);
+                                let is_selected =
+                                    picker.selected_session_ids.contains(&session.id);
                                 div()
-                                    .font_family(".SystemUIFont")
-                                    .text_sm()
-                                    .text_color(rgb(THEME.foreground))
-                                    .child(format!(
-                                        "{}{}",
-                                        if is_selected { "✓ " } else { "" },
-                                        session.name
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(2.0))
-                                    .font_family(".SystemUIFont")
-                                    .text_xs()
-                                    .text_color(rgb(THEME.muted))
-                                    .child(format!("{} window(s) · {attached}", session.windows)),
-                            )
-                    }))
+                                    .id(("tmux-session", index))
+                                    .px(px(10.0))
+                                    .py(px(8.0))
+                                    .rounded(px(6.0))
+                                    .when(!is_open, |element| element.cursor_pointer())
+                                    .border_1()
+                                    .border_color(rgb(if is_selected {
+                                        THEME.accent
+                                    } else {
+                                        THEME.border_strong
+                                    }))
+                                    .bg(rgb(if is_selected {
+                                        THEME.accent_soft
+                                    } else {
+                                        THEME.surface
+                                    }))
+                                    .when(!is_open, |element| {
+                                        element.on_click(cx.listener(move |this, _, _, cx| {
+                                            this.mutate_tmux_selection(
+                                                TmuxSelectionChange::Session(session_id.clone()),
+                                                cx,
+                                            );
+                                        }))
+                                    })
+                                    .child(
+                                        div()
+                                            .font_family(".SystemUIFont")
+                                            .text_sm()
+                                            .text_color(rgb(if is_open {
+                                                THEME.muted
+                                            } else {
+                                                THEME.foreground
+                                            }))
+                                            .child(format!(
+                                                "{}{}",
+                                                if is_selected { "✓ " } else { "" },
+                                                session.name
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(2.0))
+                                            .font_family(".SystemUIFont")
+                                            .text_xs()
+                                            .text_color(rgb(THEME.muted))
+                                            .child(if is_open {
+                                                "Already open in a tab".to_owned()
+                                            } else {
+                                                format!(
+                                                    "{} window(s) · {}",
+                                                    session.windows,
+                                                    if session.attached_clients == 0 {
+                                                        "detached".to_owned()
+                                                    } else {
+                                                        format!(
+                                                            "{} attached",
+                                                            session.attached_clients
+                                                        )
+                                                    }
+                                                )
+                                            }),
+                                    )
+                            })),
+                    )
                     .child(
                         div()
                             .flex()
@@ -7441,25 +6775,29 @@ impl NahApp {
                                     .text_sm()
                                     .text_color(rgb(THEME.muted))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.tmux_session_picker = None;
+                                        this.modal = Modal::None;
                                         cx.notify();
                                     }))
                                     .child("Cancel"),
                             )
                             .child(
                                 div()
-                                    .id("open-selected-tmux-session")
+                                    .id("open-selected-tmux-sessions")
                                     .px(px(12.0))
                                     .py(px(7.0))
                                     .rounded(px(5.0))
                                     .cursor_pointer()
-                                    .bg(rgb(if can_open { THEME.accent } else { THEME.border_strong }))
+                                    .bg(rgb(if can_open {
+                                        THEME.accent
+                                    } else {
+                                        THEME.border_strong
+                                    }))
                                     .text_sm()
                                     .text_color(rgb(0xffffff))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_selected_tmux_sessions(cx)
+                                        this.open_selected_tmux_sessions(cx);
                                     }))
-                                    .child(format!("Open {selected_count} selected in tmux")),
+                                    .child(format!("Open {selected_count} selected session(s)")),
                             ),
                     ),
             )
@@ -7471,90 +6809,40 @@ impl NahApp {
         confirmation: &WorkspaceDisconnectConfirmation,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-            .bg(rgba(0x090b0f88))
+        let body = div()
             .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
+            .flex_col()
+            .gap(px(10.0))
             .child(
                 div()
-                    .w(px(420.0))
-                    .p(px(18.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(THEME.elevated))
-                    .border_1()
-                    .border_color(rgb(THEME.border_strong))
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.0))
+                    .text_sm()
+                    .text_color(rgb(THEME.muted))
                     .child(
-                        div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child(format!("Disconnect {}?", confirmation.title)),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(THEME.muted))
-                            .child(
-                                "This closes the active system OpenSSH terminal. The saved workstation stays available for reconnect.",
-                            ),
-                    )
-                    .child(
-                        div()
-                            .p(px(8.0))
-                            .rounded(px(5.0))
-                            .bg(rgb(THEME.terminal))
-                            .font_family("SF Mono")
-                            .text_xs()
-                            .text_color(rgb(THEME.foreground))
-                            .child(confirmation.destination.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .id("cancel-workspace-disconnect")
-                                    .px(px(12.0))
-                                    .py(px(7.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(rgb(THEME.muted))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.workspace_disconnect_confirmation = None;
-                                        cx.notify();
-                                    }))
-                                    .child("Cancel"),
-                            )
-                            .child(
-                                div()
-                                    .id("confirm-workspace-disconnect")
-                                    .px(px(12.0))
-                                    .py(px(7.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .bg(rgb(THEME.accent))
-                                    .text_sm()
-                                    .text_color(rgb(0xffffff))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.confirm_workspace_disconnect(cx)
-                                    }))
-                                    .child("Disconnect"),
-                            ),
+                        "This closes the active system OpenSSH terminal. The saved workstation stays available for reconnect.",
                     ),
             )
-            .into_any_element()
+            .child(
+                div()
+                    .p(px(8.0))
+                    .rounded(px(5.0))
+                    .bg(rgb(THEME.terminal))
+                    .font_family("SF Mono")
+                    .text_xs()
+                    .text_color(rgb(THEME.foreground))
+                    .child(confirmation.destination.clone()),
+            )
+            .into_any_element();
+        self.confirm_dialog(
+            body,
+            DialogSpec {
+                title: format!("Disconnect {}?", confirmation.title),
+                confirm_label: "Disconnect",
+                confirm_tone: DialogTone::Accent,
+                confirm_id: "confirm-workspace-disconnect",
+                action: DialogAction::DisconnectWorkspace,
+            },
+            cx,
+        )
     }
 
     fn render_close_dialog(
@@ -7562,86 +6850,29 @@ impl NahApp {
         confirmation: &CloseConfirmation,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-            .bg(rgba(0x090b0f88))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
-            .child(
-                div()
-                    .w(px(410.0))
-                    .p(px(18.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(THEME.elevated))
-                    .border_1()
-                    .border_color(rgb(THEME.border_strong))
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .gap(px(9.0))
-                    .child(
-                        div()
-                            .font_family(".SystemUIFont")
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child(format!("Close {}?", confirmation.title)),
-                    )
-                    .child(
-                        div()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.muted))
-                            .child(if confirmation.leaves_workspace_empty {
-                                "This will terminate the last terminal and leave the saved workstation empty. You can open a new terminal from its empty state."
-                            } else {
-                                "This will terminate this terminal and its running shell process. Other terminal tabs stay open."
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt(px(7.0))
-                            .flex()
-                            .justify_end()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .id("cancel-close")
-                                    .px(px(12.0))
-                                    .py(px(7.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(rgb(THEME.muted))
-                                    .hover(|element| element.bg(rgb(THEME.surface)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_confirmation = None;
-                                        cx.notify();
-                                    }))
-                                    .child("Cancel"),
-                            )
-                            .child(
-                                div()
-                                    .id("confirm-close")
-                                    .px(px(12.0))
-                                    .py(px(7.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .bg(rgb(THEME.danger))
-                                    .text_sm()
-                                    .text_color(rgb(0xffffff))
-                                    .on_click(cx.listener(|this, _, _, cx| this.confirm_close(cx)))
-                                    .child("Close Terminal"),
-                            ),
-                    ),
-            )
-            .into_any_element()
+        let message = if confirmation.leaves_workspace_empty {
+            "This will terminate the last terminal and leave the saved workstation empty. You can open a new terminal from its empty state."
+        } else {
+            "This will terminate this terminal and its running shell process. Other terminal tabs stay open."
+        };
+        let body = div()
+            .font_family(".SystemUIFont")
+            .text_sm()
+            .text_color(rgb(THEME.muted))
+            .child(message)
+            .into_any_element();
+        self.confirm_dialog(
+            body,
+            DialogSpec {
+                title: format!("Close {}?", confirmation.title),
+                confirm_label: "Close Terminal",
+                confirm_tone: DialogTone::Danger,
+                confirm_id: "confirm-close",
+                action: DialogAction::ClosePane,
+            },
+            cx,
+        )
     }
-
     fn render_layout(
         &self,
         layout: PaneLayout,
@@ -7766,7 +6997,7 @@ impl NahApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.command_palette = None;
+                    this.modal = Modal::None;
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -7960,7 +7191,7 @@ impl NahApp {
                 )
                 .into_any_element()
         };
-        let workspace_content = if self.appearance_settings_open {
+        let workspace_content = if matches!(self.modal, Modal::AppearanceSettings) {
             self.render_appearance_settings(cx)
         } else {
             workspace_content
@@ -7985,16 +7216,38 @@ impl Render for NahApp {
         // The workspace dialog has its own focus targets. A pointer click on
         // the sidebar button must not leave native text input attached to the
         // terminal behind the dialog.
-        if let Some(dialog) = self.workspace_creation.as_ref() {
+        if let Some(dialog) = self.modal.workspace_creation() {
             self.workspace_input_focus[dialog.field.index()].focus(window);
-        } else if self.rename_editor.is_some() || self.workspace_rename_editor.is_some() {
+        } else if self.modal.pane_rename().is_some() || self.modal.workspace_rename().is_some() {
             // Keep a rename modal on the root text-input route. This makes
             // replacement typing reliable after clearing the selected title.
             self.focus_handle.focus(window);
         }
+        let modal_element = match &self.modal {
+            Modal::None | Modal::AppearanceSettings | Modal::Search(_) => None,
+            Modal::CommandPalette(palette) => Some(self.render_command_palette(palette, cx)),
+            Modal::WorkspaceCreation(dialog) => {
+                Some(self.render_workspace_creation_dialog(dialog, cx))
+            }
+            Modal::WorkspaceRename(editor) => Some(self.render_workspace_rename_dialog(editor, cx)),
+            Modal::PaneRename(editor) => Some(self.render_rename_dialog(editor, cx)),
+            Modal::WorkspaceDelete(confirmation) => {
+                Some(self.render_workspace_delete_dialog(confirmation, cx))
+            }
+            Modal::TmuxPicker(picker) => Some(self.render_tmux_session_picker(picker, cx)),
+            Modal::WorkspaceDisconnect(confirmation) => {
+                Some(self.render_workspace_disconnect_dialog(confirmation, cx))
+            }
+            Modal::Close(confirmation) => Some(self.render_close_dialog(confirmation, cx)),
+            Modal::TabMenu(menu) => Some(self.render_tab_menu(*menu, cx)),
+            Modal::WorkspaceMenu(menu) => Some(self.render_workspace_menu(*menu, cx)),
+            Modal::WorkspaceConnectionInfo(info) => {
+                Some(self.render_workspace_connection_info(info, cx))
+            }
+        };
 
         div()
-            .key_context(if self.command_palette.is_some() {
+            .key_context(if self.modal.command_palette().is_some() {
                 "NahPalette"
             } else {
                 ROOT_KEY_CONTEXT
@@ -8027,10 +7280,13 @@ impl Render for NahApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    let dismissed_tab = this.tab_menu.take().is_some();
-                    let dismissed_workspace = this.workspace_menu.take().is_some();
-                    let dismissed_connection = this.workspace_connection_info.take().is_some();
-                    if dismissed_tab || dismissed_workspace || dismissed_connection {
+                    if matches!(
+                        this.modal,
+                        Modal::TabMenu(_)
+                            | Modal::WorkspaceMenu(_)
+                            | Modal::WorkspaceConnectionInfo(_)
+                    ) {
+                        this.modal = Modal::None;
                         cx.notify();
                     }
                 }),
@@ -8083,6 +7339,10 @@ impl Render for NahApp {
                 this.execute_command(AppCommand::EqualizePanes, cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|this, _: &ReattachPane, _, cx| {
+                this.execute_command(AppCommand::ReattachPane, cx);
+                cx.stop_propagation();
+            }))
             .on_action(
                 cx.listener(|_: &mut NahApp, _: &ConsumeChordPrefix, _, cx| {
                     cx.stop_propagation();
@@ -8125,45 +7385,7 @@ impl Render for NahApp {
                     })
                     .child(self.render_workspace(cx)),
             )
-            .when_some(self.tab_menu, |element, menu| {
-                element.child(self.render_tab_menu(menu, cx))
-            })
-            .when_some(self.workspace_menu, |element, menu| {
-                element.child(self.render_workspace_menu(menu, cx))
-            })
-            .when_some(self.workspace_connection_info.as_ref(), |element, info| {
-                element.child(self.render_workspace_connection_info(info, cx))
-            })
-            .when_some(self.rename_editor.as_ref(), |element, editor| {
-                element.child(self.render_rename_dialog(editor, cx))
-            })
-            .when_some(self.workspace_rename_editor.as_ref(), |element, editor| {
-                element.child(self.render_workspace_rename_dialog(editor, cx))
-            })
-            .when_some(self.close_confirmation.as_ref(), |element, confirmation| {
-                element.child(self.render_close_dialog(confirmation, cx))
-            })
-            .when_some(
-                self.workspace_delete_confirmation.as_ref(),
-                |element, confirmation| {
-                    element.child(self.render_workspace_delete_dialog(confirmation, cx))
-                },
-            )
-            .when_some(
-                self.workspace_disconnect_confirmation.as_ref(),
-                |element, confirmation| {
-                    element.child(self.render_workspace_disconnect_dialog(confirmation, cx))
-                },
-            )
-            .when_some(self.tmux_session_picker.as_ref(), |element, picker| {
-                element.child(self.render_tmux_session_picker(picker, cx))
-            })
-            .when_some(self.command_palette.as_ref(), |element, palette| {
-                element.child(self.render_command_palette(palette, cx))
-            })
-            .when_some(self.workspace_creation.as_ref(), |element, dialog| {
-                element.child(self.render_workspace_creation_dialog(dialog, cx))
-            })
+            .when_some(modal_element, |element, modal| element.child(modal))
             .when_some(
                 self.color_picker.as_ref().filter(|picker| {
                     matches!(
@@ -8185,8 +7407,8 @@ impl EntityInputHandler for NahApp {
         _: &mut Context<Self>,
     ) -> Option<String> {
         if let Some(dialog) = self
-            .workspace_creation
-            .as_ref()
+            .modal
+            .workspace_creation()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
         {
             let editor = dialog.active_editor();
@@ -8205,8 +7427,8 @@ impl EntityInputHandler for NahApp {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         if let Some(dialog) = self
-            .workspace_creation
-            .as_ref()
+            .modal
+            .workspace_creation()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
         {
             let editor = dialog.active_editor();
@@ -8224,8 +7446,8 @@ impl EntityInputHandler for NahApp {
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
         if let Some(dialog) = self
-            .workspace_creation
-            .as_ref()
+            .modal
+            .workspace_creation()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
         {
             let editor = dialog.active_editor();
@@ -8239,8 +7461,8 @@ impl EntityInputHandler for NahApp {
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(dialog) = self
-            .workspace_creation
-            .as_mut()
+            .modal
+            .workspace_creation_mut()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
         {
             dialog.active_editor_mut().marked_range = None;
@@ -8259,8 +7481,8 @@ impl EntityInputHandler for NahApp {
         cx: &mut Context<Self>,
     ) {
         if let Some(dialog) = self
-            .workspace_creation
-            .as_mut()
+            .modal
+            .workspace_creation_mut()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
         {
             dialog.replace_text(range.as_ref(), text, false, None);
@@ -8280,8 +7502,8 @@ impl EntityInputHandler for NahApp {
         cx: &mut Context<Self>,
     ) {
         if let Some(dialog) = self
-            .workspace_creation
-            .as_mut()
+            .modal
+            .workspace_creation_mut()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
         {
             dialog.replace_text(range.as_ref(), text, true, selected_range.as_ref());
@@ -8300,8 +7522,8 @@ impl EntityInputHandler for NahApp {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         if let Some(dialog) = self
-            .workspace_creation
-            .as_ref()
+            .modal
+            .workspace_creation()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
         {
             let index = dialog.field.index();
@@ -8336,8 +7558,8 @@ impl EntityInputHandler for NahApp {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         if let Some(dialog) = self
-            .workspace_creation
-            .as_ref()
+            .modal
+            .workspace_creation()
             .filter(|dialog| dialog.step == WorkspaceCreationStep::Details)
         {
             let index = dialog.field.index();
@@ -8411,7 +7633,7 @@ impl Element for WorkspaceTextInputElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let app = self.input.read(cx);
-        let dialog = app.workspace_creation.as_ref();
+        let dialog = app.modal.workspace_creation();
         let active = dialog.is_some_and(|dialog| {
             dialog.step == WorkspaceCreationStep::Details && dialog.field == self.field
         });
@@ -8542,13 +7764,16 @@ impl Element for WorkspaceTextInputElement {
                 cx,
             );
         }
+        if state
+            .line
+            .paint(state.text_bounds.origin, window.line_height(), window, cx)
+            .is_err()
+        {
+            return;
+        }
         if let Some(selection) = state.selection.take() {
             window.paint_quad(selection);
         }
-        state
-            .line
-            .paint(state.text_bounds.origin, window.line_height(), window, cx)
-            .expect("workspace input text should paint");
         if let Some(cursor) = state.cursor.take() {
             window.paint_quad(cursor);
         }
@@ -8620,7 +7845,7 @@ impl Element for TerminalInputElement {
         cx: &mut App,
     ) {
         let app = self.input.read(cx);
-        if app.workspace_creation.is_none() {
+        if app.modal.workspace_creation().is_none() {
             window.handle_input(
                 &app.focus_handle,
                 ElementInputHandler::new(bounds, self.input.clone()),
@@ -8824,877 +8049,6 @@ impl Element for TerminalPointerElement {
     }
 }
 
-fn terminal_point_at(
-    position: Point<Pixels>,
-    bounds: Bounds<Pixels>,
-    row: u16,
-    columns: u16,
-    cell_width: f32,
-) -> TerminalPoint {
-    let relative_x = f32::from(position.x - bounds.origin.x).max(0.0);
-    let column = if columns == 0 || cell_width <= f32::EPSILON {
-        0
-    } else {
-        (relative_x / cell_width).floor() as u16
-    };
-    TerminalPoint {
-        row,
-        column: column.min(columns.saturating_sub(1)),
-    }
-}
-
-fn next_terminal_poll_delay_ms(current: u64, state_changed: bool) -> u64 {
-    if state_changed {
-        ACTIVE_TERMINAL_POLL_MS
-    } else {
-        current.saturating_mul(2).min(IDLE_TERMINAL_POLL_MS)
-    }
-}
-
-fn pane_update_requires_repaint(snapshot_delivered: bool, screens_delivered: usize) -> bool {
-    snapshot_delivered || screens_delivered > 0
-}
-
-fn responsive_panes(
-    now: Instant,
-    focused_pane: Option<Uuid>,
-    pane_attention: &HashMap<Uuid, Instant>,
-) -> Vec<Uuid> {
-    let mut panes = pane_attention
-        .iter()
-        .filter_map(|(pane_id, attended)| {
-            (Some(*pane_id) == focused_pane
-                || now.saturating_duration_since(*attended) < COLD_PANE_AFTER)
-                .then_some(*pane_id)
-        })
-        .collect::<Vec<_>>();
-    if let Some(focused) = focused_pane
-        && !panes.contains(&focused)
-    {
-        panes.push(focused);
-    }
-    panes.sort_unstable();
-    panes
-}
-
-fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
-    match button {
-        MouseButton::Left => Some(TerminalMouseButton::Left),
-        MouseButton::Middle => Some(TerminalMouseButton::Middle),
-        MouseButton::Right => Some(TerminalMouseButton::Right),
-        MouseButton::Navigate(_) => None,
-    }
-}
-
-fn terminal_modifiers(modifiers: gpui::Modifiers) -> TerminalModifiers {
-    TerminalModifiers {
-        shift: modifiers.shift,
-        alt: modifiers.alt,
-        control: modifiers.control,
-    }
-}
-
-fn selection_span(selection: TerminalSelection, row: usize, columns: u16) -> Option<(u16, u16)> {
-    let row = u16::try_from(row).ok()?;
-    if row < selection.start.row || row > selection.end.row || columns == 0 {
-        return None;
-    }
-    let start = if selection.is_block || row == selection.start.row {
-        selection.start.column.min(columns - 1)
-    } else {
-        0
-    };
-    let end = if selection.is_block || row == selection.end.row {
-        selection.end.column.min(columns - 1)
-    } else {
-        columns - 1
-    };
-    (end >= start).then_some((start, end - start + 1))
-}
-
-fn prepare_paste(text: &str, bracketed: bool) -> Result<Vec<u8>, &'static str> {
-    let normalized = text.replace("\r\n", "\n").replace('\n', "\r");
-    let sanitized = normalized.replace(['\0', '\u{1b}'], "");
-    let wrapper_size = if bracketed { 12 } else { 0 };
-    if sanitized.len().saturating_add(wrapper_size) > MAX_PASTE_BYTES {
-        return Err("paste rejected: clipboard text exceeds 64 KiB");
-    }
-    if bracketed {
-        let mut bytes = Vec::with_capacity(sanitized.len() + wrapper_size);
-        bytes.extend_from_slice(b"\x1b[200~");
-        bytes.extend_from_slice(sanitized.as_bytes());
-        bytes.extend_from_slice(b"\x1b[201~");
-        Ok(bytes)
-    } else {
-        Ok(sanitized.into_bytes())
-    }
-}
-
-fn visible_panes(layout: &PaneLayout) -> Vec<Uuid> {
-    match layout {
-        PaneLayout::Leaf { pane } => vec![pane.id],
-        PaneLayout::Stack { active, .. } => vec![*active],
-        PaneLayout::Split { first, second, .. } => {
-            let mut panes = visible_panes(first);
-            panes.extend(visible_panes(second));
-            panes
-        }
-    }
-}
-
-fn split_target_for_drag(source: Uuid, panes: &[Pane], active: Uuid) -> Option<Uuid> {
-    let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
-    split_target_for_drag_ids(source, &pane_ids, active)
-}
-
-fn split_target_for_drag_ids(source: Uuid, pane_ids: &[Uuid], active: Uuid) -> Option<Uuid> {
-    if source == active {
-        pane_ids
-            .iter()
-            .copied()
-            .find(|pane| *pane != source)
-            .or_else(|| (pane_ids.len() == 1).then_some(active))
-    } else {
-        Some(active)
-    }
-}
-
-fn split_placement_at(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<DropPlacement> {
-    if !bounds.contains(&position) {
-        return None;
-    }
-    let x = f32::from(position.x - bounds.origin.x);
-    let y = f32::from(position.y - bounds.origin.y);
-    let width = f32::from(bounds.size.width);
-    let height = f32::from(bounds.size.height);
-    if y < PANE_HEADER_HEIGHT || width <= 0.0 || height <= PANE_HEADER_HEIGHT {
-        return None;
-    }
-    if x <= width * 0.25 {
-        Some(DropPlacement::Left)
-    } else if x >= width * 0.75 {
-        Some(DropPlacement::Right)
-    } else if y - PANE_HEADER_HEIGHT <= (height - PANE_HEADER_HEIGHT) * 0.5 {
-        Some(DropPlacement::Top)
-    } else {
-        Some(DropPlacement::Bottom)
-    }
-}
-
-fn history_label(label: &'static str) -> AnyElement {
-    div()
-        .w(px(76.0))
-        .font_family(".SystemUIFont")
-        .text_xs()
-        .text_color(rgb(THEME.muted))
-        .child(label)
-        .into_any_element()
-}
-
-fn history_scope_key(scope: HistoryClearScope) -> usize {
-    match scope {
-        HistoryClearScope::Terminal { .. } => 0,
-        HistoryClearScope::Workspace { .. } => 1,
-        HistoryClearScope::All => 2,
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const MIB: u64 = 1024 * 1024;
-    if bytes >= GIB {
-        format!("{}.{} GiB", bytes / GIB, (bytes % GIB) * 10 / GIB)
-    } else {
-        format!("{}.{} MiB", bytes / MIB, (bytes % MIB) * 10 / MIB)
-    }
-}
-
-fn format_history_date(milliseconds: u64) -> String {
-    let days = i64::try_from(milliseconds / 1_000 / 86_400).unwrap_or(i64::MAX);
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
-    let days = days_since_epoch + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (
-        year,
-        u32::try_from(month).unwrap_or(1),
-        u32::try_from(day).unwrap_or(1),
-    )
-}
-
-fn history_warning_text(warning: Option<HistoryWarning>, dropped_bytes: u64) -> Option<String> {
-    match warning {
-        Some(HistoryWarning::ApproachingCapacity) => Some(
-            "Archive is nearing its quota. Increase the limit or clear selected history before it fills."
-                .to_owned(),
-        ),
-        Some(HistoryWarning::PausedAtCapacity) => Some(format!(
-            "Archive is full and paused; the terminal is still live. {} could not be archived. Increase the quota or clear selected history.",
-            format_bytes(dropped_bytes)
-        )),
-        Some(HistoryWarning::QueueOverflow) => Some(format!(
-            "The storage queue could not keep up; {} is marked as an archive gap. Terminal input and output continued normally.",
-            format_bytes(dropped_bytes)
-        )),
-        Some(HistoryWarning::CorruptChunk) => Some(
-            "A local archive chunk failed integrity checks. It is shown as a gap; other chunks remain available."
-                .to_owned(),
-        ),
-        None => None,
-    }
-}
-
-fn plain_history_line(text: &str) -> TerminalLine {
-    TerminalLine {
-        runs: if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![TerminalRun {
-                text: text.to_owned(),
-                columns: text.chars().fold(0_u16, |columns, character| {
-                    columns.saturating_add(
-                        u16::try_from(character.width().unwrap_or(0)).unwrap_or(u16::MAX),
-                    )
-                }),
-                foreground: TerminalColor::DefaultForeground,
-                background: TerminalColor::DefaultBackground,
-                attributes: TerminalAttributes::default(),
-            }]
-        },
-    }
-}
-
-fn terminal_run_columns(run: &TerminalRun, start_column: u16) -> u16 {
-    if run.columns == 0 {
-        legacy_text_columns(&run.text, start_column)
-    } else {
-        run.columns
-    }
-}
-
-fn legacy_text_columns(text: &str, start_column: u16) -> u16 {
-    const TAB_WIDTH: u16 = 8;
-    let mut column = start_column;
-    for character in text.chars() {
-        if character == '\t' {
-            let remainder = column % TAB_WIDTH;
-            column = column.saturating_add(TAB_WIDTH - remainder);
-        } else {
-            let width = u16::try_from(character.width().unwrap_or(0)).unwrap_or(u16::MAX);
-            column = column.saturating_add(width);
-        }
-    }
-    column.saturating_sub(start_column)
-}
-
-fn expand_terminal_tabs(text: &str, start_column: u16) -> String {
-    const TAB_WIDTH: u16 = 8;
-    let mut column = start_column;
-    let mut expanded = String::with_capacity(text.len());
-    for character in text.chars() {
-        if character == '\t' {
-            let spaces = TAB_WIDTH - (column % TAB_WIDTH);
-            expanded.extend(std::iter::repeat_n(' ', usize::from(spaces)));
-            column = column.saturating_add(spaces);
-        } else {
-            expanded.push(character);
-            let width = u16::try_from(character.width().unwrap_or(0)).unwrap_or(u16::MAX);
-            column = column.saturating_add(width);
-        }
-    }
-    expanded
-}
-
-fn terminal_run_display_text(run: &TerminalRun, start_column: u16) -> String {
-    if run.columns == 0 {
-        expand_terminal_tabs(&run.text, start_column)
-    } else {
-        // The terminal model already represents every occupied grid cell,
-        // including the cells skipped by a tab. Render its tab cell as one
-        // blank cell instead of asking GPUI to apply proportional tab stops.
-        run.text.replace('\t', " ")
-    }
-}
-
-fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
-    match layout {
-        PaneLayout::Leaf { pane } if pane.id == pane_id => Some(pane),
-        PaneLayout::Leaf { .. } => None,
-        PaneLayout::Stack { panes, .. } => panes.iter().find(|pane| pane.id == pane_id),
-        PaneLayout::Split { first, second, .. } => {
-            find_pane(first, pane_id).or_else(|| find_pane(second, pane_id))
-        }
-    }
-}
-
-fn collect_terminal_tabs<'a>(layout: &'a PaneLayout, panes: &mut Vec<&'a Pane>) {
-    match layout {
-        PaneLayout::Leaf { pane } => panes.push(pane),
-        PaneLayout::Stack { panes: stacked, .. } => panes.extend(stacked),
-        PaneLayout::Split { first, second, .. } => {
-            collect_terminal_tabs(first, panes);
-            collect_terminal_tabs(second, panes);
-        }
-    }
-}
-
-fn workspace_terminal_tabs(workspace: &Workspace) -> Vec<&Pane> {
-    let mut panes = Vec::new();
-    for tab in &workspace.tabs {
-        collect_terminal_tabs(&tab.layout, &mut panes);
-    }
-    panes
-}
-
-fn workspace_layout_for_focused_pane(
-    workspace: &Workspace,
-    focused_pane: Option<Uuid>,
-) -> Option<&PaneLayout> {
-    focused_pane
-        .and_then(|pane_id| {
-            workspace
-                .tabs
-                .iter()
-                .find(|tab| find_pane(&tab.layout, pane_id).is_some())
-                .map(|tab| &tab.layout)
-        })
-        .or_else(|| workspace.tabs.first().map(|tab| &tab.layout))
-}
-
-fn terminal_tab_count_label(count: usize) -> String {
-    format!("{count} terminal{}", if count == 1 { "" } else { "s" })
-}
-
-fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
-    let detection_detail = match pane.identity.source {
-        nah_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
-        nah_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
-        nah_protocol::TerminalIdentitySource::TerminalTitle => {
-            "Detected from a bounded terminal-title signal; terminal content is not inspected"
-        }
-        nah_protocol::TerminalIdentitySource::Command => {
-            "Detected from a bounded local child-process name; terminal content is not inspected"
-        }
-        nah_protocol::TerminalIdentitySource::Fallback => "Ordinary terminal",
-    };
-    let definition = agent_icon_definition(pane.identity.profile);
-    let asset_detail = if definition.asset.is_some() {
-        "Bundled official artwork is shown unchanged for referential identification only; no affiliation or endorsement is implied"
-    } else if pane.identity.profile == TerminalProfile::GitHubCopilot {
-        "The official CLI package exposes no standalone icon asset, so Not a Harness uses the neutral terminal glyph"
-    } else {
-        "Not a Harness uses the neutral terminal glyph"
-    };
-    TabIdentityPresentation {
-        label: pane.title.clone(),
-        profile: pane.identity.profile,
-        detail: format!(
-            "{} — {detection_detail}. {asset_detail}.",
-            definition.accessible_name
-        ),
-    }
-}
-
-const IDENTITY_MARK_SIZE: f32 = 22.0;
-const OFFICIAL_IDENTITY_ICON_SIZE: f32 = 20.0;
-const FALLBACK_IDENTITY_ICON_SIZE: f32 = 14.0;
-const FALLBACK_IDENTITY_FRAME_SIZE: f32 = 18.0;
-
-fn terminal_profile_icon_is_framed(profile: TerminalProfile) -> bool {
-    agent_icon_definition(profile).asset.is_none()
-}
-
-fn terminal_profile_icon_size(profile: TerminalProfile) -> f32 {
-    if terminal_profile_icon_is_framed(profile) {
-        FALLBACK_IDENTITY_ICON_SIZE
-    } else {
-        OFFICIAL_IDENTITY_ICON_SIZE
-    }
-}
-
-fn render_terminal_profile_mark(
-    profile: TerminalProfile,
-    fallback_color: u32,
-    fallback_border_color: u32,
-) -> AnyElement {
-    let icon =
-        render_terminal_profile_icon(profile, fallback_color, terminal_profile_icon_size(profile));
-    if terminal_profile_icon_is_framed(profile) {
-        div()
-            .w(px(FALLBACK_IDENTITY_FRAME_SIZE))
-            .h(px(FALLBACK_IDENTITY_FRAME_SIZE))
-            .rounded(px(4.0))
-            .border_1()
-            .border_color(rgb(fallback_border_color))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(icon)
-            .into_any_element()
-    } else {
-        icon
-    }
-}
-
-fn render_sidebar_toggle_icon(sidebar_visible: bool) -> AnyElement {
-    div()
-        .relative()
-        .w(px(15.0))
-        .h(px(13.0))
-        .rounded(px(3.0))
-        .border_1()
-        .border_color(rgb(THEME.muted))
-        .child(
-            div()
-                .absolute()
-                .left(px(4.0))
-                .top(px(0.0))
-                .w(px(1.0))
-                .h_full()
-                .bg(rgb(THEME.muted)),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(if sidebar_visible { 1.5 } else { 7.0 }))
-                .top(px(3.0))
-                .w(px(if sidebar_visible { 1.5 } else { 4.0 }))
-                .h(px(5.0))
-                .rounded(px(1.0))
-                .bg(rgb(THEME.muted)),
-        )
-        .into_any_element()
-}
-
-fn render_terminal_profile_icon(
-    profile: TerminalProfile,
-    fallback_color: u32,
-    icon_size: f32,
-) -> AnyElement {
-    let definition = agent_icon_definition(profile);
-    let icon = match definition.asset {
-        Some(asset) if asset.format == AgentIconFormat::Svg => svg()
-            .path(asset.path)
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(rgb(fallback_color))
-            .into_any_element(),
-        Some(asset) => img(asset.path)
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .object_fit(gpui::ObjectFit::Contain)
-            .into_any_element(),
-        None => div()
-            .font_family("SF Mono")
-            .text_size(px(7.5))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(rgb(fallback_color))
-            .child(profile.fallback_glyph())
-            .into_any_element(),
-    };
-    div()
-        .w(px(icon_size))
-        .h(px(icon_size))
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(icon)
-        .into_any_element()
-}
-
-fn resolved_terminal_accent(snapshot: &SessionSnapshot, pane_id: Uuid) -> AppearanceColor {
-    snapshot
-        .workspaces
-        .iter()
-        .flat_map(|workspace| &workspace.tabs)
-        .find_map(|tab| find_pane(&tab.layout, pane_id))
-        .and_then(|pane| pane.color)
-        .unwrap_or(snapshot.appearance.default_terminal_accent)
-}
-
-fn resolved_workspace_color(snapshot: &SessionSnapshot, workspace_id: Uuid) -> AppearanceColor {
-    snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == workspace_id)
-        .and_then(|workspace| workspace.color)
-        .unwrap_or(snapshot.appearance.default_workspace_color)
-}
-
-fn workspace_is_selectable(workspace: &Workspace) -> bool {
-    workspace.tabs.is_empty()
-        || !matches!(
-            workspace.connection,
-            WorkspaceConnection::SystemSsh {
-                status: WorkspaceConnectionStatus::Offline,
-                ..
-            }
-        )
-}
-
-fn stable_representative_pane(layout: &PaneLayout) -> Uuid {
-    match layout {
-        PaneLayout::Leaf { pane } => pane.id,
-        PaneLayout::Stack { panes, active } => panes.first().map_or(*active, |pane| pane.id),
-        PaneLayout::Split { first, .. } => stable_representative_pane(first),
-    }
-}
-
-fn split_control_id(first: &PaneLayout, second: &PaneLayout) -> SplitControlId {
-    SplitControlId {
-        first: stable_representative_pane(first),
-        second: stable_representative_pane(second),
-    }
-}
-
-fn zoom_projection(layout: &PaneLayout, pane_id: Uuid) -> Option<PaneLayout> {
-    match layout {
-        PaneLayout::Leaf { pane } => (pane.id == pane_id).then(|| layout.clone()),
-        PaneLayout::Stack { panes, .. } => panes
-            .iter()
-            .any(|pane| pane.id == pane_id)
-            .then(|| layout.clone()),
-        PaneLayout::Split { first, second, .. } => {
-            zoom_projection(first, pane_id).or_else(|| zoom_projection(second, pane_id))
-        }
-    }
-}
-
-fn apply_layout_control_mutation(
-    layout: &PaneLayout,
-    ratios: &mut HashMap<SplitControlId, f32>,
-    mutation: LayoutControlMutation,
-) -> usize {
-    match layout {
-        PaneLayout::Leaf { .. } | PaneLayout::Stack { .. } => 0,
-        PaneLayout::Split { first, second, .. } => {
-            match mutation {
-                LayoutControlMutation::Equalize => {
-                    ratios.insert(split_control_id(first, second), 0.5);
-                }
-            }
-            1 + apply_layout_control_mutation(first, ratios, mutation)
-                + apply_layout_control_mutation(second, ratios, mutation)
-        }
-    }
-}
-
-fn default_sidebar_width() -> f32 {
-    default_sidebar_width_for(development_build())
-}
-
-const fn default_sidebar_width_for(development: bool) -> f32 {
-    if development {
-        DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH
-    } else {
-        DEFAULT_SIDEBAR_WIDTH
-    }
-}
-
-/// Restore only the short-lived 104 px Dev migration introduced by the
-/// compact-rail experiment. Any other persisted width is user-resized data.
-fn migrated_sidebar_width(stored_width: Option<f32>) -> f32 {
-    migrated_sidebar_width_for(stored_width, development_build())
-}
-
-fn migrated_sidebar_width_for(stored_width: Option<f32>, development: bool) -> f32 {
-    if development && stored_width.is_some_and(|width| (width - 104.0).abs() < f32::EPSILON) {
-        DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH
-    } else {
-        stored_width.unwrap_or_else(|| default_sidebar_width_for(development))
-    }
-}
-
-fn constrained_sidebar_width(preferred_width: f32, window_width: f32) -> f32 {
-    let preferred_width = if preferred_width.is_finite() {
-        preferred_width
-    } else {
-        default_sidebar_width()
-    };
-    let maximum_for_window =
-        (window_width - MIN_TERMINAL_AREA_WIDTH).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-    preferred_width.clamp(MIN_SIDEBAR_WIDTH, maximum_for_window)
-}
-
-fn sidebar_width_for_visibility(preferred_width: f32, window_width: f32, visible: bool) -> f32 {
-    if visible {
-        constrained_sidebar_width(preferred_width, window_width)
-    } else {
-        0.0
-    }
-}
-
-fn workspace_pixel_size(window_width: f32, window_height: f32, sidebar_width: f32) -> (f32, f32) {
-    (
-        (window_width - sidebar_width).max(1.0),
-        (window_height - APP_CHROME_HEIGHT).max(1.0),
-    )
-}
-
-fn readable_text_color(background: u32) -> u32 {
-    let red = (background >> 16) & 0xff;
-    let green = (background >> 8) & 0xff;
-    let blue = background & 0xff;
-    if red * 299 + green * 587 + blue * 114 > 150_000 {
-        0x111318
-    } else {
-        0xffffff
-    }
-}
-
-fn parse_hex_color(value: &str) -> Option<AppearanceColor> {
-    let value = value.strip_prefix('#').unwrap_or(value);
-    if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let rgb = u32::from_str_radix(value, 16).ok()?;
-    Some(AppearanceColor::new(
-        ((rgb >> 16) & 0xff) as u8,
-        ((rgb >> 8) & 0xff) as u8,
-        (rgb & 0xff) as u8,
-    ))
-}
-
-fn effective_split_ratio(axis: SplitAxis, width: f32, height: f32, ratio: f32) -> f32 {
-    let extent = match axis {
-        SplitAxis::Horizontal => width,
-        SplitAxis::Vertical => height,
-    }
-    .max(1.0);
-    let minimum = match axis {
-        SplitAxis::Horizontal => MIN_PANE_WIDTH,
-        SplitAxis::Vertical => MIN_PANE_HEIGHT,
-    };
-    if extent < minimum * 2.0 + SPLIT_DIVIDER_SIZE {
-        return 0.5;
-    }
-    let low = minimum / extent;
-    let high = (extent - SPLIT_DIVIDER_SIZE - minimum) / extent;
-    ratio.clamp(low, high)
-}
-
-fn split_child_dimensions(
-    axis: SplitAxis,
-    width: f32,
-    height: f32,
-    ratio: f32,
-) -> (f32, f32, f32, f32) {
-    match axis {
-        SplitAxis::Horizontal => {
-            let first_width = (width * ratio).floor().max(1.0);
-            let second_width = (width - first_width - SPLIT_DIVIDER_SIZE).max(1.0);
-            (first_width, height, second_width, height)
-        }
-        SplitAxis::Vertical => {
-            let first_height = (height * ratio).floor().max(1.0);
-            let second_height = (height - first_height - SPLIT_DIVIDER_SIZE).max(1.0);
-            (width, first_height, width, second_height)
-        }
-    }
-}
-
-fn find_split_rect(
-    layout: &PaneLayout,
-    target_split_id: SplitControlId,
-    rect: PixelRect,
-    ratios: &HashMap<SplitControlId, f32>,
-) -> Option<PixelRect> {
-    let PaneLayout::Split {
-        axis,
-        ratio,
-        first,
-        second,
-    } = layout
-    else {
-        return None;
-    };
-    let split_id = split_control_id(first, second);
-    if split_id == target_split_id {
-        return Some(rect);
-    }
-    let ratio = effective_split_ratio(
-        *axis,
-        rect.width,
-        rect.height,
-        ratios.get(&split_id).copied().unwrap_or(*ratio),
-    );
-    let (first_width, first_height, second_width, second_height) =
-        split_child_dimensions(*axis, rect.width, rect.height, ratio);
-    let first_rect = PixelRect {
-        width: first_width,
-        height: first_height,
-        ..rect
-    };
-    let second_rect = match axis {
-        SplitAxis::Horizontal => PixelRect {
-            x: rect.x + first_width + SPLIT_DIVIDER_SIZE,
-            y: rect.y,
-            width: second_width,
-            height: second_height,
-        },
-        SplitAxis::Vertical => PixelRect {
-            x: rect.x,
-            y: rect.y + first_height + SPLIT_DIVIDER_SIZE,
-            width: second_width,
-            height: second_height,
-        },
-    };
-    find_split_rect(first, target_split_id, first_rect, ratios)
-        .or_else(|| find_split_rect(second, target_split_id, second_rect, ratios))
-}
-
-fn collect_pane_sizes(
-    layout: &PaneLayout,
-    width: f32,
-    height: f32,
-    metrics: typography::TerminalCellMetrics,
-    ratios: &HashMap<SplitControlId, f32>,
-    output: &mut Vec<(Uuid, u16, u16)>,
-) {
-    match layout {
-        PaneLayout::Leaf { pane } => {
-            let (columns, rows) = terminal_grid_for_pane(width, height, metrics);
-            output.push((pane.id, columns, rows));
-        }
-        PaneLayout::Stack { active, .. } => {
-            let (columns, rows) = terminal_grid_for_pane(width, height, metrics);
-            output.push((*active, columns, rows));
-        }
-        PaneLayout::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } => {
-            let ratio = effective_split_ratio(
-                *axis,
-                width,
-                height,
-                ratios
-                    .get(&split_control_id(first, second))
-                    .copied()
-                    .unwrap_or(*ratio),
-            );
-            let (first_width, first_height, second_width, second_height) =
-                split_child_dimensions(*axis, width, height, ratio);
-            collect_pane_sizes(first, first_width, first_height, metrics, ratios, output);
-            collect_pane_sizes(second, second_width, second_height, metrics, ratios, output);
-        }
-    }
-}
-
-fn terminal_input_bytes(
-    key: &str,
-    key_char: Option<&str>,
-    control: bool,
-    alt: bool,
-    platform: bool,
-) -> Option<Vec<u8>> {
-    // Command/Super is an application modifier, not a PTY modifier. Unmatched
-    // platform shortcuts remain available to the OS instead of becoming text.
-    if platform {
-        return None;
-    }
-    if control && key.len() == 1 {
-        return key
-            .as_bytes()
-            .first()
-            .map(|byte| vec![byte.to_ascii_lowercase() & 0x1f]);
-    }
-    let mut bytes = match key {
-        "enter" => vec![b'\r'],
-        "backspace" => vec![0x7f],
-        "tab" => vec![b'\t'],
-        "escape" => vec![0x1b],
-        "left" => b"\x1b[D".to_vec(),
-        "right" => b"\x1b[C".to_vec(),
-        "up" => b"\x1b[A".to_vec(),
-        "down" => b"\x1b[B".to_vec(),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
-        "delete" => b"\x1b[3~".to_vec(),
-        _ => key_char?.as_bytes().to_vec(),
-    };
-    if alt {
-        bytes.insert(0, 0x1b);
-    }
-    Some(bytes)
-}
-
-fn terminal_grid_for_pane(
-    pane_width: f32,
-    pane_height: f32,
-    metrics: typography::TerminalCellMetrics,
-) -> (u16, u16) {
-    let content_width =
-        (pane_width - TERMINAL_HORIZONTAL_PADDING - TERMINAL_FOCUS_BORDER_WIDTH).max(1.0);
-    let content_height = (pane_height - PANE_HEADER_HEIGHT - TERMINAL_VERTICAL_PADDING).max(1.0);
-    (
-        metrics.columns_for_width(content_width),
-        metrics.rows_for_height(content_height),
-    )
-}
-
-fn element_key(id: Uuid) -> u64 {
-    let (high, low) = id.as_u64_pair();
-    high ^ low
-}
-
-fn split_element_key(id: SplitControlId) -> u64 {
-    element_key(id.first).rotate_left(17) ^ element_key(id.second)
-}
-
-fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
-    match binding.command {
-        AppCommand::NewWorkspace => {
-            KeyBinding::new(&binding.sequence, NewWorkspace, Some(ROOT_KEY_CONTEXT))
-        }
-        AppCommand::ToggleSidebar => {
-            KeyBinding::new(&binding.sequence, ToggleSidebar, Some(ROOT_KEY_CONTEXT))
-        }
-        AppCommand::NewTab => KeyBinding::new(&binding.sequence, NewTab, Some(ROOT_KEY_CONTEXT)),
-        AppCommand::SplitRight => {
-            KeyBinding::new(&binding.sequence, SplitRight, Some(ROOT_KEY_CONTEXT))
-        }
-        AppCommand::SplitDown => {
-            KeyBinding::new(&binding.sequence, SplitDown, Some(ROOT_KEY_CONTEXT))
-        }
-        AppCommand::FocusLeft => {
-            KeyBinding::new(&binding.sequence, FocusLeft, Some(ROOT_KEY_CONTEXT))
-        }
-        AppCommand::FocusRight => {
-            KeyBinding::new(&binding.sequence, FocusRight, Some(ROOT_KEY_CONTEXT))
-        }
-        AppCommand::FocusUp => KeyBinding::new(&binding.sequence, FocusUp, Some(ROOT_KEY_CONTEXT)),
-        AppCommand::FocusDown => {
-            KeyBinding::new(&binding.sequence, FocusDown, Some(ROOT_KEY_CONTEXT))
-        }
-        AppCommand::ShowCommandPalette => KeyBinding::new(
-            &binding.sequence,
-            ShowCommandPalette,
-            Some(ROOT_KEY_CONTEXT),
-        ),
-        AppCommand::TogglePaneZoom => {
-            KeyBinding::new(&binding.sequence, TogglePaneZoom, Some(ROOT_KEY_CONTEXT))
-        }
-        AppCommand::EqualizePanes => {
-            KeyBinding::new(&binding.sequence, EqualizePanes, Some(ROOT_KEY_CONTEXT))
-        }
-    }
-}
-
 /// Starts the bundled session service only when no compatible local service is
 /// reachable. The service is deliberately detached from the desktop lifetime:
 /// closing or replacing the app UI never asks it to stop, preserving active
@@ -9702,7 +8056,9 @@ fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
 /// explicitly quiescent (see `docs/macos-release.md`).
 fn ensure_bundled_session_service() {
     if std::env::var_os("NAH_DISABLE_BUNDLED_SERVICE").is_some()
-        || request(ClientRequest::GetSnapshot).is_ok()
+        || SessionClient::connect()
+            .and_then(|mut client| client.call(&ClientRequest::GetSnapshot))
+            .is_ok()
     {
         return;
     }
@@ -9723,7 +8079,10 @@ fn ensure_bundled_session_service() {
 
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(50));
-        if request(ClientRequest::GetSnapshot).is_ok() {
+        if SessionClient::connect()
+            .and_then(|mut client| client.call(&ClientRequest::GetSnapshot))
+            .is_ok()
+        {
             return;
         }
     }
@@ -9732,31 +8091,6 @@ fn ensure_bundled_session_service() {
 
 fn development_build() -> bool {
     std::env::var("NAH_DEVELOPMENT_BUILD").as_deref() == Ok("1")
-}
-
-fn product_name(development_build: bool) -> &'static str {
-    if development_build {
-        DEVELOPMENT_PRODUCT_NAME
-    } else {
-        STABLE_PRODUCT_NAME
-    }
-}
-
-fn workstation_banner_header_height(sidebar_content_width: f32) -> f32 {
-    sidebar_content_width.max(0.0) / WORKSTATION_BANNER_ASPECT_RATIO
-}
-
-fn append_rename_text(value: &mut String, replace_on_type: &mut bool, text: &str) {
-    if *replace_on_type {
-        value.clear();
-    }
-    let remaining = 80_usize.saturating_sub(value.chars().count());
-    value.extend(
-        text.chars()
-            .filter(|character| !character.is_control())
-            .take(remaining),
-    );
-    *replace_on_type = false;
 }
 
 /// Prefer the copy packaged inside a native macOS bundle. The source-tree path
@@ -9863,687 +8197,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn per_tab_close_requires_an_explicit_confirmation_for_the_exact_terminal() {
-        let pane = Pane {
-            id: Uuid::new_v4(),
-            title: "build".to_owned(),
-            shell: "zsh".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
-            custom_title: Some("build".to_owned()),
-            profile_override: None,
-        };
-
-        let confirmation = CloseConfirmation::for_pane(&pane, true);
-
-        assert_eq!(confirmation.pane_id, pane.id);
-        assert_eq!(confirmation.title, "build");
-        assert!(confirmation.leaves_workspace_empty);
-        assert_eq!(
-            confirmation.request(),
-            ClientRequest::ClosePane { pane_id: pane.id }
-        );
-    }
-
-    #[test]
-    fn empty_offline_ssh_workspace_is_selectable_only_for_its_reopen_affordance() {
-        let mut snapshot = SessionSnapshot::seeded();
-        let workspace = &mut snapshot.workspaces[0];
-        workspace.connection = WorkspaceConnection::SystemSsh {
-            destination: "tailnet-host".to_owned(),
-            status: WorkspaceConnectionStatus::Offline,
-        };
-        assert!(!workspace_is_selectable(workspace));
-
-        workspace.tabs.clear();
-
-        assert!(workspace_is_selectable(workspace));
-    }
-
-    #[test]
-    fn native_tab_identity_label_and_icon_registry_smoke_test() {
-        let cases = [
-            (TerminalProfile::Terminal, false),
-            (TerminalProfile::Hermes, true),
-            (TerminalProfile::Codex, true),
-            (TerminalProfile::Claude, true),
-            (TerminalProfile::Droid, true),
-            (TerminalProfile::KiloCode, true),
-            (TerminalProfile::Cursor, true),
-            (TerminalProfile::OpenCode, true),
-            (TerminalProfile::Aider, true),
-            (TerminalProfile::GitHubCopilot, false),
-            (TerminalProfile::Gemini, true),
-        ];
-        for (profile, has_official_asset) in cases {
-            let label = profile.display_name();
-            let pane = Pane {
-                id: Uuid::new_v4(),
-                title: label.to_owned(),
-                shell: "zsh".to_owned(),
-                color: None,
-                identity: nah_protocol::TerminalIdentity {
-                    profile,
-                    source: if profile == TerminalProfile::Terminal {
-                        nah_protocol::TerminalIdentitySource::Fallback
-                    } else {
-                        nah_protocol::TerminalIdentitySource::Command
-                    },
-                },
-                custom_title: None,
-                profile_override: None,
-            };
-
-            let presentation = tab_identity_presentation(&pane);
-            assert_eq!(presentation.label, label);
-            assert_eq!(presentation.profile, profile);
-            assert!(presentation.detail.contains(label));
-            assert_eq!(
-                agent_icon_definition(profile).asset.is_some(),
-                has_official_asset
-            );
-            assert_eq!(
-                terminal_profile_icon_is_framed(profile),
-                !has_official_asset
-            );
-            let expected_size = if has_official_asset {
-                OFFICIAL_IDENTITY_ICON_SIZE
-            } else {
-                FALLBACK_IDENTITY_ICON_SIZE
-            };
-            assert!((terminal_profile_icon_size(profile) - expected_size).abs() < f32::EPSILON);
-        }
-    }
-
-    #[test]
-    fn workspace_rail_lists_every_terminal_tab_across_stacks_and_splits() {
-        let make_pane = |id: u128, title: &str, profile: TerminalProfile| Pane {
-            id: Uuid::from_u128(id),
-            title: title.to_owned(),
-            shell: "zsh".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity {
-                profile,
-                source: nah_protocol::TerminalIdentitySource::Command,
-            },
-            custom_title: None,
-            profile_override: None,
-        };
-        let codex = make_pane(1, "Codex review", TerminalProfile::Codex);
-        let droid = make_pane(2, "Droid build", TerminalProfile::Droid);
-        let terminal = make_pane(3, "Logs", TerminalProfile::Terminal);
-        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
-        workspace.tabs[0].layout = PaneLayout::Split {
-            axis: SplitAxis::Horizontal,
-            ratio: 0.5,
-            first: Box::new(PaneLayout::Stack {
-                panes: vec![codex.clone(), droid.clone()],
-                active: droid.id,
-            }),
-            second: Box::new(PaneLayout::Leaf {
-                pane: terminal.clone(),
-            }),
-        };
-
-        let tabs = workspace_terminal_tabs(&workspace);
-
-        assert_eq!(
-            tabs.iter().map(|pane| pane.id).collect::<Vec<_>>(),
-            vec![codex.id, droid.id, terminal.id]
-        );
-        assert_eq!(
-            tabs.iter()
-                .map(|pane| tab_identity_presentation(pane).profile)
-                .collect::<Vec<_>>(),
-            vec![
-                TerminalProfile::Codex,
-                TerminalProfile::Droid,
-                TerminalProfile::Terminal
-            ]
-        );
-        assert_eq!(terminal_tab_count_label(tabs.len()), "3 terminals");
-    }
-
-    #[test]
-    fn workspace_rail_empty_state_and_tab_count_labels_are_explicit() {
-        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
-        workspace.tabs.clear();
-
-        assert!(workspace_terminal_tabs(&workspace).is_empty());
-        assert_eq!(terminal_tab_count_label(0), "0 terminals");
-        assert_eq!(terminal_tab_count_label(1), "1 terminal");
-    }
-
-    #[test]
-    fn workstation_rows_start_collapsed_but_can_expand_after_creation() {
-        let workstation = SessionSnapshot::seeded().workspaces.remove(0);
-        let mut expanded_workstations: HashSet<Uuid> = HashSet::new();
-
-        assert!(!expanded_workstations.contains(&workstation.id));
-        assert_eq!(
-            terminal_tab_count_label(workspace_terminal_tabs(&workstation).len()),
-            "1 terminal"
-        );
-
-        assert!(expanded_workstations.insert(workstation.id));
-        assert!(expanded_workstations.contains(&workstation.id));
-    }
-
-    #[test]
-    fn appearance_color_precedence_keeps_terminal_and_workspace_scopes_independent() {
-        let mut snapshot = SessionSnapshot::seeded();
-        let pane_id = visible_panes(&snapshot.workspaces[0].tabs[0].layout)[0];
-        let workspace_id = snapshot.workspaces[0].id;
-        let terminal_default = AppearanceColor::new(0x95, 0xcc, 0x7f);
-        let workspace_default = AppearanceColor::new(0xc9, 0x90, 0xe5);
-        let terminal_override = AppearanceColor::new(0xef, 0x71, 0x7a);
-        let workspace_override = AppearanceColor::new(0xe4, 0xbd, 0x72);
-        snapshot.appearance.default_terminal_accent = terminal_default;
-        snapshot.appearance.default_workspace_color = workspace_default;
-
-        assert_eq!(
-            resolved_terminal_accent(&snapshot, pane_id),
-            terminal_default
-        );
-        assert_eq!(
-            resolved_workspace_color(&snapshot, workspace_id),
-            workspace_default
-        );
-
-        let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[0].tabs[0].layout else {
-            panic!("expected leaf");
-        };
-        pane.color = Some(terminal_override);
-        snapshot.workspaces[0].color = Some(workspace_override);
-
-        assert_eq!(
-            resolved_terminal_accent(&snapshot, pane_id),
-            terminal_override
-        );
-        assert_eq!(
-            resolved_workspace_color(&snapshot, workspace_id),
-            workspace_override
-        );
-        snapshot.workspaces[0].color = None;
-        assert_eq!(
-            resolved_terminal_accent(&snapshot, pane_id),
-            terminal_override
-        );
-        assert_eq!(
-            resolved_workspace_color(&snapshot, workspace_id),
-            workspace_default
-        );
-    }
-
-    #[test]
-    fn color_picker_accepts_exact_hex_and_rejects_partial_or_non_hex_input() {
-        assert_eq!(
-            parse_hex_color("#67C8C6"),
-            Some(AppearanceColor::new(0x67, 0xc8, 0xc6))
-        );
-        assert_eq!(
-            parse_hex_color("62adff"),
-            Some(AppearanceColor::HARBOR_BLUE)
-        );
-        assert_eq!(parse_hex_color("FFF"), None);
-        assert_eq!(parse_hex_color("GGADFF"), None);
-    }
-
-    #[test]
-    fn ssh_workspace_cannot_create_a_network_action_before_review_and_confirmation() {
-        let mut dialog = WorkspaceCreationDialog::new();
-        dialog.kind = WorkspaceCreationKind::SystemSsh;
-        dialog.destination = DialogTextEditor::with_text("prod-east");
-
-        assert_eq!(dialog.approved_request(), None);
-
-        dialog.review();
-
-        assert_eq!(dialog.step, WorkspaceCreationStep::ConfirmSsh);
-        assert_eq!(
-            dialog.approved_request(),
-            Some(ClientRequest::CreateSshWorkspace {
-                title: None,
-                destination: "prod-east".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn workspace_dialog_editor_inserts_and_deletes_at_the_visible_caret() {
-        let mut editor = DialogTextEditor::with_text("Terminal App");
-        editor.move_home(false);
-        for _ in 0..8 {
-            editor.move_right(false);
-        }
-
-        editor.replace(None, "-", 80, false, false, None);
-        assert_eq!(editor.text, "Terminal- App");
-        assert_eq!(editor.selected_range, 9..9);
-
-        editor.delete_backward();
-        assert_eq!(editor.text, "Terminal App");
-        assert_eq!(editor.selected_range, 8..8);
-
-        editor.delete_forward();
-        assert_eq!(editor.text, "TerminalApp");
-        assert_eq!(editor.selected_range, 8..8);
-    }
-
-    #[test]
-    fn workspace_dialog_selection_replacement_supports_normal_editing() {
-        let mut editor = DialogTextEditor::with_text("tailscale-old");
-        for _ in 0..3 {
-            editor.move_left(true);
-        }
-        assert_eq!(editor.selected_text(), Some("old"));
-
-        editor.replace(None, "node", MAX_SSH_INPUT_LEN, true, false, None);
-
-        assert_eq!(editor.text, "tailscale-node");
-        assert_eq!(editor.selected_range, editor.text.len()..editor.text.len());
-    }
-
-    #[test]
-    fn workspace_dialog_double_click_selection_replaces_a_name_or_destination_unit() {
-        let mut name = DialogTextEditor::with_text("Build workstation");
-        name.select_word_at(2);
-        assert_eq!(name.selected_text(), Some("Build"));
-        name.replace(None, "Deploy", 80, false, false, None);
-        assert_eq!(name.text, "Deploy workstation");
-
-        let mut destination = DialogTextEditor::with_text("admin@build-node");
-        destination.select_word_at(7);
-        assert_eq!(destination.selected_text(), Some("admin@build-node"));
-        destination.replace(None, "ops@edge", MAX_SSH_INPUT_LEN, true, false, None);
-        assert_eq!(destination.text, "ops@edge");
-    }
-
-    #[test]
-    fn workspace_dialog_select_all_supports_cut_or_replacement_without_terminal_input() {
-        let mut dialog = WorkspaceCreationDialog::new();
-        dialog.name = DialogTextEditor::with_text("Default workstation name");
-        dialog.name.select_all();
-        assert_eq!(
-            dialog.name.selected_text(),
-            Some("Default workstation name")
-        );
-
-        dialog.replace_text(None, "My Mac", false, None);
-        assert_eq!(dialog.name.text, "My Mac");
-        assert!(dialog.name.selected_text().is_none());
-    }
-
-    #[test]
-    fn workspace_dialog_uses_utf16_ranges_without_splitting_unicode_text() {
-        let mut editor = DialogTextEditor::with_text("box😀x");
-        assert_eq!(editor.range_to_utf16(&(3..7)), 3..5);
-
-        editor.replace(Some(&(3..5)), "🌐", 80, false, false, None);
-
-        assert_eq!(editor.text, "box🌐x");
-        assert_eq!(editor.range_to_utf16(&editor.selected_range), 5..5);
-        editor.delete_backward();
-        assert_eq!(editor.text, "boxx");
-    }
-
-    #[test]
-    fn workspace_dialog_fields_keep_independent_cursors_and_selection() {
-        let mut dialog = WorkspaceCreationDialog::new();
-        dialog.name = DialogTextEditor::with_text("Build box");
-        dialog.name.select_all();
-        dialog.destination = DialogTextEditor::with_text("admin@node");
-        dialog.field = WorkspaceCreationField::Name;
-        dialog.replace_text(None, "Tailscale", false, None);
-        dialog.field = WorkspaceCreationField::Destination;
-        dialog.backspace();
-
-        assert_eq!(dialog.name.text, "Tailscale");
-        assert_eq!(dialog.destination.text, "admin@nod");
-        assert_eq!(dialog.name.selected_range, 9..9);
-        assert_eq!(dialog.destination.selected_range, 9..9);
-    }
-
-    #[test]
-    fn workspace_dialog_marked_text_tracks_gpui_relative_utf16_selection() {
-        let mut editor = DialogTextEditor::with_text("host");
-        editor.move_home(false);
-        editor.replace(None, "候補", 80, false, true, Some(&(1..1)));
-
-        assert_eq!(editor.text, "候補host");
-        assert_eq!(editor.marked_range, Some(0..6));
-        assert_eq!(editor.selected_range, 3..3);
-        assert_eq!(editor.range_to_utf16(&editor.selected_range), 1..1);
-    }
-
-    #[test]
-    fn pasted_ssh_command_is_normalized_before_confirmation() {
-        let mut dialog = WorkspaceCreationDialog::new();
-        dialog.kind = WorkspaceCreationKind::SystemSsh;
-        dialog.field = WorkspaceCreationField::Destination;
-        dialog.name = DialogTextEditor::with_text("Build box");
-
-        dialog.paste("ssh tailscale_user@build-node\n");
-        assert_eq!(dialog.destination.text, "ssh tailscale_user@build-node");
-        assert_eq!(dialog.approved_request(), None);
-
-        dialog.review();
-
-        assert_eq!(dialog.step, WorkspaceCreationStep::ConfirmSsh);
-        assert_eq!(dialog.destination.text, "tailscale_user@build-node");
-        assert_eq!(
-            dialog.approved_request(),
-            Some(ClientRequest::CreateSshWorkspace {
-                title: Some("Build box".to_owned()),
-                destination: "tailscale_user@build-node".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn pasted_ssh_options_never_cross_the_confirmation_boundary() {
-        let mut dialog = WorkspaceCreationDialog::new();
-        dialog.kind = WorkspaceCreationKind::SystemSsh;
-        dialog.field = WorkspaceCreationField::Destination;
-        dialog.paste("ssh -A build-node");
-
-        dialog.review();
-
-        assert_eq!(dialog.step, WorkspaceCreationStep::Details);
-        assert!(dialog.error.is_some());
-        assert_eq!(dialog.approved_request(), None);
-    }
-
-    #[test]
-    fn workspace_creation_modal_consumes_paste_instead_of_leaking_it_to_the_terminal() {
-        let mut dialog = WorkspaceCreationDialog::new();
-        dialog.kind = WorkspaceCreationKind::SystemSsh;
-        dialog.field = WorkspaceCreationField::Destination;
-        assert!(route_workspace_creation_paste(
-            Some(&mut dialog),
-            "ssh admin@tailscale-node"
-        ));
-        assert_eq!(dialog.destination.text, "ssh admin@tailscale-node");
-
-        dialog.review();
-        assert!(route_workspace_creation_paste(
-            Some(&mut dialog),
-            "ssh other-node"
-        ));
-        assert_eq!(dialog.destination.text, "admin@tailscale-node");
-
-        assert!(!route_workspace_creation_paste(
-            None,
-            "ordinary terminal paste"
-        ));
-    }
-
-    #[test]
-    fn ssh_review_keeps_invalid_input_out_of_the_network_action_boundary() {
-        let mut dialog = WorkspaceCreationDialog::new();
-        dialog.kind = WorkspaceCreationKind::SystemSsh;
-        dialog.destination = DialogTextEditor::with_text("-oProxyCommand=bad");
-
-        dialog.review();
-
-        assert_eq!(dialog.step, WorkspaceCreationStep::Details);
-        assert!(dialog.error.is_some());
-        assert_eq!(dialog.approved_request(), None);
-    }
-
-    #[test]
-    fn drag_hover_state_persists_updates_and_clears_for_leave_drop_or_cancel() {
-        let first = Uuid::from_u128(1);
-        let second = Uuid::from_u128(2);
-        let mut hover = DragHoverState::default();
-
-        hover.enter(DragDestination::Split {
-            target_pane: first,
-            placement: DropPlacement::Left,
-        });
-        assert_eq!(hover.split_for(first), Some(DropPlacement::Left));
-
-        hover.enter(DragDestination::Split {
-            target_pane: first,
-            placement: DropPlacement::Bottom,
-        });
-        assert_eq!(hover.split_for(first), Some(DropPlacement::Bottom));
-
-        hover.enter(DragDestination::Merge {
-            target_pane: second,
-        });
-        assert!(hover.merges_into(second));
-        assert_eq!(hover.split_for(first), None);
-
-        hover.clear();
-        assert_eq!(hover, DragHoverState::default());
-    }
-
-    #[test]
-    fn pointer_local_split_zones_exclude_the_tab_strip_and_cover_each_half() {
-        let bounds = Bounds {
-            origin: point(px(0.0), px(0.0)),
-            size: size(px(100.0), px(100.0)),
-        };
-
-        assert_eq!(split_placement_at(point(px(50.0), px(10.0)), bounds), None);
-        assert_eq!(
-            split_placement_at(point(px(10.0), px(50.0)), bounds),
-            Some(DropPlacement::Left)
-        );
-        assert_eq!(
-            split_placement_at(point(px(90.0), px(50.0)), bounds),
-            Some(DropPlacement::Right)
-        );
-        assert_eq!(
-            split_placement_at(point(px(50.0), px(40.0)), bounds),
-            Some(DropPlacement::Top)
-        );
-        assert_eq!(
-            split_placement_at(point(px(50.0), px(90.0)), bounds),
-            Some(DropPlacement::Bottom)
-        );
-        assert_eq!(split_placement_at(point(px(101.0), px(50.0)), bounds), None);
-    }
-
-    #[test]
-    fn multi_column_terminal_rows_keep_spaces_and_wide_cells_on_one_grid() {
-        let listing = TerminalRun {
-            text: "Applications                         Music                 Work".to_owned(),
-            columns: 0,
-            foreground: TerminalColor::DefaultForeground,
-            background: TerminalColor::DefaultBackground,
-            attributes: TerminalAttributes::default(),
-        };
-        assert_eq!(
-            terminal_run_columns(&listing, 0),
-            u16::try_from(listing.text.chars().count()).unwrap()
-        );
-
-        let wide = TerminalRun {
-            text: "A界B".to_owned(),
-            columns: 4,
-            foreground: TerminalColor::DefaultForeground,
-            background: TerminalColor::DefaultBackground,
-            attributes: TerminalAttributes::default(),
-        };
-        assert_eq!(terminal_run_columns(&wide, 0), 4);
-
-        let combining = TerminalRun {
-            text: "e\u{301}".to_owned(),
-            columns: 1,
-            foreground: TerminalColor::DefaultForeground,
-            background: TerminalColor::DefaultBackground,
-            attributes: TerminalAttributes::default(),
-        };
-        assert_eq!(terminal_run_columns(&combining, 0), 1);
-
-        let tabbed = TerminalRun {
-            text: "Applications\tMusic\tWork".to_owned(),
-            columns: 0,
-            foreground: TerminalColor::DefaultForeground,
-            background: TerminalColor::DefaultBackground,
-            attributes: TerminalAttributes::default(),
-        };
-        assert_eq!(terminal_run_columns(&tabbed, 0), 28);
-        assert_eq!(legacy_text_columns("\tWork", 32), 12);
-        assert_eq!(
-            expand_terminal_tabs(&tabbed.text, 0),
-            "Applications    Music   Work"
-        );
-        assert!(!expand_terminal_tabs(&tabbed.text, 0).contains('\t'));
-
-        let modeled_cells = TerminalRun {
-            text: "A\t  B".to_owned(),
-            columns: 5,
-            ..tabbed
-        };
-        assert_eq!(terminal_run_display_text(&modeled_cells, 0), "A   B");
-        assert_eq!(terminal_run_columns(&modeled_cells, 0), 5);
-    }
-
-    #[test]
-    fn one_row_hit_surface_maps_pointer_positions_to_terminal_cells() {
-        let bounds = Bounds {
-            origin: point(px(100.0), px(40.0)),
-            size: size(px(80.0), px(18.0)),
-        };
-
-        assert_eq!(
-            terminal_point_at(point(px(100.0), px(49.0)), bounds, 7, 10, 8.0),
-            TerminalPoint { row: 7, column: 0 }
-        );
-        assert_eq!(
-            terminal_point_at(point(px(139.9), px(49.0)), bounds, 7, 10, 8.0),
-            TerminalPoint { row: 7, column: 4 }
-        );
-        assert_eq!(
-            terminal_point_at(point(px(190.0), px(49.0)), bounds, 7, 10, 8.0),
-            TerminalPoint { row: 7, column: 9 }
-        );
-    }
-
-    #[test]
-    fn terminal_polling_is_fast_while_output_changes_and_backs_off_when_idle() {
-        assert_eq!(
-            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, true),
-            ACTIVE_TERMINAL_POLL_MS
-        );
-        assert_eq!(
-            next_terminal_poll_delay_ms(ACTIVE_TERMINAL_POLL_MS, false),
-            ACTIVE_TERMINAL_POLL_MS * 2
-        );
-        assert_eq!(
-            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, false),
-            IDLE_TERMINAL_POLL_MS
-        );
-    }
-
-    #[test]
-    fn attention_policy_keeps_focused_and_recent_panes_but_cools_old_inactive_panes() {
-        let now = Instant::now();
-        let focused = Uuid::from_u128(1);
-        let recent = Uuid::from_u128(2);
-        let cold = Uuid::from_u128(3);
-        let attention = HashMap::from([
-            (focused, now.checked_sub(Duration::from_mins(2)).unwrap()),
-            (recent, now.checked_sub(Duration::from_secs(59)).unwrap()),
-            (cold, now.checked_sub(Duration::from_secs(61)).unwrap()),
-        ]);
-
-        assert_eq!(
-            responsive_panes(now, Some(focused), &attention),
-            vec![focused, recent]
-        );
-    }
-
-    #[test]
-    fn revision_metadata_alone_does_not_repaint_inactive_panes() {
-        assert!(!pane_update_requires_repaint(false, 0));
-        assert!(pane_update_requires_repaint(false, 1));
-        assert!(pane_update_requires_repaint(true, 0));
-    }
-
-    #[test]
-    fn pane_geometry_tracks_narrow_medium_and_wide_windows_without_fixed_columns() {
-        let pane = Pane {
-            id: Uuid::from_u128(10),
-            title: "Terminal 1".to_owned(),
-            shell: "zsh".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
-            custom_title: None,
-            profile_override: None,
-        };
-        let layout = PaneLayout::Leaf { pane };
-        let metrics = typography::TerminalCellMetrics {
-            font_size: 13.5,
-            cell_width: 8.0,
-            ascent: 10.0,
-            descent: 3.0,
-            baseline: 13.0,
-            line_height: 19.0,
-        };
-        let ratios = HashMap::new();
-
-        let dimensions = [(720.0, 460.0), (1280.0, 820.0), (1800.0, 1000.0)]
-            .into_iter()
-            .map(|(window_width, window_height)| {
-                let workspace =
-                    workspace_pixel_size(window_width, window_height, DEFAULT_SIDEBAR_WIDTH);
-                let mut sizes = Vec::new();
-                collect_pane_sizes(
-                    &layout,
-                    workspace.0,
-                    workspace.1,
-                    metrics,
-                    &ratios,
-                    &mut sizes,
-                );
-                sizes[0]
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(dimensions[0], (Uuid::from_u128(10), 69, 20));
-        assert_eq!(dimensions[1], (Uuid::from_u128(10), 139, 39));
-        assert_eq!(dimensions[2], (Uuid::from_u128(10), 204, 48));
-        assert!(
-            dimensions
-                .windows(2)
-                .all(|pair| { pair[0].1 < pair[1].1 && pair[0].2 < pair[1].2 })
-        );
-    }
-
-    #[test]
-    fn sidebar_width_is_bounded_without_forgetting_a_wider_preference() {
-        assert!((constrained_sidebar_width(80.0, 1280.0) - MIN_SIDEBAR_WIDTH).abs() < 0.0001);
-        assert!((constrained_sidebar_width(900.0, 1280.0) - 420.0).abs() < 0.0001);
-
-        let preferred = 390.0;
-        let compact = constrained_sidebar_width(preferred, 640.0);
-        assert!((compact - 320.0).abs() < 0.0001);
-        assert!((workspace_pixel_size(640.0, 460.0, compact).0 - 320.0).abs() < 0.0001);
-        assert!((constrained_sidebar_width(preferred, 1280.0) - preferred).abs() < 0.0001);
-    }
-
-    #[test]
-    fn development_sidebar_restores_the_normal_width_after_the_compact_experiment() {
-        assert!(
-            (default_sidebar_width_for(true) - DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH).abs()
-                < f32::EPSILON
-        );
-        assert!(
-            (migrated_sidebar_width_for(Some(104.0), true) - DEVELOPMENT_DEFAULT_SIDEBAR_WIDTH)
-                .abs()
-                < f32::EPSILON
-        );
-        assert!((migrated_sidebar_width_for(Some(356.0), true) - 356.0).abs() < f32::EPSILON);
-        assert!(
-            (migrated_sidebar_width_for(None, false) - DEFAULT_SIDEBAR_WIDTH).abs() < f32::EPSILON
-        );
-    }
-
-    #[test]
     fn workstation_banner_resolves_to_a_local_packaged_resource() {
         let banner = workstation_banner_path();
         assert!(banner.is_file(), "banner is missing: {}", banner.display());
@@ -10551,400 +8204,5 @@ mod tests {
             banner.file_name().and_then(|name| name.to_str()),
             Some("notaharness-banner.png")
         );
-    }
-
-    #[test]
-    fn workstation_banner_header_preserves_the_artwork_aspect_at_normal_and_wide_rails() {
-        for sidebar_content_width in [136.0, 217.0, 412.0] {
-            let height = workstation_banner_header_height(sidebar_content_width);
-            assert!(
-                (height * WORKSTATION_BANNER_ASPECT_RATIO - sidebar_content_width).abs() < 0.0001
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_rename_accepts_replacement_text_after_the_original_is_cleared() {
-        let mut value = "Terminal 1".to_owned();
-        let mut replace_on_type = true;
-
-        append_rename_text(&mut value, &mut replace_on_type, "Build shell");
-
-        assert_eq!(value, "Build shell");
-        assert!(!replace_on_type);
-
-        append_rename_text(&mut value, &mut replace_on_type, "\n");
-        assert_eq!(value, "Build shell");
-    }
-
-    #[test]
-    fn sidebar_resize_only_updates_while_the_left_button_is_held() {
-        let mut resize = SidebarResizeLifecycle::default();
-
-        assert_eq!(
-            resize.pointer_move(Some(MouseButton::Left)),
-            SidebarResizeMove::Ignore
-        );
-
-        resize.begin(240.0);
-        assert_eq!(
-            resize.pointer_move(Some(MouseButton::Left)),
-            SidebarResizeMove::Update
-        );
-        assert_eq!(resize.pointer_move(None), SidebarResizeMove::Complete);
-        assert!(!resize.is_active());
-        assert_eq!(resize.pointer_move(None), SidebarResizeMove::Ignore);
-    }
-
-    #[test]
-    fn sidebar_resize_release_and_cancel_end_the_capture() {
-        let mut resize = SidebarResizeLifecycle::default();
-
-        resize.begin(275.0);
-        assert!(resize.finish());
-        assert!(!resize.finish());
-        assert!(!resize.is_active());
-
-        resize.begin(310.0);
-        assert_eq!(resize.cancel(), Some(310.0));
-        assert_eq!(resize.cancel(), None);
-        assert!(!resize.is_active());
-    }
-
-    #[test]
-    fn hidden_sidebar_gives_the_workspace_the_full_window_width() {
-        let visible = sidebar_width_for_visibility(260.0, 1280.0, true);
-        let hidden = sidebar_width_for_visibility(260.0, 1280.0, false);
-
-        assert!((visible - 260.0).abs() < f32::EPSILON);
-        assert!(hidden.abs() < f32::EPSILON);
-        assert!((workspace_pixel_size(1280.0, 820.0, hidden).0 - 1280.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn widest_sidebar_still_leaves_two_constrained_split_panes_in_the_minimum_window() {
-        let sidebar = constrained_sidebar_width(MAX_SIDEBAR_WIDTH, 720.0);
-        let workspace = workspace_pixel_size(720.0, 460.0, sidebar);
-        let ratio = effective_split_ratio(SplitAxis::Horizontal, workspace.0, workspace.1, 0.95);
-        let (first_width, _, second_width, _) =
-            split_child_dimensions(SplitAxis::Horizontal, workspace.0, workspace.1, ratio);
-
-        assert!((sidebar - 400.0).abs() < 0.0001);
-        assert!((workspace.0 - MIN_TERMINAL_AREA_WIDTH).abs() < 0.0001);
-        assert!(first_width >= MIN_PANE_WIDTH);
-        assert!(second_width >= MIN_PANE_WIDTH);
-    }
-
-    #[test]
-    fn split_geometry_accounts_for_the_divider_and_each_panes_chrome() {
-        let first = Pane {
-            id: Uuid::from_u128(21),
-            title: "Terminal 1".to_owned(),
-            shell: "zsh".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
-            custom_title: None,
-            profile_override: None,
-        };
-        let second = Pane {
-            id: Uuid::from_u128(22),
-            title: "Terminal 2".to_owned(),
-            shell: "zsh".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
-            custom_title: None,
-            profile_override: None,
-        };
-        let layout = PaneLayout::Split {
-            axis: SplitAxis::Horizontal,
-            ratio: 0.5,
-            first: Box::new(PaneLayout::Leaf {
-                pane: first.clone(),
-            }),
-            second: Box::new(PaneLayout::Leaf { pane: second }),
-        };
-        let metrics = typography::TerminalCellMetrics {
-            font_size: 13.5,
-            cell_width: 8.0,
-            ascent: 10.0,
-            descent: 3.0,
-            baseline: 13.0,
-            line_height: 19.0,
-        };
-        let workspace = workspace_pixel_size(1280.0, 820.0, DEFAULT_SIDEBAR_WIDTH);
-        let mut sizes = Vec::new();
-        collect_pane_sizes(
-            &layout,
-            workspace.0,
-            workspace.1,
-            metrics,
-            &HashMap::new(),
-            &mut sizes,
-        );
-
-        assert_eq!(
-            sizes,
-            vec![(first.id, 68, 39), (Uuid::from_u128(22), 68, 39)]
-        );
-        let used_pixel_width = 568.0 + SPLIT_DIVIDER_SIZE + 564.0;
-        assert!((used_pixel_width - workspace.0).abs() < 0.0001);
-    }
-
-    #[test]
-    fn split_ratio_respects_practical_pane_constraints_at_each_window_size() {
-        let narrow = effective_split_ratio(SplitAxis::Horizontal, 530.0, 422.0, 0.05);
-        let wide = effective_split_ratio(SplitAxis::Horizontal, 1610.0, 962.0, 0.05);
-        assert!((narrow - (MIN_PANE_WIDTH / 530.0)).abs() < 0.0001);
-        assert!((wide - (MIN_PANE_WIDTH / 1610.0)).abs() < 0.0001);
-
-        let too_short = effective_split_ratio(SplitAxis::Vertical, 530.0, 150.0, 0.9);
-        assert!((too_short - 0.5).abs() < 0.0001);
-    }
-
-    #[test]
-    fn terminal_input_encodes_unmatched_keys_once_with_control_and_alt_semantics() {
-        assert_eq!(
-            terminal_input_bytes("x", Some("x"), false, false, false),
-            Some(vec![b'x'])
-        );
-        assert_eq!(
-            terminal_input_bytes("c", Some("c"), true, false, false),
-            Some(vec![0x03])
-        );
-        assert_eq!(
-            terminal_input_bytes("x", Some("x"), false, true, false),
-            Some(vec![0x1b, b'x'])
-        );
-        assert_eq!(
-            terminal_input_bytes("up", None, false, false, false),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            terminal_input_bytes("x", Some("x"), false, false, true),
-            None
-        );
-    }
-
-    #[test]
-    fn bracketed_paste_normalizes_newlines_and_cannot_inject_an_early_end_marker() {
-        let bytes = prepare_paste("one\n\x1b[201~two\r\n", true).unwrap();
-        assert_eq!(bytes, b"\x1b[200~one\r[201~two\r\x1b[201~");
-        assert_eq!(
-            bytes
-                .windows(b"\x1b[201~".len())
-                .filter(|window| *window == b"\x1b[201~")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn tmux_picker_supports_multi_select_select_all_and_clear_all_in_scan_order() {
-        let sessions = ["$1", "$2", "$3"]
-            .into_iter()
-            .map(|id| TmuxSession {
-                id: id.to_owned(),
-                name: format!("session-{id}"),
-                windows: 1,
-                attached_clients: 0,
-            })
-            .collect();
-        let mut picker = TmuxSessionPicker {
-            workspace_id: Uuid::nil(),
-            scope: TmuxScanScope::Local,
-            sessions,
-            no_server: false,
-            selected_session_ids: HashSet::new(),
-            status: None,
-            error: None,
-        };
-        picker.toggle_session("$3");
-        picker.toggle_session("$1");
-        assert_eq!(
-            picker.selected_session_ids_in_scan_order(),
-            vec!["$1", "$3"]
-        );
-        picker.select_all();
-        assert_eq!(
-            picker.selected_session_ids_in_scan_order(),
-            vec!["$1", "$2", "$3"]
-        );
-        picker.clear_all();
-        assert!(picker.selected_session_ids_in_scan_order().is_empty());
-    }
-
-    #[test]
-    fn focused_workspace_tab_layout_is_rendered_instead_of_the_first_tab() {
-        let pane = |id, title: &str| Pane {
-            id: Uuid::from_u128(id),
-            title: title.to_owned(),
-            shell: "tmux".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
-            custom_title: None,
-            profile_override: None,
-        };
-        let first = pane(1, "SSH");
-        let tmux = pane(2, "tmux $2");
-        let workspace = Workspace {
-            id: Uuid::nil(),
-            title: "Remote".to_owned(),
-            color: None,
-            pinned: false,
-            pin_order: 0,
-            order: 0,
-            active_terminal_count: 2,
-            connection: WorkspaceConnection::Local,
-            tabs: vec![
-                nah_protocol::Tab {
-                    id: Uuid::from_u128(10),
-                    title: "SSH".to_owned(),
-                    layout: PaneLayout::Leaf {
-                        pane: first.clone(),
-                    },
-                },
-                nah_protocol::Tab {
-                    id: Uuid::from_u128(20),
-                    title: "tmux".to_owned(),
-                    layout: PaneLayout::Leaf { pane: tmux.clone() },
-                },
-            ],
-        };
-
-        assert_eq!(
-            workspace_layout_for_focused_pane(&workspace, Some(tmux.id)),
-            Some(&PaneLayout::Leaf { pane: tmux })
-        );
-        assert_eq!(
-            workspace_layout_for_focused_pane(&workspace, Some(Uuid::from_u128(99))),
-            Some(&PaneLayout::Leaf { pane: first })
-        );
-    }
-
-    #[test]
-    fn zoom_is_a_projection_that_does_not_mutate_canonical_layout() {
-        let first = Pane {
-            id: Uuid::from_u128(101),
-            title: "one".to_owned(),
-            shell: "zsh".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
-            custom_title: None,
-            profile_override: None,
-        };
-        let second = Pane {
-            id: Uuid::from_u128(102),
-            title: "two".to_owned(),
-            shell: "zsh".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
-            custom_title: None,
-            profile_override: None,
-        };
-        let layout = PaneLayout::Split {
-            axis: SplitAxis::Horizontal,
-            ratio: 0.3,
-            first: Box::new(PaneLayout::Leaf {
-                pane: first.clone(),
-            }),
-            second: Box::new(PaneLayout::Stack {
-                panes: vec![second.clone()],
-                active: second.id,
-            }),
-        };
-        let before = layout.clone();
-
-        assert_eq!(
-            zoom_projection(&layout, second.id),
-            Some(PaneLayout::Stack {
-                panes: vec![second.clone()],
-                active: second.id
-            })
-        );
-        assert_eq!(layout, before);
-        assert_eq!(zoom_projection(&layout, Uuid::from_u128(999)), None);
-    }
-
-    #[test]
-    fn equalize_is_a_controlled_mutation_over_all_current_split_identities() {
-        let pane = |id| Pane {
-            id: Uuid::from_u128(id),
-            title: format!("pane {id}"),
-            shell: "zsh".to_owned(),
-            color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
-            custom_title: None,
-            profile_override: None,
-        };
-        let nested = PaneLayout::Split {
-            axis: SplitAxis::Vertical,
-            ratio: 0.8,
-            first: Box::new(PaneLayout::Leaf { pane: pane(2) }),
-            second: Box::new(PaneLayout::Leaf { pane: pane(3) }),
-        };
-        let layout = PaneLayout::Split {
-            axis: SplitAxis::Horizontal,
-            ratio: 0.2,
-            first: Box::new(PaneLayout::Leaf { pane: pane(1) }),
-            second: Box::new(nested),
-        };
-        let mut ratios = HashMap::from([
-            (
-                SplitControlId {
-                    first: Uuid::from_u128(1),
-                    second: Uuid::from_u128(2),
-                },
-                0.1,
-            ),
-            (
-                SplitControlId {
-                    first: Uuid::from_u128(2),
-                    second: Uuid::from_u128(3),
-                },
-                0.9,
-            ),
-        ]);
-
-        let changed =
-            apply_layout_control_mutation(&layout, &mut ratios, LayoutControlMutation::Equalize);
-
-        assert_eq!(changed, 2);
-        assert!(
-            (ratios[&SplitControlId {
-                first: Uuid::from_u128(1),
-                second: Uuid::from_u128(2)
-            }] - 0.5)
-                .abs()
-                < f32::EPSILON
-        );
-        assert!(
-            (ratios[&SplitControlId {
-                first: Uuid::from_u128(2),
-                second: Uuid::from_u128(3)
-            }] - 0.5)
-                .abs()
-                < f32::EPSILON
-        );
-    }
-
-    #[test]
-    fn oversized_paste_is_rejected_before_it_reaches_the_protocol() {
-        let text = "x".repeat(MAX_PASTE_BYTES + 1);
-        assert_eq!(
-            prepare_paste(&text, false),
-            Err("paste rejected: clipboard text exceeds 64 KiB")
-        );
-    }
-
-    #[test]
-    fn selection_highlight_spans_exact_grid_cells_across_rows() {
-        let selection = TerminalSelection {
-            start: TerminalPoint { row: 1, column: 3 },
-            end: TerminalPoint { row: 2, column: 4 },
-            is_block: false,
-        };
-        assert_eq!(selection_span(selection, 0, 10), None);
-        assert_eq!(selection_span(selection, 1, 10), Some((3, 7)));
-        assert_eq!(selection_span(selection, 2, 10), Some((0, 5)));
     }
 }

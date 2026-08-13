@@ -7,6 +7,9 @@ license.workspace = true
 description = "Minimal macOS Dock icon bridge for Not a Harness"
 
 [dependencies]
-objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSString"] }
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
+[lints]
+workspace = true
