@@ -3075,10 +3075,14 @@ fn tmux_ssh_probe_command(destination: &str) -> Result<Command> {
     let mut command = Command::new(system_ssh_binary()?);
     // This is intentionally a single fixed remote command, not an arbitrary
     // user string. With piped stdout, OpenSSH does not allocate a tty.
+    // The host's tmux format expansion uses the SSH-propagated locale for
+    // literal tab escapes. Pin a UTF-8 locale so the parser's fixed tab
+    // delimiter cannot vary with how the desktop service was launched.
     command
         .arg("--")
         .arg(destination)
         .arg(TMUX_REMOTE_LIST_COMMAND)
+        .env("LC_ALL", "C.UTF-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4300,6 +4304,9 @@ mod tests {
         assert_eq!(args[0], OsStr::new("--"));
         assert_eq!(args[1], OsStr::new("admin@build-node"));
         assert_eq!(args[2], OsStr::new(TMUX_REMOTE_LIST_COMMAND));
+        assert!(command.get_envs().any(
+            |(key, value)| key == OsStr::new("LC_ALL") && value == Some(OsStr::new("C.UTF-8"))
+        ));
         assert!(tmux_ssh_probe_command("build;whoami").is_err());
     }
 
