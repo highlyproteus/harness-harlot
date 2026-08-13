@@ -7870,7 +7870,14 @@ impl NahApp {
         let empty_workspace_uses_ssh =
             matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. });
         let open_terminal_binding = self.binding_label(AppCommand::NewTab);
-        let canonical_layout = workspace.tabs.first().map(|tab| tab.layout.clone());
+        // A workstation owns several top-level terminal tabs. The service
+        // validates activation by pane ID, while the desktop owns the visible
+        // tab selection through `focused_pane`. Rendering the first tab here
+        // hid every later (including runtime-only tmux) tab even after a
+        // successful sidebar click, so route the viewport to the tab that
+        // contains the focused pane instead.
+        let canonical_layout =
+            workspace_layout_for_focused_pane(workspace, self.focused_pane).cloned();
         let layout = canonical_layout.as_ref().map(|layout| {
             self.zoomed_pane
                 .and_then(|pane_id| zoom_projection(layout, pane_id))
@@ -9149,6 +9156,21 @@ fn workspace_terminal_tabs(workspace: &Workspace) -> Vec<&Pane> {
         collect_terminal_tabs(&tab.layout, &mut panes);
     }
     panes
+}
+
+fn workspace_layout_for_focused_pane(
+    workspace: &Workspace,
+    focused_pane: Option<Uuid>,
+) -> Option<&PaneLayout> {
+    focused_pane
+        .and_then(|pane_id| {
+            workspace
+                .tabs
+                .iter()
+                .find(|tab| find_pane(&tab.layout, pane_id).is_some())
+                .map(|tab| &tab.layout)
+        })
+        .or_else(|| workspace.tabs.first().map(|tab| &tab.layout))
 }
 
 fn terminal_tab_count_label(count: usize) -> String {
@@ -10749,6 +10771,54 @@ mod tests {
         );
         picker.clear_all();
         assert!(picker.selected_session_ids_in_scan_order().is_empty());
+    }
+
+    #[test]
+    fn focused_workspace_tab_layout_is_rendered_instead_of_the_first_tab() {
+        let pane = |id, title: &str| Pane {
+            id: Uuid::from_u128(id),
+            title: title.to_owned(),
+            shell: "tmux".to_owned(),
+            color: None,
+            identity: nah_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+        };
+        let first = pane(1, "SSH");
+        let tmux = pane(2, "tmux $2");
+        let workspace = Workspace {
+            id: Uuid::nil(),
+            title: "Remote".to_owned(),
+            color: None,
+            pinned: false,
+            pin_order: 0,
+            order: 0,
+            active_terminal_count: 2,
+            connection: WorkspaceConnection::Local,
+            tabs: vec![
+                nah_protocol::Tab {
+                    id: Uuid::from_u128(10),
+                    title: "SSH".to_owned(),
+                    layout: PaneLayout::Leaf {
+                        pane: first.clone(),
+                    },
+                },
+                nah_protocol::Tab {
+                    id: Uuid::from_u128(20),
+                    title: "tmux".to_owned(),
+                    layout: PaneLayout::Leaf { pane: tmux.clone() },
+                },
+            ],
+        };
+
+        assert_eq!(
+            workspace_layout_for_focused_pane(&workspace, Some(tmux.id)),
+            Some(&PaneLayout::Leaf { pane: tmux })
+        );
+        assert_eq!(
+            workspace_layout_for_focused_pane(&workspace, Some(Uuid::from_u128(99))),
+            Some(&PaneLayout::Leaf { pane: first })
+        );
     }
 
     #[test]
