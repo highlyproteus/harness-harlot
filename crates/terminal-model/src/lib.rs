@@ -147,28 +147,6 @@ impl TerminalModel {
         self.title.lock().ok().and_then(|title| title.clone())
     }
 
-    /// Returns a plain-text view of the visible screen for toolkit spikes and
-    /// accessibility fallbacks. Styling remains available through `terminal`.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the visible line count cannot fit in Alacritty's signed
-    /// line index. Not a Harness caps PTY rows far below that bound.
-    pub fn visible_lines(&self) -> Vec<String> {
-        (0..self.terminal.screen_lines())
-            .map(|line| {
-                let line = i32::try_from(line).unwrap_or(i32::MAX);
-                let mut text = (0..self.terminal.columns())
-                    .map(|column| self.terminal.grid()[Line(line)][Column(column)].c)
-                    .collect::<String>();
-                while text.ends_with(' ') {
-                    text.pop();
-                }
-                text
-            })
-            .collect()
-    }
-
     /// Returns the visible terminal grid as compact styled runs.
     pub fn styled_lines(&self) -> Vec<TerminalLine> {
         let display_offset =
@@ -176,12 +154,10 @@ impl TerminalModel {
         (0..self.terminal.screen_lines())
             .map(|line| {
                 let line = i32::try_from(line).unwrap_or(i32::MAX) - display_offset;
-                let cells = (0..self.terminal.columns())
-                    .map(|column| &self.terminal.grid()[Line(line)][Column(column)])
-                    .collect::<Vec<_>>();
-                let end = cells
-                    .iter()
-                    .rposition(|cell| {
+                let row = &self.terminal.grid()[Line(line)];
+                let end = (0..self.terminal.columns())
+                    .rposition(|column| {
+                        let cell = &row[Column(column)];
                         cell.c != ' '
                             || cell.bg != Color::Named(NamedColor::Background)
                             || cell.flags.contains(Flags::INVERSE)
@@ -189,7 +165,8 @@ impl TerminalModel {
                     })
                     .map_or(0, |index| index + 1);
                 let mut runs: Vec<TerminalRun> = Vec::new();
-                for cell in cells.into_iter().take(end) {
+                for column in 0..end {
+                    let cell = &row[Column(column)];
                     if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                         if let Some(previous) = runs.last_mut() {
                             previous.columns = previous.columns.saturating_add(1);
@@ -201,16 +178,7 @@ impl TerminalModel {
                     if cell.flags.contains(Flags::INVERSE) {
                         std::mem::swap(&mut foreground, &mut background);
                     }
-                    let mut text = if cell.flags.contains(Flags::HIDDEN) {
-                        " ".to_owned()
-                    } else {
-                        cell.c.to_string()
-                    };
-                    if !cell.flags.contains(Flags::HIDDEN)
-                        && let Some(zerowidth) = cell.zerowidth()
-                    {
-                        text.extend(zerowidth);
-                    }
+                    let hidden = cell.flags.contains(Flags::HIDDEN);
                     let mut attributes = 0;
                     for (present, flag) in [
                         (cell.flags.contains(Flags::BOLD), TerminalAttributes::BOLD),
@@ -232,20 +200,29 @@ impl TerminalModel {
                             attributes |= flag;
                         }
                     }
-                    let run = TerminalRun {
-                        text,
-                        columns: 1,
-                        foreground,
-                        background,
-                        attributes: TerminalAttributes::new(attributes),
-                    };
+                    let attributes = TerminalAttributes::new(attributes);
                     if let Some(previous) = runs.last_mut()
-                        && same_style(previous, &run)
+                        && previous.foreground == foreground
+                        && previous.background == background
+                        && previous.attributes == attributes
                     {
-                        previous.text.push_str(&run.text);
-                        previous.columns = previous.columns.saturating_add(run.columns);
+                        previous.text.push(if hidden { ' ' } else { cell.c });
+                        if !hidden && let Some(zerowidth) = cell.zerowidth() {
+                            previous.text.extend(zerowidth);
+                        }
+                        previous.columns = previous.columns.saturating_add(1);
                     } else {
-                        runs.push(run);
+                        let mut text = String::from(if hidden { ' ' } else { cell.c });
+                        if !hidden && let Some(zerowidth) = cell.zerowidth() {
+                            text.extend(zerowidth);
+                        }
+                        runs.push(TerminalRun {
+                            text,
+                            columns: 1,
+                            foreground,
+                            background,
+                            attributes,
+                        });
                     }
                 }
                 TerminalLine { runs }
@@ -468,12 +445,6 @@ fn escape_regex_literal(query: &str) -> String {
     escaped
 }
 
-fn same_style(left: &TerminalRun, right: &TerminalRun) -> bool {
-    left.foreground == right.foreground
-        && left.background == right.background
-        && left.attributes == right.attributes
-}
-
 fn terminal_color(color: Color) -> TerminalColor {
     match color {
         Color::Spec(color) => TerminalColor::Rgb {
@@ -527,14 +498,6 @@ mod tests {
             styled[0].runs[1].foreground,
             TerminalColor::Ansi { index: 1 }
         );
-    }
-
-    #[test]
-    fn exposes_trimmed_visible_text_without_reimplementing_parsing() {
-        let mut model = TerminalModel::new(12, 3);
-        model.process_output(b"one\r\ntwo");
-
-        assert_eq!(model.visible_lines(), ["one", "two", ""]);
     }
 
     #[test]

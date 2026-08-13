@@ -22,10 +22,11 @@ pub enum AppCommand {
     ShowCommandPalette,
     TogglePaneZoom,
     EqualizePanes,
+    ReattachPane,
 }
 
 impl AppCommand {
-    const COUNT: usize = 12;
+    const COUNT: usize = 13;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +124,13 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         title: "Equalize Pane Sizes",
         category: "Pane",
         default_bindings: &["cmd-alt-e"],
+    },
+    CommandDescriptor {
+        command: AppCommand::ReattachPane,
+        id: "pane.reattach",
+        title: "Reattach Exited Terminal",
+        category: "Pane",
+        default_bindings: &["cmd-shift-r"],
     },
 ];
 

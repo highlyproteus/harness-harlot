@@ -114,6 +114,69 @@ async fn older_full_state_protocol_is_rejected_before_any_request() {
     server_task.await.unwrap();
 }
 
+/// Terminal input is one-way: the service writes no frame for it, so the next
+/// request's response is the very next frame the client reads.
+#[tokio::test]
+async fn terminal_input_is_not_acknowledged_on_the_wire() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let registry = SessionRegistry::default();
+    let snapshot = registry.snapshot().unwrap();
+    let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
+        nah_protocol::PaneLayout::Leaf { pane } => pane.id,
+        other => panic!("unexpected initial layout: {other:?}"),
+    };
+    let server_task = tokio::spawn(async move {
+        serve_connection(server, &registry).await.unwrap();
+    });
+
+    write_message(
+        &mut client,
+        &ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_message::<ServiceResponse>(&mut client).await.unwrap(),
+        ServiceResponse::Hello {
+            protocol_version: PROTOCOL_VERSION
+        }
+    ));
+
+    write_message(
+        &mut client,
+        &ClientRequest::WriteInput {
+            pane_id,
+            bytes: b"x".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    write_message(
+        &mut client,
+        &ClientRequest::UpdateSelection {
+            pane_id,
+            point: nah_protocol::TerminalPoint { row: 0, column: 0 },
+        },
+    )
+    .await
+    .unwrap();
+    write_message(&mut client, &ClientRequest::GetSnapshot)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            read_message::<ServiceResponse>(&mut client).await.unwrap(),
+            ServiceResponse::Snapshot { .. }
+        ),
+        "the first frame after one-way requests must be the snapshot response"
+    );
+
+    drop(client);
+    server_task.await.unwrap();
+}
+
 async fn write_message<T: Serialize>(
     stream: &mut UnixStream,
     message: &T,

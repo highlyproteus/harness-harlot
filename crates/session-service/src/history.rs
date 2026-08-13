@@ -3,9 +3,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,7 @@ use nah_protocol::{
     HistoryPageDirection, HistoryPageFlags, HistoryRetention, HistorySettings, HistoryWarning,
     TerminalHistoryPage,
 };
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -250,19 +251,15 @@ impl HistoryArchive {
         }
     }
 
-    pub(crate) fn status(&self) -> Result<HistoryArchiveStatus> {
-        let mut status = self
-            .status
-            .read()
-            .map_err(|_| anyhow!("history status lock was poisoned"))?
-            .clone();
+    pub(crate) fn status(&self) -> HistoryArchiveStatus {
+        let mut status = self.status.read().clone();
         status.dropped_bytes = status
             .dropped_bytes
             .saturating_add(self.dropped_bytes.load(Ordering::Relaxed));
         if status.dropped_bytes > 0 && status.warning.is_none() {
             status.warning = Some(HistoryWarning::QueueOverflow);
         }
-        Ok(status)
+        status
     }
 
     pub(crate) fn update_settings(&self, settings: HistorySettings) -> Result<()> {
@@ -537,11 +534,7 @@ impl Store {
     }
 
     fn make_capacity(&mut self, incoming: u64) -> Result<bool> {
-        let archived = self
-            .status
-            .read()
-            .map_err(|_| anyhow!("history status lock was poisoned"))?
-            .archived_bytes;
+        let archived = self.status.read().archived_bytes;
         let buffered = self
             .active
             .values()
@@ -841,10 +834,7 @@ impl Store {
             dropped_bytes: dropped,
             warning,
         };
-        *self
-            .status
-            .write()
-            .map_err(|_| anyhow!("history status lock was poisoned"))? = status;
+        *self.status.write() = status;
         Ok(())
     }
 
@@ -1470,7 +1460,7 @@ mod tests {
         );
         store.refresh_status().unwrap();
         assert_eq!(
-            store.status.read().unwrap().warning,
+            store.status.read().warning,
             Some(HistoryWarning::PausedAtCapacity)
         );
         fs::remove_dir_all(root).unwrap();

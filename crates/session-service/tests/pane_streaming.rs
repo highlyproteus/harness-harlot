@@ -12,15 +12,19 @@ fn stream_delivers_only_changed_subscribed_panes_without_cross_pane_churn() {
     let first = first_pane(&registry);
     let second = registry.create_pane(first, SplitAxis::Horizontal).unwrap();
 
-    let initial = registry.pane_updates(None, &[], &[first, second]).unwrap();
+    let initial = registry
+        .pane_updates(None, &[], &[first, second], true)
+        .unwrap();
     assert_eq!(initial.screens.len(), 2);
-    let initial_cursors = cursors(&initial.screens);
+    let initial_cursors =
+        settle_pane_cursors(&registry, cursors(&initial.screens), &[first, second]);
 
     let unchanged = registry
         .pane_updates(
             initial.snapshot.as_ref().map(|snapshot| snapshot.revision),
             &initial_cursors,
             &[first, second],
+            true,
         )
         .unwrap();
     assert!(unchanged.snapshot.is_none());
@@ -33,7 +37,7 @@ fn stream_delivers_only_changed_subscribed_panes_without_cross_pane_churn() {
     wait_for_revision_after(&registry, first, revision_for(&initial_cursors, first));
 
     let changed = registry
-        .pane_updates(None, &initial_cursors, &[first, second])
+        .pane_updates(None, &initial_cursors, &[first, second], true)
         .unwrap();
     assert_eq!(
         changed
@@ -58,7 +62,7 @@ fn stream_delivers_only_changed_subscribed_panes_without_cross_pane_churn() {
 fn cold_pane_keeps_draining_and_refocus_resyncs_without_output_loss() {
     let registry = SessionRegistry::new().unwrap();
     let pane_id = first_pane(&registry);
-    let initial = registry.pane_updates(None, &[], &[pane_id]).unwrap();
+    let initial = registry.pane_updates(None, &[], &[pane_id], true).unwrap();
     let initial_revision = initial.screens[0].revision;
     let cursor = [PaneRevisionCursor {
         pane_id,
@@ -73,7 +77,7 @@ fn cold_pane_keeps_draining_and_refocus_resyncs_without_output_loss() {
         .unwrap();
     wait_for_bounded_screen_text(&registry, pane_id, "RMUX_COLD_FINAL");
 
-    let cold = registry.pane_updates(None, &cursor, &[]).unwrap();
+    let cold = registry.pane_updates(None, &cursor, &[], true).unwrap();
     assert!(cold.screens.is_empty(), "cold panes must not repaint");
     let cold_state = cold
         .pane_states
@@ -97,7 +101,9 @@ fn cold_pane_keeps_draining_and_refocus_resyncs_without_output_loss() {
         pane_id,
         revision: resynced.revision,
     }];
-    let live = registry.pane_updates(None, &caught_up, &[pane_id]).unwrap();
+    let live = registry
+        .pane_updates(None, &caught_up, &[pane_id], true)
+        .unwrap();
     assert!(live.screens.is_empty());
     assert!(live.pane_states.iter().all(|state| !state.dirty));
 }
@@ -112,7 +118,9 @@ fn receiver_reconnect_with_no_cursors_gets_one_current_resync() {
         .unwrap();
     wait_for_screen_text(&registry, second, "RMUX_RECONNECT_SECOND");
 
-    let reconnected = registry.pane_updates(None, &[], &[first, second]).unwrap();
+    let reconnected = registry
+        .pane_updates(None, &[], &[first, second], true)
+        .unwrap();
     assert!(reconnected.snapshot.is_some());
     assert_eq!(reconnected.screens.len(), 2);
     assert!(
@@ -132,6 +140,7 @@ fn receiver_reconnect_with_no_cursors_gets_one_current_resync() {
                 .map(|snapshot| snapshot.revision),
             &cursors,
             &[first, second],
+            true,
         )
         .unwrap();
     assert!(settled.snapshot.is_none());
@@ -159,7 +168,7 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
     }
     thread::sleep(Duration::from_millis(200));
 
-    let initial = registry.pane_updates(None, &[], &panes).unwrap();
+    let initial = registry.pane_updates(None, &[], &panes, true).unwrap();
     let matrix_cursors = cursors(&initial.screens);
     assert_eq!(initial.screens.len(), panes.len());
     assert!(initial.diagnostics.service_memory_bytes > 0);
@@ -169,6 +178,7 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
             initial.snapshot.as_ref().map(|snapshot| snapshot.revision),
             &matrix_cursors,
             &panes,
+            true,
         )
         .unwrap();
     assert_eq!(idle.diagnostics.screen_bytes, 0);
@@ -178,13 +188,15 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
         .unwrap();
     wait_for_revision_after(&registry, first, revision_for(&matrix_cursors, first));
     let active = registry
-        .pane_updates(None, &matrix_cursors, &[first])
+        .pane_updates(None, &matrix_cursors, &[first], true)
         .unwrap();
     assert_eq!(active.screens.len(), 1);
     assert_eq!(active.screens[0].pane_id, first);
 
     let cold_cursors = cursors(&active.screens);
-    let cold = registry.pane_updates(None, &cold_cursors, &[]).unwrap();
+    let cold = registry
+        .pane_updates(None, &cold_cursors, &[], true)
+        .unwrap();
     assert_eq!(cold.diagnostics.screen_bytes, 0);
     assert_eq!(cold.diagnostics.screens_delivered, 0);
 
@@ -208,6 +220,96 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
     );
 }
 
+/// The socket path asks for no byte accounting, which is the only reason the
+/// update path serialized every delivered screen twice.
+#[test]
+fn byte_accounting_is_opt_in_and_does_not_change_delivery() {
+    let registry = SessionRegistry::new().unwrap();
+    let first = first_pane(&registry);
+    let initial = registry.pane_updates(None, &[], &[first], false).unwrap();
+    assert_eq!(initial.diagnostics.screen_bytes, 0);
+    let settled = settle_pane_cursors(&registry, cursors(&initial.screens), &[first]);
+
+    registry
+        .write_input(first, b"printf 'RMUX_MEASURE_OPT_IN\\n'\r")
+        .unwrap();
+    wait_for_revision_after(&registry, first, revision_for(&settled, first));
+
+    let unmeasured = registry
+        .pane_updates(None, &settled, &[first], false)
+        .unwrap();
+    assert_eq!(unmeasured.screens.len(), 1);
+    assert_eq!(unmeasured.diagnostics.screens_delivered, 1);
+    assert_eq!(
+        unmeasured.diagnostics.screen_bytes, 0,
+        "the hot path must not serialize screens a second time"
+    );
+    assert_eq!(unmeasured.diagnostics.snapshot_bytes, 0);
+
+    let measured = registry
+        .pane_updates(None, &settled, &[first], true)
+        .unwrap();
+    assert_eq!(measured.screens.len(), 1);
+    assert!(measured.diagnostics.screen_bytes > 0);
+}
+
+/// Echo latency for a keystroke through the delivery path, with no socket and
+/// no desktop in the way: this is the floor the app can offer locally.
+#[test]
+fn keystroke_echo_reaches_a_subscribed_pane_promptly() {
+    let registry = SessionRegistry::new().unwrap();
+    let first = first_pane(&registry);
+    let panes = [
+        first,
+        registry.create_pane(first, SplitAxis::Horizontal).unwrap(),
+        registry.create_pane(first, SplitAxis::Vertical).unwrap(),
+        registry.create_tab(first).unwrap(),
+    ];
+    for (index, pane_id) in panes.iter().enumerate() {
+        registry
+            .resize_pane(
+                *pane_id,
+                80 + u16::try_from(index).unwrap() * 20,
+                24 + u16::try_from(index).unwrap() * 8,
+            )
+            .unwrap();
+    }
+    let initial = registry.pane_updates(None, &[], &panes, false).unwrap();
+    let settled = settle_pane_cursors(&registry, cursors(&initial.screens), &panes);
+
+    let started = Instant::now();
+    registry
+        .write_input(first, b"printf 'NAH_ECHO_MARKER\\n'\r")
+        .unwrap();
+    let deadline = started + Duration::from_secs(5);
+    let mut preparation_micros = 0;
+    loop {
+        let update = registry
+            .pane_updates(None, &settled, &panes, false)
+            .unwrap();
+        preparation_micros = preparation_micros.max(update.diagnostics.preparation_micros);
+        if update
+            .screens
+            .iter()
+            .filter(|screen| screen.pane_id == first)
+            .any(|screen| screen_contains(screen, "NAH_ECHO_MARKER"))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "keystroke echo never arrived");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let echo_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    eprintln!(
+        "keystroke-echo panes={} echo_micros={echo_micros} preparation_micros={preparation_micros}",
+        panes.len(),
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "local keystroke echo took {echo_micros} us"
+    );
+}
+
 fn first_pane(registry: &SessionRegistry) -> Uuid {
     let snapshot = registry.snapshot().unwrap();
     match &snapshot.workspaces[0].tabs[0].layout {
@@ -226,6 +328,37 @@ fn cursors(screens: &[TerminalScreen]) -> Vec<PaneRevisionCursor> {
         .collect()
 }
 
+fn settle_pane_cursors(
+    registry: &SessionRegistry,
+    mut current: Vec<PaneRevisionCursor>,
+    pane_ids: &[Uuid],
+) -> Vec<PaneRevisionCursor> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut quiet_since = Instant::now();
+    loop {
+        let update = registry
+            .pane_updates(None, &current, pane_ids, true)
+            .unwrap();
+        if update.screens.is_empty() {
+            if quiet_since.elapsed() >= Duration::from_millis(50) {
+                return current;
+            }
+        } else {
+            for screen in &update.screens {
+                if let Some(cursor) = current
+                    .iter_mut()
+                    .find(|cursor| cursor.pane_id == screen.pane_id)
+                {
+                    cursor.revision = screen.revision;
+                }
+            }
+            quiet_since = Instant::now();
+        }
+        assert!(Instant::now() < deadline, "panes did not settle");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn revision_for(cursors: &[PaneRevisionCursor], pane_id: Uuid) -> u64 {
     cursors
         .iter()
@@ -237,7 +370,7 @@ fn revision_for(cursors: &[PaneRevisionCursor], pane_id: Uuid) -> u64 {
 fn wait_for_revision_after(registry: &SessionRegistry, pane_id: Uuid, revision: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let update = registry.pane_updates(None, &[], &[]).unwrap();
+        let update = registry.pane_updates(None, &[], &[], true).unwrap();
         if update
             .pane_states
             .iter()

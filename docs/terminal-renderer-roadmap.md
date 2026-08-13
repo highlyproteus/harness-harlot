@@ -88,15 +88,17 @@ This order is canonical and should be advanced from the repository rather than r
 
 The sequence retains four non-negotiable boundaries: the renderer and terminal engine remain all Rust; macOS and Linux are first-class; CMUX influence stays clean-room and behavior-level only; and Not a Harness is network-silent by default. SSH or a later browser/remote feature may make network connections only after an explicit user action, with no unauthenticated listener or background telemetry.
 
-## Idle-pane performance contract
+## Hidden-pane performance contract
 
-Not a Harness is a lightweight terminal workspace, not an agent harness or runtime. Terminals and agents are ordinary shell workloads, and the workspace must avoid competing with them for CPU or memory. The streaming design therefore has three attention states:
+Not a Harness is a lightweight terminal workspace, not an agent harness or runtime. Terminals and agents are ordinary shell workloads, and the workspace must avoid competing with them for CPU or memory. The streaming design therefore has three states, decided by what is on screen rather than by recent attention:
 
-- A focused or recently attended pane remains subscribed to responsive, revision-aware deltas.
-- After about 60 seconds without user attention, the daemon keeps draining and parsing the PTY into bounded history, but stops serializing and pushing live screen updates for that pane. The desktop marks its projection stale and receives only coalesced state metadata needed for correctness.
-- Selecting a stale pane requests one immediate current snapshot before it is rendered, then resumes live deltas. Normal frequent tab switching stays on the recent path and must not introduce visible waiting.
+- A pane rendered right now stays subscribed to responsive, revision-aware deltas for as long as it is displayed: the focused pane on every poll, other on-screen panes paced at roughly 8 frames per second.
+- For a pane on a tab that is not displayed, the daemon keeps draining and parsing the PTY into bounded history but serializes no screen. The desktop holds only coalesced state metadata needed for correctness.
+- Displaying such a pane requests one immediate current snapshot before it is rendered, then resumes live deltas. Normal frequent tab switching must not introduce visible waiting.
 
-Idle never means disconnected: local shells and system-SSH processes continue running, their PTYs continue draining, and output stays available within the documented history bound. Revision gaps also force a deterministic fresh snapshot. Protocol decoding, update preparation, and terminal parsing must not run on the UI thread; only bounded paint-ready data crosses into it.
+Global idleness relaxes cadence rather than dropping panes: after an hour with no output and no input, polling drops to once every two seconds, and pane-state metadata at that cadence restores the active rate within one poll of the next output byte.
+
+Hidden never means disconnected: local shells and system-SSH processes continue running, their PTYs continue draining, and output stays available within the documented history bound. Revision gaps also force a deterministic fresh snapshot. Protocol decoding, update preparation, and terminal parsing must not run on the UI thread; only bounded paint-ready data crosses into it. Terminal input is a one-way message on its own connection, so keystrokes never queue behind screen payloads.
 
 Acceptance targets must be measured before implementation is called complete: per-pane serialized bytes and update rate, UI-thread time, focus-to-fresh-frame latency, daemon/client CPU, memory bounds, and behavior under high output, slow clients, multiple idle panes, reconnect, and revision gaps. Diagnostics are transparent and content-safe: they may expose revisions, queue depth, byte counts, timings, and stale/subscribed state, but never terminal text, keys, SSH secrets, or background telemetry.
 

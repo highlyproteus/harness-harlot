@@ -39,7 +39,7 @@ pub struct UpdateManifest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionServicePolicy {
-    pub protocol_version: u32,
+    pub protocol_version: u16,
     /// Replacing the bundle while a service owns PTYs can strand a client on a
     /// different protocol. The updater must wait for the user to end sessions.
     pub requires_quiescent_service: bool,
@@ -62,7 +62,7 @@ pub struct CurrentRelease<'a> {
     pub version: &'a str,
     pub build: u64,
     pub architecture: &'a str,
-    pub protocol_version: u32,
+    pub protocol_version: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

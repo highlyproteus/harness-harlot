@@ -15,7 +15,7 @@ fn real_pty_output_is_archived_and_lazily_loaded_without_expanding_live_history(
     let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
     let snapshot = registry.snapshot().unwrap();
     let pane_id = leaf(&snapshot.workspaces[0].tabs[0].layout);
-    let initial = registry.pane_updates(None, &[], &[pane_id]).unwrap();
+    let initial = registry.pane_updates(None, &[], &[pane_id], true).unwrap();
     let initial_cursor = PaneRevisionCursor {
         pane_id,
         revision: initial.screens[0].revision,
@@ -52,6 +52,7 @@ fn real_pty_output_is_archived_and_lazily_loaded_without_expanding_live_history(
             initial.snapshot.as_ref().map(|snapshot| snapshot.revision),
             &[initial_cursor],
             &[pane_id],
+            true,
         )
         .unwrap();
     let integrated_snapshot = integrated.snapshot.expect("identity changed desired state");
@@ -69,7 +70,7 @@ fn real_pty_output_is_archived_and_lazily_loaded_without_expanding_live_history(
                 .flat_map(|line| &line.runs)
                 .any(|run| run.text.contains("RMUX_ARCHIVE_ROUND_TRIP"))
     }));
-    let status = registry.history_status().unwrap();
+    let status = registry.history_status();
     assert_eq!(status.live_scrollback_lines, 2_000);
     assert!(status.archived_bytes > 0);
     assert_eq!(status.retained_sessions, 1);

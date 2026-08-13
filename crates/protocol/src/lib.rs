@@ -1,12 +1,12 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 17;
 pub const SOCKET_ENV: &str = "NAH_SOCKET";
 pub const STATE_DIR_ENV: &str = "NAH_STATE_DIR";
 pub const CONFIG_ENV: &str = "NAH_CONFIG";
@@ -128,23 +128,77 @@ pub struct Workspace {
     pub tabs: Vec<Tab>,
 }
 
+const MAX_TMUX_ID_LEN: usize = 32;
+
+fn validate_tmux_id(value: &str, sigil: char, label: &str) -> Result<(), String> {
+    if value.len() < 2
+        || value.len() > MAX_TMUX_ID_LEN
+        || !value.starts_with(sigil)
+        || !value[1..].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!(
+            "tmux {label} target must be an opaque numeric {label} ID"
+        ));
+    }
+    Ok(())
+}
+
+/// Opaque tmux session ID (`$` + ASCII digits) reported by a bounded scan.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TmuxSessionId(String);
+
+impl TmuxSessionId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for TmuxSessionId {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_tmux_id(&value, '$', "session")?;
+        Ok(Self(value))
+    }
+}
+
+impl FromStr for TmuxSessionId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value.to_owned())
+    }
+}
+
+impl From<TmuxSessionId> for String {
+    fn from(value: TmuxSessionId) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for TmuxSessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Ephemeral metadata returned by an explicit tmux scan.
 ///
 /// This is deliberately not part of the desired-state snapshot: a tmux server
 /// and its opaque IDs belong to the host running tmux, not to Not a Harness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TmuxSession {
-    pub id: String,
+    pub id: TmuxSessionId,
     pub name: String,
     pub windows: u32,
     pub attached_clients: u32,
 }
 
-/// One selected tmux session which was not opened. The target is always the
-/// opaque numeric ID returned by a preceding bounded scan.
+/// One selected tmux session which was not opened.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TmuxSessionAttachIssue {
-    pub session_id: String,
+    pub session_id: TmuxSessionId,
     pub message: String,
 }
 
@@ -455,6 +509,10 @@ pub struct PaneStreamState {
     pub revision: u64,
     pub subscribed: bool,
     pub dirty: bool,
+    /// The pane's process has exited: its terminal is frozen and input goes
+    /// nowhere. Runtime-only panes (tmux attach, SSH) can be reattached.
+    #[serde(default)]
+    pub exited: bool,
 }
 
 /// Per-response, content-free measurements for the pane stream hot path.
@@ -551,10 +609,8 @@ pub struct TerminalLine {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalRun {
     pub text: String,
-    /// Number of terminal grid cells occupied by this run. Older protocol-v4
-    /// peers omit this field, so renderers must fall back to the text width
-    /// when it is zero.
-    #[serde(default)]
+    /// Number of terminal grid cells occupied by this run. Every producer
+    /// populates this field.
     pub columns: u16,
     pub foreground: TerminalColor,
     pub background: TerminalColor,
@@ -751,15 +807,10 @@ pub enum ClientRequest {
     ScanTmuxSessions {
         workspace_id: Uuid,
     },
-    /// Opens one runtime-only tab attached to an existing tmux session.
-    AttachTmuxSession {
-        workspace_id: Uuid,
-        session_id: String,
-    },
     /// Opens selected existing tmux sessions as independent runtime-only tabs.
     AttachTmuxSessions {
         workspace_id: Uuid,
-        session_ids: Vec<String>,
+        session_ids: Vec<TmuxSessionId>,
     },
     ActivateTab {
         pane_id: Uuid,
@@ -789,6 +840,11 @@ pub enum ClientRequest {
         pane_id: Uuid,
     },
     ClosePane {
+        pane_id: Uuid,
+    },
+    /// Respawns a runtime-only pane whose process exited, in place. For a tmux
+    /// pane this is a plain re-`attach-session`; it never creates a session.
+    ReattachPane {
         pane_id: Uuid,
     },
     SetDefaultTerminalAccent {
@@ -1009,6 +1065,9 @@ pub enum ServiceResponse {
     TmuxSessions {
         scope: TmuxScanScope,
         sessions: Vec<TmuxSession>,
+        /// Sessions this workstation already shows in a tab. The picker marks
+        /// them instead of offering a selection the service would only skip.
+        open_session_ids: Vec<TmuxSessionId>,
         no_server: bool,
     },
     TmuxSessionsAttached {
@@ -1125,13 +1184,14 @@ pub const fn pane_id_env() -> &'static str {
     PANE_ID_ENV
 }
 
-/// Writes one length-prefixed JSON message and flushes it to the peer.
+/// Encodes a JSON message as one bounded, big-endian length-prefixed frame.
 ///
 /// # Errors
 ///
-/// Returns [`WireError::Json`] when serialization fails and [`WireError::Io`]
-/// when the encoded message cannot be written or flushed.
-pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> Result<(), WireError> {
+/// Returns [`WireError::Json`] when serialization fails and
+/// [`WireError::FrameTooLarge`] when the encoded payload exceeds
+/// [`MAX_FRAME_SIZE`].
+pub fn encode_frame<T: Serialize + ?Sized>(message: &T) -> Result<Vec<u8>, WireError> {
     let payload = serde_json::to_vec(message)?;
     if payload.len() > MAX_FRAME_SIZE {
         return Err(WireError::FrameTooLarge(payload.len()));
@@ -1139,8 +1199,35 @@ pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> Resu
     let length = u32::try_from(payload.len())
         .map_err(|_| WireError::FrameTooLarge(payload.len()))?
         .to_be_bytes();
-    writer.write_all(&length)?;
-    writer.write_all(&payload)?;
+    let mut frame = Vec::with_capacity(length.len() + payload.len());
+    frame.extend_from_slice(&length);
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// Decodes one bounded JSON frame payload.
+///
+/// # Errors
+///
+/// Returns [`WireError::FrameTooLarge`] when `payload` exceeds
+/// [`MAX_FRAME_SIZE`] and [`WireError::Json`] when it is not a valid message
+/// of the requested type.
+pub fn decode_frame<T: DeserializeOwned>(payload: &[u8]) -> Result<T, WireError> {
+    if payload.len() > MAX_FRAME_SIZE {
+        return Err(WireError::FrameTooLarge(payload.len()));
+    }
+    Ok(serde_json::from_slice(payload)?)
+}
+
+/// Writes one length-prefixed JSON message and flushes it to the peer.
+///
+/// # Errors
+///
+/// Returns [`WireError::Json`] when serialization fails and [`WireError::Io`]
+/// when the encoded message cannot be written or flushed.
+pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> Result<(), WireError> {
+    let frame = encode_frame(message)?;
+    writer.write_all(&frame)?;
     writer.flush()?;
     Ok(())
 }
@@ -1167,7 +1254,7 @@ pub fn read_message<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<T,
     }
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload)?;
-    Ok(serde_json::from_slice(&payload)?)
+    decode_frame(&payload)
 }
 
 #[cfg(test)]
