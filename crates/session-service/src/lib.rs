@@ -3001,9 +3001,13 @@ fn tmux_remote_attach_command(session_id: &str) -> Result<OsString> {
 fn tmux_ssh_attach_command(pane_id: Uuid, host: &str, session_id: &str) -> Result<CommandBuilder> {
     validate_ssh_host(host).map_err(|message| anyhow!(message))?;
     let remote_command = tmux_remote_attach_command(session_id)?;
+    // OpenSSH does not allocate a remote PTY for a supplied command by
+    // default. tmux attach requires one, while the metadata-only scan does
+    // not, so force it only for this fixed attach path.
     Ok(command_with_terminal_env(
         [
             system_ssh_binary()?.into_os_string(),
+            OsString::from("-tt"),
             OsString::from("--"),
             OsString::from(host),
             remote_command,
@@ -4153,6 +4157,17 @@ mod tests {
 
         let remote = tmux_remote_attach_command("$42").unwrap();
         assert_eq!(remote, OsString::from("exec tmux attach-session -t '$42'"));
+        let remote_ssh = tmux_ssh_attach_command(Uuid::nil(), "admin@build-node", "$42").unwrap();
+        assert_eq!(
+            remote_ssh.get_argv(),
+            &[
+                system_ssh_binary().unwrap().into_os_string(),
+                OsString::from("-tt"),
+                OsString::from("--"),
+                OsString::from("admin@build-node"),
+                OsString::from("exec tmux attach-session -t '$42'"),
+            ]
+        );
         for target in ["name", "$42;bad", "$4 2", "$-1", "42", "$42'bad"] {
             assert!(
                 validate_tmux_session_id(target).is_err(),
