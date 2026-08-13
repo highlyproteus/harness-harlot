@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const SOCKET_ENV: &str = "NAH_SOCKET";
 pub const STATE_DIR_ENV: &str = "NAH_STATE_DIR";
 pub const CONFIG_ENV: &str = "NAH_CONFIG";
@@ -138,6 +138,14 @@ pub struct TmuxSession {
     pub name: String,
     pub windows: u32,
     pub attached_clients: u32,
+}
+
+/// One selected tmux session which was not opened. The target is always the
+/// opaque numeric ID returned by a preceding bounded scan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TmuxSessionAttachIssue {
+    pub session_id: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -748,6 +756,11 @@ pub enum ClientRequest {
         workspace_id: Uuid,
         session_id: String,
     },
+    /// Opens selected existing tmux sessions as independent runtime-only tabs.
+    AttachTmuxSessions {
+        workspace_id: Uuid,
+        session_ids: Vec<String>,
+    },
     ActivateTab {
         pane_id: Uuid,
     },
@@ -997,6 +1010,10 @@ pub enum ServiceResponse {
         scope: TmuxScanScope,
         sessions: Vec<TmuxSession>,
         no_server: bool,
+    },
+    TmuxSessionsAttached {
+        pane_ids: Vec<Uuid>,
+        skipped: Vec<TmuxSessionAttachIssue>,
     },
     Ack,
     SelectionText {

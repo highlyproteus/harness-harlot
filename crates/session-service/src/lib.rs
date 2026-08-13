@@ -21,9 +21,10 @@ use nah_protocol::{
     PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionSnapshot, SplitAxis,
     StreamDiagnostics, Tab, TerminalHistoryPage, TerminalIdentity, TerminalIdentitySource,
     TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
-    TerminalProfile, TerminalScreen, TerminalSelectionKind, TmuxScanScope, TmuxSession, Workspace,
-    WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
-    terminal_profile_for_executable, terminal_profile_for_title, validate_ssh_host,
+    TerminalProfile, TerminalScreen, TerminalSelectionKind, TmuxScanScope, TmuxSession,
+    TmuxSessionAttachIssue, Workspace, WorkspaceConnection, WorkspaceConnectionStatus,
+    WorkspacePinMove, terminal_profile_for_command, terminal_profile_for_executable,
+    terminal_profile_for_title, validate_ssh_host,
 };
 use nah_terminal_model::TerminalModel;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -52,6 +53,8 @@ const MAX_DISCOVERY_DEPTH: usize = 4;
 const TMUX_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const TMUX_PROBE_MAX_BYTES: usize = 64 * 1024;
 const TMUX_PROBE_MAX_SESSIONS: usize = 64;
+const MAX_TMUX_ATTACH_SESSIONS: usize = 32;
+const TMUX_ATTACH_STARTUP_GRACE: Duration = Duration::from_millis(75);
 const TMUX_LIST_FORMAT: &str =
     "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}";
 const TMUX_REMOTE_LIST_COMMAND: &str = "exec tmux list-sessions -F '#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}'";
@@ -400,6 +403,22 @@ impl PtySession {
             .context("observe PTY child exit")
     }
 
+    /// A successful `spawn` only means the executable started. tmux reports a
+    /// missing/dead target by exiting immediately, so do not register a tab
+    /// until it survived a short bounded startup window.
+    fn confirm_live_for_tmux_attach(&self) -> Result<()> {
+        let deadline = Instant::now() + TMUX_ATTACH_STARTUP_GRACE;
+        loop {
+            if let Some(status) = self.exit_status()? {
+                bail!("tmux attach exited before the terminal became live ({status})");
+            }
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn process_id(&self) -> Option<u32> {
         self.child.lock().ok().and_then(|child| child.process_id())
     }
@@ -433,8 +452,8 @@ struct SshWorkspaceIds {
 enum RuntimePaneKind {
     Local,
     SystemSsh { host: String },
-    TmuxLocal,
-    TmuxSystemSsh { host: String },
+    TmuxLocal { session_id: String },
+    TmuxSystemSsh { host: String, session_id: String },
 }
 
 impl RuntimePaneKind {
@@ -443,16 +462,37 @@ impl RuntimePaneKind {
     }
 
     fn is_runtime_only(&self) -> bool {
-        matches!(self, Self::TmuxLocal | Self::TmuxSystemSsh { .. })
+        matches!(self, Self::TmuxLocal { .. } | Self::TmuxSystemSsh { .. })
+    }
+
+    fn tmux_session_id(&self) -> Option<&str> {
+        match self {
+            Self::TmuxLocal { session_id } | Self::TmuxSystemSsh { session_id, .. } => {
+                Some(session_id)
+            }
+            Self::Local | Self::SystemSsh { .. } => None,
+        }
     }
 
     fn shell_label(&self) -> String {
         match self {
             Self::Local => shell_title(),
             Self::SystemSsh { host } => format!("ssh {host}"),
-            Self::TmuxLocal | Self::TmuxSystemSsh { .. } => "tmux".to_owned(),
+            Self::TmuxLocal { .. } | Self::TmuxSystemSsh { .. } => "tmux".to_owned(),
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TmuxAttachmentPlan {
+    launch: Vec<String>,
+    skipped: Vec<TmuxSessionAttachIssue>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct TmuxAttachmentResult {
+    pub pane_ids: Vec<Uuid>,
+    pub skipped: Vec<TmuxSessionAttachIssue>,
 }
 
 fn runtime_kind_for_workspace(connection: &WorkspaceConnection) -> RuntimePaneKind {
@@ -2160,13 +2200,86 @@ impl SessionRegistry {
     /// deliberately runtime-only: desired-state persistence omits it so a
     /// daemon restart never auto-attaches or stores an opaque tmux target.
     pub fn attach_tmux_session(&self, workspace_id: Uuid, session_id: &str) -> Result<Uuid> {
-        validate_tmux_session_id(session_id)?;
+        let result = self.attach_tmux_sessions(workspace_id, &[session_id.to_owned()])?;
+        result.pane_ids.into_iter().next().with_context(|| {
+            let detail = result
+                .skipped
+                .first()
+                .map_or("tmux session was not opened", |issue| {
+                    issue.message.as_str()
+                });
+            format!("tmux session {session_id} was not opened: {detail}")
+        })
+    }
+
+    /// Opens each selected existing tmux session in an independent live tab.
+    /// Each target is isolated: an immediate attach failure returns a clear
+    /// issue for that target while the rest can still open.
+    pub fn attach_tmux_sessions(
+        &self,
+        workspace_id: Uuid,
+        session_ids: &[String],
+    ) -> Result<TmuxAttachmentResult> {
         let connection = self.workspace_connection(workspace_id)?;
+        if matches!(
+            connection,
+            WorkspaceConnection::SystemSsh {
+                status: WorkspaceConnectionStatus::Offline,
+                ..
+            }
+        ) {
+            bail!("reconnect this SSH workstation before opening tmux");
+        }
+        let already_open = self.open_tmux_session_ids(workspace_id)?;
+        let plan = plan_tmux_session_attachments(session_ids, &already_open)?;
+        let mut result = TmuxAttachmentResult {
+            pane_ids: Vec::new(),
+            skipped: plan.skipped,
+        };
+        for session_id in plan.launch {
+            match self.attach_tmux_session_one(workspace_id, &session_id, &connection) {
+                Ok(pane_id) => result.pane_ids.push(pane_id),
+                Err(error) => result.skipped.push(TmuxSessionAttachIssue {
+                    session_id,
+                    message: error.to_string(),
+                }),
+            }
+        }
+        Ok(result)
+    }
+
+    fn open_tmux_session_ids(&self, workspace_id: Uuid) -> Result<HashSet<String>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| anyhow!("session state lock was poisoned"))?;
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+        Ok(pane_ids_for_workspace(workspace)
+            .into_iter()
+            .filter_map(|pane_id| state.panes.get(&pane_id))
+            .filter_map(|runtime| runtime.kind.tmux_session_id().map(str::to_owned))
+            .collect())
+    }
+
+    fn attach_tmux_session_one(
+        &self,
+        workspace_id: Uuid,
+        session_id: &str,
+        connection: &WorkspaceConnection,
+    ) -> Result<Uuid> {
+        validate_tmux_session_id(session_id)?;
         let pane_id = Uuid::new_v4();
-        let (session, kind) = match &connection {
+        let (session, kind) = match connection {
             WorkspaceConnection::Local => (
                 PtySession::spawn_tmux_local(pane_id, workspace_id, session_id, &self.history)?,
-                RuntimePaneKind::TmuxLocal,
+                RuntimePaneKind::TmuxLocal {
+                    session_id: session_id.to_owned(),
+                },
             ),
             WorkspaceConnection::SystemSsh {
                 destination,
@@ -2181,6 +2294,7 @@ impl SessionRegistry {
                 )?,
                 RuntimePaneKind::TmuxSystemSsh {
                     host: destination.clone(),
+                    session_id: session_id.to_owned(),
                 },
             ),
             WorkspaceConnection::SystemSsh {
@@ -2188,6 +2302,21 @@ impl SessionRegistry {
                 ..
             } => bail!("reconnect this SSH workstation before opening tmux"),
         };
+        self.register_live_tmux_tab(workspace_id, pane_id, session_id, &session, kind)
+    }
+
+    fn register_live_tmux_tab(
+        &self,
+        workspace_id: Uuid,
+        pane_id: Uuid,
+        session_id: &str,
+        session: &Arc<PtySession>,
+        kind: RuntimePaneKind,
+    ) -> Result<Uuid> {
+        if let Err(error) = session.confirm_live_for_tmux_attach() {
+            let _ = session.terminate_and_wait();
+            return Err(error);
+        }
         let result = (|| {
             let mut state = self
                 .state
@@ -2195,6 +2324,20 @@ impl SessionRegistry {
                 .map_err(|_| anyhow!("session state lock was poisoned"))?;
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
+            }
+            let already_open = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .map(pane_ids_for_workspace)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|pane_id| state.panes.get(&pane_id))
+                .filter_map(|runtime| runtime.kind.tmux_session_id())
+                .any(|existing| existing == session_id);
+            if already_open {
+                bail!("already open in this workstation");
             }
             let workspace = state
                 .snapshot
@@ -2232,7 +2375,7 @@ impl SessionRegistry {
             state.panes.insert(
                 pane_id,
                 RuntimePane {
-                    session: Arc::clone(&session),
+                    session: Arc::clone(session),
                     last_valid_cwd: fallback_cwd()?,
                     kind,
                     recovered: false,
@@ -2273,7 +2416,7 @@ impl SessionRegistry {
         match &runtime.kind {
             RuntimePaneKind::Local => Ok(runtime.last_valid_cwd.clone()),
             RuntimePaneKind::SystemSsh { .. }
-            | RuntimePaneKind::TmuxLocal
+            | RuntimePaneKind::TmuxLocal { .. }
             | RuntimePaneKind::TmuxSystemSsh { .. } => fallback_cwd(),
         }
     }
@@ -2315,7 +2458,7 @@ impl SessionRegistry {
             RuntimePaneKind::SystemSsh { host } => {
                 PtySession::spawn_ssh(pane_id, workspace_id, host, &self.history)?
             }
-            RuntimePaneKind::TmuxLocal | RuntimePaneKind::TmuxSystemSsh { .. } => {
+            RuntimePaneKind::TmuxLocal { .. } | RuntimePaneKind::TmuxSystemSsh { .. } => {
                 unreachable!("workspace connection cannot resolve to a runtime-only tmux pane")
             }
         };
@@ -2796,6 +2939,40 @@ fn validate_tmux_session_id(session_id: &str) -> Result<()> {
         bail!("tmux session target must be an opaque numeric session ID");
     }
     Ok(())
+}
+
+fn plan_tmux_session_attachments(
+    session_ids: &[String],
+    already_open: &HashSet<String>,
+) -> Result<TmuxAttachmentPlan> {
+    if session_ids.is_empty() {
+        bail!("select at least one tmux session to open");
+    }
+    if session_ids.len() > MAX_TMUX_ATTACH_SESSIONS {
+        bail!("select at most {MAX_TMUX_ATTACH_SESSIONS} tmux sessions at once");
+    }
+    let mut seen = HashSet::new();
+    let mut plan = TmuxAttachmentPlan {
+        launch: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for session_id in session_ids {
+        validate_tmux_session_id(session_id)?;
+        if !seen.insert(session_id.clone()) {
+            plan.skipped.push(TmuxSessionAttachIssue {
+                session_id: session_id.clone(),
+                message: "selected more than once".to_owned(),
+            });
+        } else if already_open.contains(session_id) {
+            plan.skipped.push(TmuxSessionAttachIssue {
+                session_id: session_id.clone(),
+                message: "already open in this workstation".to_owned(),
+            });
+        } else {
+            plan.launch.push(session_id.clone());
+        }
+    }
+    Ok(plan)
 }
 
 fn tmux_local_attach_command(pane_id: Uuid, session_id: &str) -> Result<CommandBuilder> {
@@ -3434,6 +3611,7 @@ pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<ServiceResponse> {
     if matches!(
         &request,
@@ -3459,6 +3637,9 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         return handle_identity_request(sessions, request);
     }
     if let Some(response) = handle_tmux_scan_request(sessions, &request)? {
+        return Ok(response);
+    }
+    if let Some(response) = handle_tmux_attach_request(sessions, &request)? {
         return Ok(response);
     }
     if matches!(
@@ -3510,6 +3691,7 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         | ClientRequest::CreateWorkspaceTerminal { .. }
         | ClientRequest::ConnectSsh { .. }
         | ClientRequest::AttachTmuxSession { .. }
+        | ClientRequest::AttachTmuxSessions { .. }
         | ClientRequest::ActivateTab { .. }
         | ClientRequest::SwapPanes { .. }
         | ClientRequest::MovePaneToSplit { .. }
@@ -3548,6 +3730,24 @@ fn handle_tmux_scan_request(
         scope,
         sessions: sessions_found,
         no_server,
+    }))
+}
+
+fn handle_tmux_attach_request(
+    sessions: &SessionRegistry,
+    request: &ClientRequest,
+) -> Result<Option<ServiceResponse>> {
+    let ClientRequest::AttachTmuxSessions {
+        workspace_id,
+        session_ids,
+    } = request
+    else {
+        return Ok(None);
+    };
+    let result = sessions.attach_tmux_sessions(*workspace_id, session_ids)?;
+    Ok(Some(ServiceResponse::TmuxSessionsAttached {
+        pane_ids: result.pane_ids,
+        skipped: result.skipped,
     }))
 }
 
@@ -3959,6 +4159,105 @@ mod tests {
                 "target: {target:?}"
             );
         }
+    }
+
+    #[test]
+    fn tmux_attachment_plan_opens_each_unique_selection_and_skips_existing_tabs() {
+        let already_open = HashSet::from(["$2".to_owned()]);
+        let plan = plan_tmux_session_attachments(
+            &["$1".to_owned(), "$2".to_owned(), "$1".to_owned()],
+            &already_open,
+        )
+        .unwrap();
+        assert_eq!(plan.launch, vec!["$1"]);
+        assert_eq!(
+            plan.skipped,
+            vec![
+                TmuxSessionAttachIssue {
+                    session_id: "$2".to_owned(),
+                    message: "already open in this workstation".to_owned(),
+                },
+                TmuxSessionAttachIssue {
+                    session_id: "$1".to_owned(),
+                    message: "selected more than once".to_owned(),
+                },
+            ]
+        );
+        assert!(plan_tmux_session_attachments(&["$1;bad".to_owned()], &already_open).is_err());
+    }
+
+    #[test]
+    fn live_tmux_runtime_tab_is_registered_and_selectable() {
+        let registry = SessionRegistry::new().unwrap();
+        let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+        let pane_id = Uuid::new_v4();
+        let session = PtySession::spawn_command(
+            pane_id,
+            workspace_id,
+            CommandBuilder::from_argv(vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("printf fixture; sleep 1"),
+            ]),
+            "live tmux fixture",
+            &registry.history,
+        )
+        .unwrap();
+
+        let attached = registry
+            .register_live_tmux_tab(
+                workspace_id,
+                pane_id,
+                "$9",
+                &session,
+                RuntimePaneKind::TmuxLocal {
+                    session_id: "$9".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(attached, pane_id);
+        registry.activate_tab(pane_id).unwrap();
+        assert!(registry.pane_snapshot(pane_id).is_ok());
+        let snapshot = registry.snapshot().unwrap();
+        assert!(
+            snapshot.workspaces[0]
+                .tabs
+                .iter()
+                .any(|tab| layout_contains(&tab.layout, pane_id))
+        );
+    }
+
+    #[test]
+    fn immediate_tmux_attach_exit_never_registers_a_placeholder_tab() {
+        let registry = SessionRegistry::new().unwrap();
+        let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+        let pane_id = Uuid::new_v4();
+        let session = PtySession::spawn_command(
+            pane_id,
+            workspace_id,
+            CommandBuilder::from_argv(vec![OsString::from("/usr/bin/false")]),
+            "failed tmux fixture",
+            &registry.history,
+        )
+        .unwrap();
+
+        let error = registry
+            .register_live_tmux_tab(
+                workspace_id,
+                pane_id,
+                "$10",
+                &session,
+                RuntimePaneKind::TmuxLocal {
+                    session_id: "$10".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("before the terminal became live")
+        );
+        assert!(registry.pane_snapshot(pane_id).is_err());
     }
 
     #[test]
