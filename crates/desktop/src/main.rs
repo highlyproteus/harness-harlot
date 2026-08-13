@@ -5618,59 +5618,74 @@ impl NahApp {
             .id("settings-workspace-surface")
             .size_full()
             .min_h(px(0.0))
-            .overflow_y_scroll()
-            .p(px(18.0))
             .bg(rgb(THEME.terminal))
             .flex()
-            .justify_center()
+            .flex_col()
             .child(
                 div()
-                    .w(px(680.0))
-                    .h_full()
-                    .p(px(18.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(THEME.elevated))
-                    .border_1()
-                    .border_color(rgb(THEME.border_strong))
-                    .shadow_lg()
+                    .h(px(PANE_HEADER_HEIGHT))
+                    .flex_none()
+                    .px(px(10.0))
+                    .bg(rgb(THEME.surface))
+                    .border_b_1()
+                    .border_color(rgb(THEME.border))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .text_center()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.muted))
+                            .child("⚙"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .id("close-appearance")
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(THEME.elevated))
+                                    .text_color(rgb(THEME.foreground))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.appearance_settings_open = false;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-workspace-content")
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px(px(24.0))
+                    .py(px(20.0))
+                    .child(
+                        div()
+                    .w_full()
                     .flex()
                     .flex_col()
                     .gap(px(14.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .font_family(".SystemUIFont")
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(THEME.foreground))
-                                    .child("Settings"),
-                            )
-                            .child(
-                                div()
-                                    .id("close-appearance")
-                                    .w(px(26.0))
-                                    .h(px(26.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(rgb(THEME.muted))
-                                    .hover(|element| {
-                                        element
-                                            .bg(rgb(THEME.surface))
-                                            .text_color(rgb(THEME.foreground))
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.appearance_settings_open = false;
-                                        cx.notify();
-                                    }))
-                                    .child("×"),
-                            ),
-                    )
                     .child(
                         div()
                             .font_family(".SystemUIFont")
@@ -5709,6 +5724,7 @@ impl NahApp {
                             .child("Saved locally with session layout · no network or telemetry"),
                     )
                     .child(self.render_history_settings(cx)),
+                    ),
             )
             .into_any_element()
     }
