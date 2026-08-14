@@ -43,4 +43,9 @@ if [ -f "$contents_directory/MacOS/nah-update-tool" ]; then
   chmod 755 "$contents_directory/MacOS/nah-update-tool"
 fi
 
+# Replacing nested executables invalidates any signature left on a prior bundle.
+# Re-sign the complete local app. Release packaging replaces this ad-hoc
+# signature with the configured distribution identity.
+codesign --force --deep --sign - "$app_directory"
+
 echo "$app_directory"
