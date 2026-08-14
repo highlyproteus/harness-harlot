@@ -43,6 +43,7 @@ const INITIAL_COLUMNS: u16 = 100;
 const INITIAL_ROWS: u16 = 30;
 const MAX_INPUT_FRAME: usize = 64 * 1024;
 const MAX_PANES: usize = 32;
+const MAX_TABS_PER_WORKSPACE: usize = 32;
 const MAX_WORKSPACES: usize = 16;
 const MAX_WORKSPACE_TITLE_CHARS: usize = 80;
 const MAX_RECENT_COLORS: usize = 8;
@@ -484,6 +485,7 @@ struct RegistryState {
     snapshot: SessionSnapshot,
     panes: HashMap<Uuid, RuntimePane>,
     next_terminal_number: u32,
+    next_group_number: u32,
     system: System,
     last_identity_refresh: Option<Instant>,
 }
@@ -611,6 +613,7 @@ impl SessionRegistry {
                 snapshot: recovered.snapshot,
                 panes,
                 next_terminal_number,
+                next_group_number: 1,
                 last_identity_refresh: None,
                 system: System::new(),
             })),
@@ -646,6 +649,7 @@ impl SessionRegistry {
                     },
                 )]),
                 next_terminal_number: 2,
+                next_group_number: 1,
                 last_identity_refresh: None,
                 system: System::new(),
             })),
@@ -928,7 +932,7 @@ impl SessionRegistry {
         Ok(new_id)
     }
 
-    pub fn create_tab(&self, target_pane: Uuid) -> Result<Uuid> {
+    pub fn create_group_terminal(&self, target_pane: Uuid) -> Result<Uuid> {
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
@@ -1038,6 +1042,7 @@ impl SessionRegistry {
             workspace.tabs.push(Tab {
                 id: Uuid::new_v4(),
                 title: tab_title,
+                custom_title: None,
                 layout: PaneLayout::Leaf { pane },
             });
             workspace.active_terminal_count = 1;
@@ -1061,6 +1066,101 @@ impl SessionRegistry {
                 drop(state);
                 self.write_snapshot(&bytes)?;
             };
+            Ok(pane_id)
+        })();
+        if result.is_err() {
+            let _ = session.terminate_and_wait();
+        }
+        result
+    }
+
+    /// Appends one more top-level tab to a workstation that already has a layout.
+    /// Unlike `create_workspace_terminal` this is deliberately not idempotent:
+    /// every request adds a tab, which is what the workstation menu's "New Tab"
+    /// means.
+    pub fn create_workspace_tab(&self, workspace_id: Uuid) -> Result<Uuid> {
+        self.append_workspace_tab(workspace_id, None)
+    }
+
+    /// Appends a named group holding its first terminal, so the group is visible
+    /// and right-clickable before a second terminal exists.
+    pub fn create_workspace_group(&self, workspace_id: Uuid) -> Result<Uuid> {
+        let number = {
+            let mut state = self.state.write();
+            let number = state.next_group_number;
+            state.next_group_number = state.next_group_number.saturating_add(1);
+            number
+        };
+        self.append_workspace_tab(workspace_id, Some(format!("Group {number}")))
+    }
+
+    fn append_workspace_tab(
+        &self,
+        workspace_id: Uuid,
+        custom_title: Option<String>,
+    ) -> Result<Uuid> {
+        let _connection = {
+            let state = self.state.read();
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+            if workspace.tabs.len() >= MAX_TABS_PER_WORKSPACE {
+                bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
+            }
+            workspace.connection.clone()
+        };
+
+        let pane_id = Uuid::new_v4();
+        let cwd = fallback_cwd()?;
+        let (session, kind) = self.spawn_pane_for_workspace(pane_id, workspace_id, &cwd)?;
+        let result = (|| {
+            let mut state = self.state.write();
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+            let workspace_index = state
+                .snapshot
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+            if state.snapshot.workspaces[workspace_index].tabs.len() >= MAX_TABS_PER_WORKSPACE {
+                bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
+            }
+            let mut pane = state.new_pane(pane_id);
+            if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
+                "ssh".clone_into(&mut pane.shell);
+            }
+            let tab = Tab {
+                id: Uuid::new_v4(),
+                title: pane.title.clone(),
+                custom_title,
+                layout: PaneLayout::Leaf { pane },
+            };
+            let workspace = &mut state.snapshot.workspaces[workspace_index];
+            workspace.tabs.push(tab);
+            workspace.active_terminal_count = workspace.active_terminal_count.saturating_add(1);
+            state.panes.insert(
+                pane_id,
+                RuntimePane {
+                    session: Arc::clone(&session),
+                    last_valid_cwd: cwd,
+                    kind,
+                    recovered: false,
+                    exit_status: None,
+                    detected_command_profile: None,
+                },
+            );
+            state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+            let bytes = encode_desired_state(&state)?;
+            drop(state);
+            self.write_snapshot(&bytes)?;
             Ok(pane_id)
         })();
         if result.is_err() {
@@ -1316,6 +1416,27 @@ impl SessionRegistry {
             drop(state);
             self.write_snapshot(&bytes)?;
         };
+        Ok(())
+    }
+
+    pub fn rename_tab(&self, tab_id: Uuid, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() || title.chars().count() > 80 || title.chars().any(char::is_control) {
+            bail!("group name must be 1 to 80 visible characters");
+        }
+        let mut state = self.state.write();
+        let tab = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.tabs.iter_mut())
+            .find(|tab| tab.id == tab_id)
+            .with_context(|| format!("group {tab_id} does not exist"))?;
+        tab.custom_title = Some(title.to_owned());
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)?;
         Ok(())
     }
 
@@ -1610,6 +1731,7 @@ impl SessionRegistry {
                 tabs: vec![Tab {
                     id: tab_id,
                     title: "Terminals".to_owned(),
+                    custom_title: None,
                     layout: PaneLayout::Leaf { pane },
                 }],
             });
@@ -1697,6 +1819,7 @@ impl SessionRegistry {
             tabs: vec![Tab {
                 id: ids.tab,
                 title: "Remote".to_owned(),
+                custom_title: None,
                 layout: PaneLayout::Leaf { pane },
             }],
         });
@@ -2068,6 +2191,7 @@ impl SessionRegistry {
                 workspace.tabs.push(Tab {
                     id: Uuid::new_v4(),
                     title: "Remote".to_owned(),
+                    custom_title: None,
                     layout: PaneLayout::Leaf { pane },
                 });
             } else {
@@ -2448,6 +2572,7 @@ impl SessionRegistry {
             workspace.tabs.push(Tab {
                 id: Uuid::new_v4(),
                 title: tmux_session.name.clone(),
+                custom_title: None,
                 layout: PaneLayout::Leaf {
                     pane: Pane {
                         id: pane_id,
@@ -2604,11 +2729,9 @@ fn encode_desired_state(state: &RegistryState) -> Result<Vec<u8>> {
         .collect::<HashSet<_>>();
     if !runtime_only_panes.is_empty() {
         for workspace in &mut snapshot.workspaces {
-            workspace.tabs.retain(|tab| {
-                !runtime_only_panes
-                    .iter()
-                    .any(|pane_id| layout_contains(&tab.layout, *pane_id))
-            });
+            workspace
+                .tabs
+                .retain_mut(|tab| retain_persistable_panes(&mut tab.layout, &runtime_only_panes));
         }
     }
     let cwd_by_pane = state
@@ -3465,6 +3588,50 @@ fn layout_contains(layout: &PaneLayout, pane_id: Uuid) -> bool {
     }
 }
 
+/// Removes runtime-only (tmux) panes from a layout that is about to be
+/// persisted, collapsing the nodes they vacate. Returns false when nothing of
+/// the layout survives, so the caller drops the tab entirely.
+fn retain_persistable_panes(layout: &mut PaneLayout, dropped: &HashSet<Uuid>) -> bool {
+    match layout {
+        PaneLayout::Leaf { pane } => !dropped.contains(&pane.id),
+        PaneLayout::Stack { panes, active } => {
+            panes.retain(|pane| !dropped.contains(&pane.id));
+            if panes.len() >= 2 {
+                if !panes.iter().any(|pane| pane.id == *active) {
+                    *active = panes[0].id;
+                }
+                return true;
+            }
+            let sole = panes.first().cloned();
+            match sole {
+                Some(pane) => {
+                    *layout = PaneLayout::Leaf { pane };
+                    true
+                }
+                None => false,
+            }
+        }
+        PaneLayout::Split { first, second, .. } => {
+            let keep_first = retain_persistable_panes(first, dropped);
+            let keep_second = retain_persistable_panes(second, dropped);
+            match (keep_first, keep_second) {
+                (true, true) => true,
+                (true, false) => {
+                    let survivor = (**first).clone();
+                    *layout = survivor;
+                    true
+                }
+                (false, true) => {
+                    let survivor = (**second).clone();
+                    *layout = survivor;
+                    true
+                }
+                (false, false) => false,
+            }
+        }
+    }
+}
+
 fn workspace_id_for_pane(snapshot: &SessionSnapshot, pane_id: Uuid) -> Option<Uuid> {
     snapshot
         .workspaces
@@ -3776,14 +3943,20 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         ClientRequest::CreatePane { target_pane, axis } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.create_pane(target_pane, axis)?,
         }),
-        ClientRequest::CreateTab { target_pane } => Ok(ServiceResponse::PaneCreated {
-            pane_id: sessions.create_tab(target_pane)?,
+        ClientRequest::CreateGroupTerminal { target_pane } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_group_terminal(target_pane)?,
         }),
         ClientRequest::CreateWorkspaceTerminal { workspace_id } => {
             Ok(ServiceResponse::PaneCreated {
                 pane_id: sessions.create_workspace_terminal(workspace_id)?,
             })
         }
+        ClientRequest::CreateWorkspaceTab { workspace_id } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_workspace_tab(workspace_id)?,
+        }),
+        ClientRequest::CreateWorkspaceGroup { workspace_id } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_workspace_group(workspace_id)?,
+        }),
         ClientRequest::ConnectSsh { target_pane, host } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.connect_ssh(target_pane, &host)?,
         }),
@@ -3834,6 +4007,10 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
         }
         ClientRequest::RenamePane { pane_id, title } => {
             sessions.rename_pane(pane_id, &title)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::RenameTab { tab_id, title } => {
+            sessions.rename_tab(tab_id, &title)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::SetPaneProfile { pane_id, profile } => {
@@ -4173,6 +4350,91 @@ mod tests {
         }
     }
 
+    fn pane_fixture(id: Uuid) -> Pane {
+        Pane {
+            id,
+            title: format!("Terminal {id}"),
+            shell: "shell".to_owned(),
+            color: None,
+            identity: TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+        }
+    }
+
+    #[test]
+    fn persistable_pane_pruning_collapses_invalid_layout_shapes() {
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let third_id = Uuid::new_v4();
+
+        let mut leaf = PaneLayout::Leaf {
+            pane: pane_fixture(first_id),
+        };
+        assert!(!retain_persistable_panes(
+            &mut leaf,
+            &HashSet::from([first_id])
+        ));
+
+        let second = pane_fixture(second_id);
+        let mut two_pane_stack = PaneLayout::Stack {
+            panes: vec![pane_fixture(first_id), second.clone()],
+            active: first_id,
+        };
+        assert!(retain_persistable_panes(
+            &mut two_pane_stack,
+            &HashSet::from([first_id])
+        ));
+        assert_eq!(two_pane_stack, PaneLayout::Leaf { pane: second });
+
+        let first = pane_fixture(first_id);
+        let third = pane_fixture(third_id);
+        let mut three_pane_stack = PaneLayout::Stack {
+            panes: vec![first.clone(), pane_fixture(second_id), third.clone()],
+            active: second_id,
+        };
+        assert!(retain_persistable_panes(
+            &mut three_pane_stack,
+            &HashSet::from([second_id])
+        ));
+        assert_eq!(
+            three_pane_stack,
+            PaneLayout::Stack {
+                panes: vec![first.clone(), third.clone()],
+                active: first_id,
+            }
+        );
+
+        let mut one_sided_split = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneLayout::Leaf {
+                pane: pane_fixture(second_id),
+            }),
+            second: Box::new(PaneLayout::Leaf {
+                pane: third.clone(),
+            }),
+        };
+        assert!(retain_persistable_panes(
+            &mut one_sided_split,
+            &HashSet::from([second_id])
+        ));
+        assert_eq!(one_sided_split, PaneLayout::Leaf { pane: third });
+
+        let mut empty_split = PaneLayout::Split {
+            axis: SplitAxis::Vertical,
+            ratio: 0.5,
+            first: Box::new(PaneLayout::Leaf { pane: first }),
+            second: Box::new(PaneLayout::Leaf {
+                pane: pane_fixture(second_id),
+            }),
+        };
+        assert!(!retain_persistable_panes(
+            &mut empty_split,
+            &HashSet::from([first_id, second_id])
+        ));
+    }
+
     #[test]
     fn tmux_attachment_plan_opens_each_unique_selection_and_skips_invalid_targets() {
         let first = tmux_session("$1", "editor");
@@ -4254,6 +4516,70 @@ mod tests {
                 .iter()
                 .any(|tab| layout_contains(&tab.layout, pane_id))
         );
+    }
+
+    #[test]
+    fn a_plain_terminal_added_to_a_tmux_tab_survives_restart_without_the_tmux_pane() {
+        let directory =
+            std::env::temp_dir().join(format!("nah-tmux-group-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let snapshot_path = directory.join("sessions.json");
+        let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+        let tmux_pane_id = Uuid::new_v4();
+        let session = PtySession::spawn_command(
+            tmux_pane_id,
+            workspace_id,
+            CommandBuilder::from_argv(vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("printf fixture; sleep 1"),
+            ]),
+            "live tmux fixture",
+            &registry.history,
+        )
+        .unwrap();
+        let tmux_session = tmux_session("$11", "persisted-group");
+        registry
+            .register_live_tmux_tab(
+                workspace_id,
+                tmux_pane_id,
+                &tmux_session,
+                &session,
+                RuntimePaneKind::TmuxLocal {
+                    session_id: tmux_session.id.clone(),
+                },
+            )
+            .unwrap();
+
+        let plain_pane_id = registry.create_group_terminal(tmux_pane_id).unwrap();
+        let live_snapshot = registry.snapshot().unwrap();
+        let live_tab = live_snapshot.workspaces[0]
+            .tabs
+            .iter()
+            .find(|tab| layout_contains(&tab.layout, tmux_pane_id))
+            .expect("tmux tab remains present while attached");
+        assert!(matches!(
+            &live_tab.layout,
+            PaneLayout::Stack { panes, .. }
+                if panes.iter().any(|pane| pane.id == tmux_pane_id)
+                    && panes.iter().any(|pane| pane.id == plain_pane_id)
+        ));
+
+        drop(session);
+        drop(registry);
+
+        let recovered = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let recovered_snapshot = recovered.snapshot().unwrap();
+        assert!(recovered_snapshot.workspaces[0].tabs.iter().any(|tab| {
+            matches!(
+                &tab.layout,
+                PaneLayout::Leaf { pane } if pane.id == plain_pane_id
+            )
+        }));
+
+        drop(recovered);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4357,6 +4683,51 @@ mod tests {
             runtime_kind_for_workspace(&WorkspaceConnection::Local),
             RuntimePaneKind::Local
         );
+    }
+
+    #[test]
+    fn group_names_are_validated_and_survive_restart() {
+        let directory =
+            std::env::temp_dir().join(format!("nah-group-name-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let snapshot_path = directory.join("sessions.json");
+        let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+
+        let pane_id = registry.create_workspace_group(workspace_id).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let tab = snapshot.workspaces[0]
+            .tabs
+            .iter()
+            .find(|tab| layout_contains(&tab.layout, pane_id))
+            .expect("new group owns the returned pane");
+        let tab_id = tab.id;
+        assert_eq!(tab.custom_title.as_deref(), Some("Group 1"));
+
+        registry.rename_tab(tab_id, "  Design bank  ").unwrap();
+        assert!(registry.rename_tab(tab_id, "").is_err());
+        assert!(registry.rename_tab(tab_id, &"x".repeat(81)).is_err());
+        let renamed = registry.snapshot().unwrap();
+        let tab = renamed.workspaces[0]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .expect("renamed group remains present");
+        assert_eq!(tab.custom_title.as_deref(), Some("Design bank"));
+
+        drop(registry);
+
+        let recovered = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let snapshot = recovered.snapshot().unwrap();
+        let tab = snapshot.workspaces[0]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .expect("renamed group survives restart");
+        assert_eq!(tab.custom_title.as_deref(), Some("Design bank"));
+
+        drop(recovered);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4971,7 +5342,7 @@ mod tests {
     fn terminals_receive_human_names_and_can_be_renamed() {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
-        let second = registry.create_tab(first).unwrap();
+        let second = registry.create_group_terminal(first).unwrap();
         registry.rename_pane(second, "Build logs").unwrap();
 
         let snapshot = registry.snapshot().unwrap();
@@ -4987,7 +5358,7 @@ mod tests {
     fn moving_a_live_tab_to_a_directional_split_preserves_its_process() {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
-        let second = registry.create_tab(first).unwrap();
+        let second = registry.create_group_terminal(first).unwrap();
         let first_pid = registry.pane_process_id(first).unwrap();
         let second_pid = registry.pane_process_id(second).unwrap();
 
@@ -5046,7 +5417,7 @@ mod tests {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
         let target = registry.create_pane(first, SplitAxis::Horizontal).unwrap();
-        let moved = registry.create_tab(first).unwrap();
+        let moved = registry.create_group_terminal(first).unwrap();
         let moved_pid = registry.pane_process_id(moved).unwrap();
 
         registry.move_pane_to_tab(moved, target).unwrap();
@@ -5077,7 +5448,7 @@ mod tests {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
         let first_pid = registry.pane_process_id(first).unwrap();
-        let closing = registry.create_tab(first).unwrap();
+        let closing = registry.create_group_terminal(first).unwrap();
 
         registry.close_pane(closing).unwrap();
 
@@ -5160,7 +5531,7 @@ mod tests {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
         let second = registry.create_pane(first, SplitAxis::Horizontal).unwrap();
-        let second_tab = registry.create_tab(second).unwrap();
+        let second_tab = registry.create_group_terminal(second).unwrap();
         registry.rename_pane(second_tab, "Second pane tab").unwrap();
 
         let snapshot = registry.snapshot().unwrap();

@@ -14,7 +14,7 @@ use nah_protocol::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 4;
+const SCHEMA_VERSION: u16 = 5;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 const MAX_WORKSPACES: usize = 16;
@@ -278,6 +278,8 @@ struct DesiredWorkspace {
 struct DesiredTab {
     id: Uuid,
     title: String,
+    #[serde(default)]
+    custom_title: Option<String>,
     layout: DesiredLayout,
 }
 
@@ -349,6 +351,7 @@ impl DesiredState {
                             Ok(DesiredTab {
                                 id: tab.id,
                                 title: tab.title.clone(),
+                                custom_title: tab.custom_title.clone(),
                                 layout: DesiredLayout::from_runtime(
                                     &tab.layout,
                                     cwd_by_pane,
@@ -398,6 +401,7 @@ impl DesiredState {
                     .map(|tab| Tab {
                         id: tab.id,
                         title: tab.title,
+                        custom_title: tab.custom_title,
                         layout: tab
                             .layout
                             .into_runtime(&mut cwd_by_pane, &mut offline_panes),
@@ -446,6 +450,9 @@ impl DesiredState {
             for tab in &workspace.tabs {
                 validate_id(tab.id, &mut ids)?;
                 validate_title(&tab.title, "tab")?;
+                if let Some(name) = &tab.custom_title {
+                    validate_title(name, "group")?;
+                }
                 tab.layout.validate(1, &mut ids, &mut panes)?;
             }
         }
