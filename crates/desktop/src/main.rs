@@ -58,18 +58,19 @@ use commands::{
 };
 use helpers::{
     FocusResync, IDENTITY_MARK_SIZE, append_rename_text, apply_layout_control_mutation,
-    collect_pane_sizes, constrained_sidebar_width, default_sidebar_width, effective_split_ratio,
-    element_key, find_pane, find_split_rect, focus_resync_for, format_bytes, format_history_date,
-    gpui_binding, history_label, history_scope_key, history_warning_text, migrated_sidebar_width,
-    next_terminal_poll_delay_ms, paced_subscriptions, pane_update_requires_repaint,
-    parse_hex_color, plain_history_line, prepare_paste, product_name, readable_text_color,
-    render_sidebar_toggle_icon, render_terminal_profile_mark, resolved_terminal_accent,
-    resolved_workspace_color, selection_span, sidebar_width_for_visibility, split_child_dimensions,
-    split_control_id, split_element_key, split_placement_at, split_target_for_drag,
-    split_target_for_drag_ids, tab_identity_presentation, terminal_input_bytes, terminal_modifiers,
-    terminal_mouse_button, terminal_point_at, terminal_run_display_text, terminal_tab_count_label,
-    visible_panes, workspace_is_selectable, workspace_layout_for_focused_pane,
-    workspace_pixel_size, workspace_terminal_tabs, workspace_visible_panes,
+    collect_pane_sizes, collect_terminal_tabs, constrained_sidebar_width, default_sidebar_width,
+    effective_split_ratio, element_key, find_pane, find_split_rect, focus_resync_for, format_bytes,
+    format_history_date, gpui_binding, history_label, history_scope_key, history_warning_text,
+    migrated_sidebar_width, next_terminal_poll_delay_ms, paced_subscriptions,
+    pane_update_requires_repaint, parse_hex_color, plain_history_line, prepare_paste, product_name,
+    readable_text_color, render_sidebar_toggle_icon, render_terminal_profile_mark,
+    resolved_terminal_accent, resolved_workspace_color, selection_span,
+    sidebar_width_for_visibility, split_child_dimensions, split_control_id, split_element_key,
+    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
+    tab_identity_presentation, terminal_input_bytes, terminal_modifiers, terminal_mouse_button,
+    terminal_point_at, terminal_run_display_text, terminal_tab_count_label, visible_panes,
+    workspace_is_selectable, workspace_layout_for_focused_pane, workspace_pixel_size,
+    workspace_tab_entries, workspace_terminal_tabs, workspace_visible_panes,
     workstation_banner_header_height, zoom_projection,
 };
 use theme::{AppTheme, BuiltInTheme};
@@ -78,14 +79,14 @@ use ui_state::UiStateStore;
 use view_models::{
     ArchivedView, CloseConfirmation, ColorPickerState, ColorTarget, CommandPaletteState,
     DialogAction, DialogSpec, DialogTextEditor, DialogTone, DragDestination, DragHoverState,
-    HistoryEditField, HistoryEditor, LayoutControlMutation, Modal, PaneControlIcon, PaneDrag,
-    PixelRect, RenameEditor, ResizeDrag, SearchEditor, SelectionDrag, SidebarResizeLifecycle,
-    SidebarResizeMove, SplitControlId, TabIdentityPresentation, TabMenu, TerminalLineRender,
-    TmuxSelectionChange, TmuxSessionPicker, TooltipView, WorkspaceConnectionInfo,
-    WorkspaceCreationDialog, WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
-    WorkspaceDeleteConfirmation, WorkspaceDisconnectConfirmation, WorkspaceDrag,
-    WorkspaceDropPreview, WorkspaceMenu, WorkspaceRenameEditor, WorkstationGroupExpansion,
-    route_workspace_creation_paste,
+    GroupMenu, GroupRenameEditor, HistoryEditField, HistoryEditor, LayoutControlMutation, Modal,
+    PaneControlIcon, PaneDrag, PixelRect, RenameEditor, RenameTarget, ResizeDrag, SearchEditor,
+    SelectionDrag, SidebarResizeLifecycle, SidebarResizeMove, SplitControlId,
+    TabIdentityPresentation, TabMenu, TerminalLineRender, TmuxSelectionChange, TmuxSessionPicker,
+    TooltipView, WorkspaceConnectionInfo, WorkspaceCreationDialog, WorkspaceCreationField,
+    WorkspaceCreationKind, WorkspaceCreationStep, WorkspaceDeleteConfirmation,
+    WorkspaceDisconnectConfirmation, WorkspaceDrag, WorkspaceDropPreview, WorkspaceMenu,
+    WorkspaceRenameEditor, WorkstationGroupExpansion, route_workspace_creation_paste,
 };
 
 actions!(
@@ -213,6 +214,7 @@ struct NahApp {
     stream_diagnostics: StreamDiagnostics,
     active_workspace: Option<Uuid>,
     expanded_workspaces: HashSet<Uuid>,
+    collapsed_groups: HashSet<Uuid>,
     workstation_groups: WorkstationGroupExpansion,
     focused_pane: Option<Uuid>,
     split_ratios: HashMap<SplitControlId, f32>,
@@ -293,6 +295,7 @@ impl NahApp {
             stream_diagnostics: StreamDiagnostics::default(),
             active_workspace: None,
             expanded_workspaces: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             workstation_groups: WorkstationGroupExpansion::default(),
             focused_pane: None,
             split_ratios: HashMap::new(),
@@ -500,6 +503,13 @@ impl NahApp {
                         FocusResync::Switch(pane_id) => focus_resync = Some(pane_id),
                         FocusResync::Clear => self.focused_pane = None,
                     }
+                    let live_tab_ids = snapshot
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| workspace.tabs.iter().map(|tab| tab.id))
+                        .collect::<HashSet<_>>();
+                    self.collapsed_groups
+                        .retain(|tab_id| live_tab_ids.contains(tab_id));
                     self.snapshot = Some(snapshot);
                 }
                 let delivered_at = Instant::now();
@@ -941,6 +951,13 @@ impl NahApp {
         cx.notify();
     }
 
+    fn toggle_group_collapsed(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        if !self.collapsed_groups.remove(&tab_id) {
+            self.collapsed_groups.insert(tab_id);
+        }
+        cx.notify();
+    }
+
     fn select_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
         self.active_workspace = Some(workspace_id);
         let first_pane = self.snapshot.as_ref().and_then(|snapshot| {
@@ -1027,8 +1044,38 @@ impl NahApp {
         cx.notify();
     }
 
+    fn new_workspace_tab(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        match self.call(&ClientRequest::CreateWorkspaceTab { workspace_id }) {
+            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                self.focus_pane_with_snapshot(pane_id);
+                self.expanded_workspaces.insert(workspace_id);
+            }
+            Ok(response) => self.report_unexpected(&response),
+            Err(error) => self.report(&error),
+        }
+        self.refresh_state();
+        self.last_sizes.clear();
+        self.modal = Modal::None;
+        cx.notify();
+    }
+
+    fn new_workspace_group(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        match self.call(&ClientRequest::CreateWorkspaceGroup { workspace_id }) {
+            Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                self.focus_pane_with_snapshot(pane_id);
+                self.expanded_workspaces.insert(workspace_id);
+            }
+            Ok(response) => self.report_unexpected(&response),
+            Err(error) => self.report(&error),
+        }
+        self.refresh_state();
+        self.last_sizes.clear();
+        self.modal = Modal::None;
+        cx.notify();
+    }
+
     fn new_tab_at(&mut self, target_pane: Uuid, cx: &mut Context<Self>) {
-        match self.call(&ClientRequest::CreateTab { target_pane }) {
+        match self.call(&ClientRequest::CreateGroupTerminal { target_pane }) {
             Ok(ServiceResponse::PaneCreated { pane_id }) => {
                 self.focus_pane_with_snapshot(pane_id);
             }
@@ -1129,6 +1176,29 @@ impl NahApp {
         })
     }
 
+    fn group_metadata(&self, tab_id: Uuid) -> Option<(String, Uuid)> {
+        self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| {
+                    let pane_id = visible_panes(&tab.layout).first().copied().or_else(|| {
+                        let mut panes = Vec::new();
+                        collect_terminal_tabs(&tab.layout, &mut panes);
+                        panes.first().map(|pane| pane.id)
+                    })?;
+                    Some((
+                        tab.custom_title
+                            .clone()
+                            .unwrap_or_else(|| tab.title.clone()),
+                        pane_id,
+                    ))
+                })
+        })
+    }
+
     fn open_tab_menu(&mut self, pane_id: Uuid, position: Point<Pixels>, cx: &mut Context<Self>) {
         if let Err(error) = self.call(&ClientRequest::ActivateTab { pane_id }) {
             self.report(&error);
@@ -1155,6 +1225,32 @@ impl NahApp {
         });
         self.last_sizes.clear();
         cx.notify();
+    }
+
+    fn open_group_menu(&mut self, tab_id: Uuid, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.modal = Modal::GroupMenu(GroupMenu { tab_id, position });
+        cx.notify();
+    }
+
+    fn new_group_terminal(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        let target_pane = self.group_metadata(tab_id).map(|(_, pane_id)| pane_id);
+        self.modal = Modal::None;
+        if let Some(target_pane) = target_pane {
+            self.new_tab_at(target_pane, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn begin_group_rename(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        if let Some((label, _)) = self.group_metadata(tab_id) {
+            self.modal = Modal::GroupRename(GroupRenameEditor {
+                tab_id,
+                value: label,
+                replace_on_type: true,
+            });
+            cx.notify();
+        }
     }
 
     fn begin_rename(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
@@ -1185,6 +1281,17 @@ impl NahApp {
         };
         self.send(&ClientRequest::RenamePane {
             pane_id: editor.pane_id,
+            title: editor.value,
+        });
+        cx.notify();
+    }
+
+    fn submit_group_rename(&mut self, cx: &mut Context<Self>) {
+        let Modal::GroupRename(editor) = std::mem::take(&mut self.modal) else {
+            return;
+        };
+        self.send(&ClientRequest::RenameTab {
+            tab_id: editor.tab_id,
             title: editor.value,
         });
         cx.notify();
@@ -1959,6 +2066,11 @@ impl NahApp {
             cx.notify();
             return;
         }
+        if let Some(editor) = self.modal.group_rename_mut() {
+            append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
+            cx.notify();
+            return;
+        }
         if let Some(editor) = self.modal.search_mut() {
             let remaining = 256_usize.saturating_sub(editor.query.chars().count());
             editor
@@ -2347,14 +2459,19 @@ impl NahApp {
     fn handle_rename_key(
         &mut self,
         keystroke: &gpui::Keystroke,
-        workspace: bool,
+        target: RenameTarget,
         cx: &mut Context<Self>,
     ) {
-        let (value, replace_on_type) = match (&mut self.modal, workspace) {
-            (Modal::WorkspaceRename(editor), true) => {
+        let (value, replace_on_type) = match (&mut self.modal, target) {
+            (Modal::WorkspaceRename(editor), RenameTarget::Workspace) => {
                 (&mut editor.value, &mut editor.replace_on_type)
             }
-            (Modal::PaneRename(editor), false) => (&mut editor.value, &mut editor.replace_on_type),
+            (Modal::PaneRename(editor), RenameTarget::Pane) => {
+                (&mut editor.value, &mut editor.replace_on_type)
+            }
+            (Modal::GroupRename(editor), RenameTarget::Group) => {
+                (&mut editor.value, &mut editor.replace_on_type)
+            }
             _ => return,
         };
         if keystroke.modifiers.platform && keystroke.key.eq_ignore_ascii_case("a") {
@@ -2363,8 +2480,11 @@ impl NahApp {
             return;
         }
         match keystroke.key.as_str() {
-            "enter" if workspace => self.submit_workspace_rename(cx),
-            "enter" => self.submit_rename(cx),
+            "enter" => match target {
+                RenameTarget::Pane => self.submit_rename(cx),
+                RenameTarget::Workspace => self.submit_workspace_rename(cx),
+                RenameTarget::Group => self.submit_group_rename(cx),
+            },
             "escape" => {
                 self.modal = Modal::None;
                 cx.notify();
@@ -2513,12 +2633,17 @@ impl NahApp {
                 return;
             }
             Modal::WorkspaceRename(_) => {
-                self.handle_rename_key(keystroke, true, cx);
+                self.handle_rename_key(keystroke, RenameTarget::Workspace, cx);
                 cx.stop_propagation();
                 return;
             }
             Modal::PaneRename(_) => {
-                self.handle_rename_key(keystroke, false, cx);
+                self.handle_rename_key(keystroke, RenameTarget::Pane, cx);
+                cx.stop_propagation();
+                return;
+            }
+            Modal::GroupRename(_) => {
+                self.handle_rename_key(keystroke, RenameTarget::Group, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -2575,7 +2700,10 @@ impl NahApp {
                 cx.stop_propagation();
                 return;
             }
-            Modal::TabMenu(_) | Modal::WorkspaceMenu(_) | Modal::WorkspaceConnectionInfo(_) => {
+            Modal::TabMenu(_)
+            | Modal::WorkspaceMenu(_)
+            | Modal::GroupMenu(_)
+            | Modal::WorkspaceConnectionInfo(_) => {
                 if keystroke.key == "escape" {
                     self.modal = Modal::None;
                     cx.stop_propagation();
@@ -2967,15 +3095,21 @@ impl NahApp {
                             }
                         );
                         let workspace_title = workspace.title.clone();
-                        let terminal_tabs = workspace_terminal_tabs(workspace)
+                        let tab_entries = workspace_tab_entries(workspace)
                             .into_iter()
-                            .cloned()
+                            .map(|entry| {
+                                (
+                                    entry.tab_id,
+                                    entry.group_label,
+                                    entry.panes.into_iter().cloned().collect::<Vec<_>>(),
+                                )
+                            })
                             .collect::<Vec<_>>();
                         let first_pane = workspace
                             .tabs
                             .first()
                             .and_then(|tab| visible_panes(&tab.layout).first().copied());
-                        let terminal_count = terminal_tabs.len();
+                        let terminal_count = workspace_terminal_tabs(workspace).len();
                         let expanded = self.expanded_workspaces.contains(&workspace_id);
                         let workspace_color = self.workspace_color(workspace_id).as_rgb();
                         let card_color = if connected {
@@ -3312,7 +3446,7 @@ impl NahApp {
                                     }),
                             )
                             .when(expanded, |element| {
-                                if terminal_tabs.is_empty() {
+                                if terminal_count == 0 {
                                     element.child(
                                         div()
                                             .ml(px(28.0))
@@ -3324,96 +3458,120 @@ impl NahApp {
                                             .child("No open terminal tabs"),
                                     )
                                 } else {
-                                    element.children(terminal_tabs.into_iter().map(|pane| {
-                                        let pane_id = pane.id;
-                                        let selected = self.focused_pane == Some(pane_id);
-                                        let identity = tab_identity_presentation(&pane);
-                                        let identity_detail = identity.detail.clone();
-                                        let pane_accent = self.terminal_accent(pane_id).as_rgb();
-                                        div()
-                                            .id(("workspace-tab", element_key(pane_id)))
-                                            .ml(px(20.0))
-                                            .mr(px(4.0))
-                                            .px(px(7.0))
-                                            .h(px(27.0))
-                                            .rounded(px(4.0))
-                                            .cursor_pointer()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(7.0))
-                                            .when(selected, |element| {
-                                                element.bg(rgb(THEME.surface))
-                                            })
-                                            .hover(|element| element.bg(rgb(THEME.elevated)))
-                                            .tooltip(move |_, cx| {
-                                                cx.new(|_| TooltipView {
-                                                    text: identity_detail.clone(),
-                                                })
-                                                .into()
-                                            })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.select_workspace_tab(
-                                                    workspace_id,
-                                                    pane_id,
-                                                    cx,
-                                                );
-                                                cx.stop_propagation();
-                                            }))
-                                            .on_mouse_down(
-                                                MouseButton::Right,
-                                                cx.listener(
-                                                    move |this, event: &MouseDownEvent, _, cx| {
-                                                        this.open_tab_menu(
-                                                            pane_id,
-                                                            event.position,
-                                                            cx,
+                                    element.children(tab_entries.into_iter().flat_map(
+                                        |(tab_id, group_label, panes)| {
+                                            let mut rows = Vec::new();
+                                            match group_label {
+                                                None => {
+                                                    if let Some(pane) = panes.into_iter().next() {
+                                                        rows.push(
+                                                            self.render_workspace_terminal_row(
+                                                                workspace_id,
+                                                                &pane,
+                                                                20.0,
+                                                                cx,
+                                                            ),
                                                         );
-                                                        cx.stop_propagation();
-                                                    },
-                                                ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .w(px(18.0))
-                                                    .h(px(18.0))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(render_terminal_profile_mark(
-                                                        identity.profile,
-                                                        if selected {
-                                                            THEME.foreground
-                                                        } else {
-                                                            THEME.muted
-                                                        },
-                                                        if selected {
-                                                            pane_accent
-                                                        } else {
-                                                            THEME.muted
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
-                                                div()
-                                                    .min_w(px(0.0))
-                                                    .flex_1()
-                                                    .truncate()
-                                                    .font_family(".SystemUIFont")
-                                                    .text_xs()
-                                                    .font_weight(if selected {
-                                                        gpui::FontWeight::MEDIUM
-                                                    } else {
-                                                        gpui::FontWeight::NORMAL
-                                                    })
-                                                    .text_color(if selected {
-                                                        rgb(THEME.foreground)
-                                                    } else {
-                                                        rgb(THEME.muted)
-                                                    })
-                                                    .child(identity.label),
-                                            )
-                                    }))
+                                                    }
+                                                }
+                                                Some(label) => {
+                                                    let collapsed =
+                                                        self.collapsed_groups.contains(&tab_id);
+                                                    let count_label =
+                                                        terminal_tab_count_label(panes.len());
+                                                    rows.push(
+                                                        div()
+                                                            .id((
+                                                                "workspace-group",
+                                                                element_key(tab_id),
+                                                            ))
+                                                            .ml(px(20.0))
+                                                            .mr(px(4.0))
+                                                            .px(px(7.0))
+                                                            .h(px(27.0))
+                                                            .rounded(px(4.0))
+                                                            .cursor_pointer()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap(px(6.0))
+                                                            .hover(|element| {
+                                                                element.bg(rgb(THEME.elevated))
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.toggle_group_collapsed(
+                                                                        tab_id, cx,
+                                                                    );
+                                                                    cx.stop_propagation();
+                                                                },
+                                                            ))
+                                                            .on_mouse_down(
+                                                                MouseButton::Right,
+                                                                cx.listener(
+                                                                    move |this,
+                                                                          event:
+                                                                              &MouseDownEvent,
+                                                                          _,
+                                                                          cx| {
+                                                                        this.open_group_menu(
+                                                                            tab_id,
+                                                                            event.position,
+                                                                            cx,
+                                                                        );
+                                                                        cx.stop_propagation();
+                                                                    },
+                                                                ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_none()
+                                                                    .w(px(12.0))
+                                                                    .font_family(".SystemUIFont")
+                                                                    .text_xs()
+                                                                    .text_color(rgb(THEME.dim))
+                                                                    .child(if collapsed {
+                                                                        "▸"
+                                                                    } else {
+                                                                        "▾"
+                                                                    }),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .min_w(px(0.0))
+                                                                    .flex_1()
+                                                                    .truncate()
+                                                                    .font_family(".SystemUIFont")
+                                                                    .text_xs()
+                                                                    .text_color(rgb(
+                                                                        THEME.foreground,
+                                                                    ))
+                                                                    .child(label),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_none()
+                                                                    .font_family(".SystemUIFont")
+                                                                    .text_xs()
+                                                                    .text_color(rgb(THEME.dim))
+                                                                    .child(count_label),
+                                                            )
+                                                            .into_any_element(),
+                                                    );
+                                                    if !collapsed {
+                                                        rows.extend(panes.into_iter().map(|pane| {
+                                                            self.render_workspace_terminal_row(
+                                                                workspace_id,
+                                                                &pane,
+                                                                34.0,
+                                                                cx,
+                                                            )
+                                                        }));
+                                                    }
+                                                }
+                                            }
+                                            rows
+                                        },
+                                    ))
                                 }
                             })
                                 )
@@ -3436,6 +3594,88 @@ impl NahApp {
                     })
             })
             .child(div().flex_1())
+            .into_any_element()
+    }
+
+    fn render_workspace_terminal_row(
+        &self,
+        workspace_id: Uuid,
+        pane: &Pane,
+        indent: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pane_id = pane.id;
+        let selected = self.focused_pane == Some(pane_id);
+        let identity = tab_identity_presentation(pane);
+        let identity_detail = identity.detail.clone();
+        let pane_accent = self.terminal_accent(pane_id).as_rgb();
+        div()
+            .id(("workspace-tab", element_key(pane_id)))
+            .ml(px(indent))
+            .mr(px(4.0))
+            .px(px(7.0))
+            .h(px(27.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .when(selected, |element| element.bg(rgb(THEME.surface)))
+            .hover(|element| element.bg(rgb(THEME.elevated)))
+            .tooltip(move |_, cx| {
+                cx.new(|_| TooltipView {
+                    text: identity_detail.clone(),
+                })
+                .into()
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_workspace_tab(workspace_id, pane_id, cx);
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_tab_menu(pane_id, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(render_terminal_profile_mark(
+                        identity.profile,
+                        if selected {
+                            THEME.foreground
+                        } else {
+                            THEME.muted
+                        },
+                        if selected { pane_accent } else { THEME.muted },
+                    )),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .font_weight(if selected {
+                        gpui::FontWeight::MEDIUM
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        rgb(THEME.foreground)
+                    } else {
+                        rgb(THEME.muted)
+                    })
+                    .child(identity.label),
+            )
             .into_any_element()
     }
 
@@ -4796,6 +5036,57 @@ impl NahApp {
             .into_any_element()
     }
 
+    fn render_group_menu(&self, menu: GroupMenu, cx: &mut Context<Self>) -> AnyElement {
+        let tab_id = menu.tab_id;
+        div()
+            .absolute()
+            .left(menu.position.x)
+            .top(menu.position.y)
+            .w(px(232.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .bg(rgb(THEME.elevated))
+            .border_1()
+            .border_color(rgb(THEME.border_strong))
+            .shadow_lg()
+            .occlude()
+            .child(
+                div()
+                    .id(("new-group-terminal", element_key(tab_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.new_group_terminal(tab_id, cx)),
+                    )
+                    .child("New terminal in group"),
+            )
+            .child(
+                div()
+                    .id(("rename-group-menu", element_key(tab_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.begin_group_rename(tab_id, cx)),
+                    )
+                    .child("Rename group…"),
+            )
+            .into_any_element()
+    }
+
     fn render_workspace_menu(&self, menu: WorkspaceMenu, cx: &mut Context<Self>) -> AnyElement {
         let workspace_id = menu.workspace_id;
         let workspace = self.snapshot.as_ref().and_then(|snapshot| {
@@ -4839,6 +5130,42 @@ impl NahApp {
             .border_color(rgb(THEME.border_strong))
             .shadow_lg()
             .occlude()
+            .child(
+                div()
+                    .id(("new-workspace-tab-menu", element_key(workspace_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.new_workspace_tab(workspace_id, cx)),
+                    )
+                    .child("New Tab"),
+            )
+            .child(
+                div()
+                    .id(("new-workspace-group-menu", element_key(workspace_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.new_workspace_group(workspace_id, cx)
+                        }),
+                    )
+                    .child("New Group"),
+            )
             .child(
                 div()
                     .id(("rename-workspace-menu", element_key(workspace_id)))
@@ -5995,6 +6322,9 @@ impl NahApp {
                                         DialogAction::RenameWorkspace => {
                                             this.submit_workspace_rename(cx);
                                         }
+                                        DialogAction::RenameTab => {
+                                            this.submit_group_rename(cx);
+                                        }
                                         DialogAction::DeleteWorkspace => {
                                             this.confirm_workspace_delete(cx);
                                         }
@@ -6049,6 +6379,47 @@ impl NahApp {
                 confirm_tone: DialogTone::Accent,
                 confirm_id: "save-rename",
                 action: DialogAction::RenamePane,
+            },
+            cx,
+        )
+    }
+
+    fn render_group_rename_dialog(
+        &self,
+        editor: &GroupRenameEditor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = div()
+            .id("group-rename-input")
+            .track_focus(&self.focus_handle)
+            .h(px(36.0))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .bg(rgb(THEME.terminal))
+            .border_1()
+            .border_color(rgb(THEME.accent))
+            .flex()
+            .items_center()
+            .font_family(".SystemUIFont")
+            .text_sm()
+            .text_color(rgb(THEME.foreground))
+            .child(
+                div()
+                    .when(editor.replace_on_type, |element| {
+                        element.bg(rgb(THEME.selection))
+                    })
+                    .child(format!("{}{}", editor.value, self.ime_preedit)),
+            )
+            .child("│")
+            .into_any_element();
+        self.confirm_dialog(
+            body,
+            DialogSpec {
+                title: "Rename group".to_owned(),
+                confirm_label: "Rename",
+                confirm_tone: DialogTone::Accent,
+                confirm_id: "save-group-rename",
+                action: DialogAction::RenameTab,
             },
             cx,
         )
@@ -7218,7 +7589,10 @@ impl Render for NahApp {
         // terminal behind the dialog.
         if let Some(dialog) = self.modal.workspace_creation() {
             self.workspace_input_focus[dialog.field.index()].focus(window);
-        } else if self.modal.pane_rename().is_some() || self.modal.workspace_rename().is_some() {
+        } else if self.modal.pane_rename().is_some()
+            || self.modal.workspace_rename().is_some()
+            || self.modal.group_rename().is_some()
+        {
             // Keep a rename modal on the root text-input route. This makes
             // replacement typing reliable after clearing the selected title.
             self.focus_handle.focus(window);
@@ -7231,6 +7605,7 @@ impl Render for NahApp {
             }
             Modal::WorkspaceRename(editor) => Some(self.render_workspace_rename_dialog(editor, cx)),
             Modal::PaneRename(editor) => Some(self.render_rename_dialog(editor, cx)),
+            Modal::GroupRename(editor) => Some(self.render_group_rename_dialog(editor, cx)),
             Modal::WorkspaceDelete(confirmation) => {
                 Some(self.render_workspace_delete_dialog(confirmation, cx))
             }
@@ -7241,6 +7616,7 @@ impl Render for NahApp {
             Modal::Close(confirmation) => Some(self.render_close_dialog(confirmation, cx)),
             Modal::TabMenu(menu) => Some(self.render_tab_menu(*menu, cx)),
             Modal::WorkspaceMenu(menu) => Some(self.render_workspace_menu(*menu, cx)),
+            Modal::GroupMenu(menu) => Some(self.render_group_menu(*menu, cx)),
             Modal::WorkspaceConnectionInfo(info) => {
                 Some(self.render_workspace_connection_info(info, cx))
             }
@@ -7284,6 +7660,7 @@ impl Render for NahApp {
                         this.modal,
                         Modal::TabMenu(_)
                             | Modal::WorkspaceMenu(_)
+                            | Modal::GroupMenu(_)
                             | Modal::WorkspaceConnectionInfo(_)
                     ) {
                         this.modal = Modal::None;

@@ -297,7 +297,7 @@ pub(super) fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
     }
 }
 
-fn collect_terminal_tabs<'a>(layout: &'a PaneLayout, panes: &mut Vec<&'a Pane>) {
+pub(super) fn collect_terminal_tabs<'a>(layout: &'a PaneLayout, panes: &mut Vec<&'a Pane>) {
     match layout {
         PaneLayout::Leaf { pane } => panes.push(pane),
         PaneLayout::Stack { panes: stacked, .. } => panes.extend(stacked),
@@ -314,6 +314,35 @@ pub(super) fn workspace_terminal_tabs(workspace: &Workspace) -> Vec<&Pane> {
         collect_terminal_tabs(&tab.layout, &mut panes);
     }
     panes
+}
+
+/// One sidebar entry per tab. `group_label` is `Some` exactly when the tab
+/// must render as a group: it holds several terminals, or the user named it.
+pub(super) struct WorkstationTabEntry<'a> {
+    pub(super) tab_id: Uuid,
+    pub(super) group_label: Option<String>,
+    pub(super) panes: Vec<&'a Pane>,
+}
+
+pub(super) fn workspace_tab_entries(workspace: &Workspace) -> Vec<WorkstationTabEntry<'_>> {
+    workspace
+        .tabs
+        .iter()
+        .map(|tab| {
+            let mut panes = Vec::new();
+            collect_terminal_tabs(&tab.layout, &mut panes);
+            let group_label = (panes.len() >= 2 || tab.custom_title.is_some()).then(|| {
+                tab.custom_title
+                    .clone()
+                    .unwrap_or_else(|| tab.title.clone())
+            });
+            WorkstationTabEntry {
+                tab_id: tab.id,
+                group_label,
+                panes,
+            }
+        })
+        .collect()
 }
 
 /// Visible panes across every tab of one workstation, in tab order.
@@ -1048,6 +1077,80 @@ mod tests {
         );
         assert_eq!(terminal_tab_count_label(tabs.len()), "3 terminals");
     }
+
+    #[test]
+    fn workspace_tab_projection_preserves_tab_order_and_group_identity() {
+        let make_pane = |id: u128| Pane {
+            id: Uuid::from_u128(id),
+            title: format!("Terminal {id}"),
+            shell: "zsh".to_owned(),
+            color: None,
+            identity: nah_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+        };
+        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
+        workspace.tabs = vec![
+            nah_protocol::Tab {
+                id: Uuid::from_u128(10),
+                title: "Single".to_owned(),
+                custom_title: None,
+                layout: PaneLayout::Leaf { pane: make_pane(1) },
+            },
+            nah_protocol::Tab {
+                id: Uuid::from_u128(20),
+                title: "Named".to_owned(),
+                custom_title: Some("Group 1".to_owned()),
+                layout: PaneLayout::Leaf { pane: make_pane(2) },
+            },
+            nah_protocol::Tab {
+                id: Uuid::from_u128(30),
+                title: "Stacked".to_owned(),
+                custom_title: None,
+                layout: PaneLayout::Stack {
+                    panes: vec![make_pane(3), make_pane(4)],
+                    active: Uuid::from_u128(3),
+                },
+            },
+            nah_protocol::Tab {
+                id: Uuid::from_u128(40),
+                title: "Split".to_owned(),
+                custom_title: None,
+                layout: PaneLayout::Split {
+                    axis: SplitAxis::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(PaneLayout::Leaf { pane: make_pane(5) }),
+                    second: Box::new(PaneLayout::Leaf { pane: make_pane(6) }),
+                },
+            },
+        ];
+
+        let entries = workspace_tab_entries(&workspace);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.group_label.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, Some("Group 1"), Some("Stacked"), Some("Split")]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.panes.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 2]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.tab_id).collect::<Vec<_>>(),
+            vec![
+                Uuid::from_u128(10),
+                Uuid::from_u128(20),
+                Uuid::from_u128(30),
+                Uuid::from_u128(40)
+            ]
+        );
+    }
     #[test]
     fn runtime_tmux_tab_panes_stay_visible_to_focus_bookkeeping() {
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
@@ -1056,6 +1159,7 @@ mod tests {
         workspace.tabs.push(nah_protocol::Tab {
             id: Uuid::from_u128(0x88),
             title: "buzz".to_owned(),
+            custom_title: None,
             layout: PaneLayout::Leaf {
                 pane: Pane {
                     id: tmux_pane,
@@ -1583,6 +1687,7 @@ mod tests {
                 nah_protocol::Tab {
                     id: Uuid::from_u128(10),
                     title: "SSH".to_owned(),
+                    custom_title: None,
                     layout: PaneLayout::Leaf {
                         pane: first.clone(),
                     },
@@ -1590,6 +1695,7 @@ mod tests {
                 nah_protocol::Tab {
                     id: Uuid::from_u128(20),
                     title: "tmux".to_owned(),
+                    custom_title: None,
                     layout: PaneLayout::Leaf { pane: tmux.clone() },
                 },
             ],

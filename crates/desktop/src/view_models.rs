@@ -110,6 +110,12 @@ pub(super) struct WorkspaceMenu {
     pub(super) position: Point<Pixels>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GroupMenu {
+    pub(super) tab_id: Uuid,
+    pub(super) position: Point<Pixels>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ColorTarget {
     DefaultTerminal,
@@ -131,6 +137,20 @@ pub(super) struct RenameEditor {
     pub(super) pane_id: Uuid,
     pub(super) value: String,
     pub(super) replace_on_type: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct GroupRenameEditor {
+    pub(super) tab_id: Uuid,
+    pub(super) value: String,
+    pub(super) replace_on_type: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RenameTarget {
+    Pane,
+    Workspace,
+    Group,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -823,6 +843,7 @@ pub(super) enum DialogTone {
 pub(super) enum DialogAction {
     RenamePane,
     RenameWorkspace,
+    RenameTab,
     DeleteWorkspace,
     DisconnectWorkspace,
     ClosePane,
@@ -843,6 +864,7 @@ pub(super) enum Modal {
     WorkspaceCreation(WorkspaceCreationDialog),
     WorkspaceRename(WorkspaceRenameEditor),
     PaneRename(RenameEditor),
+    GroupRename(GroupRenameEditor),
     Search(SearchEditor),
     WorkspaceDelete(WorkspaceDeleteConfirmation),
     TmuxPicker(TmuxSessionPicker),
@@ -850,6 +872,7 @@ pub(super) enum Modal {
     Close(CloseConfirmation),
     TabMenu(TabMenu),
     WorkspaceMenu(WorkspaceMenu),
+    GroupMenu(GroupMenu),
     WorkspaceConnectionInfo(WorkspaceConnectionInfo),
     AppearanceSettings,
 }
@@ -906,6 +929,20 @@ impl Modal {
 
     pub(super) fn pane_rename(&self) -> Option<&RenameEditor> {
         let Self::PaneRename(editor) = self else {
+            return None;
+        };
+        Some(editor)
+    }
+
+    pub(super) fn group_rename_mut(&mut self) -> Option<&mut GroupRenameEditor> {
+        let Self::GroupRename(editor) = self else {
+            return None;
+        };
+        Some(editor)
+    }
+
+    pub(super) fn group_rename(&self) -> Option<&GroupRenameEditor> {
+        let Self::GroupRename(editor) = self else {
             return None;
         };
         Some(editor)

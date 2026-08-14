@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 18;
 pub const SOCKET_ENV: &str = "NAH_SOCKET";
 pub const STATE_DIR_ENV: &str = "NAH_STATE_DIR";
 pub const CONFIG_ENV: &str = "NAH_CONFIG";
@@ -87,6 +87,7 @@ impl SessionSnapshot {
         let tab = Tab {
             id: Uuid::new_v4(),
             title: "Shell".to_owned(),
+            custom_title: None,
             layout: PaneLayout::Leaf { pane },
         };
 
@@ -239,6 +240,8 @@ pub enum WorkspacePinMove {
 pub struct Tab {
     pub id: Uuid,
     pub title: String,
+    #[serde(default)]
+    pub custom_title: Option<String>,
     pub layout: PaneLayout,
 }
 
@@ -793,10 +796,16 @@ pub enum ClientRequest {
         target_pane: Uuid,
         axis: SplitAxis,
     },
-    CreateTab {
+    CreateGroupTerminal {
         target_pane: Uuid,
     },
     CreateWorkspaceTerminal {
+        workspace_id: Uuid,
+    },
+    CreateWorkspaceTab {
+        workspace_id: Uuid,
+    },
+    CreateWorkspaceGroup {
         workspace_id: Uuid,
     },
     ConnectSsh {
@@ -830,6 +839,10 @@ pub enum ClientRequest {
     },
     RenamePane {
         pane_id: Uuid,
+        title: String,
+    },
+    RenameTab {
+        tab_id: Uuid,
         title: String,
     },
     SetPaneProfile {

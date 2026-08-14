@@ -155,7 +155,7 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
         first,
         registry.create_pane(first, SplitAxis::Horizontal).unwrap(),
         registry.create_pane(first, SplitAxis::Vertical).unwrap(),
-        registry.create_tab(first).unwrap(),
+        registry.create_group_terminal(first).unwrap(),
     ];
     for (index, pane_id) in panes.iter().enumerate() {
         registry
@@ -263,7 +263,7 @@ fn keystroke_echo_reaches_a_subscribed_pane_promptly() {
         first,
         registry.create_pane(first, SplitAxis::Horizontal).unwrap(),
         registry.create_pane(first, SplitAxis::Vertical).unwrap(),
-        registry.create_tab(first).unwrap(),
+        registry.create_group_terminal(first).unwrap(),
     ];
     for (index, pane_id) in panes.iter().enumerate() {
         registry
