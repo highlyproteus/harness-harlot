@@ -20,6 +20,20 @@ pub(super) struct WorkspaceDrag {
     pub(super) position: Point<Pixels>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct TabDrag {
+    pub(super) workspace_id: Uuid,
+    pub(super) tab_id: Uuid,
+    pub(super) title: String,
+    pub(super) position: Point<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TabDropPreview {
+    pub(super) target_tab_id: Uuid,
+    pub(super) after: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct WorkspaceDropPreview {
     pub(super) target_workspace_id: Uuid,
@@ -55,6 +69,28 @@ impl Render for PaneDrag {
 }
 
 impl Render for WorkspaceDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .left(self.position.x - px(82.0))
+            .top(self.position.y - px(14.0))
+            .w(px(164.0))
+            .h(px(28.0))
+            .rounded(px(5.0))
+            .bg(rgb(THEME.elevated))
+            .border_1()
+            .border_color(rgb(THEME.accent))
+            .flex()
+            .items_center()
+            .justify_center()
+            .font_family(".SystemUIFont")
+            .text_sm()
+            .text_color(rgb(THEME.foreground))
+            .child(self.title.clone())
+    }
+}
+
+impl Render for TabDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .absolute()
@@ -1034,6 +1070,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: Some("build".to_owned()),
             profile_override: None,
+            custom_icon: None,
         };
 
         let confirmation = CloseConfirmation::for_pane(&pane, true);

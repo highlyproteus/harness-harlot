@@ -10,7 +10,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-#[cfg(test)]
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -22,10 +21,10 @@ use gpui::{
     DispatchPhase, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, Image, ImageFormat, InspectorElementId,
     KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine, StrikethroughStyle,
-    Style, StyledText, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window,
-    WindowBounds, WindowOptions, actions, div, fill, img, point, prelude::*, px, relative, rgb,
-    rgba, size, svg,
+    PaintQuad, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine,
+    StrikethroughStyle, Style, StyledText, TextRun, TitlebarOptions, UTF16Selection,
+    UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, fill, img, point,
+    prelude::*, px, relative, rgb, rgba, size, svg,
 };
 use nah_desktop::SessionClient;
 use nah_protocol::{
@@ -36,8 +35,8 @@ use nah_protocol::{
     TerminalColor, TerminalHistoryPage, TerminalLine, TerminalModes, TerminalModifiers,
     TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalRun,
     TerminalScreen, TerminalSelection, TerminalSelectionKind, TmuxScanScope, TmuxSession,
-    TmuxSessionId, Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove,
-    normalize_ssh_input, validate_ssh_host,
+    TmuxSessionId, Workspace, WorkspaceConnection, WorkspaceConnectionStatus, normalize_ssh_input,
+    validate_ssh_host,
 };
 use parking_lot::Mutex;
 use unicode_width::UnicodeWidthChar;
@@ -51,27 +50,31 @@ mod typography;
 mod ui_state;
 mod view_models;
 
-use agent_icons::{AgentIconAssets, AgentIconFormat, agent_icon_definition};
+use agent_icons::{
+    AgentIconAssets, AgentIconFormat, CustomIcon, agent_icon_definition, import_custom_icon,
+    load_custom_icons,
+};
 use commands::{
     AppCommand, AppConfig, ROOT_KEY_CONTEXT, ResolvedBinding, ResolvedKeymap, descriptor,
     palette_matches,
 };
 use helpers::{
     FocusResync, IDENTITY_MARK_SIZE, append_rename_text, apply_layout_control_mutation,
-    collect_pane_sizes, collect_terminal_tabs, constrained_sidebar_width, default_sidebar_width,
-    effective_split_ratio, element_key, find_pane, find_split_rect, focus_resync_for, format_bytes,
-    format_history_date, gpui_binding, history_label, history_scope_key, history_warning_text,
-    migrated_sidebar_width, next_terminal_poll_delay_ms, paced_subscriptions,
-    pane_update_requires_repaint, parse_hex_color, plain_history_line, prepare_paste, product_name,
-    readable_text_color, render_sidebar_toggle_icon, render_terminal_profile_mark,
-    resolved_terminal_accent, resolved_workspace_color, selection_span,
-    sidebar_width_for_visibility, split_child_dimensions, split_control_id, split_element_key,
-    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
-    tab_identity_presentation, terminal_input_bytes, terminal_modifiers, terminal_mouse_button,
-    terminal_point_at, terminal_run_display_text, terminal_tab_count_label, visible_panes,
-    workspace_is_selectable, workspace_layout_for_focused_pane, workspace_pixel_size,
-    workspace_tab_entries, workspace_terminal_tabs, workspace_visible_panes,
-    workstation_banner_header_height, zoom_projection,
+    collect_pane_sizes, collect_terminal_tabs, composite_rgb, constrained_sidebar_width,
+    default_sidebar_width, effective_split_ratio, element_key, find_pane, find_split_rect,
+    focus_resync_for, format_bytes, format_history_date, gpui_binding, history_label,
+    history_scope_key, history_warning_text, migrated_sidebar_width, next_terminal_poll_delay_ms,
+    paced_subscriptions, pane_update_requires_repaint, parse_hex_color, plain_history_line,
+    prepare_paste, product_name, readable_text_color, render_sidebar_toggle_icon,
+    render_terminal_profile_mark, resolved_terminal_accent, resolved_workspace_color,
+    rgba_with_alpha, selection_span, sidebar_width_for_visibility, split_child_dimensions,
+    split_control_id, split_element_key, split_placement_at, split_target_for_drag,
+    split_target_for_drag_ids, tab_identity_presentation, terminal_input_bytes, terminal_modifiers,
+    terminal_mouse_button, terminal_point_at, terminal_run_display_text, terminal_tab_count_label,
+    terminal_tab_secondary_label, visible_panes, workspace_is_selectable,
+    workspace_layout_for_focused_pane, workspace_pixel_size, workspace_tab_entries,
+    workspace_terminal_tabs, workspace_visible_panes, workstation_banner_header_height,
+    zoom_projection,
 };
 use theme::{AppTheme, BuiltInTheme};
 use typography::TerminalFontProfile;
@@ -81,12 +84,13 @@ use view_models::{
     DialogAction, DialogSpec, DialogTextEditor, DialogTone, DragDestination, DragHoverState,
     GroupMenu, GroupRenameEditor, HistoryEditField, HistoryEditor, LayoutControlMutation, Modal,
     PaneControlIcon, PaneDrag, PixelRect, RenameEditor, RenameTarget, ResizeDrag, SearchEditor,
-    SelectionDrag, SidebarResizeLifecycle, SidebarResizeMove, SplitControlId,
-    TabIdentityPresentation, TabMenu, TerminalLineRender, TmuxSelectionChange, TmuxSessionPicker,
-    TooltipView, WorkspaceConnectionInfo, WorkspaceCreationDialog, WorkspaceCreationField,
-    WorkspaceCreationKind, WorkspaceCreationStep, WorkspaceDeleteConfirmation,
-    WorkspaceDisconnectConfirmation, WorkspaceDrag, WorkspaceDropPreview, WorkspaceMenu,
-    WorkspaceRenameEditor, WorkstationGroupExpansion, route_workspace_creation_paste,
+    SelectionDrag, SidebarResizeLifecycle, SidebarResizeMove, SplitControlId, TabDrag,
+    TabDropPreview, TabIdentityPresentation, TabMenu, TerminalLineRender, TmuxSelectionChange,
+    TmuxSessionPicker, TooltipView, WorkspaceConnectionInfo, WorkspaceCreationDialog,
+    WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
+    WorkspaceDeleteConfirmation, WorkspaceDisconnectConfirmation, WorkspaceDrag,
+    WorkspaceDropPreview, WorkspaceMenu, WorkspaceRenameEditor, WorkstationGroupExpansion,
+    route_workspace_creation_paste,
 };
 
 actions!(
@@ -144,6 +148,7 @@ const PTY_RESIZE_DEBOUNCE_MS: u64 = 16;
 /// On-screen panes other than the focused one stream at this cadence so a
 /// four-way split cannot multiply the focused pane's payload every 33 ms.
 const SECONDARY_PANE_INTERVAL: Duration = Duration::from_millis(120);
+const TAB_COLOR_ALPHA: u8 = 0xd0;
 const STABLE_PRODUCT_NAME: &str = "Not a Harness";
 const DEVELOPMENT_PRODUCT_NAME: &str = "Not a Harness Dev";
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
@@ -155,7 +160,7 @@ const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
     AppearanceColor::new(0xef, 0x71, 0x7a),
     AppearanceColor::new(0xc9, 0x90, 0xe5),
     AppearanceColor::new(0xf0, 0x8a, 0xc0),
-    AppearanceColor::new(0x9a, 0xa2, 0xaf),
+    AppearanceColor::DARK_GRAY,
 ];
 
 type SharedSessionClient = Arc<Mutex<Option<SessionClient>>>;
@@ -230,6 +235,8 @@ struct NahApp {
     dragging_workspace: Option<Uuid>,
     workspace_drop_preview: Option<WorkspaceDropPreview>,
     suppress_workspace_click: bool,
+    tab_drop_preview: Option<TabDropPreview>,
+    suppress_tab_click: bool,
     last_sizes: HashMap<Uuid, (u16, u16)>,
     resize_generation: u64,
     workspace_pixels: (f32, f32),
@@ -239,6 +246,7 @@ struct NahApp {
     history_editor: Option<HistoryEditor>,
     history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
+    custom_icons: Vec<CustomIcon>,
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
     selection_drag: Option<SelectionDrag>,
@@ -311,6 +319,8 @@ impl NahApp {
             dragging_workspace: None,
             workspace_drop_preview: None,
             suppress_workspace_click: false,
+            tab_drop_preview: None,
+            suppress_tab_click: false,
             last_sizes: HashMap::new(),
             resize_generation: 0,
             workspace_pixels: (0.0, 0.0),
@@ -320,6 +330,7 @@ impl NahApp {
             history_editor: None,
             history_clear_confirmation: None,
             color_picker: None,
+            custom_icons: load_custom_icons(),
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
             selection_drag: None,
@@ -650,7 +661,7 @@ impl NahApp {
     fn terminal_accent(&self, pane_id: Uuid) -> AppearanceColor {
         self.snapshot
             .as_ref()
-            .map_or(AppearanceColor::HARBOR_BLUE, |snapshot| {
+            .map_or(AppearanceColor::DARK_GRAY, |snapshot| {
                 resolved_terminal_accent(snapshot, pane_id)
             })
     }
@@ -658,7 +669,7 @@ impl NahApp {
     fn workspace_color(&self, workspace_id: Uuid) -> AppearanceColor {
         self.snapshot
             .as_ref()
-            .map_or(AppearanceColor::HARBOR_BLUE, |snapshot| {
+            .map_or(AppearanceColor::DARK_GRAY, |snapshot| {
                 resolved_workspace_color(snapshot, workspace_id)
             })
     }
@@ -683,13 +694,13 @@ impl NahApp {
             ColorTarget::DefaultTerminal => self
                 .snapshot
                 .as_ref()
-                .map_or(AppearanceColor::HARBOR_BLUE, |snapshot| {
+                .map_or(AppearanceColor::DARK_GRAY, |snapshot| {
                     snapshot.appearance.default_terminal_accent
                 }),
             ColorTarget::DefaultWorkspace => self
                 .snapshot
                 .as_ref()
-                .map_or(AppearanceColor::HARBOR_BLUE, |snapshot| {
+                .map_or(AppearanceColor::DARK_GRAY, |snapshot| {
                     snapshot.appearance.default_workspace_color
                 }),
             ColorTarget::Pane(pane_id) => self.terminal_accent(pane_id),
@@ -1010,9 +1021,17 @@ impl NahApp {
     }
 
     fn select_workspace_tab(&mut self, workspace_id: Uuid, pane_id: Uuid, cx: &mut Context<Self>) {
-        self.active_workspace = Some(workspace_id);
-        self.activate_tab(pane_id, cx);
+        match self.call(&ClientRequest::ActivateTab { pane_id }) {
+            Ok(ServiceResponse::Ack) => {
+                self.refresh_state();
+                self.active_workspace = Some(workspace_id);
+                self.focus_pane_with_snapshot(pane_id);
+            }
+            Ok(response) => self.report_unexpected(&response),
+            Err(error) => self.report(&error),
+        }
         self.last_sizes.clear();
+        cx.notify();
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
@@ -1308,6 +1327,67 @@ impl NahApp {
         cx.notify();
     }
 
+    fn set_pane_custom_icon(
+        &mut self,
+        pane_id: Uuid,
+        icon: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(&ClientRequest::SetPaneCustomIcon { pane_id, icon });
+        self.modal = Modal::None;
+        cx.notify();
+    }
+
+    fn import_pane_custom_icon(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose tab image".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match selection.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.report(&error);
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(error) => {
+                    let error = anyhow::anyhow!("custom icon picker failed: {error}");
+                    let _ = this.update(cx, |this, cx| {
+                        this.report(&error);
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let Some(path) = path else {
+                return;
+            };
+            let result = cx
+                .background_spawn(async move { import_custom_icon(&path) })
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(icon) => {
+                    let icon_id = icon.id.clone();
+                    if !this.custom_icons.iter().any(|saved| saved.id == icon_id) {
+                        this.custom_icons.push(icon);
+                    }
+                    this.set_pane_custom_icon(pane_id, Some(icon_id), cx);
+                }
+                Err(error) => {
+                    this.report(&error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn reset_pane_identity(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
         self.send(&ClientRequest::ResetPaneIdentity { pane_id });
         self.modal = Modal::None;
@@ -1460,20 +1540,6 @@ impl NahApp {
         cx.notify();
     }
 
-    fn move_pinned_workspace(
-        &mut self,
-        workspace_id: Uuid,
-        direction: WorkspacePinMove,
-        cx: &mut Context<Self>,
-    ) {
-        self.send(&ClientRequest::MovePinnedWorkspace {
-            workspace_id,
-            direction,
-        });
-        self.modal = Modal::None;
-        cx.notify();
-    }
-
     fn reorder_workspace(
         &mut self,
         workspace_id: Uuid,
@@ -1489,6 +1555,23 @@ impl NahApp {
         self.dragging_workspace = None;
         self.workspace_drop_preview = None;
         self.suppress_workspace_click = true;
+        cx.notify();
+    }
+
+    fn reorder_workspace_tab(
+        &mut self,
+        tab_id: Uuid,
+        target_tab_id: Uuid,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(&ClientRequest::ReorderTab {
+            tab_id,
+            target_tab_id,
+            after,
+        });
+        self.tab_drop_preview = None;
+        self.suppress_tab_click = true;
         cx.notify();
     }
 
@@ -3112,13 +3195,7 @@ impl NahApp {
                         let terminal_count = workspace_terminal_tabs(workspace).len();
                         let expanded = self.expanded_workspaces.contains(&workspace_id);
                         let workspace_color = self.workspace_color(workspace_id).as_rgb();
-                        let card_color = if connected {
-                            0x234b38
-                        } else if offline {
-                            0x40252a
-                        } else {
-                            workspace_color
-                        };
+                        let card_color = workspace_color;
                         let active_text = readable_text_color(card_color);
                         let drop_preview = self.workspace_drop_preview;
                         let drop_above = drop_preview.is_some_and(|preview| {
@@ -3467,6 +3544,7 @@ impl NahApp {
                                                         rows.push(
                                                             self.render_workspace_terminal_row(
                                                                 workspace_id,
+                                                                Some(tab_id),
                                                                 &pane,
                                                                 20.0,
                                                                 cx,
@@ -3479,6 +3557,23 @@ impl NahApp {
                                                         self.collapsed_groups.contains(&tab_id);
                                                     let count_label =
                                                         terminal_tab_count_label(panes.len());
+                                                    let drop_preview = self.tab_drop_preview;
+                                                    let drop_above =
+                                                        drop_preview.is_some_and(|preview| {
+                                                            preview.target_tab_id == tab_id
+                                                                && !preview.after
+                                                        });
+                                                    let drop_below =
+                                                        drop_preview.is_some_and(|preview| {
+                                                            preview.target_tab_id == tab_id
+                                                                && preview.after
+                                                        });
+                                                    let drag = TabDrag {
+                                                        workspace_id,
+                                                        tab_id,
+                                                        title: label.clone(),
+                                                        position: Point::default(),
+                                                    };
                                                     rows.push(
                                                         div()
                                                             .id((
@@ -3490,6 +3585,23 @@ impl NahApp {
                                                             .px(px(7.0))
                                                             .h(px(27.0))
                                                             .rounded(px(4.0))
+                                                            .border_t(if drop_above {
+                                                                px(2.0)
+                                                            } else {
+                                                                px(0.0)
+                                                            })
+                                                            .border_b(if drop_below {
+                                                                px(2.0)
+                                                            } else {
+                                                                px(0.0)
+                                                            })
+                                                            .border_color(rgb(if drop_above
+                                                                || drop_below
+                                                            {
+                                                                THEME.accent
+                                                            } else {
+                                                                THEME.border
+                                                            }))
                                                             .cursor_pointer()
                                                             .flex()
                                                             .items_center()
@@ -3499,9 +3611,102 @@ impl NahApp {
                                                             })
                                                             .on_click(cx.listener(
                                                                 move |this, _, _, cx| {
+                                                                    if this.suppress_tab_click {
+                                                                        this.suppress_tab_click =
+                                                                            false;
+                                                                        cx.notify();
+                                                                        return;
+                                                                    }
                                                                     this.toggle_group_collapsed(
                                                                         tab_id, cx,
                                                                     );
+                                                                    cx.stop_propagation();
+                                                                },
+                                                            ))
+                                                            .on_drag(
+                                                                drag,
+                                                                |info: &TabDrag,
+                                                                 position,
+                                                                 _,
+                                                                 cx| {
+                                                                    cx.new(|_| TabDrag {
+                                                                        position,
+                                                                        ..info.clone()
+                                                                    })
+                                                                },
+                                                            )
+                                                            .on_drag_move::<TabDrag>(cx.listener(
+                                                                move |this,
+                                                                      event:
+                                                                          &gpui::DragMoveEvent<
+                                                                            TabDrag,
+                                                                        >,
+                                                                      _,
+                                                                      cx| {
+                                                                    let drag = event.drag(cx);
+                                                                    if drag.workspace_id
+                                                                        != workspace_id
+                                                                        || drag.tab_id == tab_id
+                                                                    {
+                                                                        if this
+                                                                            .tab_drop_preview
+                                                                            .take()
+                                                                            .is_some()
+                                                                        {
+                                                                            cx.notify();
+                                                                        }
+                                                                        return;
+                                                                    }
+                                                                    if event.bounds.contains(
+                                                                        &event.event.position,
+                                                                    ) {
+                                                                        this.tab_drop_preview =
+                                                                            Some(
+                                                                                TabDropPreview {
+                                                                                    target_tab_id:
+                                                                                        tab_id,
+                                                                                    after: event
+                                                                                        .event
+                                                                                        .position
+                                                                                        .y
+                                                                                        > event
+                                                                                            .bounds
+                                                                                            .center()
+                                                                                            .y,
+                                                                                },
+                                                                            );
+                                                                        cx.stop_propagation();
+                                                                        cx.notify();
+                                                                    }
+                                                                },
+                                                            ))
+                                                            .on_drop(cx.listener(
+                                                                move |this,
+                                                                      info: &TabDrag,
+                                                                      _,
+                                                                      cx| {
+                                                                    if info.workspace_id
+                                                                        == workspace_id
+                                                                        && info.tab_id != tab_id
+                                                                    {
+                                                                        let after = this
+                                                                            .tab_drop_preview
+                                                                            .is_some_and(
+                                                                                |preview| {
+                                                                                    preview
+                                                                                        .target_tab_id
+                                                                                        == tab_id
+                                                                                        && preview
+                                                                                            .after
+                                                                                },
+                                                                            );
+                                                                        this.reorder_workspace_tab(
+                                                                            info.tab_id,
+                                                                            tab_id,
+                                                                            after,
+                                                                            cx,
+                                                                        );
+                                                                    }
                                                                     cx.stop_propagation();
                                                                 },
                                                             ))
@@ -3561,6 +3766,7 @@ impl NahApp {
                                                         rows.extend(panes.into_iter().map(|pane| {
                                                             self.render_workspace_terminal_row(
                                                                 workspace_id,
+                                                                None,
                                                                 &pane,
                                                                 34.0,
                                                                 cx,
@@ -3597,9 +3803,35 @@ impl NahApp {
             .into_any_element()
     }
 
+    fn custom_icon_path(&self, pane: &Pane) -> Option<PathBuf> {
+        let icon = pane.custom_icon.as_deref()?;
+        self.custom_icons
+            .iter()
+            .find(|saved| saved.id == icon)
+            .map(|saved| saved.path.clone())
+    }
+
+    fn render_pane_identity_mark(
+        &self,
+        pane: &Pane,
+        fallback_color: u32,
+        frame_color: u32,
+    ) -> AnyElement {
+        if let Some(path) = self.custom_icon_path(pane) {
+            return img(path)
+                .w(px(IDENTITY_MARK_SIZE))
+                .h(px(IDENTITY_MARK_SIZE))
+                .object_fit(gpui::ObjectFit::Contain)
+                .rounded(px(3.0))
+                .into_any_element();
+        }
+        render_terminal_profile_mark(pane.identity.profile, fallback_color, frame_color)
+    }
+
     fn render_workspace_terminal_row(
         &self,
         workspace_id: Uuid,
+        tab_id: Option<Uuid>,
         pane: &Pane,
         indent: f32,
         cx: &mut Context<Self>,
@@ -3608,7 +3840,18 @@ impl NahApp {
         let selected = self.focused_pane == Some(pane_id);
         let identity = tab_identity_presentation(pane);
         let identity_detail = identity.detail.clone();
+        let drag_title = identity.label.clone();
+        let drop_above = tab_id.is_some_and(|tab_id| {
+            self.tab_drop_preview
+                .is_some_and(|preview| preview.target_tab_id == tab_id && !preview.after)
+        });
+        let drop_below = tab_id.is_some_and(|tab_id| {
+            self.tab_drop_preview
+                .is_some_and(|preview| preview.target_tab_id == tab_id && preview.after)
+        });
         let pane_accent = self.terminal_accent(pane_id).as_rgb();
+        let row_background = composite_rgb(pane_accent, THEME.sidebar, TAB_COLOR_ALPHA);
+        let row_text = readable_text_color(row_background);
         div()
             .id(("workspace-tab", element_key(pane_id)))
             .ml(px(indent))
@@ -3620,8 +3863,16 @@ impl NahApp {
             .flex()
             .items_center()
             .gap(px(7.0))
-            .when(selected, |element| element.bg(rgb(THEME.surface)))
-            .hover(|element| element.bg(rgb(THEME.elevated)))
+            .bg(rgba(rgba_with_alpha(pane_accent, TAB_COLOR_ALPHA)))
+            .border_t(if drop_above { px(2.0) } else { px(0.0) })
+            .border_b(if drop_below { px(2.0) } else { px(0.0) })
+            .border_color(rgb(if drop_above || drop_below {
+                THEME.accent
+            } else {
+                row_text
+            }))
+            .when(selected, |element| element.border_1())
+            .hover(|element| element.border_1().border_color(rgb(row_text)))
             .tooltip(move |_, cx| {
                 cx.new(|_| TooltipView {
                     text: identity_detail.clone(),
@@ -3629,9 +3880,57 @@ impl NahApp {
                 .into()
             })
             .on_click(cx.listener(move |this, _, _, cx| {
+                if this.suppress_tab_click {
+                    this.suppress_tab_click = false;
+                    cx.notify();
+                    return;
+                }
                 this.select_workspace_tab(workspace_id, pane_id, cx);
                 cx.stop_propagation();
             }))
+            .when_some(tab_id, |element, tab_id| {
+                let drag = TabDrag {
+                    workspace_id,
+                    tab_id,
+                    title: drag_title,
+                    position: Point::default(),
+                };
+                element
+                    .on_drag(drag, |info: &TabDrag, position, _, cx| {
+                        cx.new(|_| TabDrag {
+                            position,
+                            ..info.clone()
+                        })
+                    })
+                    .on_drag_move::<TabDrag>(cx.listener(
+                        move |this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                            let drag = event.drag(cx);
+                            if drag.workspace_id != workspace_id || drag.tab_id == tab_id {
+                                if this.tab_drop_preview.take().is_some() {
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            if event.bounds.contains(&event.event.position) {
+                                this.tab_drop_preview = Some(TabDropPreview {
+                                    target_tab_id: tab_id,
+                                    after: event.event.position.y > event.bounds.center().y,
+                                });
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, info: &TabDrag, _, cx| {
+                        if info.workspace_id == workspace_id && info.tab_id != tab_id {
+                            let after = this.tab_drop_preview.is_some_and(|preview| {
+                                preview.target_tab_id == tab_id && preview.after
+                            });
+                            this.reorder_workspace_tab(info.tab_id, tab_id, after, cx);
+                        }
+                        cx.stop_propagation();
+                    }))
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -3647,15 +3946,7 @@ impl NahApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(render_terminal_profile_mark(
-                        identity.profile,
-                        if selected {
-                            THEME.foreground
-                        } else {
-                            THEME.muted
-                        },
-                        if selected { pane_accent } else { THEME.muted },
-                    )),
+                    .child(self.render_pane_identity_mark(pane, row_text, row_text)),
             )
             .child(
                 div()
@@ -3669,11 +3960,7 @@ impl NahApp {
                     } else {
                         gpui::FontWeight::NORMAL
                     })
-                    .text_color(if selected {
-                        rgb(THEME.foreground)
-                    } else {
-                        rgb(THEME.muted)
-                    })
+                    .text_color(rgb(row_text))
                     .child(identity.label),
             )
             .into_any_element()
@@ -3831,6 +4118,8 @@ impl NahApp {
                         let pane_id = pane.id;
                         let identity = tab_identity_presentation(&pane);
                         let identity_detail = identity.detail.clone();
+                        let secondary_label =
+                            terminal_tab_secondary_label(&pane).map(str::to_owned);
                         let selected = pane_id == active;
                         let pane_accent = pane
                             .color
@@ -3894,8 +4183,8 @@ impl NahApp {
                                         })
                                         .into()
                                     })
-                                    .child(render_terminal_profile_mark(
-                                        identity.profile,
+                                    .child(self.render_pane_identity_mark(
+                                        &pane,
                                         if selected {
                                             THEME.foreground
                                         } else {
@@ -3923,17 +4212,19 @@ impl NahApp {
                                     })
                                     .child(identity.label),
                             )
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .flex_shrink()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .font_family("SF Mono")
-                                    .text_size(px(9.5))
-                                    .text_color(rgb(THEME.dim))
-                                    .child(pane.shell),
-                            )
+                            .when_some(secondary_label, |element, label| {
+                                element.child(
+                                    div()
+                                        .min_w(px(0.0))
+                                        .flex_shrink()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .font_family("SF Mono")
+                                        .text_size(px(9.5))
+                                        .text_color(rgb(THEME.dim))
+                                        .child(label),
+                                )
+                            })
                             .child(
                                 div()
                                     .id(("close-tab", element_key(pane_id)))
@@ -4586,9 +4877,7 @@ impl NahApp {
             .color_picker
             .as_ref()
             .filter(|picker| picker.target == ColorTarget::Pane(pane_id));
-        let selected_profile = self
-            .pane_metadata(pane_id)
-            .and_then(|pane| pane.profile_override);
+        let pane = self.pane_metadata(pane_id);
         div()
             .id(("terminal-context-menu", element_key(pane_id)))
             .absolute()
@@ -4652,8 +4941,8 @@ impl NahApp {
                     .gap(px(7.0))
                     .child("Select icon")
                     .child(div().flex_1())
-                    .children(selected_profile.map(|profile| {
-                        render_terminal_profile_mark(profile, THEME.foreground, THEME.accent)
+                    .children(pane.as_ref().map(|pane| {
+                        self.render_pane_identity_mark(pane, THEME.foreground, THEME.accent)
                     }))
                     .child(if menu.identity_picker_open {
                         "⌄"
@@ -4732,9 +5021,9 @@ impl NahApp {
     }
 
     fn render_profile_choices(&self, pane_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self
-            .pane_metadata(pane_id)
-            .and_then(|pane| pane.profile_override);
+        let pane = self.pane_metadata(pane_id);
+        let selected = pane.as_ref().and_then(|pane| pane.profile_override);
+        let selected_custom = pane.and_then(|pane| pane.custom_icon);
         let choices = std::iter::once(None).chain(TerminalProfile::ALL.into_iter().map(Some));
         div()
             .mx(px(8.0))
@@ -4743,7 +5032,7 @@ impl NahApp {
             .flex_wrap()
             .gap(px(6.0))
             .children(choices.enumerate().map(|(index, profile)| {
-                let active = selected == profile;
+                let active = selected_custom.is_none() && selected == profile;
                 let label = profile.map_or_else(
                     || "Automatic terminal icon".to_owned(),
                     |profile| profile.display_name().to_owned(),
@@ -4798,6 +5087,69 @@ impl NahApp {
                     }))
                     .when(profile.is_none(), |element| element.child("A"))
             }))
+            .children(self.custom_icons.iter().enumerate().map(|(index, icon)| {
+                let active = selected_custom.as_deref() == Some(icon.id.as_str());
+                let icon_id = icon.id.clone();
+                let path = icon.path.clone();
+                div()
+                    .id(("custom-identity-profile", index))
+                    .w(px(30.0))
+                    .h(px(28.0))
+                    .p(px(3.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if active {
+                        rgb(THEME.accent)
+                    } else {
+                        rgb(THEME.border_strong)
+                    })
+                    .bg(if active {
+                        rgb(THEME.accent_soft)
+                    } else {
+                        rgb(THEME.surface)
+                    })
+                    .hover(|element| element.border_color(rgb(THEME.foreground)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_pane_custom_icon(pane_id, Some(icon_id.clone()), cx)
+                    }))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: "Saved custom image".to_owned(),
+                        })
+                        .into()
+                    })
+                    .child(
+                        img(path)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .rounded(px(3.0)),
+                    )
+            }))
+            .child(
+                div()
+                    .id(("upload-custom-identity", element_key(pane_id)))
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .bg(rgb(THEME.surface))
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.foreground))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|element| element.border_color(rgb(THEME.foreground)))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.import_pane_custom_icon(pane_id, cx)
+                        }),
+                    )
+                    .child("Upload image…"),
+            )
             .into_any_element()
     }
 
@@ -5107,13 +5459,6 @@ impl NahApp {
                     }
             )
         );
-        let tmux_reconnect_required = matches!(
-            connection.as_ref(),
-            Some(WorkspaceConnection::SystemSsh {
-                status: WorkspaceConnectionStatus::Offline,
-                ..
-            })
-        );
         let inline_color_picker = self
             .color_picker
             .as_ref()
@@ -5204,66 +5549,12 @@ impl NahApp {
                         "Pin workstation"
                     }),
             )
-            .when(pinned, |element| {
-                element
-                    .child(
-                        div()
-                            .id(("move-workspace-up", element_key(workspace_id)))
-                            .mx(px(5.0))
-                            .px(px(9.0))
-                            .py(px(7.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .hover(|item| item.bg(rgb(THEME.accent_soft)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.move_pinned_workspace(workspace_id, WorkspacePinMove::Up, cx)
-                            }))
-                            .child("Move pinned workstation up"),
-                    )
-                    .child(
-                        div()
-                            .id(("move-workspace-down", element_key(workspace_id)))
-                            .mx(px(5.0))
-                            .px(px(9.0))
-                            .py(px(7.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .hover(|item| item.bg(rgb(THEME.accent_soft)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.move_pinned_workspace(workspace_id, WorkspacePinMove::Down, cx)
-                            }))
-                            .child("Move pinned workstation down"),
-                    )
-            })
             .when_some(connection, |element, connection| match connection {
-                WorkspaceConnection::Local => element,
-                WorkspaceConnection::SystemSsh {
+                WorkspaceConnection::Local
+                | WorkspaceConnection::SystemSsh {
                     status: WorkspaceConnectionStatus::Connected,
                     ..
-                } => element.child(
-                    div()
-                        .id(("disconnect-workspace-menu", element_key(workspace_id)))
-                        .mx(px(5.0))
-                        .px(px(9.0))
-                        .py(px(7.0))
-                        .rounded(px(4.0))
-                        .cursor_pointer()
-                        .font_family(".SystemUIFont")
-                        .text_sm()
-                        .bg(rgb(THEME.danger))
-                        .text_color(rgb(0xffffff))
-                        .hover(|item| item.bg(rgb(0xc93c45)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.begin_workspace_disconnect(workspace_id, cx)
-                        }))
-                        .child("Disconnect and keep workstation"),
-                ),
+                } => element,
                 WorkspaceConnection::SystemSsh {
                     status: WorkspaceConnectionStatus::Offline,
                     ..
@@ -5282,7 +5573,7 @@ impl NahApp {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.reconnect_workspace(workspace_id, cx)
                         }))
-                        .child("Reconnect with system OpenSSH"),
+                        .child("Reconnect"),
                 ),
             })
             .when(tmux_scan_available, |element| {
@@ -5302,25 +5593,6 @@ impl NahApp {
                             this.scan_tmux_sessions(workspace_id, cx)
                         }))
                         .child("Scan tmux sessions…"),
-                )
-            })
-            .when(tmux_reconnect_required, |element| {
-                element.child(
-                    div()
-                        .id(("reconnect-tmux-sessions-menu", element_key(workspace_id)))
-                        .mx(px(5.0))
-                        .px(px(9.0))
-                        .py(px(7.0))
-                        .rounded(px(4.0))
-                        .cursor_pointer()
-                        .font_family(".SystemUIFont")
-                        .text_sm()
-                        .text_color(rgb(THEME.ansi[2]))
-                        .hover(|item| item.bg(rgb(THEME.accent_soft)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.reconnect_workspace(workspace_id, cx)
-                        }))
-                        .child("Reconnect to scan tmux…"),
                 )
             })
             .child(

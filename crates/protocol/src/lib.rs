@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 20;
 pub const SOCKET_ENV: &str = "NAH_SOCKET";
 pub const STATE_DIR_ENV: &str = "NAH_STATE_DIR";
 pub const CONFIG_ENV: &str = "NAH_CONFIG";
@@ -37,6 +37,7 @@ pub struct AppearanceColor {
 
 impl AppearanceColor {
     pub const HARBOR_BLUE: Self = Self::new(0x62, 0xad, 0xff);
+    pub const DARK_GRAY: Self = Self::new(0x3b, 0x42, 0x4f);
 
     pub const fn new(red: u8, green: u8, blue: u8) -> Self {
         Self { red, green, blue }
@@ -49,7 +50,7 @@ impl AppearanceColor {
 
 impl Default for AppearanceColor {
     fn default() -> Self {
-        Self::HARBOR_BLUE
+        Self::DARK_GRAY
     }
 }
 
@@ -66,8 +67,8 @@ pub struct AppearanceSettings {
 impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
-            default_terminal_accent: AppearanceColor::HARBOR_BLUE,
-            default_workspace_color: AppearanceColor::HARBOR_BLUE,
+            default_terminal_accent: AppearanceColor::DARK_GRAY,
+            default_workspace_color: AppearanceColor::DARK_GRAY,
             recent_colors: Vec::new(),
         }
     }
@@ -83,6 +84,7 @@ impl SessionSnapshot {
             identity: TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let tab = Tab {
             id: Uuid::new_v4(),
@@ -285,6 +287,9 @@ pub struct Pane {
     pub custom_title: Option<String>,
     #[serde(default)]
     pub profile_override: Option<TerminalProfile>,
+    /// Stable filename of an image copied into the application's custom icon store.
+    #[serde(default)]
+    pub custom_icon: Option<String>,
 }
 
 /// A stable local terminal profile. The protocol carries only identity, never
@@ -304,10 +309,11 @@ pub enum TerminalProfile {
     Aider,
     GitHubCopilot,
     Gemini,
+    Tmux,
 }
 
 impl TerminalProfile {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Terminal,
         Self::Hermes,
         Self::Codex,
@@ -319,6 +325,7 @@ impl TerminalProfile {
         Self::Aider,
         Self::GitHubCopilot,
         Self::Gemini,
+        Self::Tmux,
     ];
 
     pub const fn display_name(self) -> &'static str {
@@ -334,6 +341,7 @@ impl TerminalProfile {
             Self::Aider => "Aider",
             Self::GitHubCopilot => "GitHub Copilot CLI",
             Self::Gemini => "Gemini CLI",
+            Self::Tmux => "tmux",
         }
     }
 
@@ -370,7 +378,7 @@ pub struct TerminalProfileDefinition {
 
 /// Local, compile-time registry used for explicit profiles and bounded exact
 /// detection. It performs no network access and contains no third-party art.
-pub const TERMINAL_PROFILE_REGISTRY: [TerminalProfileDefinition; 10] = [
+pub const TERMINAL_PROFILE_REGISTRY: [TerminalProfileDefinition; 11] = [
     TerminalProfileDefinition {
         profile: TerminalProfile::Hermes,
         commands: &["hermes", "hermes-agent"],
@@ -419,6 +427,11 @@ pub const TERMINAL_PROFILE_REGISTRY: [TerminalProfileDefinition; 10] = [
     TerminalProfileDefinition {
         profile: TerminalProfile::Gemini,
         commands: &["gemini"],
+        terminal_titles: &[],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::Tmux,
+        commands: &["tmux"],
         terminal_titles: &[],
     },
 ];
@@ -837,6 +850,11 @@ pub enum ClientRequest {
         source_pane: Uuid,
         target_pane: Uuid,
     },
+    ReorderTab {
+        tab_id: Uuid,
+        target_tab_id: Uuid,
+        after: bool,
+    },
     RenamePane {
         pane_id: Uuid,
         title: String,
@@ -848,6 +866,10 @@ pub enum ClientRequest {
     SetPaneProfile {
         pane_id: Uuid,
         profile: Option<TerminalProfile>,
+    },
+    SetPaneCustomIcon {
+        pane_id: Uuid,
+        icon: Option<String>,
     },
     ResetPaneIdentity {
         pane_id: Uuid,
@@ -1401,6 +1423,10 @@ mod tests {
         assert_eq!(
             terminal_profile_for_command("gemini"),
             Some(TerminalProfile::Gemini)
+        );
+        assert_eq!(
+            terminal_profile_for_command("tmux"),
+            Some(TerminalProfile::Tmux)
         );
         assert_eq!(terminal_profile_for_command("vim"), None);
         assert_eq!(terminal_profile_for_command("chatgpt"), None);
