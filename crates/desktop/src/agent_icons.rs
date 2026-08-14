@@ -1,7 +1,11 @@
 use std::borrow::Cow;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context as _, Result, bail};
 use gpui::{AssetSource, SharedString};
-use nah_protocol::TerminalProfile;
+use nah_protocol::{TerminalProfile, state_directory};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentIconFormat {
@@ -23,6 +27,97 @@ pub struct AgentIconDefinition {
     pub asset: Option<AgentIconAsset>,
     pub notice_key: &'static str,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomIcon {
+    pub id: String,
+    pub path: PathBuf,
+}
+
+const MAX_CUSTOM_ICON_BYTES: u64 = 5 * 1024 * 1024;
+
+pub fn load_custom_icons() -> Vec<CustomIcon> {
+    let Some(directory) = custom_icon_directory() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut icons = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry.file_type().ok().filter(std::fs::FileType::is_file)?;
+            let id = entry.file_name().into_string().ok()?;
+            is_valid_custom_icon_id(&id).then(|| CustomIcon {
+                id,
+                path: entry.path(),
+            })
+        })
+        .collect::<Vec<_>>();
+    icons.sort_by(|left, right| left.id.cmp(&right.id));
+    icons
+}
+
+pub fn import_custom_icon(source: &Path) -> Result<CustomIcon> {
+    let extension = supported_custom_icon_extension(source)
+        .context("choose a PNG, JPEG, WebP, or GIF image")?;
+    let metadata = fs::metadata(source)
+        .with_context(|| format!("read custom icon metadata from {}", source.display()))?;
+    if !metadata.is_file() {
+        bail!("custom icon must be a regular file");
+    }
+    if metadata.len() > MAX_CUSTOM_ICON_BYTES {
+        bail!("custom icon must be 5 MiB or smaller");
+    }
+    let bytes =
+        fs::read(source).with_context(|| format!("read custom icon from {}", source.display()))?;
+    if bytes.len() as u64 > MAX_CUSTOM_ICON_BYTES {
+        bail!("custom icon must be 5 MiB or smaller");
+    }
+    if !matches_custom_icon_format(extension, &bytes) {
+        bail!("custom icon contents do not match its file extension");
+    }
+    let directory =
+        custom_icon_directory().context("application state directory is unavailable")?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("create custom icon directory {}", directory.display()))?;
+    let id = format!("{}.{}", Uuid::new_v4(), extension);
+    let path = directory.join(&id);
+    fs::write(&path, bytes).with_context(|| format!("save custom icon to {}", path.display()))?;
+    Ok(CustomIcon { id, path })
+}
+
+fn custom_icon_directory() -> Option<PathBuf> {
+    state_directory().map(|directory| directory.join("icons"))
+}
+
+fn supported_custom_icon_extension(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("png"),
+        "jpg" | "jpeg" => Some("jpg"),
+        "webp" => Some("webp"),
+        "gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+fn is_valid_custom_icon_id(id: &str) -> bool {
+    let path = Path::new(id);
+    path.file_name().and_then(|name| name.to_str()) == Some(id)
+        && supported_custom_icon_extension(path).is_some()
+        && id
+            .split_once('.')
+            .is_some_and(|(stem, _)| Uuid::parse_str(stem).is_ok())
+}
+
+fn matches_custom_icon_format(extension: &str, bytes: &[u8]) -> bool {
+    match extension {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" => bytes.starts_with(b"\xff\xd8\xff"),
+        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP",
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        _ => false,
+    }
+}
 
 const fn svg(path: &'static str, sha256: &'static str) -> AgentIconAsset {
     AgentIconAsset {
@@ -42,7 +137,7 @@ const fn png(path: &'static str, sha256: &'static str) -> AgentIconAsset {
 
 /// Desktop-only icon registry. Assets are compiled into the executable and
 /// are never fetched or resolved from the user's environment at runtime.
-pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 11] = [
+pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 12] = [
     AgentIconDefinition {
         profile: TerminalProfile::Terminal,
         accessible_name: "Terminal",
@@ -136,6 +231,15 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 11] = [
         )),
         notice_key: "gemini-cli",
     },
+    AgentIconDefinition {
+        profile: TerminalProfile::Tmux,
+        accessible_name: "tmux",
+        asset: Some(svg(
+            "agent-icons/tmux.svg",
+            "bdc956f2193c3cf4a49d304b76f43d6c6e69670224a45e0422b3e8066de8e358",
+        )),
+        notice_key: "tmux",
+    },
 ];
 
 pub fn agent_icon_definition(profile: TerminalProfile) -> &'static AgentIconDefinition {
@@ -148,7 +252,7 @@ pub fn agent_icon_definition(profile: TerminalProfile) -> &'static AgentIconDefi
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgentIconAssets;
 
-const EMBEDDED_ASSETS: [(&str, &[u8]); 9] = [
+const EMBEDDED_ASSETS: [(&str, &[u8]); 11] = [
     (
         "agent-icons/hermes-agent.png",
         include_bytes!("../assets/agent-icons/hermes-agent.png"),
@@ -184,6 +288,14 @@ const EMBEDDED_ASSETS: [(&str, &[u8]); 9] = [
     (
         "agent-icons/gemini-cli.png",
         include_bytes!("../assets/agent-icons/gemini-cli.png"),
+    ),
+    (
+        "agent-icons/tmux.svg",
+        include_bytes!("../assets/agent-icons/tmux.svg"),
+    ),
+    (
+        "agent-icons/tmux-LICENSE.txt",
+        include_bytes!("../assets/agent-icons/tmux-LICENSE.txt"),
     ),
 ];
 
@@ -268,5 +380,35 @@ mod tests {
             .expect("embedded asset lookup")
             .expect("Droid asset bytes");
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn tmux_uses_the_bundled_official_logomark_and_license() {
+        let asset = agent_icon_definition(TerminalProfile::Tmux)
+            .asset
+            .expect("tmux official asset");
+        assert_eq!(asset.format, AgentIconFormat::Svg);
+        assert_eq!(asset.path, "agent-icons/tmux.svg");
+        assert!(
+            AgentIconAssets
+                .load("agent-icons/tmux-LICENSE.txt")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn custom_icon_import_accepts_only_matching_bounded_raster_formats() {
+        assert!(matches_custom_icon_format(
+            "png",
+            b"\x89PNG\r\n\x1a\npayload"
+        ));
+        assert!(matches_custom_icon_format("jpg", b"\xff\xd8\xffpayload"));
+        assert!(matches_custom_icon_format(
+            "webp",
+            b"RIFF\x04\0\0\0WEBPpayload"
+        ));
+        assert!(matches_custom_icon_format("gif", b"GIF89apayload"));
+        assert!(!matches_custom_icon_format("png", b"GIF89apayload"));
     }
 }

@@ -412,7 +412,9 @@ pub(super) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation 
         nah_protocol::TerminalIdentitySource::Fallback => "Ordinary terminal",
     };
     let definition = agent_icon_definition(pane.identity.profile);
-    let asset_detail = if definition.asset.is_some() {
+    let asset_detail = if pane.custom_icon.is_some() {
+        "A reusable user-uploaded image is selected"
+    } else if definition.asset.is_some() {
         "Bundled official artwork is shown unchanged for referential identification only; no affiliation or endorsement is implied"
     } else if pane.identity.profile == TerminalProfile::GitHubCopilot {
         "The official CLI package exposes no standalone icon asset, so Not a Harness uses the neutral terminal glyph"
@@ -427,6 +429,10 @@ pub(super) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation 
             definition.accessible_name
         ),
     }
+}
+
+pub(super) fn terminal_tab_secondary_label(pane: &Pane) -> Option<&str> {
+    pane.custom_title.is_none().then_some(pane.shell.as_str())
 }
 
 pub(super) const IDENTITY_MARK_SIZE: f32 = 22.0;
@@ -677,6 +683,21 @@ pub(super) fn workspace_pixel_size(
         (window_width - sidebar_width).max(1.0),
         (window_height - APP_CHROME_HEIGHT).max(1.0),
     )
+}
+
+pub(super) const fn rgba_with_alpha(color: u32, alpha: u8) -> u32 {
+    (color << 8) | alpha as u32
+}
+
+pub(super) fn composite_rgb(foreground: u32, background: u32, alpha: u8) -> u32 {
+    let alpha = u32::from(alpha);
+    let inverse = 255 - alpha;
+    let channel = |shift| {
+        let foreground = (foreground >> shift) & 0xff_u32;
+        let background = (background >> shift) & 0xff_u32;
+        (foreground * alpha + background * inverse + 127_u32) / 255_u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 pub(super) fn readable_text_color(background: u32) -> u32 {
@@ -1007,6 +1028,7 @@ mod tests {
                 },
                 custom_title: None,
                 profile_override: None,
+                custom_icon: None,
             };
 
             let presentation = tab_identity_presentation(&pane);
@@ -1029,6 +1051,29 @@ mod tests {
             assert!((terminal_profile_icon_size(profile) - expected_size).abs() < f32::EPSILON);
         }
     }
+
+    #[test]
+    fn renamed_tab_hides_shell_metadata_that_would_displace_its_name() {
+        let mut pane = Pane {
+            id: Uuid::new_v4(),
+            title: "Release terminal".to_owned(),
+            shell: "ssh release@long-production-host.example.com".to_owned(),
+            color: None,
+            identity: nah_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        assert_eq!(
+            terminal_tab_secondary_label(&pane),
+            Some("ssh release@long-production-host.example.com")
+        );
+
+        pane.custom_title = Some(pane.title.clone());
+
+        assert_eq!(terminal_tab_secondary_label(&pane), None);
+        assert_eq!(tab_identity_presentation(&pane).label, "Release terminal");
+    }
     #[test]
     fn workspace_rail_lists_every_terminal_tab_across_stacks_and_splits() {
         let make_pane = |id: u128, title: &str, profile: TerminalProfile| Pane {
@@ -1042,6 +1087,7 @@ mod tests {
             },
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let codex = make_pane(1, "Codex review", TerminalProfile::Codex);
         let droid = make_pane(2, "Droid build", TerminalProfile::Droid);
@@ -1088,6 +1134,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
         workspace.tabs = vec![
@@ -1169,6 +1216,7 @@ mod tests {
                     identity: nah_protocol::TerminalIdentity::default(),
                     custom_title: None,
                     profile_override: None,
+                    custom_icon: None,
                 },
             },
         });
@@ -1280,6 +1328,13 @@ mod tests {
         );
         assert_eq!(parse_hex_color("FFF"), None);
         assert_eq!(parse_hex_color("GGADFF"), None);
+    }
+
+    #[test]
+    fn alpha_color_helpers_encode_and_composite_exact_channels() {
+        assert_eq!(rgba_with_alpha(0x3b424f, 0xd0), 0x3b424fd0);
+        assert_eq!(composite_rgb(0xffffff, 0x000000, 0x80), 0x808080);
+        assert_eq!(composite_rgb(0x3b424f, 0x15171c, 0xff), 0x3b424f);
     }
     #[test]
     fn pointer_local_split_zones_exclude_the_tab_strip_and_cover_each_half() {
@@ -1452,6 +1507,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let layout = PaneLayout::Leaf { pane };
         let metrics = typography::TerminalCellMetrics {
@@ -1572,6 +1628,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let second = Pane {
             id: Uuid::from_u128(22),
@@ -1581,6 +1638,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let layout = PaneLayout::Split {
             axis: SplitAxis::Horizontal,
@@ -1671,6 +1729,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let first = pane(1, "SSH");
         let tmux = pane(2, "tmux $2");
@@ -1720,6 +1779,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let second = Pane {
             id: Uuid::from_u128(102),
@@ -1729,6 +1789,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let layout = PaneLayout::Split {
             axis: SplitAxis::Horizontal,
@@ -1763,6 +1824,7 @@ mod tests {
             identity: nah_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let nested = PaneLayout::Split {
             axis: SplitAxis::Vertical,

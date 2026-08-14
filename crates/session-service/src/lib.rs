@@ -502,6 +502,7 @@ impl RegistryState {
             identity: TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         }
     }
 }
@@ -1038,6 +1039,7 @@ impl SessionRegistry {
                 identity: TerminalIdentity::default(),
                 custom_title: None,
                 profile_override: None,
+                custom_icon: None,
             };
             workspace.tabs.push(Tab {
                 id: Uuid::new_v4(),
@@ -1206,6 +1208,7 @@ impl SessionRegistry {
                 identity: TerminalIdentity::default(),
                 custom_title: None,
                 profile_override: None,
+                custom_icon: None,
             };
             let did_add = state.snapshot.workspaces.iter_mut().any(|workspace| {
                 workspace
@@ -1409,7 +1412,7 @@ impl SessionRegistry {
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         pane.custom_title = Some(title.to_owned());
-        resolve_pane_identity(pane, None, None);
+        title.clone_into(&mut pane.title);
         state.snapshot.revision += 1;
         {
             let bytes = encode_desired_state(&state)?;
@@ -1454,11 +1457,11 @@ impl SessionRegistry {
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
-        // Choosing an identity in the context menu is an explicit correction
-        // of any prior free-form name. The resolver itself still preserves
-        // rename precedence for compatible recovered states containing both.
-        pane.custom_title = None;
+        if pane.custom_title.is_none() {
+            pane.custom_title = Some(pane.title.clone());
+        }
         pane.profile_override = profile;
+        pane.custom_icon = None;
         resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         {
@@ -1466,6 +1469,23 @@ impl SessionRegistry {
             drop(state);
             self.write_snapshot(&bytes)
         }
+    }
+
+    pub fn set_pane_custom_icon(&self, pane_id: Uuid, icon: Option<String>) -> Result<()> {
+        if let Some(icon) = icon.as_deref() {
+            persistence::validate_custom_icon_id(icon)?;
+        }
+        let mut state = self.state.write();
+        let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        if pane.custom_title.is_none() {
+            pane.custom_title = Some(pane.title.clone());
+        }
+        pane.custom_icon = icon;
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)
     }
 
     pub fn reset_pane_identity(&self, pane_id: Uuid) -> Result<()> {
@@ -1484,6 +1504,7 @@ impl SessionRegistry {
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         pane.custom_title = None;
         pane.profile_override = None;
+        pane.custom_icon = None;
         resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         {
@@ -1803,6 +1824,7 @@ impl SessionRegistry {
             identity: TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         state.snapshot.workspaces.push(Workspace {
             id: ids.workspace,
@@ -2054,6 +2076,43 @@ impl SessionRegistry {
         }
     }
 
+    pub fn reorder_tab(&self, tab_id: Uuid, target_tab_id: Uuid, after: bool) -> Result<()> {
+        let mut state = self.state.write();
+        let source_workspace = state
+            .snapshot
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id))
+            .with_context(|| format!("tab {tab_id} does not exist"))?;
+        let target_workspace = state
+            .snapshot
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.tabs.iter().any(|tab| tab.id == target_tab_id))
+            .with_context(|| format!("target tab {target_tab_id} does not exist"))?;
+        if source_workspace != target_workspace {
+            bail!("tabs can only be reordered within the same workstation");
+        }
+        if tab_id == target_tab_id {
+            return Ok(());
+        }
+        let tabs = &mut state.snapshot.workspaces[source_workspace].tabs;
+        let source = tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)
+            .context("source tab disappeared while reordering")?;
+        let tab = tabs.remove(source);
+        let target = tabs
+            .iter()
+            .position(|candidate| candidate.id == target_tab_id)
+            .context("target tab disappeared while reordering")?;
+        tabs.insert(target + usize::from(after), tab);
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)
+    }
+
     pub fn disconnect_workspace(&self, workspace_id: Uuid) -> Result<()> {
         let sessions = {
             let state = self.state.read();
@@ -2187,6 +2246,7 @@ impl SessionRegistry {
                     identity: TerminalIdentity::default(),
                     custom_title: None,
                     profile_override: None,
+                    custom_icon: None,
                 };
                 workspace.tabs.push(Tab {
                     id: Uuid::new_v4(),
@@ -2579,9 +2639,13 @@ impl SessionRegistry {
                         title: format!("tmux {}", tmux_session.name),
                         shell: "tmux".to_owned(),
                         color: None,
-                        identity: TerminalIdentity::default(),
+                        identity: TerminalIdentity {
+                            profile: TerminalProfile::Tmux,
+                            source: TerminalIdentitySource::Command,
+                        },
                         custom_title: None,
                         profile_override: None,
+                        custom_icon: None,
                     },
                 },
             });
@@ -2964,13 +3028,7 @@ fn resolve_pane_identity(
     terminal_title: Option<&str>,
     command_profile: Option<TerminalProfile>,
 ) -> bool {
-    let (profile, source, title) = if let Some(custom_title) = pane.custom_title.as_deref() {
-        (
-            TerminalProfile::Terminal,
-            TerminalIdentitySource::UserRename,
-            custom_title.to_owned(),
-        )
-    } else if let Some(profile) = pane.profile_override {
+    let (profile, mut source, generated_title) = if let Some(profile) = pane.profile_override {
         (
             profile,
             TerminalIdentitySource::UserProfile,
@@ -3002,6 +3060,10 @@ fn resolve_pane_identity(
             title,
         )
     };
+    let title = pane.custom_title.clone().unwrap_or(generated_title);
+    if pane.custom_title.is_some() && source == TerminalIdentitySource::Fallback {
+        source = TerminalIdentitySource::UserRename;
+    }
     let identity = TerminalIdentity { profile, source };
     let changed = pane.identity != identity || pane.title != title;
     pane.identity = identity;
@@ -4017,6 +4079,10 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
             sessions.set_pane_profile(pane_id, profile)?;
             Ok(ServiceResponse::Ack)
         }
+        ClientRequest::SetPaneCustomIcon { pane_id, icon } => {
+            sessions.set_pane_custom_icon(pane_id, icon)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::ResetPaneIdentity { pane_id } => {
             sessions.reset_pane_identity(pane_id)?;
             Ok(ServiceResponse::Ack)
@@ -4090,6 +4156,14 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
             after,
         } => {
             sessions.reorder_workspace(workspace_id, target_workspace_id, after)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ReorderTab {
+            tab_id,
+            target_tab_id,
+            after,
+        } => {
+            sessions.reorder_tab(tab_id, target_tab_id, after)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::DisconnectWorkspace { workspace_id } => {
@@ -4359,6 +4433,7 @@ mod tests {
             identity: TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         }
     }
 
@@ -4849,7 +4924,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_precedence_is_rename_then_profile_then_command_then_fallback() {
+    fn custom_name_and_selected_profile_resolve_independently() {
         let mut snapshot = SessionSnapshot::seeded();
         let pane_id = first_pane_id(&snapshot).unwrap();
         let pane = find_pane_mut_in_snapshot(&mut snapshot, pane_id).unwrap();
@@ -4858,7 +4933,8 @@ mod tests {
 
         resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
         assert_eq!(pane.title, "Release console");
-        assert_eq!(pane.identity.source, TerminalIdentitySource::UserRename);
+        assert_eq!(pane.identity.profile, TerminalProfile::Hermes);
+        assert_eq!(pane.identity.source, TerminalIdentitySource::UserProfile);
 
         pane.custom_title = None;
         resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
@@ -4880,26 +4956,33 @@ mod tests {
     }
 
     #[test]
-    fn manual_profile_correction_and_reset_update_only_safe_desired_identity_fields() {
+    fn custom_name_selected_profile_and_uploaded_icon_remain_independent() {
         let registry = SessionRegistry::new().unwrap();
         let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
         registry.rename_pane(pane_id, "My work").unwrap();
         registry
             .set_pane_profile(pane_id, Some(TerminalProfile::Claude))
             .unwrap();
+        let icon = format!("{}.png", Uuid::new_v4());
+        registry
+            .set_pane_custom_icon(pane_id, Some(icon.clone()))
+            .unwrap();
+        registry.rename_pane(pane_id, "Release watch").unwrap();
 
         let snapshot = registry.snapshot().unwrap();
         let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
-        assert_eq!(pane.title, "Claude Code");
-        assert_eq!(pane.custom_title, None);
+        assert_eq!(pane.title, "Release watch");
+        assert_eq!(pane.custom_title.as_deref(), Some("Release watch"));
         assert_eq!(pane.profile_override, Some(TerminalProfile::Claude));
-        assert_eq!(pane.identity.source, TerminalIdentitySource::UserProfile);
+        assert_eq!(pane.custom_icon.as_deref(), Some(icon.as_str()));
+        assert_eq!(pane.identity.profile, TerminalProfile::Claude);
 
         registry.reset_pane_identity(pane_id).unwrap();
         let snapshot = registry.snapshot().unwrap();
         let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
         assert_eq!(pane.custom_title, None);
         assert_eq!(pane.profile_override, None);
+        assert_eq!(pane.custom_icon, None);
     }
 
     #[test]
@@ -5033,6 +5116,75 @@ mod tests {
                 .find(|workspace| workspace.id == second)
                 .is_some_and(|workspace| workspace.pinned)
         );
+    }
+
+    #[test]
+    fn tab_reorder_moves_whole_tabs_only_within_their_workstation() {
+        let directory =
+            std::env::temp_dir().join(format!("nah-tab-reorder-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let snapshot_path = directory.join("sessions.json");
+        let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let initial = registry.snapshot().unwrap();
+        let workspace_id = initial.workspaces[0].id;
+        let first_tab = initial.workspaces[0].tabs[0].id;
+        let second_pane = registry.create_workspace_tab(workspace_id).unwrap();
+        let third_pane = registry.create_workspace_tab(workspace_id).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let workspace = &snapshot.workspaces[0];
+        let second_tab = workspace
+            .tabs
+            .iter()
+            .find(|tab| layout_contains(&tab.layout, second_pane))
+            .unwrap()
+            .id;
+        let third_tab = workspace
+            .tabs
+            .iter()
+            .find(|tab| layout_contains(&tab.layout, third_pane))
+            .unwrap()
+            .id;
+
+        registry.reorder_tab(third_tab, first_tab, false).unwrap();
+        registry.reorder_tab(first_tab, second_tab, true).unwrap();
+
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(
+            snapshot.workspaces[0]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![third_tab, second_tab, first_tab]
+        );
+        drop(snapshot);
+        drop(registry);
+
+        let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(
+            snapshot.workspaces[0]
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![third_tab, second_tab, first_tab]
+        );
+        drop(snapshot);
+
+        let (other_workspace, _) = registry.create_workspace(Some("Other")).unwrap();
+        let other_tab = registry
+            .snapshot()
+            .unwrap()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == other_workspace)
+            .unwrap()
+            .tabs[0]
+            .id;
+        assert!(registry.reorder_tab(first_tab, other_tab, false).is_err());
+        drop(registry);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

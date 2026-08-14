@@ -14,7 +14,7 @@ use nah_protocol::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 5;
+const SCHEMA_VERSION: u16 = 7;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 const MAX_WORKSPACES: usize = 16;
@@ -314,6 +314,8 @@ struct DesiredPane {
     custom_title: Option<String>,
     #[serde(default)]
     profile_override: Option<TerminalProfile>,
+    #[serde(default)]
+    custom_icon: Option<String>,
     local_cwd: Option<PathBuf>,
 }
 
@@ -373,6 +375,15 @@ impl DesiredState {
     }
 
     fn into_runtime(self) -> RecoveredState {
+        let mut appearance = self.appearance;
+        if self.schema_version < SCHEMA_VERSION {
+            if appearance.default_terminal_accent == AppearanceColor::HARBOR_BLUE {
+                appearance.default_terminal_accent = AppearanceColor::DARK_GRAY;
+            }
+            if appearance.default_workspace_color == AppearanceColor::HARBOR_BLUE {
+                appearance.default_workspace_color = AppearanceColor::DARK_GRAY;
+            }
+        }
         let mut cwd_by_pane = HashMap::new();
         let mut offline_panes = HashSet::new();
         let workspaces = self
@@ -412,7 +423,7 @@ impl DesiredState {
         RecoveredState {
             snapshot: SessionSnapshot {
                 revision: self.revision.saturating_add(1),
-                appearance: self.appearance,
+                appearance,
                 workspaces,
             },
             cwd_by_pane,
@@ -582,6 +593,7 @@ impl DesiredPane {
             color: pane.color,
             custom_title: pane.custom_title.clone(),
             profile_override: pane.profile_override,
+            custom_icon: pane.custom_icon.clone(),
             local_cwd,
         })
     }
@@ -614,6 +626,7 @@ impl DesiredPane {
             identity: TerminalIdentity::default(),
             custom_title,
             profile_override: self.profile_override,
+            custom_icon: self.custom_icon,
         }
     }
 
@@ -622,6 +635,9 @@ impl DesiredPane {
         validate_title(&self.title, "pane")?;
         if let Some(custom_title) = &self.custom_title {
             validate_title(custom_title, "custom terminal")?;
+        }
+        if let Some(custom_icon) = &self.custom_icon {
+            validate_custom_icon_id(custom_icon)?;
         }
         if let Some(local_cwd) = &self.local_cwd {
             if !local_cwd.is_absolute() {
@@ -661,6 +677,19 @@ fn validate_title(title: &str, kind: &str) -> Result<()> {
     let length = title.chars().count();
     if length == 0 || length > MAX_TITLE_CHARS || title.chars().any(char::is_control) {
         bail!("{kind} title must be 1 to {MAX_TITLE_CHARS} visible characters");
+    }
+    Ok(())
+}
+
+pub(super) fn validate_custom_icon_id(icon: &str) -> Result<()> {
+    let Some((stem, extension)) = icon.split_once('.') else {
+        bail!("custom icon ID is malformed");
+    };
+    if Uuid::parse_str(stem).is_err()
+        || !matches!(extension, "png" | "jpg" | "webp" | "gif")
+        || icon.contains(['/', '\\'])
+    {
+        bail!("custom icon ID is malformed");
     }
     Ok(())
 }
@@ -753,6 +782,7 @@ mod tests {
             identity: TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
+            custom_icon: None,
         };
         let first_id = first.id;
         let second_id = second.id;
@@ -853,6 +883,7 @@ mod tests {
         };
         pane.custom_title = Some("Release shell".to_owned());
         pane.profile_override = Some(TerminalProfile::Gemini);
+        pane.custom_icon = Some("00000000-0000-4000-8000-000000000001.png".to_owned());
 
         store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
         let recovered = store.load().unwrap().snapshot;
@@ -877,6 +908,10 @@ mod tests {
         assert_eq!(
             recovered_pane.profile_override,
             Some(TerminalProfile::Gemini)
+        );
+        assert_eq!(
+            recovered_pane.custom_icon.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001.png")
         );
         assert_eq!(recovered_pane.identity, TerminalIdentity::default());
 
@@ -913,6 +948,26 @@ mod tests {
         assert_eq!(old_pane.profile_override, None);
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schema_six_harbor_blue_defaults_migrate_to_dark_gray() {
+        let snapshot = SessionSnapshot::seeded();
+        let mut desired = DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot)).unwrap();
+        desired.schema_version = 6;
+        desired.appearance.default_terminal_accent = AppearanceColor::HARBOR_BLUE;
+        desired.appearance.default_workspace_color = AppearanceColor::HARBOR_BLUE;
+
+        let recovered = desired.into_runtime().snapshot;
+
+        assert_eq!(
+            recovered.appearance.default_terminal_accent,
+            AppearanceColor::DARK_GRAY
+        );
+        assert_eq!(
+            recovered.appearance.default_workspace_color,
+            AppearanceColor::DARK_GRAY
+        );
     }
 
     #[test]
