@@ -1,6 +1,6 @@
 # CMUX-reference visual brief
 
-This brief derives observable layout and interaction direction from the public cmux README screenshots and documentation. It does not authorize reuse of cmux's GPL source code, logo, icons, image assets, product text, or branding. Not a Harness uses original GPUI code and simple text/geometry primitives.
+This brief derives observable layout and interaction direction from the public cmux README screenshots and documentation. It does not authorize reuse of cmux's GPL source code, logo, icons, image assets, product text, or branding. Harness Harlot uses original GPUI code and simple text/geometry primitives.
 
 ## Whole-window hierarchy
 

@@ -233,7 +233,7 @@ pub(super) struct HistoryEditor {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TerminalLineRender {
     pub(super) row: usize,
-    pub(super) cursor: Option<nah_protocol::TerminalCursor>,
+    pub(super) cursor: Option<hh_protocol::TerminalCursor>,
     pub(super) focused: bool,
     pub(super) pane_id: Uuid,
     pub(super) columns: u16,
@@ -1067,7 +1067,7 @@ mod tests {
             title: "build".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: Some("build".to_owned()),
             profile_override: None,
             custom_icon: None,

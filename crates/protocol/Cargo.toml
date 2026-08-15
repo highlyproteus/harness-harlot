@@ -1,12 +1,14 @@
 [package]
-name = "nah-protocol"
+name = "hh-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Local protocol types for Not a Harness"
+description = "Local protocol types for Harness Harlot"
 
 [dependencies]
+libc.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

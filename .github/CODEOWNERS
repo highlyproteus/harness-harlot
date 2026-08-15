@@ -1,0 +1,7 @@
+* @justbytes
+
+/scripts/ @justbytes
+/packaging/ @justbytes
+/.github/workflows/ @justbytes
+/crates/updater/ @justbytes
+/crates/release-signer/ @justbytes

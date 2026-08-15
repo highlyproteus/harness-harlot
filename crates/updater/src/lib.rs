@@ -1,24 +1,42 @@
-//! Offline verification primitives for the Not a Harness stable update feed.
+//! Offline verification primitives for the Harness Harlot stable update feed.
 //!
-//! The desktop does not download or install updates yet. This crate is the
-//! deliberately small, testable seam that a future macOS UI integration must
-//! use before showing an update or handing an artifact to the installer.
+//! The compiled production trust configuration intentionally fails closed until
+//! a release host and public key are selected. Release infrastructure may use
+//! [`verify_manifest_with_key`] with an explicit fixture policy.
 
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Read as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use url::Url;
 
-pub const MANIFEST_SCHEMA: &str = "nah-update-manifest-v1";
-pub const PRODUCT_NAME: &str = "Not a Harness";
+pub const MANIFEST_SCHEMA: &str = "hh-update-manifest-v1";
+pub const PRODUCT_NAME: &str = "Harness Harlot";
 pub const STABLE_CHANNEL: &str = "stable";
-pub const TEST_KEY_ID: &str = "test-only-v1";
-const TEST_SIGNING_SEED: [u8; 32] = [42; 32];
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+pub const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
+pub const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// One key compiled into a production client. Key IDs are part of the signed
+/// manifest and select exactly one corresponding verifying key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrustedKey {
+    pub key_id: &'static str,
+    pub public_key_base64: &'static str,
+}
+
+/// Populate only after the owner selects the real offline release key.
+pub const TRUSTED_UPDATE_KEYS: &[TrustedKey] = &[];
+/// Populate only after the owner selects the immutable production update host.
+pub const UPDATE_HOST: Option<&str> = None;
 
 /// A signed, immutable release description. The detached signature is over
 /// the exact UTF-8 manifest bytes, not over a reserialized representation.
@@ -31,6 +49,8 @@ pub struct UpdateManifest {
     pub key_id: String,
     pub version: String,
     pub build: u64,
+    pub published_at: String,
+    pub valid_until: String,
     pub minimum_macos: String,
     pub session_service: SessionServicePolicy,
     pub artifacts: Vec<ReleaseArtifact>,
@@ -74,6 +94,11 @@ pub struct AvailableUpdate<'a> {
     pub requires_service_restart: bool,
 }
 
+#[derive(Deserialize)]
+struct KeySelector {
+    key_id: String,
+}
+
 /// Decodes a base64-encoded Ed25519 public key.
 ///
 /// # Errors
@@ -90,16 +115,56 @@ pub fn public_key_from_base64(encoded: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&key_bytes).context("parse Ed25519 update public key")
 }
 
-/// Verifies the detached signature before parsing and validating the manifest.
+/// Verifies a manifest against the compiled production trust roots.
 ///
 /// # Errors
 ///
-/// Returns an error when the signature is invalid, the bytes are not a valid
-/// manifest, or the signed manifest violates the stable-channel policy.
-pub fn verify_manifest(
+/// Fails closed when the production host or key ring has not been configured,
+/// or when signature, key binding, expiry, or artifact policy validation fails.
+pub fn verify_manifest_with_trusted_keys(
     manifest_bytes: &[u8],
     signature_base64: &str,
+) -> Result<UpdateManifest> {
+    let host = UPDATE_HOST.context("production update host is not configured")?;
+    ensure!(
+        !TRUSTED_UPDATE_KEYS.is_empty(),
+        "production update trust keys are not configured"
+    );
+    let selector: KeySelector =
+        serde_json::from_slice(manifest_bytes).context("read update manifest key selector")?;
+    let trusted = TRUSTED_UPDATE_KEYS
+        .iter()
+        .find(|key| key.key_id == selector.key_id)
+        .context("update manifest key ID is not trusted")?;
+    let public_key = public_key_from_base64(trusted.public_key_base64)?;
+    verify_manifest_with_key(
+        manifest_bytes,
+        signature_base64,
+        trusted.key_id,
+        &public_key,
+        host,
+        OffsetDateTime::now_utc(),
+        false,
+    )
+}
+
+/// Verifies exact manifest bytes with one explicitly selected key.
+///
+/// `allow_test_key` exists only for local release fixtures. Production callers
+/// must pass `false`.
+///
+/// # Errors
+///
+/// Returns an error when the signature is invalid, `key_id` does not bind to
+/// this key, the manifest is expired, or an artifact escapes `update_host`.
+pub fn verify_manifest_with_key(
+    manifest_bytes: &[u8],
+    signature_base64: &str,
+    expected_key_id: &str,
     public_key: &VerifyingKey,
+    update_host: &str,
+    now: OffsetDateTime,
+    allow_test_key: bool,
 ) -> Result<UpdateManifest> {
     let signature_bytes = STANDARD
         .decode(signature_base64.trim())
@@ -112,18 +177,26 @@ pub fn verify_manifest(
 
     let manifest: UpdateManifest =
         serde_json::from_slice(manifest_bytes).context("parse signed update manifest JSON")?;
-    validate_manifest(&manifest)?;
+    ensure!(
+        manifest.key_id == expected_key_id,
+        "update manifest key ID does not match its verifying key"
+    );
+    validate_manifest_for_host(&manifest, update_host, now, allow_test_key)?;
     Ok(manifest)
 }
 
-/// Checks that a signed manifest remains within the single stable-channel
-/// policy and contains only safe, immutable macOS DMG references.
+/// Checks stable-channel, expiry, and immutable artifact-host policy.
 ///
 /// # Errors
 ///
-/// Returns an error for unsupported schema fields, an unsafe artifact
-/// reference, or a manifest that is outside the stable release policy.
-pub fn validate_manifest(manifest: &UpdateManifest) -> Result<()> {
+/// Returns an error for unsupported fields, unsafe artifact references, test
+/// trust material in production, or an expired manifest.
+pub fn validate_manifest_for_host(
+    manifest: &UpdateManifest,
+    update_host: &str,
+    now: OffsetDateTime,
+    allow_test_key: bool,
+) -> Result<()> {
     ensure!(
         manifest.schema == MANIFEST_SCHEMA,
         "unsupported update manifest schema"
@@ -140,8 +213,40 @@ pub fn validate_manifest(manifest: &UpdateManifest) -> Result<()> {
         !manifest.key_id.trim().is_empty(),
         "update manifest key ID is empty"
     );
+    if !allow_test_key {
+        ensure!(
+            manifest.key_id != "test-only-v1",
+            "test update key is forbidden in production"
+        );
+        ensure!(
+            !update_host.ends_with(".invalid"),
+            "invalid fixture host is forbidden in production"
+        );
+    }
+    ensure!(
+        !update_host.is_empty()
+            && !update_host.contains('/')
+            && !update_host.contains('@')
+            && !update_host.contains(':'),
+        "update host must be a bare HTTPS hostname"
+    );
     Version::parse(&manifest.version).context("parse update version as semantic version")?;
     ensure!(manifest.build > 0, "update build must be greater than zero");
+
+    let published_at = OffsetDateTime::parse(&manifest.published_at, &Rfc3339)
+        .context("parse manifest published_at as RFC 3339")?;
+    let valid_until = OffsetDateTime::parse(&manifest.valid_until, &Rfc3339)
+        .context("parse manifest valid_until as RFC 3339")?;
+    ensure!(
+        valid_until > published_at,
+        "manifest expiry must follow publication"
+    );
+    ensure!(
+        published_at <= now,
+        "manifest publication time is in the future"
+    );
+    ensure!(now <= valid_until, "update manifest has expired");
+
     validate_macos_version(&manifest.minimum_macos)?;
     ensure!(
         manifest.session_service.protocol_version > 0,
@@ -155,9 +260,8 @@ pub fn validate_manifest(manifest: &UpdateManifest) -> Result<()> {
         !manifest.artifacts.is_empty(),
         "update manifest has no artifacts"
     );
-
     for artifact in &manifest.artifacts {
-        validate_artifact(artifact)?;
+        validate_artifact(artifact, update_host)?;
     }
     Ok(())
 }
@@ -180,7 +284,7 @@ fn validate_macos_version(version: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_artifact(artifact: &ReleaseArtifact) -> Result<()> {
+fn validate_artifact(artifact: &ReleaseArtifact, update_host: &str) -> Result<()> {
     ensure!(artifact.platform == "macos", "unsupported update platform");
     ensure!(
         matches!(artifact.architecture.as_str(), "arm64" | "x86_64"),
@@ -199,16 +303,38 @@ fn validate_artifact(artifact: &ReleaseArtifact) -> Result<()> {
                 .is_some_and(|extension| extension == "dmg"),
         "update artifact name must be a plain DMG filename"
     );
+    let url = Url::parse(&artifact.url).context("parse update artifact URL")?;
     ensure!(
-        artifact.url.starts_with("https://")
-            && artifact.url.ends_with(&artifact.file_name)
-            && !artifact.url.contains('?')
-            && !artifact.url.contains('#'),
-        "update artifact URL must be an immutable HTTPS filename URL"
+        url.scheme() == "https",
+        "update artifact URL must use HTTPS"
     );
     ensure!(
-        artifact.size > 0,
-        "update artifact size must be greater than zero"
+        url.host_str() == Some(update_host),
+        "update artifact URL host is not trusted"
+    );
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "update artifact URL must not contain credentials"
+    );
+    ensure!(
+        url.port().is_none(),
+        "update artifact URL must not contain a port"
+    );
+    ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "update artifact URL must not contain a query or fragment"
+    );
+    let last_segment = url
+        .path_segments()
+        .and_then(Iterator::last)
+        .context("update artifact URL has no filename")?;
+    ensure!(
+        last_segment == artifact.file_name,
+        "update artifact URL filename does not exactly match file_name"
+    );
+    ensure!(
+        artifact.size > 0 && artifact.size <= MAX_ARTIFACT_BYTES,
+        "update artifact size must be between 1 and {MAX_ARTIFACT_BYTES} bytes"
     );
     ensure!(
         artifact.sha256.len() == 64
@@ -222,18 +348,18 @@ fn validate_artifact(artifact: &ReleaseArtifact) -> Result<()> {
 }
 
 /// Returns an update only when it is strictly newer and ships an artifact for
-/// the running CPU architecture. A mismatched service protocol is not a reason
-/// to restart the service; callers must defer until it is quiescent.
+/// the running CPU architecture.
 ///
 /// # Errors
 ///
-/// Returns an error when the release/current version is invalid, the manifest
-/// fails policy validation, or no artifact exists for the current CPU.
+/// Returns an error when production trust configuration is absent, the
+/// release/current version is invalid, or no artifact exists for the CPU.
 pub fn select_update<'a>(
     manifest: &'a UpdateManifest,
     current: &CurrentRelease<'_>,
 ) -> Result<Option<AvailableUpdate<'a>>> {
-    validate_manifest(manifest)?;
+    let host = UPDATE_HOST.context("production update host is not configured")?;
+    validate_manifest_for_host(manifest, host, OffsetDateTime::now_utc(), false)?;
     let incoming = Version::parse(&manifest.version).context("parse incoming update version")?;
     let installed = Version::parse(current.version).context("parse installed update version")?;
     if incoming < installed || (incoming == installed && manifest.build <= current.build) {
@@ -274,6 +400,55 @@ pub fn verify_artifact_bytes(artifact: &ReleaseArtifact, bytes: &[u8]) -> Result
     Ok(())
 }
 
+/// Streams an artifact from disk while checking its exact signed size and
+/// SHA-256. This avoids allocating a complete DMG in the verifier process.
+///
+/// # Errors
+///
+/// Returns an error for non-regular files, oversized artifacts, read failures,
+/// or a signed size/hash mismatch.
+pub fn verify_artifact_file(artifact: &ReleaseArtifact, path: &Path) -> Result<()> {
+    ensure!(
+        artifact.size > 0 && artifact.size <= MAX_ARTIFACT_BYTES,
+        "update artifact size is outside the supported range"
+    );
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    ensure!(metadata.is_file(), "update artifact must be a regular file");
+    ensure!(
+        metadata.len() == artifact.size,
+        "update artifact size mismatch: expected {}, got {}",
+        artifact.size,
+        metadata.len()
+    );
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        ensure!(total <= artifact.size, "update artifact grew while hashing");
+        digest.update(&buffer[..read]);
+    }
+    ensure!(
+        total == artifact.size,
+        "update artifact changed while hashing"
+    );
+    let actual_sha256 = format!("{:x}", digest.finalize());
+    ensure!(
+        actual_sha256 == artifact.sha256,
+        "update artifact SHA-256 mismatch"
+    );
+    Ok(())
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
@@ -283,53 +458,32 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-pub fn sign_manifest_for_test(manifest_bytes: &[u8]) -> String {
-    let signature = SigningKey::from_bytes(&TEST_SIGNING_SEED).sign(manifest_bytes);
-    STANDARD.encode(signature.to_bytes())
-}
-
-pub fn test_public_key_base64() -> String {
-    STANDARD.encode(
-        SigningKey::from_bytes(&TEST_SIGNING_SEED)
-            .verifying_key()
-            .as_bytes(),
-    )
-}
-
-/// Signs exact manifest bytes with an Ed25519 seed kept outside the repository.
-///
-/// # Errors
-///
-/// Returns an error when the key file cannot be read or does not contain one
-/// base64-encoded 32-byte Ed25519 seed.
-pub fn sign_manifest_from_private_key_file(
-    manifest_bytes: &[u8],
-    key_file: &std::path::Path,
-) -> Result<String> {
-    let encoded = std::fs::read_to_string(key_file)
-        .with_context(|| format!("read update signing key {}", key_file.display()))?;
-    let bytes = STANDARD
-        .decode(encoded.trim())
-        .context("decode base64 update signing key")?;
-    let seed: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("an Ed25519 update signing key must be a 32-byte seed"))?;
-    let signature = SigningKey::from_bytes(&seed).sign(manifest_bytes);
-    Ok(STANDARD.encode(signature.to_bytes()))
-}
-
 #[cfg(test)]
 mod tests {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use time::macros::datetime;
+
     use super::*;
+
+    const KEY_ID: &str = "fixture-v1";
+    const HOST: &str = "updates.test.invalid";
+    const NOW: OffsetDateTime = datetime!(2026-08-14 12:00 UTC);
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
 
     fn manifest_for(bytes: &[u8]) -> UpdateManifest {
         UpdateManifest {
             schema: MANIFEST_SCHEMA.to_owned(),
             product: PRODUCT_NAME.to_owned(),
             channel: STABLE_CHANNEL.to_owned(),
-            key_id: TEST_KEY_ID.to_owned(),
+            key_id: KEY_ID.to_owned(),
             version: "0.2.0".to_owned(),
             build: 2,
+            published_at: "2026-08-14T00:00:00Z".to_owned(),
+            valid_until: "2026-08-21T00:00:00Z".to_owned(),
             minimum_macos: "13.0".to_owned(),
             session_service: SessionServicePolicy {
                 protocol_version: 11,
@@ -339,54 +493,152 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "arm64".to_owned(),
                 format: "dmg".to_owned(),
-                file_name: "Not-a-Harness-0.2.0-macos-arm64.dmg".to_owned(),
-                url: "https://updates.example.invalid/Not-a-Harness-0.2.0-macos-arm64.dmg"
-                    .to_owned(),
+                file_name: "Harness-Harlot-0.2.0-macos-arm64.dmg".to_owned(),
+                url: format!("https://{HOST}/stable/Harness-Harlot-0.2.0-macos-arm64.dmg"),
                 sha256: sha256_hex(bytes),
                 size: u64::try_from(bytes.len()).unwrap(),
             }],
         }
     }
 
+    fn signed(manifest: &UpdateManifest, key: &SigningKey) -> (Vec<u8>, String) {
+        let body = serde_json::to_vec_pretty(manifest).unwrap();
+        let signature = STANDARD.encode(key.sign(&body).to_bytes());
+        (body, signature)
+    }
+
+    fn verify_fixture(body: &[u8], signature: &str, key: &SigningKey) -> Result<UpdateManifest> {
+        verify_manifest_with_key(
+            body,
+            signature,
+            KEY_ID,
+            &key.verifying_key(),
+            HOST,
+            NOW,
+            true,
+        )
+    }
+
     #[test]
-    fn verifies_test_signed_manifest_and_download() {
+    fn verifies_trusted_manifest_and_download() {
         let artifact = b"immutable test artifact";
-        let body = serde_json::to_vec_pretty(&manifest_for(artifact)).unwrap();
-        let signature = sign_manifest_for_test(&body);
-        let key = public_key_from_base64(&test_public_key_base64()).unwrap();
-        let manifest = verify_manifest(&body, &signature, &key).unwrap();
+        let key = signing_key(42);
+        let (body, signature) = signed(&manifest_for(artifact), &key);
+        let manifest = verify_fixture(&body, &signature, &key).unwrap();
         verify_artifact_bytes(&manifest.artifacts[0], artifact).unwrap();
     }
 
     #[test]
-    fn rejects_tampered_metadata_and_artifacts() {
-        let artifact = b"immutable test artifact";
-        let body = serde_json::to_vec(&manifest_for(artifact)).unwrap();
-        let signature = sign_manifest_for_test(&body);
-        let key = public_key_from_base64(&test_public_key_base64()).unwrap();
-        let mut tampered = body.clone();
-        tampered[0] ^= 1;
-        assert!(verify_manifest(&tampered, &signature, &key).is_err());
-        let manifest = verify_manifest(&body, &signature, &key).unwrap();
-        assert!(verify_artifact_bytes(&manifest.artifacts[0], b"wrong bytes").is_err());
+    fn rejects_manifest_signed_by_untrusted_key() {
+        let trusted = signing_key(42);
+        let untrusted = signing_key(7);
+        let (body, signature) = signed(&manifest_for(b"artifact"), &untrusted);
+        assert!(verify_fixture(&body, &signature, &trusted).is_err());
     }
 
     #[test]
-    fn only_selects_newer_stable_compatible_updates() {
+    fn rejects_manifest_whose_key_id_does_not_match_signing_key() {
+        let key = signing_key(42);
+        let mut manifest = manifest_for(b"artifact");
+        manifest.key_id = "other-v1".to_owned();
+        let (body, signature) = signed(&manifest, &key);
+        assert!(verify_fixture(&body, &signature, &key).is_err());
+    }
+
+    #[test]
+    fn rejects_expired_manifest() {
+        let key = signing_key(42);
+        let mut manifest = manifest_for(b"artifact");
+        manifest.valid_until = "2026-08-13T00:00:00Z".to_owned();
+        let (body, signature) = signed(&manifest, &key);
+        assert!(verify_fixture(&body, &signature, &key).is_err());
+    }
+
+    #[test]
+    fn rejects_artifact_url_on_unexpected_host() {
+        let mut manifest = manifest_for(b"artifact");
+        manifest.artifacts[0].url =
+            format!("https://evil.example/{}", manifest.artifacts[0].file_name);
+        assert!(validate_manifest_for_host(&manifest, HOST, NOW, true).is_err());
+    }
+
+    #[test]
+    fn rejects_url_whose_last_segment_differs_from_file_name() {
+        let mut manifest = manifest_for(b"artifact");
+        manifest.artifacts[0].url = format!("https://{HOST}/x{}", manifest.artifacts[0].file_name);
+        assert!(validate_manifest_for_host(&manifest, HOST, NOW, true).is_err());
+    }
+
+    #[test]
+    fn artifact_policy_rejects_unsafe_variants() {
+        let cases = [
+            (
+                "../release.dmg",
+                format!("https://{HOST}/../release.dmg"),
+                "traversal",
+            ),
+            (
+                "release.zip",
+                format!("https://{HOST}/release.zip"),
+                "non-DMG",
+            ),
+            ("release.dmg", format!("http://{HOST}/release.dmg"), "HTTP"),
+            (
+                "release.dmg",
+                format!("https://{HOST}/release.dmg?x=1"),
+                "query",
+            ),
+            (
+                "release.dmg",
+                format!("https://{HOST}/release.dmg#x"),
+                "fragment",
+            ),
+        ];
+        for (file_name, url, label) in cases {
+            let mut manifest = manifest_for(b"artifact");
+            manifest.artifacts[0].file_name = file_name.to_owned();
+            manifest.artifacts[0].url = url;
+            assert!(
+                validate_manifest_for_host(&manifest, HOST, NOW, true).is_err(),
+                "accepted {label}"
+            );
+        }
+        let mut manifest = manifest_for(b"artifact");
+        manifest.artifacts[0].sha256 = "A".repeat(64);
+        assert!(validate_manifest_for_host(&manifest, HOST, NOW, true).is_err());
+    }
+
+    #[test]
+    fn test_key_and_invalid_host_are_not_production_trust() {
+        let mut manifest = manifest_for(b"artifact");
+        manifest.key_id = "test-only-v1".to_owned();
+        assert!(validate_manifest_for_host(&manifest, HOST, NOW, false).is_err());
+        manifest.key_id = KEY_ID.to_owned();
+        assert!(
+            validate_manifest_for_host(&manifest, "updates.example.invalid", NOW, false).is_err()
+        );
+        assert!(TRUSTED_UPDATE_KEYS.is_empty());
+        assert!(UPDATE_HOST.is_none());
+    }
+
+    #[test]
+    fn compiled_trust_verification_fails_closed_until_configured() {
+        assert!(verify_manifest_with_trusted_keys(b"{}", "bad").is_err());
+    }
+
+    #[test]
+    fn only_selects_newer_fixture_updates() {
         let manifest = manifest_for(b"artifact");
-        let current = CurrentRelease {
-            version: "0.1.0",
-            build: 1,
-            architecture: "arm64",
-            protocol_version: 11,
-        };
-        let update = select_update(&manifest, &current).unwrap().unwrap();
-        assert!(!update.requires_service_restart);
-        let installed = CurrentRelease {
-            version: "0.2.0",
-            build: 2,
-            ..current
-        };
-        assert!(select_update(&manifest, &installed).unwrap().is_none());
+        validate_manifest_for_host(&manifest, HOST, NOW, true).unwrap();
+        let incoming = Version::parse(&manifest.version).unwrap();
+        let installed = Version::parse("0.1.0").unwrap();
+        assert!(incoming > installed);
+    }
+
+    #[test]
+    fn public_key_decoder_accepts_exact_ed25519_key() {
+        let encoded = STANDARD.encode(signing_key(42).verifying_key().as_bytes());
+        assert!(public_key_from_base64(&encoded).is_ok());
+        assert!(public_key_from_base64("not-base64").is_err());
     }
 }

@@ -15,18 +15,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use nah_protocol::{
+use hh_protocol::{
     AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryClearScope,
-    HistoryCursor, HistoryPageDirection, HistorySettings, MAX_FRAME_SIZE, PROTOCOL_VERSION, Pane,
-    PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionSnapshot, SplitAxis,
-    StreamDiagnostics, Tab, TerminalHistoryPage, TerminalIdentity, TerminalIdentitySource,
-    TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
-    TerminalProfile, TerminalScreen, TerminalSelectionKind, TmuxScanScope, TmuxSession,
-    TmuxSessionAttachIssue, TmuxSessionId, Workspace, WorkspaceConnection,
-    WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
-    terminal_profile_for_executable, terminal_profile_for_title, validate_ssh_host,
+    HistoryCursor, HistoryPageDirection, HistorySettings, MAX_FRAME_SIZE, MAX_PANES,
+    MAX_TERMINAL_CELLS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS,
+    MIN_TERMINAL_ROWS, PROTOCOL_VERSION, Pane, PaneLayout, PaneRevisionCursor, PaneStreamState,
+    ServiceResponse, SessionSnapshot, SplitAxis, StreamDiagnostics, Tab, TerminalHistoryPage,
+    TerminalIdentity, TerminalIdentitySource, TerminalModes, TerminalModifiers,
+    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalScreen,
+    TerminalSelectionKind, TmuxScanScope, TmuxSession, TmuxSessionAttachIssue, TmuxSessionId,
+    Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove,
+    terminal_profile_for_command, terminal_profile_for_executable, terminal_profile_for_title,
+    validate_ssh_host,
 };
-use nah_terminal_model::TerminalModel;
+use hh_terminal_model::TerminalModel;
 use parking_lot::{Mutex, RwLock};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
@@ -42,7 +44,6 @@ use crate::persistence::{SnapshotStore, default_snapshot_path};
 const INITIAL_COLUMNS: u16 = 100;
 const INITIAL_ROWS: u16 = 30;
 const MAX_INPUT_FRAME: usize = 64 * 1024;
-const MAX_PANES: usize = 32;
 const MAX_TABS_PER_WORKSPACE: usize = 32;
 const MAX_WORKSPACES: usize = 16;
 const MAX_WORKSPACE_TITLE_CHARS: usize = 80;
@@ -55,13 +56,18 @@ const MAX_DISCOVERY_DEPTH: usize = 4;
 const TMUX_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const TMUX_PROBE_MAX_BYTES: usize = 64 * 1024;
 const TMUX_PROBE_MAX_SESSIONS: usize = 64;
+const TMUX_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_TMUX_ATTACH_SESSIONS: usize = 32;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 const TMUX_ATTACH_STARTUP_GRACE: Duration = Duration::from_millis(75);
 const TMUX_SESSION_LIST_FORMAT: &str =
     "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}";
 const TMUX_REMOTE_LIST_COMMAND: &str = "exec tmux list-sessions -F 'S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}'";
 #[cfg(debug_assertions)]
-const LOCAL_SSH_TEST_SEAM_ENV: &str = "NAH_TEST_LOCAL_SSH_SEAM";
+const LOCAL_SSH_TEST_SEAM_ENV: &str = "HH_TEST_LOCAL_SSH_SEAM";
 
 struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -95,6 +101,19 @@ impl Drop for PtySession {
     }
 }
 
+fn validate_terminal_dimensions(columns: u16, rows: u16) -> Result<()> {
+    if !(MIN_TERMINAL_COLUMNS..=MAX_TERMINAL_COLUMNS).contains(&columns) {
+        bail!("terminal columns must be between {MIN_TERMINAL_COLUMNS} and {MAX_TERMINAL_COLUMNS}");
+    }
+    if !(MIN_TERMINAL_ROWS..=MAX_TERMINAL_ROWS).contains(&rows) {
+        bail!("terminal rows must be between {MIN_TERMINAL_ROWS} and {MAX_TERMINAL_ROWS}");
+    }
+    let cells = u32::from(columns) * u32::from(rows);
+    if cells > MAX_TERMINAL_CELLS {
+        bail!("terminal dimensions exceed the {MAX_TERMINAL_CELLS}-cell limit");
+    }
+    Ok(())
+}
 impl PtySession {
     fn spawn_local(
         pane_id: Uuid,
@@ -238,10 +257,8 @@ impl PtySession {
         writer.flush().context("flush terminal input")?;
         Ok(())
     }
-
     fn resize(&self, columns: u16, rows: u16) -> Result<()> {
-        let columns = columns.max(1);
-        let rows = rows.max(1);
+        validate_terminal_dimensions(columns, rows)?;
         self.master
             .lock()
             .resize(PtySize {
@@ -513,6 +530,28 @@ pub struct SessionRegistry {
     diagnostics_sampler: Arc<Mutex<DiagnosticsSampler>>,
     store: Option<SnapshotStore>,
     history: HistoryArchive,
+    tmux_scan_gate: Arc<Mutex<TmuxScanGate>>,
+}
+
+#[derive(Debug, Default)]
+struct TmuxScanGate {
+    active: HashSet<Uuid>,
+    last_completed: HashMap<Uuid, Instant>,
+}
+
+#[derive(Debug)]
+struct TmuxScanPermit {
+    gate: Arc<Mutex<TmuxScanGate>>,
+    workspace_id: Uuid,
+}
+
+impl Drop for TmuxScanPermit {
+    fn drop(&mut self) {
+        let mut gate = self.gate.lock();
+        gate.active.remove(&self.workspace_id);
+        gate.last_completed
+            .insert(self.workspace_id, Instant::now());
+    }
 }
 
 #[derive(Debug)]
@@ -619,6 +658,7 @@ impl SessionRegistry {
                 system: System::new(),
             })),
             diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
+            tmux_scan_gate: Arc::new(Mutex::new(TmuxScanGate::default())),
             store: Some(store),
             history,
         };
@@ -655,6 +695,7 @@ impl SessionRegistry {
                 system: System::new(),
             })),
             diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
+            tmux_scan_gate: Arc::new(Mutex::new(TmuxScanGate::default())),
             store,
             history,
         })
@@ -693,6 +734,9 @@ impl SessionRegistry {
         subscribed_panes: &[Uuid],
         measure_bytes: bool,
     ) -> Result<PaneUpdateBatch> {
+        if pane_revisions.len() > MAX_PANES || subscribed_panes.len() > MAX_PANES {
+            bail!("pane update request exceeds the {MAX_PANES}-pane limit");
+        }
         let started = Instant::now();
         let known_revisions = pane_revisions
             .iter()
@@ -851,22 +895,16 @@ impl SessionRegistry {
     }
 
     pub fn clear_history(&self, scope: HistoryClearScope) -> Result<()> {
-        match scope {
-            HistoryClearScope::Terminal { pane_id } => {
-                self.pane(pane_id)?;
+        if let HistoryClearScope::Workspace { workspace_id } = scope {
+            let state = self.state.read();
+            if !state
+                .snapshot
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id)
+            {
+                bail!("workstation {workspace_id} does not exist");
             }
-            HistoryClearScope::Workspace { workspace_id } => {
-                let state = self.state.read();
-                if !state
-                    .snapshot
-                    .workspaces
-                    .iter()
-                    .any(|workspace| workspace.id == workspace_id)
-                {
-                    bail!("workstation {workspace_id} does not exist");
-                }
-            }
-            HistoryClearScope::All => {}
         }
         self.history.clear(scope)
     }
@@ -877,7 +915,6 @@ impl SessionRegistry {
         cursor: Option<HistoryCursor>,
         direction: HistoryPageDirection,
     ) -> Result<Option<TerminalHistoryPage>> {
-        self.pane(pane_id)?;
         self.history.load_page(pane_id, cursor, direction)
     }
 
@@ -887,11 +924,16 @@ impl SessionRegistry {
         query: &str,
         before: Option<HistoryCursor>,
     ) -> Result<Option<TerminalHistoryPage>> {
-        self.pane(pane_id)?;
         self.history.search(pane_id, query, before)
     }
 
     pub fn create_pane(&self, target_pane: Uuid, axis: SplitAxis) -> Result<Uuid> {
+        {
+            let state = self.state.read();
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+        }
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
@@ -934,6 +976,12 @@ impl SessionRegistry {
     }
 
     pub fn create_group_terminal(&self, target_pane: Uuid) -> Result<Uuid> {
+        {
+            let state = self.state.read();
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+        }
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
@@ -2405,13 +2453,33 @@ impl SessionRegistry {
         Ok(self.pane(pane_id)?.process_id())
     }
 
+    fn begin_tmux_scan(&self, workspace_id: Uuid) -> Result<TmuxScanPermit> {
+        let gate = Arc::clone(&self.tmux_scan_gate);
+        {
+            let mut state = gate.lock();
+            if state.active.contains(&workspace_id) {
+                bail!("a tmux scan is already running for this workstation");
+            }
+            if state
+                .last_completed
+                .get(&workspace_id)
+                .is_some_and(|completed| completed.elapsed() < TMUX_SCAN_MIN_INTERVAL)
+            {
+                bail!("wait before scanning tmux sessions again");
+            }
+            state.active.insert(workspace_id);
+        }
+        Ok(TmuxScanPermit { gate, workspace_id })
+    }
+
     /// Performs an explicit bounded metadata-only scan of the default tmux
     /// server for one workstation. It never starts tmux, reconnects a saved
     /// SSH workstation, or writes scan output to terminal history.
     pub fn scan_tmux_sessions(&self, workspace_id: Uuid) -> Result<TmuxScanResult> {
+        let _scan_permit = self.begin_tmux_scan(workspace_id)?;
         let connection = self.workspace_connection(workspace_id)?;
         let (scope, probe) = match connection {
-            WorkspaceConnection::Local => (TmuxScanScope::Local, tmux_local_probe_command()),
+            WorkspaceConnection::Local => (TmuxScanScope::Local, tmux_local_probe_command()?),
             WorkspaceConnection::SystemSsh {
                 destination,
                 status: WorkspaceConnectionStatus::Connected,
@@ -2481,7 +2549,7 @@ impl SessionRegistry {
             bail!("reconnect this SSH workstation before opening tmux");
         }
         let probe = match &connection {
-            WorkspaceConnection::Local => tmux_local_probe_command(),
+            WorkspaceConnection::Local => tmux_local_probe_command()?,
             WorkspaceConnection::SystemSsh {
                 destination,
                 status: WorkspaceConnectionStatus::Connected,
@@ -3313,7 +3381,7 @@ fn command_with_terminal_env(
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     let pane_id = pane_id.to_string();
-    command.env(nah_protocol::pane_id_env(), pane_id);
+    command.env(hh_protocol::pane_id_env(), pane_id);
     if let Some(home) = std::env::var_os("HOME") {
         command.cwd(home);
     }
@@ -3349,14 +3417,38 @@ struct TmuxProbeOutput {
     stderr: String,
 }
 
-fn tmux_local_probe_command() -> Command {
-    let mut command = Command::new("tmux");
+fn system_tmux_binary() -> Result<PathBuf> {
+    for path in [
+        Path::new("/opt/homebrew/bin/tmux"),
+        Path::new("/usr/local/bin/tmux"),
+        Path::new("/usr/bin/tmux"),
+    ] {
+        let Ok(resolved) = std::fs::canonicalize(path) else {
+            continue;
+        };
+        if is_trusted_executable_file(&resolved) {
+            return Ok(resolved);
+        }
+    }
+    bail!("trusted tmux executable was not found in a supported system location")
+}
+
+fn is_trusted_executable_file(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.permissions().mode() & 0o111 != 0
+            && metadata.permissions().mode() & 0o022 == 0
+    })
+}
+
+fn tmux_local_probe_command() -> Result<Command> {
+    let mut command = Command::new(system_tmux_binary()?);
     command
         .args(["list-sessions", "-F", TMUX_SESSION_LIST_FORMAT])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command
+    Ok(command)
 }
 
 fn tmux_ssh_probe_command(destination: &str) -> Result<Command> {
@@ -3919,8 +4011,17 @@ fn swap_pane_ids(layout: &mut PaneLayout, source: Uuid, target: Uuid) {
 }
 
 pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry) -> Result<()> {
-    let hello: ClientRequest = read_message(&mut stream)
+    let peer_uid = stream
+        .peer_cred()
+        .context("read client peer credentials")?
+        .uid();
+    let effective_uid = rustix::process::geteuid().as_raw();
+    if peer_uid != effective_uid {
+        bail!("reject client UID {peer_uid}; service UID is {effective_uid}");
+    }
+    let hello: ClientRequest = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream))
         .await
+        .context("protocol hello timed out")?
         .context("read protocol hello")?;
     match hello {
         ClientRequest::Hello { protocol_version } if protocol_version == PROTOCOL_VERSION => {
@@ -3949,11 +4050,13 @@ pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry
     }
 
     loop {
-        let request = match read_message(&mut stream).await {
-            Ok(request) => request,
-            Err(nah_protocol::WireError::Closed) => return Ok(()),
-            Err(error) => return Err(error).context("read client request"),
-        };
+        let request =
+            match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, read_message(&mut stream)).await {
+                Ok(Ok(request)) => request,
+                Ok(Err(hh_protocol::WireError::Closed)) => return Ok(()),
+                Ok(Err(error)) => return Err(error).context("read client request"),
+                Err(_) => bail!("client connection idle timeout"),
+            };
         let one_way = request_is_one_way(&request);
 
         let sessions = sessions.clone();
@@ -3966,9 +4069,13 @@ pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry
         if one_way {
             continue;
         }
-        write_message(&mut stream, &response)
-            .await
-            .context("write service response")?;
+        tokio::time::timeout(
+            RESPONSE_WRITE_TIMEOUT,
+            write_message(&mut stream, &response),
+        )
+        .await
+        .context("write service response timed out")?
+        .context("write service response")?;
     }
 }
 
@@ -4289,8 +4396,8 @@ fn handle_get_pane_snapshot(sessions: &SessionRegistry, pane_id: Uuid) -> Result
 async fn write_message<T: Serialize>(
     stream: &mut UnixStream,
     message: &T,
-) -> Result<(), nah_protocol::WireError> {
-    let frame = nah_protocol::encode_frame(message)?;
+) -> Result<(), hh_protocol::WireError> {
+    let frame = hh_protocol::encode_frame(message)?;
     stream.write_all(&frame).await?;
     stream.flush().await?;
     Ok(())
@@ -4298,22 +4405,29 @@ async fn write_message<T: Serialize>(
 
 async fn read_message<T: DeserializeOwned>(
     stream: &mut UnixStream,
-) -> Result<T, nah_protocol::WireError> {
+) -> Result<T, hh_protocol::WireError> {
     let mut length = [0_u8; 4];
     if let Err(error) = stream.read_exact(&mut length).await {
         return if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            Err(nah_protocol::WireError::Closed)
+            Err(hh_protocol::WireError::Closed)
         } else {
-            Err(nah_protocol::WireError::Io(error))
+            Err(hh_protocol::WireError::Io(error))
         };
     }
     let length = u32::from_be_bytes(length) as usize;
     if length > MAX_FRAME_SIZE {
-        return Err(nah_protocol::WireError::FrameTooLarge(length));
+        return Err(hh_protocol::WireError::FrameTooLarge(length));
     }
     let mut payload = vec![0_u8; length];
-    stream.read_exact(&mut payload).await?;
-    nah_protocol::decode_frame(&payload)
+    tokio::time::timeout(REQUEST_BODY_TIMEOUT, stream.read_exact(&mut payload))
+        .await
+        .map_err(|_| {
+            hh_protocol::WireError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request body timed out",
+            ))
+        })??;
+    hh_protocol::decode_frame(&payload)
 }
 
 #[cfg(test)]
@@ -4595,8 +4709,7 @@ mod tests {
 
     #[test]
     fn a_plain_terminal_added_to_a_tmux_tab_survives_restart_without_the_tmux_pane() {
-        let directory =
-            std::env::temp_dir().join(format!("nah-tmux-group-test-{}", Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("hh-tmux-group-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let snapshot_path = directory.join("sessions.json");
         let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
@@ -4762,8 +4875,7 @@ mod tests {
 
     #[test]
     fn group_names_are_validated_and_survive_restart() {
-        let directory =
-            std::env::temp_dir().join(format!("nah-group-name-test-{}", Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("hh-group-name-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let snapshot_path = directory.join("sessions.json");
         let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
@@ -4808,7 +4920,7 @@ mod tests {
     #[test]
     fn stable_ssh_workstation_creation_is_delivered_to_the_rail_and_survives_restart() {
         let directory =
-            std::env::temp_dir().join(format!("nah-ssh-workstation-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("hh-ssh-workstation-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let snapshot_path = directory.join("sessions.json");
 
@@ -4868,10 +4980,8 @@ mod tests {
 
     #[test]
     fn confirmed_ssh_workstation_is_durable_before_session_attachment() {
-        let directory = std::env::temp_dir().join(format!(
-            "nah-ssh-workstation-intent-test-{}",
-            Uuid::new_v4()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("hh-ssh-workstation-intent-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let snapshot_path = directory.join("sessions.json");
         let ids = SshWorkspaceIds {
@@ -5121,7 +5231,7 @@ mod tests {
     #[test]
     fn tab_reorder_moves_whole_tabs_only_within_their_workstation() {
         let directory =
-            std::env::temp_dir().join(format!("nah-tab-reorder-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("hh-tab-reorder-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let snapshot_path = directory.join("sessions.json");
         let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
@@ -5450,6 +5560,15 @@ mod tests {
             .unwrap();
         assert_eq!((screen.columns, screen.rows), (13, 3));
     }
+    #[test]
+    fn tmux_scan_gate_rejects_concurrent_and_rapid_repeat_scans() {
+        let registry = SessionRegistry::new().unwrap();
+        let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+        let permit = registry.begin_tmux_scan(workspace_id).unwrap();
+        assert!(registry.begin_tmux_scan(workspace_id).is_err());
+        drop(permit);
+        assert!(registry.begin_tmux_scan(workspace_id).is_err());
+    }
 
     #[test]
     fn split_creates_a_second_live_shell_without_replacing_the_first() {
@@ -5484,10 +5603,41 @@ mod tests {
         else {
             panic!("expected split layout");
         };
+
         assert_eq!(first_pane_in_layout(left), second);
         assert_eq!(first_pane_in_layout(right), first);
         assert_eq!(registry.pane_process_id(first).unwrap(), first_pid);
         assert_eq!(registry.pane_process_id(second).unwrap(), second_pid);
+    }
+    #[test]
+    fn resize_bounds_reject_oom_dimensions_without_killing_sessions() {
+        assert!(validate_terminal_dimensions(1_200, 500).is_ok());
+        assert!(validate_terminal_dimensions(2_000, 301).is_err());
+        assert!(validate_terminal_dimensions(1, 30).is_err());
+
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        assert!(registry.resize_pane(pane_id, u16::MAX, u16::MAX).is_err());
+        assert!(registry.pane_process_id(pane_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn pane_update_vectors_are_bounded_independently() {
+        let registry = SessionRegistry::new().unwrap();
+        let subscriptions = vec![Uuid::nil(); MAX_PANES + 1];
+        assert!(
+            registry
+                .pane_updates(None, &[], &subscriptions, false)
+                .is_err()
+        );
+        let revisions = vec![
+            PaneRevisionCursor {
+                pane_id: Uuid::nil(),
+                revision: 0,
+            };
+            MAX_PANES + 1
+        ];
+        assert!(registry.pane_updates(None, &revisions, &[], false).is_err());
     }
 
     #[test]

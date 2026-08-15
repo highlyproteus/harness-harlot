@@ -1,0 +1,21 @@
+[package]
+name = "hh-release-signer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Offline release-only Ed25519 manifest signer for Harness Harlot"
+
+[[bin]]
+name = "hh-release-sign"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

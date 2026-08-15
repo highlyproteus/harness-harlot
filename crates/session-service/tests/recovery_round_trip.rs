@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nah_protocol::{PaneLayout, SplitAxis};
-use nah_session_service::SessionRegistry;
+use hh_protocol::{PaneLayout, SplitAxis};
+use hh_session_service::SessionRegistry;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use uuid::Uuid;
 
@@ -94,7 +94,7 @@ fn first_pane(registry: &SessionRegistry) -> Uuid {
     leaf(&snapshot.workspaces[0].tabs[0].layout).id
 }
 
-fn leaf(layout: &PaneLayout) -> &nah_protocol::Pane {
+fn leaf(layout: &PaneLayout) -> &hh_protocol::Pane {
     match layout {
         PaneLayout::Leaf { pane } => pane,
         _ => panic!("expected leaf pane"),
@@ -102,5 +102,5 @@ fn leaf(layout: &PaneLayout) -> &nah_protocol::Pane {
 }
 
 fn test_directory(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("nah-integration-{label}-{}", Uuid::new_v4()))
+    std::env::temp_dir().join(format!("hh-integration-{label}-{}", Uuid::new_v4()))
 }

@@ -1,0 +1,21 @@
+# Rust dependency notices
+
+Generated from the locked Cargo dependency graph by `cargo about generate --locked --workspace about.hbs -o THIRD_PARTY_NOTICES.md`.
+
+## Components
+
+{{#each crates}}
+- [{{package.name}} {{package.version}}]({{#if package.repository}}{{package.repository}}{{else}}https://crates.io/crates/{{package.name}}{{/if}}) — {{license}}
+{{/each}}
+
+## License texts
+
+{{#each overview}}
+### {{name}}
+
+```text
+{{text}}
+```{{#unless @last}}
+
+{{/unless}}
+{{/each}}{{! end }}

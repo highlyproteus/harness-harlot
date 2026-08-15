@@ -9,7 +9,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Osc52, TermMode, point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::{self, Color, NamedColor};
-use nah_protocol::{
+use hh_protocol::{
     TerminalAttributes, TerminalColor, TerminalCursor, TerminalLine, TerminalModifiers,
     TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalRun, TerminalSelection,
     TerminalSelectionKind,
@@ -17,6 +17,8 @@ use nah_protocol::{
 
 pub const SCROLLBACK_HISTORY_LIMIT: usize = 2_000;
 const MAX_SAFE_TITLE_CHARS: usize = 80;
+const MAX_STYLE_RUNS_PER_LINE: usize = 128;
+const MAX_TOTAL_STYLE_RUNS: usize = 3_000;
 
 #[derive(Clone, Debug, Default)]
 struct TitleListener {
@@ -151,6 +153,7 @@ impl TerminalModel {
     pub fn styled_lines(&self) -> Vec<TerminalLine> {
         let display_offset =
             i32::try_from(self.terminal.grid().display_offset()).unwrap_or(i32::MAX);
+        let mut styled_runs_remaining = MAX_TOTAL_STYLE_RUNS;
         (0..self.terminal.screen_lines())
             .map(|line| {
                 let line = i32::try_from(line).unwrap_or(i32::MAX) - display_offset;
@@ -201,16 +204,21 @@ impl TerminalModel {
                         }
                     }
                     let attributes = TerminalAttributes::new(attributes);
-                    if let Some(previous) = runs.last_mut()
-                        && previous.foreground == foreground
-                        && previous.background == background
-                        && previous.attributes == attributes
-                    {
-                        previous.text.push(if hidden { ' ' } else { cell.c });
-                        if !hidden && let Some(zerowidth) = cell.zerowidth() {
-                            previous.text.extend(zerowidth);
+                    let extends_previous = runs.last().is_some_and(|previous| {
+                        previous.foreground == foreground
+                            && previous.background == background
+                            && previous.attributes == attributes
+                    });
+                    let coarsen_style = !runs.is_empty()
+                        && (runs.len() >= MAX_STYLE_RUNS_PER_LINE || styled_runs_remaining == 0);
+                    if extends_previous || coarsen_style {
+                        if let Some(previous) = runs.last_mut() {
+                            previous.text.push(if hidden { ' ' } else { cell.c });
+                            if !hidden && let Some(zerowidth) = cell.zerowidth() {
+                                previous.text.extend(zerowidth);
+                            }
+                            previous.columns = previous.columns.saturating_add(1);
                         }
-                        previous.columns = previous.columns.saturating_add(1);
                     } else {
                         let mut text = String::from(if hidden { ' ' } else { cell.c });
                         if !hidden && let Some(zerowidth) = cell.zerowidth() {
@@ -223,6 +231,7 @@ impl TerminalModel {
                             background,
                             attributes,
                         });
+                        styled_runs_remaining = styled_runs_remaining.saturating_sub(1);
                     }
                 }
                 TerminalLine { runs }
@@ -481,6 +490,8 @@ fn terminal_color(color: Color) -> TerminalColor {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use alacritty_terminal::index::{Column, Line};
 
     use super::*;
@@ -498,6 +509,41 @@ mod tests {
             styled[0].runs[1].foreground,
             TerminalColor::Ansi { index: 1 }
         );
+    }
+
+    #[test]
+    fn adversarial_per_cell_colors_are_coarsened_to_a_bounded_run_count() {
+        let columns = 200;
+        let rows = 30;
+        let mut model = TerminalModel::new(columns, rows);
+        let mut output = String::new();
+        for row in 0..rows {
+            for column in 0..columns {
+                write!(
+                    output,
+                    "\u{1b}[38;2;{};{};{}mX",
+                    row % 256,
+                    column % 256,
+                    (row + column) % 256
+                )
+                .unwrap();
+            }
+            if row + 1 < rows {
+                output.push_str("\r\n");
+            }
+        }
+        model.process_output(output.as_bytes());
+
+        let lines = model.styled_lines();
+        let run_count = lines.iter().map(|line| line.runs.len()).sum::<usize>();
+        assert!(run_count <= MAX_TOTAL_STYLE_RUNS + rows);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.runs.len() <= MAX_STYLE_RUNS_PER_LINE)
+        );
+        assert!(hh_protocol::encode_frame(&lines).is_ok());
+        assert!(lines.iter().all(|line| !line.runs.is_empty()));
     }
 
     #[test]

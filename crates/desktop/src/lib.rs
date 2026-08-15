@@ -1,10 +1,13 @@
+use std::fs;
 use std::io::BufReader;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use nah_protocol::{
-    ClientRequest, PROTOCOL_VERSION, ServiceResponse, WireError, read_message, socket_path,
-    write_message,
+use hh_protocol::{
+    ClientRequest, PROTOCOL_VERSION, ServiceResponse, WireError, legacy_socket_path, read_message,
+    socket_path, write_message,
 };
 
 /// A persistent, serialized connection to the local session service.
@@ -19,6 +22,42 @@ pub struct SessionClient {
     reader: BufReader<UnixStream>,
 }
 
+fn validate_socket_path(path: &Path, allow_legacy_temp_parent: bool) -> Result<()> {
+    let expected_uid = rustix::process::geteuid().as_raw();
+    let parent = path
+        .parent()
+        .context("session socket has no parent directory")?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("inspect session runtime directory {}", parent.display()))?;
+    if !parent_metadata.file_type().is_dir() {
+        bail!(
+            "session runtime path is not a real directory: {}",
+            parent.display()
+        );
+    }
+    let private_parent =
+        parent_metadata.uid() == expected_uid && parent_metadata.mode() & 0o077 == 0;
+    let accepted_legacy_parent = allow_legacy_temp_parent && parent == std::env::temp_dir();
+    if !private_parent && !accepted_legacy_parent {
+        bail!(
+            "session runtime directory must be owned by the current user and mode 0700: {}",
+            parent.display()
+        );
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect session socket {}", path.display()))?;
+    if !metadata.file_type().is_socket() {
+        bail!("session path is not a Unix socket: {}", path.display());
+    }
+    if metadata.uid() != expected_uid || metadata.mode() & 0o077 != 0 {
+        bail!(
+            "session socket must be owned by the current user and inaccessible to group/other: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 impl SessionClient {
     /// Connects to the service and completes the protocol handshake once.
     ///
@@ -27,9 +66,28 @@ impl SessionClient {
     /// Returns an error when the local socket is unavailable or the service
     /// rejects the protocol version.
     pub fn connect() -> Result<Self> {
-        let path = socket_path();
+        let path = socket_path()?;
+        match Self::connect_path(&path, false) {
+            Ok(client) => Ok(client),
+            Err(primary_error) => {
+                let Some(legacy_path) = legacy_socket_path().filter(|legacy| legacy != &path)
+                else {
+                    return Err(primary_error);
+                };
+                Self::connect_path(&legacy_path, true).with_context(|| {
+                    format!(
+                        "primary session socket failed ({primary_error:#}); legacy socket {} also failed",
+                        legacy_path.display()
+                    )
+                })
+            }
+        }
+    }
+
+    fn connect_path(path: &Path, allow_legacy_temp_parent: bool) -> Result<Self> {
+        validate_socket_path(path, allow_legacy_temp_parent)?;
         let mut stream =
-            UnixStream::connect(&path).with_context(|| format!("connect to {}", path.display()))?;
+            UnixStream::connect(path).with_context(|| format!("connect to {}", path.display()))?;
         let mut reader = BufReader::new(stream.try_clone().context("clone session socket")?);
 
         write_message(
@@ -46,6 +104,28 @@ impl SessionClient {
         }
 
         Ok(Self { stream, reader })
+    }
+
+    /// Reports whether the previous socket location still has a listening
+    /// service, even when its protocol is too old for this desktop.
+    pub fn legacy_service_is_listening() -> bool {
+        legacy_socket_path().is_some_and(|path| {
+            if validate_socket_path(&path, true).is_err() {
+                return false;
+            }
+            let Ok(mut stream) = UnixStream::connect(path) else {
+                return false;
+            };
+            // Send a complete handshake so an older service never retains an
+            // idle connection merely because this compatibility probe ran.
+            write_message(
+                &mut stream,
+                &ClientRequest::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .is_ok()
+        })
     }
 
     /// Sends one request and waits for its response.
@@ -92,10 +172,10 @@ impl SessionClient {
 
 #[cfg(test)]
 mod tests {
-    use nah_protocol::MAX_FRAME_SIZE;
+    use hh_protocol::MAX_FRAME_SIZE;
 
     #[test]
     fn protocol_keeps_individual_input_frames_bounded() {
-        assert_eq!(MAX_FRAME_SIZE, 1024 * 1024);
+        assert_eq!(MAX_FRAME_SIZE, 4 * 1024 * 1024);
     }
 }

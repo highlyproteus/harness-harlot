@@ -1,16 +1,20 @@
-# Not a Harness runtime identity
+# Harness Harlot runtime identity
 
-The public product name is **Not a Harness**. Its technical prefix is `nah`.
-The supported environment interface is `NAH_SOCKET`, `NAH_STATE_DIR`,
-`NAH_CONFIG`, and `NAH_PANE_ID`.
+The public product name is **Harness Harlot**. Its technical prefix is `hh`.
+The supported environment interface is `HH_SOCKET`, `HH_STATE_DIR`,
+`HH_CONFIG`, and `HH_PANE_ID`.
 
-Fresh runtime data uses `nah-session.sock` in the temporary directory, the
-macOS `~/Library/Application Support/Not a Harness` state directory, and `nah`
-directories under XDG state and config roots on Linux and other Unix platforms.
-No legacy configuration or runtime fallback is supported by this release.
+Runtime data uses `hh-session.sock` under the owner-only runtime directory.
+Stable macOS state lives under
+`~/Library/Application Support/Harness Harlot`; development state uses
+`~/Library/Application Support/Harness Harlot Dev`. Linux and other Unix
+platforms use `hh` and `hh-dev` directories under the XDG state and
+configuration roots.
 
-The migration audit performed with this change found no existing local state,
-configuration, or socket data to move. No user data was removed. The only
-remaining historical references are the checkout path and Codex project mapping,
-plus preserved historical task and PDR identifiers; changing those can detach
-established Codex task history.
+The retired pre-rename identity is not read, migrated, or
+removed. Any pre-rename local state remains on disk and is ignored. No legacy
+configuration, socket, or state fallback exists.
+
+The checkout path and Codex project mapping remain unchanged, and historical
+task and PDR identifiers are preserved because they are dated records rather
+than living product identity.

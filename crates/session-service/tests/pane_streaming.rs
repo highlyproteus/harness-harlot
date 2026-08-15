@@ -1,9 +1,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nah_protocol::{PaneLayout, PaneRevisionCursor, SplitAxis, TerminalScreen};
-use nah_session_service::SessionRegistry;
-use nah_terminal_model::SCROLLBACK_HISTORY_LIMIT;
+use hh_protocol::{PaneLayout, PaneRevisionCursor, SplitAxis, TerminalScreen};
+use hh_session_service::SessionRegistry;
+use hh_terminal_model::SCROLLBACK_HISTORY_LIMIT;
 use uuid::Uuid;
 
 #[test]
@@ -279,7 +279,7 @@ fn keystroke_echo_reaches_a_subscribed_pane_promptly() {
 
     let started = Instant::now();
     registry
-        .write_input(first, b"printf 'NAH_ECHO_MARKER\\n'\r")
+        .write_input(first, b"printf 'HH_ECHO_MARKER\\n'\r")
         .unwrap();
     let deadline = started + Duration::from_secs(5);
     let mut preparation_micros = 0;
@@ -292,7 +292,7 @@ fn keystroke_echo_reaches_a_subscribed_pane_promptly() {
             .screens
             .iter()
             .filter(|screen| screen.pane_id == first)
-            .any(|screen| screen_contains(screen, "NAH_ECHO_MARKER"))
+            .any(|screen| screen_contains(screen, "HH_ECHO_MARKER"))
         {
             break;
         }

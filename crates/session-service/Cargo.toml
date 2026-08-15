@@ -1,23 +1,24 @@
 [package]
-name = "nah-session-service"
+name = "hh-session-service"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Persistent local session service for Not a Harness"
+description = "Persistent local session service for Harness Harlot"
 
 [[bin]]
-name = "nah-service"
+name = "hh-service"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true
 portable-pty.workspace = true
-nah-protocol = { path = "../protocol" }
+hh-protocol = { version = "0.1.0", path = "../protocol" }
 parking_lot.workspace = true
-nah-terminal-model = { path = "../terminal-model" }
+hh-terminal-model = { version = "0.1.0", path = "../terminal-model" }
 serde.workspace = true
+rustix.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
 tokio.workspace = true

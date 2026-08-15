@@ -4,6 +4,7 @@ members = [
   "crates/macos-icon",
   "crates/protocol",
   "crates/session-service",
+  "crates/release-signer",
   "crates/terminal-model",
   "crates/updater",
 ]
@@ -19,22 +20,27 @@ license = "MIT"
 alacritty_terminal = "0.26.0"
 anyhow = "1.0.99"
 base64 = "0.22.1"
-ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
 gpui = "0.2.2"
+image = "0.25.10"
 libc = "0.2.175"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSString"] }
+objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSError", "NSString", "NSURL", "NSValue"] }
+time = { version = "0.3.41", features = ["macros", "parsing"] }
 parking_lot = "0.12"
 portable-pty = "0.9.0"
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 semver = "1.0.27"
 sha2 = "0.10.9"
 sysinfo = "0.31.4"
 thiserror = "2.0.16"
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 unicode-width = "0.2.2"
+url = "2.5.8"
+zeroize = "1.8.1"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [workspace.lints.rust]
@@ -46,3 +52,8 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+strip = "debuginfo"

@@ -3,7 +3,8 @@ set -eu
 
 usage() {
   echo "usage: $0 VERSION BUILD" >&2
-  echo "set NAH_RELEASE_TEST_MODE=1 for a local fixture package, or provide NAH_CODESIGN_IDENTITY, NAH_UPDATE_SIGNING_KEY_FILE, NAH_UPDATE_PUBLIC_KEY, NAH_UPDATE_KEY_ID, and NAH_UPDATE_BASE_URL for a publishable package." >&2
+  echo "test fixtures require HH_RELEASE_TEST_MODE=1 plus HH_UPDATE_SIGNING_KEY_FILE and HH_UPDATE_PUBLIC_KEY" >&2
+  echo "production additionally requires HH_CODESIGN_IDENTITY, HH_EXPECTED_TEAM_ID, HH_NOTARY_PROFILE, HH_UPDATE_KEY_ID, HH_UPDATE_BASE_URL, and HH_RELEASE_TAG" >&2
   exit 2
 }
 
@@ -23,12 +24,12 @@ esac
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repository_root"
 
-workspace_version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+workspace_version=$(cargo metadata --locked --format-version 1 --no-deps | plutil -extract packages.0.version raw -o - -)
 if [ "$workspace_version" != "$version" ]; then
   echo "VERSION $version does not match workspace version $workspace_version" >&2
   exit 2
 fi
-protocol_version=$(awk '/^pub const PROTOCOL_VERSION/ { gsub(/[^0-9]/, "", $NF); print $NF; exit }' crates/protocol/src/lib.rs)
+protocol_version=$(sed -nE 's/^pub const PROTOCOL_VERSION: u16 = ([0-9]+);$/\1/p' crates/protocol/src/lib.rs)
 case "$protocol_version" in
   '' | *[!0-9]*) echo "could not read PROTOCOL_VERSION from crates/protocol/src/lib.rs" >&2; exit 2 ;;
 esac
@@ -39,71 +40,128 @@ case "$(uname -m)" in
   *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 2 ;;
 esac
 
-test_mode=${NAH_RELEASE_TEST_MODE:-0}
+test_mode=${HH_RELEASE_TEST_MODE:-0}
+: "${HH_UPDATE_SIGNING_KEY_FILE:?set HH_UPDATE_SIGNING_KEY_FILE to an owner-only base64 Ed25519 seed file}"
+: "${HH_UPDATE_PUBLIC_KEY:?set HH_UPDATE_PUBLIC_KEY to the matching base64 Ed25519 public key}"
 if [ "$test_mode" = 1 ]; then
-  key_id=test-only-v1
-  base_url=${NAH_UPDATE_BASE_URL:-https://updates.example.invalid/stable}
+  key_id=${HH_UPDATE_KEY_ID:-test-only-v1}
+  base_url=${HH_UPDATE_BASE_URL:-https://updates.example.invalid/stable}
+  codesign_identity=-
 else
-  : "${NAH_CODESIGN_IDENTITY:?set NAH_CODESIGN_IDENTITY for a publishable package}"
-  : "${NAH_UPDATE_SIGNING_KEY_FILE:?set NAH_UPDATE_SIGNING_KEY_FILE for a publishable package}"
-  : "${NAH_UPDATE_PUBLIC_KEY:?set NAH_UPDATE_PUBLIC_KEY for a publishable package}"
-  : "${NAH_UPDATE_KEY_ID:?set NAH_UPDATE_KEY_ID for a publishable package}"
-  : "${NAH_UPDATE_BASE_URL:?set NAH_UPDATE_BASE_URL for a publishable package}"
-  key_id=$NAH_UPDATE_KEY_ID
-  base_url=$NAH_UPDATE_BASE_URL
+  : "${HH_CODESIGN_IDENTITY:?set HH_CODESIGN_IDENTITY for a publishable package}"
+  : "${HH_EXPECTED_TEAM_ID:?set HH_EXPECTED_TEAM_ID for verification}"
+  : "${HH_NOTARY_PROFILE:?set HH_NOTARY_PROFILE created by notarytool store-credentials}"
+  : "${HH_UPDATE_KEY_ID:?set HH_UPDATE_KEY_ID for a publishable package}"
+  : "${HH_UPDATE_BASE_URL:?set HH_UPDATE_BASE_URL for a publishable package}"
+  : "${HH_RELEASE_TAG:?set HH_RELEASE_TAG to the signed annotated tag for this release}"
+  key_id=$HH_UPDATE_KEY_ID
+  base_url=$HH_UPDATE_BASE_URL
+  codesign_identity=$HH_CODESIGN_IDENTITY
+  if [ "$key_id" = "test-only-v1" ]; then
+    echo "test-only update key is forbidden in production" >&2
+    exit 2
+  fi
+  case "$base_url" in
+    *.invalid | *.invalid/*) echo ".invalid update hosts are forbidden in production" >&2; exit 2 ;;
+  esac
 fi
 case "$base_url" in
   https://*) ;;
-  *) echo "NAH_UPDATE_BASE_URL must use HTTPS" >&2; exit 2 ;;
+  *) echo "HH_UPDATE_BASE_URL must use HTTPS" >&2; exit 2 ;;
 esac
 base_url=${base_url%/}
+update_host=${base_url#https://}
+update_host=${update_host%%/*}
+case "$update_host" in
+  '' | *:* | *@*) echo "HH_UPDATE_BASE_URL must use a bare HTTPS host without credentials or port" >&2; exit 2 ;;
+esac
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  if [ "$test_mode" = 1 ] && [ "${NAH_ALLOW_DIRTY_TEST_PACKAGE:-0}" = 1 ]; then
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  if [ "$test_mode" = 1 ] && [ "${HH_ALLOW_DIRTY_TEST_PACKAGE:-0}" = 1 ]; then
     echo "warning: creating a test-only package from a dirty worktree" >&2
   else
-    echo "refusing to package a tracked dirty worktree" >&2
+    echo "refusing to package a dirty worktree, including untracked files" >&2
+    exit 2
+  fi
+fi
+if [ "$test_mode" != 1 ]; then
+  git verify-tag "$HH_RELEASE_TAG"
+  tag_commit=$(git rev-parse "$HH_RELEASE_TAG^{commit}")
+  head_commit=$(git rev-parse HEAD)
+  if [ "$tag_commit" != "$head_commit" ]; then
+    echo "signed release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
     exit 2
   fi
 fi
 
-cargo build --locked --release -p nah-desktop --bin nah
-cargo build --locked --release -p nah-session-service --bin nah-service
-cargo build --locked --release -p nah-updater --bin nah-update-tool
+cargo build --locked --release -p hh-desktop --bin hh
+cargo build --locked --release -p hh-session-service --bin hh-service
+cargo build --locked --release -p hh-updater --bin hh-update-tool
+cargo build --locked --release -p hh-release-signer --bin hh-release-sign
+derived_public_key=$("$repository_root/target/release/hh-release-sign" public-key --private-key "$HH_UPDATE_SIGNING_KEY_FILE")
+if [ "$derived_public_key" != "$HH_UPDATE_PUBLIC_KEY" ]; then
+  echo "HH_UPDATE_PUBLIC_KEY does not match HH_UPDATE_SIGNING_KEY_FILE" >&2
+  exit 2
+fi
 "$repository_root/scripts/build-macos-app.sh" release
 
-app_directory="$repository_root/target/release/Not a Harness.app"
+app_directory="$repository_root/target/release/Harness Harlot.app"
 plist="$app_directory/Contents/Info.plist"
 plutil -replace CFBundleShortVersionString -string "$version" "$plist"
 plutil -replace CFBundleVersion -string "$build" "$plist"
-
-if [ "$test_mode" = 1 ]; then
-  codesign --force --sign - "$app_directory"
-else
-  codesign --force --options runtime --timestamp --sign "$NAH_CODESIGN_IDENTITY" "$app_directory"
-fi
+"$repository_root/scripts/sign-macos-app.sh" "$codesign_identity" "$app_directory"
 codesign --verify --deep --strict --verbose=2 "$app_directory"
+update_tool="$repository_root/target/release/hh-update-tool"
+if [ "$codesign_identity" = "-" ]; then
+  codesign --force --options runtime --identifier com.harnessharlot.update-tool --sign - "$update_tool"
+else
+  codesign --force --options runtime --timestamp --identifier com.harnessharlot.update-tool \
+    --sign "$codesign_identity" "$update_tool"
+fi
+codesign --verify --strict --verbose=2 "$update_tool"
 
-artifact_stem="Not-a-Harness-${version}+${build}-macos-${architecture}"
+artifact_prefix=
+if [ "$test_mode" = 1 ]; then
+  artifact_prefix=TESTONLY-
+fi
+artifact_stem="${artifact_prefix}Harness-Harlot-${version}+${build}-macos-${architecture}"
 distribution_directory="$repository_root/target/release-dist/$artifact_stem"
 rm -rf "$distribution_directory"
 mkdir -p "$distribution_directory"
 dmg="$distribution_directory/$artifact_stem.dmg"
-hdiutil create -quiet -volname "Not a Harness" -srcfolder "$app_directory" -format UDZO -ov "$dmg"
+dmg_root="$repository_root/target/release-dmg-root"
+rm -rf "$dmg_root"
+mkdir -p "$dmg_root"
+ditto "$app_directory" "$dmg_root/Harness Harlot.app"
+cp "$update_tool" "$dmg_root/hh-update-tool"
+hdiutil create -quiet -volname "Harness Harlot" -srcfolder "$dmg_root" -format UDZO -ov "$dmg"
+rm -rf "$dmg_root"
+if [ "$test_mode" = 1 ]; then
+  codesign --force --sign - "$dmg"
+else
+  codesign --force --timestamp --sign "$HH_CODESIGN_IDENTITY" "$dmg"
+  xcrun notarytool submit "$dmg" --keychain-profile "$HH_NOTARY_PROFILE" --wait
+  xcrun stapler staple "$dmg"
+  xcrun stapler validate "$dmg"
+fi
 
 artifact_name=$(basename "$dmg")
 artifact_size=$(stat -f %z "$dmg")
-artifact_sha256=$(shasum -a 256 "$dmg" | awk '{ print $1 }')
-manifest="$distribution_directory/update.json"
-signature="$distribution_directory/update.json.sig"
+artifact_sha256=$(shasum -a 256 "$dmg" | sed 's/[[:space:]].*$//')
+manifest="$distribution_directory/$artifact_stem.update.json"
+signature="$manifest.sig"
+published_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+valid_until=$(date -u -v+7d '+%Y-%m-%dT%H:%M:%SZ')
 cat > "$manifest" <<EOF
 {
-  "schema": "nah-update-manifest-v1",
-  "product": "Not a Harness",
+  "schema": "hh-update-manifest-v1",
+  "product": "Harness Harlot",
   "channel": "stable",
   "key_id": "$key_id",
   "version": "$version",
   "build": $build,
+  "published_at": "$published_at",
+  "valid_until": "$valid_until",
   "minimum_macos": "13.0",
   "session_service": {
     "protocol_version": $protocol_version,
@@ -123,15 +181,25 @@ cat > "$manifest" <<EOF
 }
 EOF
 
-update_tool="$app_directory/Contents/MacOS/nah-update-tool"
+"$repository_root/target/release/hh-release-sign" sign \
+  --manifest "$manifest" --signature "$signature" \
+  --private-key "$HH_UPDATE_SIGNING_KEY_FILE"
 if [ "$test_mode" = 1 ]; then
-  "$update_tool" test-sign --manifest "$manifest" --signature "$signature"
-  public_key=$("$update_tool" test-public-key)
+  "$repository_root/target/release/hh-update-tool" verify \
+    --key-id "$key_id" --public-key "$HH_UPDATE_PUBLIC_KEY" --host "$update_host" \
+    --manifest "$manifest" --signature "$signature" --artifact "$dmg" --fixture
 else
-  "$update_tool" sign --manifest "$manifest" --signature "$signature" --private-key "$NAH_UPDATE_SIGNING_KEY_FILE"
-  public_key=$NAH_UPDATE_PUBLIC_KEY
+  "$repository_root/target/release/hh-update-tool" verify-trusted \
+    --manifest "$manifest" --signature "$signature" --artifact "$dmg"
 fi
-"$update_tool" verify --public-key "$public_key" --manifest "$manifest" --signature "$signature" --artifact "$dmg"
 plutil -lint "$plist"
+
+if [ "$test_mode" = 1 ]; then
+  "$repository_root/scripts/verify-macos-release.sh" --fixture \
+    com.harnessharlot.desktop "$update_host" "$key_id" "$HH_UPDATE_PUBLIC_KEY" "$manifest" "$signature"
+else
+  "$repository_root/scripts/verify-macos-release.sh" \
+    "$HH_EXPECTED_TEAM_ID" com.harnessharlot.desktop "$manifest" "$signature"
+fi
 
 printf '%s\n' "$distribution_directory"
