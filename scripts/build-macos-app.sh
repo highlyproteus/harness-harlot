@@ -4,14 +4,12 @@ set -eu
 profile="${1:-debug}"
 case "$profile" in
   debug)
-    cargo build -p nah-desktop --bin nah
-    cargo build -p nah-session-service --bin nah-service
-    cargo build -p nah-updater --bin nah-update-tool
+    cargo build --locked -p hh-desktop --bin hh
+    cargo build --locked -p hh-session-service --bin hh-service
     ;;
   release)
-    cargo build --release -p nah-desktop --bin nah
-    cargo build --release -p nah-session-service --bin nah-service
-    cargo build --release -p nah-updater --bin nah-update-tool
+    cargo build --locked --release -p hh-desktop --bin hh
+    cargo build --locked --release -p hh-session-service --bin hh-service
     ;;
   *)
     echo "usage: $0 [debug|release]" >&2
@@ -20,32 +18,29 @@ case "$profile" in
 esac
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-app_directory="$repository_root/target/$profile/Not a Harness.app"
+app_directory="$repository_root/target/$profile/Harness Harlot.app"
 contents_directory="$app_directory/Contents"
+rm -rf "$app_directory"
 
-mkdir -p "$contents_directory/MacOS" "$contents_directory/Resources"
+notices_directory="$contents_directory/Resources/licenses"
+mkdir -p "$contents_directory/MacOS" "$notices_directory/third_party/licenses"
 cp "$repository_root/packaging/macos/Info.plist" "$contents_directory/Info.plist"
-cp "$repository_root/packaging/macos/Not-a-Harness.icns" \
-  "$contents_directory/Resources/Not-a-Harness.icns"
-cp "$repository_root/crates/desktop/assets/notaharness-banner.png" \
-  "$contents_directory/Resources/notaharness-banner.png"
-cp "$repository_root/target/$profile/nah" \
-  "$contents_directory/MacOS/nah"
-cp "$repository_root/target/$profile/nah-service" \
-  "$contents_directory/MacOS/nah-service"
-if [ -x "$repository_root/target/$profile/nah-update-tool" ]; then
-  cp "$repository_root/target/$profile/nah-update-tool" \
-    "$contents_directory/MacOS/nah-update-tool"
-fi
-chmod 755 "$contents_directory/MacOS/nah"
-chmod 755 "$contents_directory/MacOS/nah-service"
-if [ -f "$contents_directory/MacOS/nah-update-tool" ]; then
-  chmod 755 "$contents_directory/MacOS/nah-update-tool"
-fi
+cp "$repository_root/packaging/macos/Harness-Harlot.icns" \
+  "$contents_directory/Resources/Harness-Harlot.icns"
+cp "$repository_root/crates/desktop/assets/harnessharlot-banner.png" \
+  "$contents_directory/Resources/harnessharlot-banner.png"
+cp "$repository_root/LICENSE" "$notices_directory/LICENSE"
+cp "$repository_root/THIRD_PARTY_NOTICES.md" "$notices_directory/THIRD_PARTY_NOTICES.md"
+cp "$repository_root/ASSET_NOTICES.md" "$notices_directory/ASSET_NOTICES.md"
+cp "$repository_root"/third_party/licenses/* "$notices_directory/third_party/licenses/"
+cp "$repository_root/target/$profile/hh" \
+  "$contents_directory/MacOS/hh"
+cp "$repository_root/target/$profile/hh-service" \
+  "$contents_directory/MacOS/hh-service"
+chmod 755 "$contents_directory/MacOS/hh"
+chmod 755 "$contents_directory/MacOS/hh-service"
 
-# Replacing nested executables invalidates any signature left on a prior bundle.
-# Re-sign the complete local app. Release packaging replaces this ad-hoc
-# signature with the configured distribution identity.
-codesign --force --deep --sign - "$app_directory"
+# This script only lays out the bundle. Signing is an explicit inside-out step
+# performed by sign-macos-app.sh so stale nested signatures cannot survive.
 
 echo "$app_directory"

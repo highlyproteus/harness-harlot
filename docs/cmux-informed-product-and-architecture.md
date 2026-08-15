@@ -1,6 +1,6 @@
 # CMUX-Informed Product and Architecture Review
 
-This review informs Not a Harness at the behavior and architecture level. It is not a source-code port, visual clone, or compatibility promise.
+This review informs Harness Harlot at the behavior and architecture level. It is not a source-code port, visual clone, or compatibility promise.
 
 ## Review baseline
 
@@ -10,11 +10,11 @@ This review informs Not a Harness at the behavior and architecture level. It is 
 
 The public repository describes cmux as a Swift/AppKit macOS app backed by libghostty, with workspace/sidebar navigation, surfaces, nested split panes, keyboard shortcuts, SSH workspaces, and a Unix-socket automation API. Its pane chrome and split behavior use Bonsplit. Its documented session restore recreates layout, working directories, scrollback on a best-effort basis, and browser state, but explicitly does not checkpoint arbitrary live process state. The current tree also shows ongoing decomposition around large app-owned `Workspace`, `TerminalController`, and `ContentView` types.
 
-These observations do not establish the cause of any reported freeze. They identify ownership and coupling boundaries Not a Harness will deliberately change.
+These observations do not establish the cause of any reported freeze. They identify ownership and coupling boundaries Harness Harlot will deliberately change.
 
 ## Behavior to preserve independently
 
-| CMUX-inspired behavior | Not a Harness interpretation | MVP treatment |
+| CMUX-inspired behavior | Harness Harlot interpretation | MVP treatment |
 |---|---|---|
 | Vertical workspace sidebar | Compact list of stable workspace identities, titles, selected state, connection type, and tab count | Include |
 | Workspace and tab creation, selection, rename, reorder, and close | Keyboard-first commands with visible state and predictable close confirmation | Include |
@@ -27,11 +27,11 @@ These observations do not establish the cause of any reported freeze. They ident
 | CLI/socket composability | Small versioned local control protocol shared by desktop and future CLI | Include necessary commands only |
 | Agent notifications, browser panes, mobile access, diff/worktree features | Useful later, but outside the focused terminal-workspace milestone | Defer |
 
-Not a Harness does not need to reproduce cmux's exact labels, colors, dimensions, keymap, iconography, screenshots, notification rings, or branded visual language. Common terminal/workspace conventions can be designed independently and tested with users.
+Harness Harlot does not need to reproduce cmux's exact labels, colors, dimensions, keymap, iconography, screenshots, notification rings, or branded visual language. Common terminal/workspace conventions can be designed independently and tested with users.
 
 ## Implementation pieces to replace
 
-| Public cmux implementation | Not a Harness replacement |
+| Public cmux implementation | Harness Harlot replacement |
 |---|---|
 | Swift, SwiftUI, and AppKit application shell | Rust-authored, WebView-free GPU desktop client selected by a short UI spike |
 | libghostty/GhosttyKit terminal surface in the app process | `alacritty_terminal` behind a toolkit-neutral terminal-model adapter; selected UI draws cells through its GPU renderer |
@@ -79,7 +79,7 @@ Windows is a later portability target and does not constrain the MVP choice. Pro
 
 ### Required backend
 
-Not a Harness needs a local Tokio daemon, not a cloud backend. It owns PTYs, local and SSH child processes, session actors, ordered output, bounded replay, layout state, persistence, and client subscriptions. On macOS and Linux, `portable-pty` supplies Unix PTYs behind a narrow adapter.
+Harness Harlot needs a local Tokio daemon, not a cloud backend. It owns PTYs, local and SSH child processes, session actors, ordered output, bounded replay, layout state, persistence, and client subscriptions. On macOS and Linux, `portable-pty` supplies Unix PTYs behind a narrow adapter.
 
 ### MVP IPC choice
 
@@ -96,7 +96,7 @@ This is preferred over HTTP for the MVP because the command surface is small, te
 
 ### Where Axum fits
 
-Axum 0.8 can serve directly from Tokio's `UnixListener`, so Axum-over-local-socket is technically valid. It becomes useful when Not a Harness needs HTTP semantics, Tower middleware, WebSocket clients, authenticated remote control, or an optional remote `rmuxd` service.
+Axum 0.8 can serve directly from Tokio's `UnixListener`, so Axum-over-local-socket is technically valid. It becomes useful when Harness Harlot needs HTTP semantics, Tower middleware, WebSocket clients, authenticated remote control, or an optional remote `rmuxd` service.
 
 It is not required for the local daemon and does not imply a hosted/cloud backend. Do not start an unauthenticated TCP listener by default. Any later TCP HTTP/WebSocket endpoint must be opt-in, authenticated, encrypted, capability scoped, rate-limited, and threat-modeled. Embedded browser and generic remote UI access remain outside MVP even though SSH terminals are early.
 
@@ -106,7 +106,7 @@ It is not required for the local daemon and does not imply a hosted/cloud backen
 
 The daemon launches the system `ssh` executable inside the same managed PTY abstraction as a local shell. A user chooses an alias from their standard SSH configuration. The daemon passes the alias as a validated argument and lets OpenSSH resolve `Host`, `Include`, `IdentityFile`, `IdentityAgent`, `ProxyJump`/`ProxyCommand`, `Match`, known-host files, algorithms, multiplexing, and user preferences.
 
-OpenSSH owns authentication and host-key decisions. Prompts render in the terminal pane. Not a Harness never reads private key material, never disables host-key verification, never invents a parallel credentials store, and never logs prompt responses or terminal contents. PTY resize naturally reaches the SSH process and remote TTY. The local daemon records only necessary metadata: session ID, requested host alias, local SSH PID, connection/lifecycle state, pane binding, timestamps, and non-secret error classification.
+OpenSSH owns authentication and host-key decisions. Prompts render in the terminal pane. Harness Harlot never reads private key material, never disables host-key verification, never invents a parallel credentials store, and never logs prompt responses or terminal contents. PTY resize naturally reaches the SSH process and remote TTY. The local daemon records only necessary metadata: session ID, requested host alias, local SSH PID, connection/lifecycle state, pane binding, timestamps, and non-secret error classification.
 
 Host discovery may parse concrete `Host` aliases for display, but `ssh -G <alias>` is the source of truth for resolution and validation. Wildcard-only entries are not shown as concrete hosts. Reject control characters and option-like aliases rather than composing a shell command. Spawn the executable with an argv vector; never use `sh -c`.
 
@@ -139,7 +139,7 @@ Protocol session metadata distinguishes local shell, system-SSH shell, and futur
 
 ## License and attribution boundary
 
-The reviewed cmux repository is GPL-3.0-or-later by default. Not a Harness's MIT license does not permit copying, translating, or adapting cmux GPL-covered source without changing resulting obligations. No cmux source, tests, documentation prose, branding, screenshots, icons, or other assets should be copied.
+The reviewed cmux repository is GPL-3.0-or-later by default. Harness Harlot's MIT license does not permit copying, translating, or adapting cmux GPL-covered source without changing resulting obligations. No cmux source, tests, documentation prose, branding, screenshots, icons, or other assets should be copied.
 
 Behavioral research may inform an independently designed specification, but contributors should record the behavior and write original Rust code/tests. If a cmux third-party dependency is considered separately, evaluate it at its upstream source and license; cmux's notices list Ghostty and Bonsplit as MIT, but that does not make cmux's own integration code MIT. This is project guidance, not legal advice.
 

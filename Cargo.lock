@@ -1348,6 +1348,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deranged"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+
+[[package]]
 name = "derive_more"
 version = "0.99.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2517,6 +2523,99 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "hh-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "hh-macos-icon",
+ "hh-protocol",
+ "hh-terminal-model",
+ "image",
+ "libc",
+ "parking_lot",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "hh-macos-icon"
+version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "hh-protocol"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "hh-release-signer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ed25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "hh-session-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hh-protocol",
+ "hh-terminal-model",
+ "libc",
+ "parking_lot",
+ "portable-pty",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "hh-terminal-model"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "hh-protocol",
+]
+
+[[package]]
+name = "hh-updater"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ed25519-dalek",
+ "hh-protocol",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "url",
+]
+
+[[package]]
 name = "hidden-trait"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3314,81 +3413,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nah-desktop"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gpui",
- "nah-macos-icon",
- "nah-protocol",
- "nah-terminal-model",
- "parking_lot",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "unicode-width",
- "uuid",
-]
-
-[[package]]
-name = "nah-macos-icon"
-version = "0.1.0"
-dependencies = [
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
-]
-
-[[package]]
-name = "nah-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "nah-session-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "nah-protocol",
- "nah-terminal-model",
- "parking_lot",
- "portable-pty",
- "serde",
- "serde_json",
- "sysinfo",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "nah-terminal-model"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "nah-protocol",
-]
-
-[[package]]
-name = "nah-updater"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "ed25519-dalek",
- "nah-protocol",
- "semver",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "nanorand"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3532,6 +3556,12 @@ dependencies = [
  "bytemuck",
  "num-traits",
 ]
+
+[[package]]
+name = "num-conv"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "num-derive"
@@ -4127,6 +4157,12 @@ checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
 dependencies = [
  "zerovec",
 ]
+
+[[package]]
+name = "powerfmt"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "ppv-lite86"
@@ -5747,6 +5783,36 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "time"
+version = "0.3.55"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
+dependencies = [
+ "deranged",
+ "num-conv",
+ "powerfmt",
+ "serde_core",
+ "time-core",
+ "time-macros",
+]
+
+[[package]]
+name = "time-core"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
+name = "time-macros"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
+dependencies = [
+ "num-conv",
+ "time-core",
 ]
 
 [[package]]

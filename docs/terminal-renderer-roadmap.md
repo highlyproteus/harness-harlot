@@ -2,7 +2,7 @@
 
 ## Hard decision
 
-Not a Harness will remain an all-Rust application. The daemon continues to own PTYs and `alacritty_terminal` continues to own VT parsing, grid state, and scrollback. The native GPUI client will render that grid through Rust and GPUI's GPU/text facilities. Ghostty, libghostty, GhosttyKit, and other non-Rust terminal engines are not candidates unless a future approved PDR revision explicitly reverses this decision.
+Harness Harlot will remain an all-Rust application. The daemon continues to own PTYs and `alacritty_terminal` continues to own VT parsing, grid state, and scrollback. The native GPUI client will render that grid through Rust and GPUI's GPU/text facilities. Ghostty, libghostty, GhosttyKit, and other non-Rust terminal engines are not candidates unless a future approved PDR revision explicitly reverses this decision.
 
 This is an architecture boundary, not a judgment about Ghostty's quality. Embedding libghostty would add a Zig/C ABI build and lifecycle boundary, couple the GPUI surface to an evolving library API, and split terminal behavior across two engines while the daemon still needs a serializable canonical grid. That change is too large for a typography fix and would weaken the current Rust ownership and restart-isolation model.
 
@@ -16,7 +16,7 @@ At the start of R1, the PTY and terminal model were not the likely source of the
 - it does not derive baseline, ascent, descent, advance, or line height from the selected font;
 - it flattens terminal cells into text runs, so cell occupancy, fallback glyph width, selection, and background painting are not yet authoritative.
 
-GPUI already provides OS font discovery, font resolution, shaping, platform rasterization, subpixel variants, and a GPU sprite atlas. On Linux its text system uses `cosmic-text`; on macOS it uses the native platform text system. Not a Harness should use this existing GPUI path before adding a second rasterizer or atlas.
+GPUI already provides OS font discovery, font resolution, shaping, platform rasterization, subpixel variants, and a GPU sprite atlas. On Linux its text system uses `cosmic-text`; on macOS it uses the native platform text system. Harness Harlot should use this existing GPUI path before adding a second rasterizer or atlas.
 
 ## R1 implementation checkpoint
 
@@ -86,11 +86,11 @@ This order is canonical and should be advanced from the repository rather than r
 3. Treat coding agents as ordinary terminal workloads first, then add only a thin status/resume layer that does not couple session ownership to an AI provider.
 4. Only after the terminal and reliability core is mature, evaluate a privacy-focused isolated browser pane type and richer optional agent workflows.
 
-The sequence retains four non-negotiable boundaries: the renderer and terminal engine remain all Rust; macOS and Linux are first-class; CMUX influence stays clean-room and behavior-level only; and Not a Harness is network-silent by default. SSH or a later browser/remote feature may make network connections only after an explicit user action, with no unauthenticated listener or background telemetry.
+The sequence retains four non-negotiable boundaries: the renderer and terminal engine remain all Rust; macOS and Linux are first-class; CMUX influence stays clean-room and behavior-level only; and Harness Harlot is network-silent by default. SSH or a later browser/remote feature may make network connections only after an explicit user action, with no unauthenticated listener or background telemetry.
 
 ## Hidden-pane performance contract
 
-Not a Harness is a lightweight terminal workspace, not an agent harness or runtime. Terminals and agents are ordinary shell workloads, and the workspace must avoid competing with them for CPU or memory. The streaming design therefore has three states, decided by what is on screen rather than by recent attention:
+Harness Harlot is a lightweight terminal workspace, not an agent harness or runtime. Terminals and agents are ordinary shell workloads, and the workspace must avoid competing with them for CPU or memory. The streaming design therefore has three states, decided by what is on screen rather than by recent attention:
 
 - A pane rendered right now stays subscribed to responsive, revision-aware deltas for as long as it is displayed: the focused pane on every poll, other on-screen panes paced at roughly 8 frames per second.
 - For a pane on a tab that is not displayed, the daemon keeps draining and parsing the PTY into bounded history but serializes no screen. The desktop holds only coalesced state metadata needed for correctness.

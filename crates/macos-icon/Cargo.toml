@@ -1,10 +1,10 @@
 [package]
-name = "nah-macos-icon"
+name = "hh-macos-icon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Minimal macOS Dock icon bridge for Not a Harness"
+description = "Minimal macOS integration bridge for Harness Harlot"
 
 [dependencies]
 objc2.workspace = true

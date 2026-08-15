@@ -1,4 +1,4 @@
-use nah_protocol::TerminalColor;
+use hh_protocol::TerminalColor;
 
 /// Complete visual contract for the desktop shell and terminal palette.
 /// Additional built-in or user themes can implement the same structure

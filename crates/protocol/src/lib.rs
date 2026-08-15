@@ -1,4 +1,6 @@
-use std::io::{BufRead, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, Read, Write};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -7,18 +9,25 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 pub const PROTOCOL_VERSION: u16 = 20;
-pub const SOCKET_ENV: &str = "NAH_SOCKET";
-pub const STATE_DIR_ENV: &str = "NAH_STATE_DIR";
-pub const CONFIG_ENV: &str = "NAH_CONFIG";
-pub const PANE_ID_ENV: &str = "NAH_PANE_ID";
+pub const SOCKET_ENV: &str = "HH_SOCKET";
+pub const STATE_DIR_ENV: &str = "HH_STATE_DIR";
+pub const CONFIG_ENV: &str = "HH_CONFIG";
+pub const PANE_ID_ENV: &str = "HH_PANE_ID";
 /// Marks the separately packaged development desktop build.
 ///
-/// Explicit `NAH_SOCKET`, `NAH_STATE_DIR`, and `NAH_CONFIG` values always
+/// Explicit `HH_SOCKET`, `HH_STATE_DIR`, and `HH_CONFIG` values always
 /// override the corresponding Dev defaults, preserving disposable test runs.
-pub const DEVELOPMENT_BUILD_ENV: &str = "NAH_DEVELOPMENT_BUILD";
-pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const DEVELOPMENT_BUILD_ENV: &str = "HH_DEVELOPMENT_BUILD";
+pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 pub const MAX_SSH_HOST_LEN: usize = 253;
 pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;
+pub const MAX_PANES: usize = 32;
+pub const MIN_TERMINAL_COLUMNS: u16 = 2;
+pub const MIN_TERMINAL_ROWS: u16 = 1;
+pub const MAX_TERMINAL_COLUMNS: u16 = 2_048;
+pub const MAX_TERMINAL_ROWS: u16 = 1_000;
+pub const MAX_TERMINAL_CELLS: u32 = 600_000;
+pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -189,7 +198,7 @@ impl std::fmt::Display for TmuxSessionId {
 /// Ephemeral metadata returned by an explicit tmux scan.
 ///
 /// This is deliberately not part of the desired-state snapshot: a tmux server
-/// and its opaque IDs belong to the host running tmux, not to Not a Harness.
+/// and its opaque IDs belong to the host running tmux, not to Harness Harlot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TmuxSession {
     pub id: TmuxSessionId,
@@ -991,7 +1000,7 @@ pub enum ClientRequest {
 /// Normalizes the single OpenSSH destination accepted from the desktop UI.
 ///
 /// A user may enter a bare `[user@]host` destination or paste the exact command
-/// form `ssh [user@]host`. Not a Harness strips only that known executable token;
+/// form `ssh [user@]host`. Harness Harlot strips only that known executable token;
 /// options, extra commands, shell syntax, and other executables remain outside
 /// this boundary. OpenSSH remains responsible for resolving normal config and
 /// agent behavior after the normalized destination is validated.
@@ -1026,7 +1035,7 @@ pub fn normalize_ssh_input(input: &str) -> Result<String, &'static str> {
 
 /// Validates the normalized OpenSSH destination sent to the session service.
 ///
-/// Not a Harness deliberately accepts only a conservative `[user@]host` or SSH
+/// Harness Harlot deliberately accepts only a conservative `[user@]host` or SSH
 /// config `Host` alias subset. Option prefixes, ports, commands, shell syntax,
 /// whitespace, and control characters are not part of this value.
 ///
@@ -1142,21 +1151,70 @@ pub enum WireError {
     FrameTooLarge(usize),
 }
 
-pub fn socket_path() -> PathBuf {
-    std::env::var_os(SOCKET_ENV)
-        .map_or_else(|| default_socket_path(development_build()), PathBuf::from)
+/// Returns the configured socket path, or the private runtime-directory
+/// default. Unix-domain socket paths must fit in macOS's 104-byte `sun_path`
+/// field including its trailing NUL.
+///
+/// # Errors
+///
+/// Returns an error when no state directory is available or when the selected
+/// path cannot fit in a macOS Unix-domain socket address.
+pub fn socket_path() -> io::Result<PathBuf> {
+    let path = std::env::var_os(SOCKET_ENV).map_or_else(
+        || {
+            runtime_directory()
+                .map(|directory| default_socket_path(&directory, development_build()))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+        },
+        |path| Ok(PathBuf::from(path)),
+    )?;
+    validate_socket_path_length(&path)?;
+    Ok(path)
 }
 
-fn default_socket_path(development_build: bool) -> PathBuf {
-    let filename = if development_build {
-        "nah-dev-session.sock"
+/// Returns the pre-hardening default socket path while no explicit socket
+/// override is configured. Clients use this only to preserve live PTYs across
+/// the one-time runtime-directory migration.
+pub fn legacy_socket_path() -> Option<PathBuf> {
+    if std::env::var_os(SOCKET_ENV).is_some() {
+        return None;
+    }
+    let path = std::env::temp_dir().join(socket_filename(development_build()));
+    validate_socket_path_length(&path).ok()?;
+    Some(path)
+}
+
+fn validate_socket_path_length(path: &Path) -> io::Result<()> {
+    let length = path.as_os_str().as_encoded_bytes().len();
+    if length > MAX_UNIX_SOCKET_PATH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "session socket path is {length} bytes; maximum is {MAX_UNIX_SOCKET_PATH_BYTES}. Set {SOCKET_ENV} to a shorter owner-only path"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn socket_filename(development_build: bool) -> &'static str {
+    if development_build {
+        "hh-dev-session.sock"
     } else {
-        "nah-session.sock"
-    };
-    std::env::temp_dir().join(filename)
+        "hh-session.sock"
+    }
 }
 
-/// Returns the owner-only Not a Harness state directory.
+/// Returns the owner-only runtime directory used for the session socket.
+pub fn runtime_directory() -> Option<PathBuf> {
+    state_directory().map(|directory| directory.join("run"))
+}
+
+fn default_socket_path(runtime_directory: &Path, development_build: bool) -> PathBuf {
+    runtime_directory.join(socket_filename(development_build))
+}
+
+/// Returns the owner-only Harness Harlot state directory.
 pub fn state_directory() -> Option<PathBuf> {
     if let Some(directory) = std::env::var_os(STATE_DIR_ENV) {
         return Some(PathBuf::from(directory));
@@ -1179,9 +1237,9 @@ fn default_state_directory(
     {
         let _ = xdg_state_home;
         let product_directory = if development_build {
-            "Not a Harness Dev"
+            "Harness Harlot Dev"
         } else {
-            "Not a Harness"
+            "Harness Harlot"
         };
         home.join("Library/Application Support")
             .join(product_directory)
@@ -1190,11 +1248,11 @@ fn default_state_directory(
     {
         let fallback = home.join(".local/state");
         let base = xdg_state_home.unwrap_or(&fallback);
-        base.join(if development_build { "nah-dev" } else { "nah" })
+        base.join(if development_build { "hh-dev" } else { "hh" })
     }
 }
 
-/// Returns the optional Not a Harness desktop configuration file.
+/// Returns the optional Harness Harlot desktop configuration file.
 pub fn config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(CONFIG_ENV) {
         return Some(PathBuf::from(path));
@@ -1206,8 +1264,54 @@ pub fn config_path() -> Option<PathBuf> {
 }
 
 fn default_config_path(base: &Path, development_build: bool) -> PathBuf {
-    let product_directory = if development_build { "nah-dev" } else { "nah" };
+    let product_directory = if development_build { "hh-dev" } else { "hh" };
     base.join(product_directory).join("config.json")
+}
+/// Reads one owner-only regular file without following a final symlink.
+///
+/// The opened descriptor, rather than a pre-open path check, supplies metadata
+/// and bytes. Permissions are reasserted to `0600`.
+///
+/// # Errors
+///
+/// Returns an error for symlinks, non-regular files, foreign ownership, files
+/// larger than `max_bytes`, or files that grow past the limit while read.
+pub fn read_private_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private path is not a regular file",
+        ));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private file is not owned by the current user",
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private file exceeds {max_bytes} bytes"),
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private file grew past {max_bytes} bytes while reading"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn development_build() -> bool {
@@ -1299,19 +1403,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_interface_uses_only_the_nah_prefix() {
-        assert_eq!(SOCKET_ENV, "NAH_SOCKET");
-        assert_eq!(STATE_DIR_ENV, "NAH_STATE_DIR");
-        assert_eq!(CONFIG_ENV, "NAH_CONFIG");
-        assert_eq!(DEVELOPMENT_BUILD_ENV, "NAH_DEVELOPMENT_BUILD");
-        assert_eq!(pane_id_env(), "NAH_PANE_ID");
-        assert!(default_socket_path(false).ends_with("nah-session.sock"));
+    fn runtime_interface_uses_only_the_hh_prefix() {
+        assert_eq!(SOCKET_ENV, "HH_SOCKET");
+        assert_eq!(STATE_DIR_ENV, "HH_STATE_DIR");
+        assert_eq!(CONFIG_ENV, "HH_CONFIG");
+        assert_eq!(DEVELOPMENT_BUILD_ENV, "HH_DEVELOPMENT_BUILD");
+        assert_eq!(pane_id_env(), "HH_PANE_ID");
+        assert!(default_socket_path(Path::new("/private/run"), false).ends_with("hh-session.sock"));
     }
 
     #[test]
     fn development_build_defaults_are_isolated_from_stable() {
-        assert!(default_socket_path(true).ends_with("nah-dev-session.sock"));
-        assert_ne!(default_socket_path(false), default_socket_path(true));
+        assert!(
+            default_socket_path(Path::new("/private/run"), true).ends_with("hh-dev-session.sock")
+        );
+        assert_ne!(
+            default_socket_path(Path::new("/private/run"), false),
+            default_socket_path(Path::new("/private/run"), true)
+        );
 
         let home = PathBuf::from("/Users/example");
         assert_ne!(
@@ -1323,6 +1432,14 @@ mod tests {
             default_config_path(&config_home, false),
             default_config_path(&config_home, true)
         );
+    }
+
+    #[test]
+    fn socket_paths_are_bounded_for_macos_sun_path() {
+        let accepted = PathBuf::from("a".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
+        let rejected = PathBuf::from("a".repeat(MAX_UNIX_SOCKET_PATH_BYTES + 1));
+        assert!(validate_socket_path_length(&accepted).is_ok());
+        assert!(validate_socket_path_length(&rejected).is_err());
     }
 
     #[test]

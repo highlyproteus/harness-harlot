@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use nah_protocol::{
+use hh_protocol::{
     HistoryArchiveStatus, HistoryCleanupPolicy, HistoryClearScope, HistoryCursor,
     HistoryPageDirection, HistoryPageFlags, HistoryRetention, HistorySettings, HistoryWarning,
     TerminalHistoryPage,
@@ -30,6 +30,7 @@ const MAX_LINE_CHARS: usize = 4096;
 const MIN_QUOTA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_QUOTA_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 const WARNING_PERCENT: u64 = 80;
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_mins(1);
 
 #[derive(Clone, Debug)]
 pub(crate) struct HistoryArchive {
@@ -157,6 +158,7 @@ struct Store {
     dropped_bytes: Arc<AtomicU64>,
     corrupt_chunk_seen: bool,
     capacity_paused: bool,
+    last_retention_sweep: Option<Instant>,
 }
 
 impl HistoryArchive {
@@ -208,6 +210,7 @@ impl HistoryArchive {
             dropped_bytes: Arc::clone(&dropped_bytes),
             corrupt_chunk_seen: false,
             capacity_paused: false,
+            last_retention_sweep: None,
         };
         store.recover_interrupted_sessions()?;
         store.apply_retention()?;
@@ -493,6 +496,7 @@ impl Store {
         if !self.active.contains_key(&session_id) {
             return Ok(false);
         }
+        self.apply_retention_if_due()?;
         let mut status_changed = false;
         if gap_before > 0
             && let Some(active) = self.active.get_mut(&session_id)
@@ -677,7 +681,7 @@ impl Store {
         direction: HistoryPageDirection,
     ) -> Result<Option<TerminalHistoryPage>> {
         let manifests = self.manifests_for_pane(pane_id)?;
-        let Some((manifest, chunk_index)) = select_chunk(&manifests, cursor, direction) else {
+        let Some((manifest, chunk_index)) = select_chunk(&manifests, cursor, direction)? else {
             return Ok(None);
         };
         let path = self.chunk_path(manifest.session_id, chunk_index);
@@ -686,7 +690,7 @@ impl Store {
             Err(error) => {
                 self.corrupt_chunk_seen = true;
                 eprintln!(
-                    "Not a Harness history chunk {} is corrupt: {error:#}",
+                    "Harness Harlot history chunk {} is corrupt: {error:#}",
                     path.display()
                 );
                 (Vec::new(), true, true)
@@ -766,6 +770,7 @@ impl Store {
     }
 
     fn apply_retention(&mut self) -> Result<()> {
+        self.last_retention_sweep = Some(Instant::now());
         let HistoryRetention::Days { days } = self.settings.retention else {
             return Ok(());
         };
@@ -776,6 +781,19 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    fn apply_retention_if_due(&mut self) -> Result<()> {
+        if !matches!(self.settings.retention, HistoryRetention::Days { .. }) {
+            return Ok(());
+        }
+        if self
+            .last_retention_sweep
+            .is_some_and(|last| last.elapsed() < RETENTION_SWEEP_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.apply_retention()
     }
 
     fn delete_oldest_closed_until(&mut self, incoming: u64) -> Result<()> {
@@ -856,7 +874,7 @@ impl Store {
             }) {
                 Ok(manifest) => manifests.push(manifest),
                 Err(error) => eprintln!(
-                    "ignoring invalid Not a Harness history manifest {}: {error:#}",
+                    "ignoring invalid Harness Harlot history manifest {}: {error:#}",
                     manifest_path.display()
                 ),
             }
@@ -891,39 +909,60 @@ fn select_chunk(
     manifests: &[Manifest],
     cursor: Option<HistoryCursor>,
     direction: HistoryPageDirection,
-) -> Option<(Manifest, u32)> {
+) -> Result<Option<(Manifest, u32)>> {
     if let Some(cursor) = cursor {
+        let current = manifests
+            .iter()
+            .find(|manifest| manifest.session_id == cursor.session_id)
+            .context("invalid history cursor session")?;
+        if cursor.chunk_index >= current.chunk_count {
+            bail!("invalid history cursor chunk index");
+        }
         let selected = match direction {
             HistoryPageDirection::Older => previous_chunk(manifests, cursor),
             HistoryPageDirection::Newer => next_chunk(manifests, cursor),
-        }?;
+        };
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
         let manifest = manifests
             .iter()
-            .find(|manifest| manifest.session_id == selected.session_id)?;
-        return Some((manifest.clone(), selected.chunk_index));
+            .find(|manifest| manifest.session_id == selected.session_id)
+            .context("selected history cursor session disappeared")?;
+        return Ok(Some((manifest.clone(), selected.chunk_index)));
     }
-    match direction {
+    let selected = match direction {
         HistoryPageDirection::Older => {
-            let manifest = manifests.last()?;
-            Some((manifest.clone(), manifest.chunk_count.checked_sub(1)?))
+            let Some(manifest) = manifests.last() else {
+                return Ok(None);
+            };
+            manifest
+                .chunk_count
+                .checked_sub(1)
+                .map(|index| (manifest.clone(), index))
         }
-        HistoryPageDirection::Newer => {
-            let manifest = manifests.first()?;
-            Some((manifest.clone(), 0))
-        }
-    }
+        HistoryPageDirection::Newer => manifests
+            .first()
+            .filter(|manifest| manifest.chunk_count > 0)
+            .map(|manifest| (manifest.clone(), 0)),
+    };
+    Ok(selected)
 }
 
 fn previous_chunk(manifests: &[Manifest], cursor: HistoryCursor) -> Option<HistoryCursor> {
+    let position = manifests
+        .iter()
+        .position(|manifest| manifest.session_id == cursor.session_id)?;
+    let current = &manifests[position];
+    if cursor.chunk_index >= current.chunk_count {
+        return None;
+    }
     if cursor.chunk_index > 0 {
         return Some(HistoryCursor {
             session_id: cursor.session_id,
             chunk_index: cursor.chunk_index - 1,
         });
     }
-    let position = manifests
-        .iter()
-        .position(|manifest| manifest.session_id == cursor.session_id)?;
     let manifest = manifests.get(position.checked_sub(1)?)?;
     Some(HistoryCursor {
         session_id: manifest.session_id,
@@ -936,14 +975,18 @@ fn next_chunk(manifests: &[Manifest], cursor: HistoryCursor) -> Option<HistoryCu
         .iter()
         .position(|manifest| manifest.session_id == cursor.session_id)?;
     let manifest = &manifests[position];
-    if cursor.chunk_index + 1 < manifest.chunk_count {
+    if cursor.chunk_index >= manifest.chunk_count {
+        return None;
+    }
+    let next_index = cursor.chunk_index.checked_add(1)?;
+    if next_index < manifest.chunk_count {
         return Some(HistoryCursor {
             session_id: cursor.session_id,
-            chunk_index: cursor.chunk_index + 1,
+            chunk_index: next_index,
         });
     }
-    let manifest = manifests.get(position + 1)?;
-    Some(HistoryCursor {
+    let manifest = manifests.get(position.checked_add(1)?)?;
+    (manifest.chunk_count > 0).then_some(HistoryCursor {
         session_id: manifest.session_id,
         chunk_index: 0,
     })
@@ -989,7 +1032,30 @@ fn validate_query(query: &str) -> Result<()> {
     }
     Ok(())
 }
-
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => bail!("history path must be a real directory"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder
+                .create(path)
+                .with_context(|| format!("create history directory {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect history directory {}", path.display()));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect history directory {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("history path must be a real directory");
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restrict history directory {}", path.display()))
+}
 fn load_settings(root: &Path) -> Result<Option<HistorySettings>> {
     let path = root.join("config.json");
     match fs::symlink_metadata(&path) {
@@ -1005,18 +1071,6 @@ fn load_settings(root: &Path) -> Result<Option<HistorySettings>> {
         );
     }
     Ok(Some(config.settings))
-}
-
-fn ensure_private_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("create history directory {}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect history directory {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("history path must be a real directory");
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("restrict history directory {}", path.display()))
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -1047,18 +1101,9 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 fn read_json_private<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("open local history metadata {}", path.display()))?;
-    let metadata = file.metadata().context("inspect history metadata")?;
-    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
-        bail!("history metadata must be a regular file no larger than 1 MiB");
-    }
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .context("restrict history metadata")?;
-    serde_json::from_reader(file).context("decode history metadata")
+    let bytes = hh_protocol::read_private_file(path, 1024 * 1024)
+        .with_context(|| format!("read local history metadata {}", path.display()))?;
+    serde_json::from_slice(&bytes).context("decode history metadata")
 }
 
 fn write_chunk_atomic(path: &Path, index: u32, gap_before: bool, payload: &[u8]) -> Result<()> {
@@ -1314,7 +1359,7 @@ mod tests {
     use super::*;
 
     fn test_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("nah-history-{label}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("hh-history-{label}-{}", Uuid::new_v4()))
     }
 
     fn open_store(label: &str) -> (PathBuf, Store) {
@@ -1330,6 +1375,7 @@ mod tests {
             dropped_bytes: Arc::new(AtomicU64::new(0)),
             corrupt_chunk_seen: false,
             capacity_paused: false,
+            last_retention_sweep: None,
         };
         (root, store)
     }
@@ -1422,6 +1468,7 @@ mod tests {
             dropped_bytes: Arc::new(AtomicU64::new(0)),
             corrupt_chunk_seen: false,
             capacity_paused: false,
+            last_retention_sweep: None,
         };
         reopened.recover_interrupted_sessions().unwrap();
         let manifest = reopened.manifests().unwrap().pop().unwrap();
@@ -1554,6 +1601,63 @@ mod tests {
     }
 
     #[test]
+    fn disabling_history_preserves_archived_bytes_until_explicit_clear() {
+        let (root, mut store) = open_store("disable-preserve");
+        let meta = SessionMeta {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            started_ms: now_ms(),
+        };
+        store.start(meta).unwrap();
+        store
+            .append(meta.session_id, b"secret output\n", 0)
+            .unwrap();
+        store.flush_all().unwrap();
+        assert!(store.session_path(meta.session_id).exists());
+
+        let mut disabled = store.settings.clone();
+        disabled.enabled = false;
+        store.update_settings(disabled).unwrap();
+
+        assert!(store.session_path(meta.session_id).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retention_runs_during_append_for_long_lived_sessions() {
+        let (root, mut store) = open_store("append-retention");
+        store.settings.retention = HistoryRetention::Days { days: 1 };
+        let expired = SessionMeta {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            started_ms: 1,
+        };
+        store.start(expired).unwrap();
+        store.end(expired.session_id).unwrap();
+        let mut manifest: Manifest =
+            read_json_private(&store.manifest_path(expired.session_id)).unwrap();
+        manifest.ended_ms = Some(1);
+        write_json_atomic(&store.manifest_path(expired.session_id), &manifest).unwrap();
+
+        let active = SessionMeta {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            started_ms: now_ms(),
+        };
+        store.start(active).unwrap();
+        store.last_retention_sweep = None;
+        store
+            .append(active.session_id, b"still running\n", 0)
+            .unwrap();
+
+        assert!(!store.session_path(expired.session_id).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn lazy_pages_walk_chunks_without_loading_the_whole_session() {
         let (root, mut store) = open_store("lazy");
         let meta = SessionMeta {
@@ -1585,6 +1689,32 @@ mod tests {
             .unwrap();
         assert_eq!(older.cursor.chunk_index, 0);
         assert!(!older.flags.contains(HistoryPageFlags::HAS_OLDER));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_cursor_never_marks_archive_corrupt_or_overflows() {
+        let (root, mut store) = open_store("invalid-cursor");
+        let meta = SessionMeta {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            started_ms: now_ms(),
+        };
+        store.start(meta).unwrap();
+        store.append(meta.session_id, b"history\n", 0).unwrap();
+        store.flush_all().unwrap();
+
+        let result = store.load_page(
+            meta.pane_id,
+            Some(HistoryCursor {
+                session_id: meta.session_id,
+                chunk_index: u32::MAX,
+            }),
+            HistoryPageDirection::Newer,
+        );
+        assert!(result.is_err());
+        assert!(!store.corrupt_chunk_seen);
         fs::remove_dir_all(root).unwrap();
     }
 

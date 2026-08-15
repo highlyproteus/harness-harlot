@@ -1,14 +1,14 @@
 [package]
-name = "nah-terminal-model"
+name = "hh-terminal-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Terminal model adapter for Not a Harness"
+description = "Terminal model adapter for Harness Harlot"
 
 [dependencies]
 alacritty_terminal.workspace = true
-nah-protocol = { path = "../protocol" }
+hh-protocol = { version = "0.1.0", path = "../protocol" }
 
 [lints]
 workspace = true

@@ -401,15 +401,15 @@ pub(super) fn terminal_tab_count_label(count: usize) -> String {
 
 pub(super) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
     let detection_detail = match pane.identity.source {
-        nah_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
-        nah_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
-        nah_protocol::TerminalIdentitySource::TerminalTitle => {
+        hh_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
+        hh_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
+        hh_protocol::TerminalIdentitySource::TerminalTitle => {
             "Detected from a bounded terminal-title signal; terminal content is not inspected"
         }
-        nah_protocol::TerminalIdentitySource::Command => {
+        hh_protocol::TerminalIdentitySource::Command => {
             "Detected from a bounded local child-process name; terminal content is not inspected"
         }
-        nah_protocol::TerminalIdentitySource::Fallback => "Ordinary terminal",
+        hh_protocol::TerminalIdentitySource::Fallback => "Ordinary terminal",
     };
     let definition = agent_icon_definition(pane.identity.profile);
     let asset_detail = if pane.custom_icon.is_some() {
@@ -417,9 +417,9 @@ pub(super) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation 
     } else if definition.asset.is_some() {
         "Bundled official artwork is shown unchanged for referential identification only; no affiliation or endorsement is implied"
     } else if pane.identity.profile == TerminalProfile::GitHubCopilot {
-        "The official CLI package exposes no standalone icon asset, so Not a Harness uses the neutral terminal glyph"
+        "The official CLI package exposes no standalone icon asset, so Harness Harlot uses the neutral terminal glyph"
     } else {
-        "Not a Harness uses the neutral terminal glyph"
+        "Harness Harlot uses the neutral terminal glyph"
     };
     TabIdentityPresentation {
         label: pane.title.clone(),
@@ -816,17 +816,17 @@ pub(super) fn collect_pane_sizes(
     layout: &PaneLayout,
     width: f32,
     height: f32,
-    metrics: typography::TerminalCellMetrics,
+    metrics_for_pane: &impl Fn(Uuid) -> typography::TerminalCellMetrics,
     ratios: &HashMap<SplitControlId, f32>,
     output: &mut Vec<(Uuid, u16, u16)>,
 ) {
     match layout {
         PaneLayout::Leaf { pane } => {
-            let (columns, rows) = terminal_grid_for_pane(width, height, metrics);
+            let (columns, rows) = terminal_grid_for_pane(width, height, metrics_for_pane(pane.id));
             output.push((pane.id, columns, rows));
         }
         PaneLayout::Stack { active, .. } => {
-            let (columns, rows) = terminal_grid_for_pane(width, height, metrics);
+            let (columns, rows) = terminal_grid_for_pane(width, height, metrics_for_pane(*active));
             output.push((*active, columns, rows));
         }
         PaneLayout::Split {
@@ -846,8 +846,22 @@ pub(super) fn collect_pane_sizes(
             );
             let (first_width, first_height, second_width, second_height) =
                 split_child_dimensions(*axis, width, height, ratio);
-            collect_pane_sizes(first, first_width, first_height, metrics, ratios, output);
-            collect_pane_sizes(second, second_width, second_height, metrics, ratios, output);
+            collect_pane_sizes(
+                first,
+                first_width,
+                first_height,
+                metrics_for_pane,
+                ratios,
+                output,
+            );
+            collect_pane_sizes(
+                second,
+                second_width,
+                second_height,
+                metrics_for_pane,
+                ratios,
+                output,
+            );
         }
     }
 }
@@ -898,10 +912,10 @@ pub(super) fn terminal_grid_for_pane(
     let content_width =
         (pane_width - TERMINAL_HORIZONTAL_PADDING - TERMINAL_FOCUS_BORDER_WIDTH).max(1.0);
     let content_height = (pane_height - PANE_HEADER_HEIGHT - TERMINAL_VERTICAL_PADDING).max(1.0);
-    (
-        metrics.columns_for_width(content_width),
-        metrics.rows_for_height(content_height),
-    )
+    let columns = metrics.columns_for_width(content_width);
+    let rows = metrics.rows_for_height(content_height);
+    let max_rows_for_columns = (hh_protocol::MAX_TERMINAL_CELLS / u32::from(columns)) as u16;
+    (columns, rows.min(max_rows_for_columns.max(1)))
 }
 
 pub(super) fn element_key(id: Uuid) -> u64 {
@@ -922,6 +936,12 @@ pub(super) fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
             KeyBinding::new(&binding.sequence, ToggleSidebar, Some(ROOT_KEY_CONTEXT))
         }
         AppCommand::NewTab => KeyBinding::new(&binding.sequence, NewTab, Some(ROOT_KEY_CONTEXT)),
+        AppCommand::TerminalZoomIn => {
+            KeyBinding::new(&binding.sequence, TerminalZoomIn, Some(ROOT_KEY_CONTEXT))
+        }
+        AppCommand::TerminalZoomOut => {
+            KeyBinding::new(&binding.sequence, TerminalZoomOut, Some(ROOT_KEY_CONTEXT))
+        }
         AppCommand::SplitRight => {
             KeyBinding::new(&binding.sequence, SplitRight, Some(ROOT_KEY_CONTEXT))
         }
@@ -962,8 +982,42 @@ pub(super) fn product_name(development_build: bool) -> &'static str {
     }
 }
 
-pub(super) fn workstation_banner_header_height(sidebar_content_width: f32) -> f32 {
-    sidebar_content_width.max(0.0) / WORKSTATION_BANNER_ASPECT_RATIO
+/// Degenerate aspect ratios (zero, negative, non-finite) fall back to the
+/// bundled 3:1 artwork shape rather than producing a zero-height header.
+pub(super) fn sanitized_banner_aspect_ratio(aspect_ratio: f32) -> f32 {
+    if aspect_ratio.is_finite() && aspect_ratio > 0.0 {
+        aspect_ratio
+    } else {
+        WORKSTATION_BANNER_ASPECT_RATIO
+    }
+}
+
+/// Rail-header height that matches the banner's own aspect at the current rail
+/// width, clamped so no image shape can collapse or dominate the rail.
+pub(super) fn workstation_banner_header_height(
+    sidebar_content_width: f32,
+    aspect_ratio: f32,
+) -> f32 {
+    (sidebar_content_width.max(0.0) / sanitized_banner_aspect_ratio(aspect_ratio))
+        .clamp(WORKSTATION_BANNER_MIN_HEIGHT, WORKSTATION_BANNER_MAX_HEIGHT)
+}
+
+/// Largest aspect-preserving size that fits the given box. Both render sites
+/// pass the result as explicit pixel width/height on the image element, so no
+/// percentage sizing or layout-injected aspect ratio can crop the artwork.
+pub(super) fn banner_fit_size(
+    available_width: f32,
+    available_height: f32,
+    aspect_ratio: f32,
+) -> (f32, f32) {
+    let aspect_ratio = sanitized_banner_aspect_ratio(aspect_ratio);
+    let available_width = available_width.max(0.0);
+    let available_height = available_height.max(0.0);
+    if available_width / aspect_ratio <= available_height {
+        (available_width, available_width / aspect_ratio)
+    } else {
+        (available_height * aspect_ratio, available_height)
+    }
 }
 
 pub(super) fn append_rename_text(value: &mut String, replace_on_type: &mut bool, text: &str) {
@@ -1018,12 +1072,12 @@ mod tests {
                 title: label.to_owned(),
                 shell: "zsh".to_owned(),
                 color: None,
-                identity: nah_protocol::TerminalIdentity {
+                identity: hh_protocol::TerminalIdentity {
                     profile,
                     source: if profile == TerminalProfile::Terminal {
-                        nah_protocol::TerminalIdentitySource::Fallback
+                        hh_protocol::TerminalIdentitySource::Fallback
                     } else {
-                        nah_protocol::TerminalIdentitySource::Command
+                        hh_protocol::TerminalIdentitySource::Command
                     },
                 },
                 custom_title: None,
@@ -1059,7 +1113,7 @@ mod tests {
             title: "Release terminal".to_owned(),
             shell: "ssh release@long-production-host.example.com".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -1081,9 +1135,9 @@ mod tests {
             title: title.to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity {
+            identity: hh_protocol::TerminalIdentity {
                 profile,
-                source: nah_protocol::TerminalIdentitySource::Command,
+                source: hh_protocol::TerminalIdentitySource::Command,
             },
             custom_title: None,
             profile_override: None,
@@ -1131,26 +1185,26 @@ mod tests {
             title: format!("Terminal {id}"),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
         };
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
         workspace.tabs = vec![
-            nah_protocol::Tab {
+            hh_protocol::Tab {
                 id: Uuid::from_u128(10),
                 title: "Single".to_owned(),
                 custom_title: None,
                 layout: PaneLayout::Leaf { pane: make_pane(1) },
             },
-            nah_protocol::Tab {
+            hh_protocol::Tab {
                 id: Uuid::from_u128(20),
                 title: "Named".to_owned(),
                 custom_title: Some("Group 1".to_owned()),
                 layout: PaneLayout::Leaf { pane: make_pane(2) },
             },
-            nah_protocol::Tab {
+            hh_protocol::Tab {
                 id: Uuid::from_u128(30),
                 title: "Stacked".to_owned(),
                 custom_title: None,
@@ -1159,7 +1213,7 @@ mod tests {
                     active: Uuid::from_u128(3),
                 },
             },
-            nah_protocol::Tab {
+            hh_protocol::Tab {
                 id: Uuid::from_u128(40),
                 title: "Split".to_owned(),
                 custom_title: None,
@@ -1203,7 +1257,7 @@ mod tests {
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
         let initial = visible_panes(&workspace.tabs[0].layout)[0];
         let tmux_pane = Uuid::from_u128(0x77);
-        workspace.tabs.push(nah_protocol::Tab {
+        workspace.tabs.push(hh_protocol::Tab {
             id: Uuid::from_u128(0x88),
             title: "buzz".to_owned(),
             custom_title: None,
@@ -1213,7 +1267,7 @@ mod tests {
                     title: "tmux buzz".to_owned(),
                     shell: "tmux".to_owned(),
                     color: None,
-                    identity: nah_protocol::TerminalIdentity::default(),
+                    identity: hh_protocol::TerminalIdentity::default(),
                     custom_title: None,
                     profile_override: None,
                     custom_icon: None,
@@ -1504,7 +1558,7 @@ mod tests {
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -1530,7 +1584,7 @@ mod tests {
                     &layout,
                     workspace.0,
                     workspace.1,
-                    metrics,
+                    &|_| metrics,
                     &ratios,
                     &mut sizes,
                 );
@@ -1575,12 +1629,44 @@ mod tests {
         );
     }
     #[test]
-    fn workstation_banner_header_preserves_the_artwork_aspect_at_normal_and_wide_rails() {
-        for sidebar_content_width in [136.0, 217.0, 412.0] {
-            let height = workstation_banner_header_height(sidebar_content_width);
+    fn workstation_banner_header_matches_the_artwork_aspect_at_every_rail_width() {
+        for sidebar_content_width in [136.0_f32, 217.0, 412.0] {
+            let height = workstation_banner_header_height(sidebar_content_width, 3.0);
+            assert!((height - sidebar_content_width / 3.0).abs() < 0.0001);
+            let (width, fitted_height) = banner_fit_size(sidebar_content_width, height, 3.0);
+            assert!((width - sidebar_content_width).abs() < 0.0001);
+            assert!((fitted_height - height).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn tall_and_wide_banners_stay_whole_inside_the_clamped_header() {
+        // Square artwork is capped, and still fits whole inside the capped box.
+        let square_height = workstation_banner_header_height(412.0, 1.0);
+        assert!((square_height - WORKSTATION_BANNER_MAX_HEIGHT).abs() < f32::EPSILON);
+        let (width, height) = banner_fit_size(412.0, square_height, 1.0);
+        assert!((width - WORKSTATION_BANNER_MAX_HEIGHT).abs() < 0.0001);
+        assert!((height - WORKSTATION_BANNER_MAX_HEIGHT).abs() < 0.0001);
+        assert!(width <= 412.0);
+
+        // A 12:1 banner is floored to the minimum height and letterboxes vertically.
+        let wide_height = workstation_banner_header_height(136.0, 12.0);
+        assert!((wide_height - WORKSTATION_BANNER_MIN_HEIGHT).abs() < f32::EPSILON);
+        let (wide_width, wide_fitted) = banner_fit_size(136.0, wide_height, 12.0);
+        assert!((wide_width - 136.0).abs() < 0.0001);
+        assert!(wide_fitted < wide_height);
+    }
+
+    #[test]
+    fn degenerate_banner_aspect_falls_back_to_the_bundled_shape() {
+        for aspect_ratio in [0.0_f32, -2.0, f32::NAN, f32::INFINITY] {
             assert!(
-                (height * WORKSTATION_BANNER_ASPECT_RATIO - sidebar_content_width).abs() < 0.0001
+                (sanitized_banner_aspect_ratio(aspect_ratio) - WORKSTATION_BANNER_ASPECT_RATIO)
+                    .abs()
+                    < f32::EPSILON
             );
+            let height = workstation_banner_header_height(217.0, aspect_ratio);
+            assert!((height - 217.0 / WORKSTATION_BANNER_ASPECT_RATIO).abs() < 0.0001);
         }
     }
     #[test]
@@ -1625,7 +1711,7 @@ mod tests {
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -1635,7 +1721,7 @@ mod tests {
             title: "Terminal 2".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -1662,7 +1748,7 @@ mod tests {
             &layout,
             workspace.0,
             workspace.1,
-            metrics,
+            &|_| metrics,
             &HashMap::new(),
             &mut sizes,
         );
@@ -1673,6 +1759,76 @@ mod tests {
         );
         let used_pixel_width = 568.0 + SPLIT_DIVIDER_SIZE + 564.0;
         assert!((used_pixel_width - workspace.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn pane_size_projection_uses_each_active_terminal_zoom() {
+        let first = Pane {
+            id: Uuid::from_u128(21),
+            title: "First".to_owned(),
+            shell: "zsh".to_owned(),
+            color: None,
+            identity: hh_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        let second = Pane {
+            id: Uuid::from_u128(22),
+            title: "Second".to_owned(),
+            shell: "zsh".to_owned(),
+            color: None,
+            identity: hh_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        let layout = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneLayout::Leaf {
+                pane: first.clone(),
+            }),
+            second: Box::new(PaneLayout::Leaf {
+                pane: second.clone(),
+            }),
+        };
+        let default_metrics = typography::TerminalCellMetrics {
+            font_size: 13.5,
+            cell_width: 8.0,
+            ascent: 10.0,
+            descent: 3.0,
+            baseline: 13.0,
+            line_height: 19.0,
+        };
+        let zoomed_metrics = typography::TerminalCellMetrics {
+            font_size: 27.0,
+            cell_width: 16.0,
+            ascent: 20.0,
+            descent: 6.0,
+            baseline: 26.0,
+            line_height: 38.0,
+        };
+        let workspace = workspace_pixel_size(1280.0, 820.0, DEFAULT_SIDEBAR_WIDTH);
+        let mut sizes = Vec::new();
+        collect_pane_sizes(
+            &layout,
+            workspace.0,
+            workspace.1,
+            &|pane_id| {
+                if pane_id == first.id {
+                    zoomed_metrics
+                } else {
+                    default_metrics
+                }
+            },
+            &HashMap::new(),
+            &mut sizes,
+        );
+
+        assert_eq!(sizes[1], (second.id, 68, 39));
+        assert!(sizes[0].1 < sizes[1].1);
+        assert!(sizes[0].2 < sizes[1].2);
     }
     #[test]
     fn split_ratio_respects_practical_pane_constraints_at_each_window_size() {
@@ -1726,7 +1882,7 @@ mod tests {
             title: title.to_owned(),
             shell: "tmux".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -1743,7 +1899,7 @@ mod tests {
             active_terminal_count: 2,
             connection: WorkspaceConnection::Local,
             tabs: vec![
-                nah_protocol::Tab {
+                hh_protocol::Tab {
                     id: Uuid::from_u128(10),
                     title: "SSH".to_owned(),
                     custom_title: None,
@@ -1751,7 +1907,7 @@ mod tests {
                         pane: first.clone(),
                     },
                 },
-                nah_protocol::Tab {
+                hh_protocol::Tab {
                     id: Uuid::from_u128(20),
                     title: "tmux".to_owned(),
                     custom_title: None,
@@ -1776,7 +1932,7 @@ mod tests {
             title: "one".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -1786,7 +1942,7 @@ mod tests {
             title: "two".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -1821,7 +1977,7 @@ mod tests {
             title: format!("pane {id}"),
             shell: "zsh".to_owned(),
             color: None,
-            identity: nah_protocol::TerminalIdentity::default(),
+            identity: hh_protocol::TerminalIdentity::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,

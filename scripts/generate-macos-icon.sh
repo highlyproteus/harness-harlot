@@ -22,7 +22,7 @@ if [ "$width" != "$height" ]; then
 fi
 
 output_directory=$(dirname "$output_icns")
-iconset=$(mktemp -d "${TMPDIR:-/tmp}/nah-iconset.XXXXXX.iconset")
+iconset=$(mktemp -d "${TMPDIR:-/tmp}/hh-iconset.XXXXXX.iconset")
 cleanup() {
   rm -rf "$iconset"
 }

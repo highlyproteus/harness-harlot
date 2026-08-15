@@ -1,5 +1,5 @@
-use nah_protocol::{ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, ServiceResponse, WireError};
-use nah_session_service::{SessionRegistry, serve_connection};
+use hh_protocol::{ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, ServiceResponse, WireError};
+use hh_session_service::{SessionRegistry, serve_connection};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,7 +37,7 @@ async fn client_can_handshake_and_fetch_snapshot() {
         ServiceResponse::Snapshot { snapshot } => {
             assert_eq!(snapshot.workspaces.len(), 1);
             let target_pane = match &snapshot.workspaces[0].tabs[0].layout {
-                nah_protocol::PaneLayout::Leaf { pane } => pane.id,
+                hh_protocol::PaneLayout::Leaf { pane } => pane.id,
                 other => panic!("unexpected initial layout: {other:?}"),
             };
             write_message(
@@ -122,7 +122,7 @@ async fn terminal_input_is_not_acknowledged_on_the_wire() {
     let registry = SessionRegistry::default();
     let snapshot = registry.snapshot().unwrap();
     let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
-        nah_protocol::PaneLayout::Leaf { pane } => pane.id,
+        hh_protocol::PaneLayout::Leaf { pane } => pane.id,
         other => panic!("unexpected initial layout: {other:?}"),
     };
     let server_task = tokio::spawn(async move {
@@ -157,7 +157,7 @@ async fn terminal_input_is_not_acknowledged_on_the_wire() {
         &mut client,
         &ClientRequest::UpdateSelection {
             pane_id,
-            point: nah_protocol::TerminalPoint { row: 0, column: 0 },
+            point: hh_protocol::TerminalPoint { row: 0, column: 0 },
         },
     )
     .await

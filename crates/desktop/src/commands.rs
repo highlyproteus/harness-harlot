@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
+use std::io;
 
 use gpui::Keystroke;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,8 @@ pub enum AppCommand {
     NewWorkspace,
     ToggleSidebar,
     NewTab,
+    TerminalZoomIn,
+    TerminalZoomOut,
     SplitRight,
     SplitDown,
     FocusLeft,
@@ -26,7 +28,7 @@ pub enum AppCommand {
 }
 
 impl AppCommand {
-    const COUNT: usize = 13;
+    const COUNT: usize = 15;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +63,20 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         title: "New Terminal Tab",
         category: "Terminal",
         default_bindings: &["cmd-t"],
+    },
+    CommandDescriptor {
+        command: AppCommand::TerminalZoomIn,
+        id: "terminal.zoom-in",
+        title: "Increase Terminal Font Size",
+        category: "Terminal",
+        default_bindings: &["secondary-=", "secondary-shift-=", "secondary-+"],
+    },
+    CommandDescriptor {
+        command: AppCommand::TerminalZoomOut,
+        id: "terminal.zoom-out",
+        title: "Decrease Terminal Font Size",
+        category: "Terminal",
+        default_bindings: &["secondary--"],
     },
     CommandDescriptor {
         command: AppCommand::SplitRight,
@@ -216,14 +232,18 @@ impl AppConfig {
     }
 
     pub fn load() -> Result<Self, ConfigError> {
-        let Some(path) = nah_protocol::config_path() else {
+        let Some(path) = hh_protocol::config_path() else {
             return Ok(Self::default());
         };
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let json = fs::read_to_string(&path)
-            .map_err(|error| ConfigError(format!("read {}: {error}", path.display())))?;
+        let bytes = match hh_protocol::read_private_file(&path, 64 * 1024) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => {
+                return Err(ConfigError(format!("read {}: {error}", path.display())));
+            }
+        };
+        let json = String::from_utf8(bytes)
+            .map_err(|error| ConfigError(format!("{} is not UTF-8: {error}", path.display())))?;
         Self::from_json(&json).map_err(|error| ConfigError(format!("{}: {error}", path.display())))
     }
 
@@ -478,7 +498,7 @@ mod tests {
         let matches = palette_matches("", usize::MAX);
         assert_eq!(matches.len(), COMMAND_DESCRIPTORS.len());
         assert_eq!(matches[0].command, AppCommand::NewWorkspace);
-        assert_eq!(matches[11].command, AppCommand::EqualizePanes);
+        assert_eq!(matches[13].command, AppCommand::EqualizePanes);
 
         let matches = palette_matches("eq pane", 8);
         assert_eq!(
@@ -497,5 +517,26 @@ mod tests {
             matches.first().map(|item| item.command),
             Some(AppCommand::NewWorkspace)
         );
+    }
+
+    #[test]
+    fn terminal_zoom_bindings_cover_character_and_physical_plus_keys() {
+        assert_eq!(
+            descriptor(AppCommand::TerminalZoomIn).default_bindings,
+            &["secondary-=", "secondary-shift-=", "secondary-+"]
+        );
+        assert_eq!(
+            descriptor(AppCommand::TerminalZoomOut).default_bindings,
+            &["secondary--"]
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut physical = Keystroke::parse("secondary-shift-=").unwrap();
+            physical.key_char = Some("+".to_owned());
+            let character =
+                gpui::KeybindingKeystroke::from_keystroke(Keystroke::parse("secondary-+").unwrap());
+            assert!(physical.should_match(&character));
+        }
     }
 }

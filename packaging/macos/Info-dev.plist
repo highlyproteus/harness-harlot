@@ -5,17 +5,17 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>Not a Harness Dev</string>
+  <string>Harness Harlot Dev</string>
   <key>CFBundleExecutable</key>
-  <string>nah-dev</string>
+  <string>hh-dev</string>
   <key>CFBundleIdentifier</key>
-  <string>com.nah.desktop.dev</string>
+  <string>com.harnessharlot.desktop.dev</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleIconFile</key>
-  <string>Not-a-Harness-Dev.icns</string>
+  <string>Harness-Harlot-Dev.icns</string>
   <key>CFBundleName</key>
-  <string>Not a Harness Dev</string>
+  <string>Harness Harlot Dev</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -26,5 +26,13 @@
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Terminal commands may access files in your Desktop folder when you request it.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Terminal commands may access files in your Documents folder when you request it.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Terminal commands may access files in your Downloads folder when you request it.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>Terminal commands may access removable volumes when you request it.</string>
 </dict>
 </plist>

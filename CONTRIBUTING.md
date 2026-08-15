@@ -1,6 +1,6 @@
-# Contributing to Not a Harness
+# Contributing to Harness Harlot
 
-Not a Harness is early-stage. Start by reading the README and the task plan, and discuss changes that alter the service/UI boundary before implementation.
+Harness Harlot is early-stage. Start by reading the README and the task plan, and discuss changes that alter the service/UI boundary before implementation.
 
 ## Local checks
 

@@ -1,28 +1,31 @@
 [package]
-name = "nah-desktop"
+name = "hh-desktop"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Native Not a Harness terminal workspace desktop"
+description = "Native Harness Harlot terminal workspace desktop"
 
 [[bin]]
-name = "nah"
+name = "hh"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
-nah-protocol = { path = "../protocol" }
-nah-terminal-model = { path = "../terminal-model" }
+image.workspace = true
+libc.workspace = true
+hh-protocol = { version = "0.1.0", path = "../protocol" }
+hh-terminal-model = { version = "0.1.0", path = "../terminal-model" }
 parking_lot.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 unicode-width.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nah-macos-icon = { path = "../macos-icon" }
+hh-macos-icon = { version = "0.1.0", path = "../macos-icon" }
 
 [dev-dependencies]
 sha2.workspace = true

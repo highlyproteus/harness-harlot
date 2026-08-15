@@ -1,6 +1,9 @@
 use gpui::{Font, FontFallbacks, FontFeatures, TextSystem, font, px};
 
 const TERMINAL_FONT_SIZE: f32 = 13.5;
+const TERMINAL_ZOOM_STEP: f32 = 1.0;
+pub(super) const TERMINAL_ZOOM_MIN_LEVEL: i8 = -5;
+pub(super) const TERMINAL_ZOOM_MAX_LEVEL: i8 = 18;
 const LINE_HEIGHT_RATIO: f32 = 1.4;
 
 #[cfg(target_os = "macos")]
@@ -62,6 +65,21 @@ impl TerminalCellMetrics {
         }
     }
 
+    fn with_font_size(self, font_size: f32) -> Self {
+        let scale = font_size / self.font_size;
+        Self::from_measurements(
+            font_size,
+            self.cell_width * scale,
+            self.ascent * scale,
+            self.descent * scale,
+        )
+    }
+
+    fn for_zoom_level(self, level: i8) -> Self {
+        let level = level.clamp(TERMINAL_ZOOM_MIN_LEVEL, TERMINAL_ZOOM_MAX_LEVEL);
+        self.with_font_size(self.font_size + f32::from(level) * TERMINAL_ZOOM_STEP)
+    }
+
     pub fn span(self, start_column: u16, columns: u16) -> TerminalCellSpan {
         TerminalCellSpan {
             x: f32::from(start_column) * self.cell_width,
@@ -71,11 +89,17 @@ impl TerminalCellMetrics {
     }
 
     pub fn columns_for_width(self, width: f32) -> u16 {
-        (width.max(0.0) / self.cell_width).floor().max(1.0) as u16
+        (width.max(0.0) / self.cell_width).floor().clamp(
+            f32::from(hh_protocol::MIN_TERMINAL_COLUMNS),
+            f32::from(hh_protocol::MAX_TERMINAL_COLUMNS),
+        ) as u16
     }
 
     pub fn rows_for_height(self, height: f32) -> u16 {
-        (height.max(0.0) / self.line_height).floor().max(1.0) as u16
+        (height.max(0.0) / self.line_height).floor().clamp(
+            f32::from(hh_protocol::MIN_TERMINAL_ROWS),
+            f32::from(hh_protocol::MAX_TERMINAL_ROWS),
+        ) as u16
     }
 }
 
@@ -133,6 +157,10 @@ impl TerminalFontProfile {
         }
     }
 
+    pub fn metrics_for_zoom_level(&self, level: i8) -> TerminalCellMetrics {
+        self.metrics.for_zoom_level(level)
+    }
+
     pub fn font(&self, bold: bool, italic: bool) -> Font {
         let mut font = self.base_font.clone();
         if bold {
@@ -143,6 +171,12 @@ impl TerminalFontProfile {
         }
         font
     }
+}
+
+pub(super) fn adjusted_terminal_zoom_level(current: i8, delta: i8) -> i8 {
+    current
+        .saturating_add(delta)
+        .clamp(TERMINAL_ZOOM_MIN_LEVEL, TERMINAL_ZOOM_MAX_LEVEL)
 }
 
 fn select_font_family(available: &[String], candidates: &[&str]) -> Option<String> {
@@ -211,5 +245,30 @@ mod tests {
         let metrics = TerminalCellMetrics::from_measurements(13.5, 8.0, 10.0, 3.0);
         assert_eq!(metrics.columns_for_width(800.0), 100);
         assert_eq!(metrics.rows_for_height(380.0), 20);
+    }
+
+    #[test]
+    fn terminal_zoom_scales_every_cell_measurement_and_is_bounded() {
+        let base = TerminalCellMetrics::from_measurements(13.5, 8.0, 10.0, 3.0);
+        let zoomed = base.for_zoom_level(3);
+        assert_close(zoomed.font_size, 16.5);
+        assert!(zoomed.cell_width > base.cell_width);
+        assert!(zoomed.line_height > base.line_height);
+        assert!(zoomed.columns_for_width(800.0) < base.columns_for_width(800.0));
+        assert!(zoomed.rows_for_height(380.0) < base.rows_for_height(380.0));
+
+        assert_eq!(
+            adjusted_terminal_zoom_level(TERMINAL_ZOOM_MAX_LEVEL, 1),
+            TERMINAL_ZOOM_MAX_LEVEL
+        );
+        assert_eq!(
+            adjusted_terminal_zoom_level(TERMINAL_ZOOM_MIN_LEVEL, -1),
+            TERMINAL_ZOOM_MIN_LEVEL
+        );
+        assert_eq!(
+            adjusted_terminal_zoom_level(TERMINAL_ZOOM_MAX_LEVEL - 1, 1),
+            TERMINAL_ZOOM_MAX_LEVEL
+        );
+        assert_eq!(adjusted_terminal_zoom_level(1, -1), 0);
     }
 }

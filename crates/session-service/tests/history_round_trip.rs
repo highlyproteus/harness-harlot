@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nah_protocol::{
+use hh_protocol::{
     HistoryClearScope, HistoryPageDirection, PaneLayout, PaneRevisionCursor, TerminalProfile,
 };
-use nah_session_service::SessionRegistry;
+use hh_session_service::SessionRegistry;
 use uuid::Uuid;
 
 #[test]
@@ -94,7 +94,7 @@ fn leaf(layout: &PaneLayout) -> Uuid {
     pane(layout).id
 }
 
-fn pane(layout: &PaneLayout) -> &nah_protocol::Pane {
+fn pane(layout: &PaneLayout) -> &hh_protocol::Pane {
     match layout {
         PaneLayout::Leaf { pane } => pane,
         _ => panic!("expected a leaf pane"),
@@ -102,5 +102,5 @@ fn pane(layout: &PaneLayout) -> &nah_protocol::Pane {
 }
 
 fn test_directory(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("nah-integration-{label}-{}", Uuid::new_v4()))
+    std::env::temp_dir().join(format!("hh-integration-{label}-{}", Uuid::new_v4()))
 }

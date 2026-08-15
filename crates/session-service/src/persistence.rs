@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use nah_protocol::{
+use hh_protocol::{
     AppearanceColor, AppearanceSettings, Pane, PaneLayout, SessionSnapshot, SplitAxis, Tab,
     TerminalIdentity, TerminalProfile, Workspace, WorkspaceConnection, WorkspaceConnectionStatus,
     validate_ssh_host,
@@ -69,7 +69,7 @@ impl SnapshotStore {
                     format!("snapshot was invalid ({error:#}) and could not be quarantined")
                 })?;
                 eprintln!(
-                    "quarantined invalid Not a Harness recovery snapshot at {}: {error:#}",
+                    "quarantined invalid Harness Harlot recovery snapshot at {}: {error:#}",
                     quarantined.display()
                 );
                 Ok(None)
@@ -78,30 +78,8 @@ impl SnapshotStore {
     }
 
     fn load(&self) -> Result<RecoveredState> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&self.path)
-            .with_context(|| format!("open snapshot {}", self.path.display()))?;
-        let metadata = file
-            .metadata()
-            .context("inspect opened recovery snapshot")?;
-        if !metadata.is_file() {
-            bail!("snapshot must be a regular file and not a symbolic link");
-        }
-        if metadata.len() > MAX_SNAPSHOT_BYTES {
-            bail!("snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes");
-        }
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .context("restrict opened recovery snapshot")?;
-        let capacity = usize::try_from(metadata.len()).context("snapshot size exceeds usize")?;
-        let mut bytes = Vec::with_capacity(capacity);
-        file.take(MAX_SNAPSHOT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .context("read recovery snapshot")?;
-        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
-            bail!("snapshot grew beyond {MAX_SNAPSHOT_BYTES} bytes while reading");
-        }
+        let bytes = hh_protocol::read_private_file(&self.path, MAX_SNAPSHOT_BYTES)
+            .with_context(|| format!("read snapshot {}", self.path.display()))?;
         let desired: DesiredState =
             serde_json::from_slice(&bytes).context("decode recovery snapshot")?;
         desired.validate()?;
@@ -217,7 +195,7 @@ impl SnapshotStore {
 }
 
 pub(crate) fn default_snapshot_path() -> Result<PathBuf> {
-    let directory = nah_protocol::state_directory().context("HOME is not set")?;
+    let directory = hh_protocol::state_directory().context("HOME is not set")?;
     Ok(directory.join("sessions.json"))
 }
 
@@ -699,7 +677,7 @@ mod tests {
     use super::*;
 
     fn test_directory(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("nah-{label}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("hh-{label}-{}", Uuid::new_v4()))
     }
 
     fn cwd_map(snapshot: &SessionSnapshot) -> HashMap<Uuid, PathBuf> {
@@ -877,9 +855,9 @@ mod tests {
         };
         pane.color = Some(AppearanceColor::new(0x67, 0xc8, 0xc6));
         pane.title = "Live-detected Claude".to_owned();
-        pane.identity = nah_protocol::TerminalIdentity {
+        pane.identity = hh_protocol::TerminalIdentity {
             profile: TerminalProfile::Claude,
-            source: nah_protocol::TerminalIdentitySource::Command,
+            source: hh_protocol::TerminalIdentitySource::Command,
         };
         pane.custom_title = Some("Release shell".to_owned());
         pane.profile_override = Some(TerminalProfile::Gemini);

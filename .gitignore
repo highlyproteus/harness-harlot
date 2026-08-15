@@ -4,3 +4,14 @@
 *.swp
 .DS_Store
 /docs/assets/
+*.p12
+*.cer
+*.pem
+*.key
+*.p8
+*.seed
+*.mobileprovision
+*.provisionprofile
+*.keychain
+.env
+.env.*

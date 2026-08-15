@@ -37,7 +37,7 @@ The diagnostics contain no terminal cells or text, keyboard input, clipboard dat
 Run the focused activity-matrix smoke test and the keystroke-echo measurement with diagnostics visible:
 
 ```sh
-cargo test -p nah-session-service --test pane_streaming -- --nocapture
+cargo test -p hh-session-service --test pane_streaming -- --nocapture
 ```
 
 The pass conditions are exact zero screen bytes for unchanged and unsubscribed panes, one changed screen for the active burst, a current targeted refocus screen in under 500 ms on the local owner-only socket path, a nonzero bounded daemon resident-memory measurement, and a delivered keystroke echo in under 300 ms. The complete suite also covers changed-pane isolation, off-screen draining through a high-output burst, final-output visibility, refocus, cursor catch-up, cursorless receiver reconnect, and the opt-in semantics of the byte counters.

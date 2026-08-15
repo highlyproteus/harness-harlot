@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,17 +26,17 @@ use gpui::{
     UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, fill, img, point,
     prelude::*, px, relative, rgb, rgba, size, svg,
 };
-use nah_desktop::SessionClient;
-use nah_protocol::{
-    AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryCleanupPolicy,
-    HistoryClearScope, HistoryPageDirection, HistoryPageFlags, HistoryRetention, HistorySettings,
-    HistoryWarning, MAX_SSH_INPUT_LEN, Pane, PaneLayout, PaneRevisionCursor, PaneStreamState,
-    ServiceResponse, SessionSnapshot, SplitAxis, StreamDiagnostics, TerminalAttributes,
-    TerminalColor, TerminalHistoryPage, TerminalLine, TerminalModes, TerminalModifiers,
-    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalRun,
-    TerminalScreen, TerminalSelection, TerminalSelectionKind, TmuxScanScope, TmuxSession,
-    TmuxSessionId, Workspace, WorkspaceConnection, WorkspaceConnectionStatus, normalize_ssh_input,
-    validate_ssh_host,
+use hh_desktop::SessionClient;
+use hh_protocol::{
+    AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, DropPlacement, HistoryArchiveStatus,
+    HistoryCleanupPolicy, HistoryClearScope, HistoryPageDirection, HistoryPageFlags,
+    HistoryRetention, HistorySettings, HistoryWarning, MAX_SSH_INPUT_LEN, Pane, PaneLayout,
+    PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionSnapshot, SplitAxis,
+    StreamDiagnostics, TerminalAttributes, TerminalColor, TerminalHistoryPage, TerminalLine,
+    TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
+    TerminalProfile, TerminalRun, TerminalScreen, TerminalSelection, TerminalSelectionKind,
+    TmuxScanScope, TmuxSession, TmuxSessionId, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus, normalize_ssh_input, validate_ssh_host,
 };
 use parking_lot::Mutex;
 use unicode_width::UnicodeWidthChar;
@@ -60,24 +60,24 @@ use commands::{
 };
 use helpers::{
     FocusResync, IDENTITY_MARK_SIZE, append_rename_text, apply_layout_control_mutation,
-    collect_pane_sizes, collect_terminal_tabs, composite_rgb, constrained_sidebar_width,
-    default_sidebar_width, effective_split_ratio, element_key, find_pane, find_split_rect,
-    focus_resync_for, format_bytes, format_history_date, gpui_binding, history_label,
-    history_scope_key, history_warning_text, migrated_sidebar_width, next_terminal_poll_delay_ms,
-    paced_subscriptions, pane_update_requires_repaint, parse_hex_color, plain_history_line,
-    prepare_paste, product_name, readable_text_color, render_sidebar_toggle_icon,
-    render_terminal_profile_mark, resolved_terminal_accent, resolved_workspace_color,
-    rgba_with_alpha, selection_span, sidebar_width_for_visibility, split_child_dimensions,
-    split_control_id, split_element_key, split_placement_at, split_target_for_drag,
-    split_target_for_drag_ids, tab_identity_presentation, terminal_input_bytes, terminal_modifiers,
-    terminal_mouse_button, terminal_point_at, terminal_run_display_text, terminal_tab_count_label,
-    terminal_tab_secondary_label, visible_panes, workspace_is_selectable,
-    workspace_layout_for_focused_pane, workspace_pixel_size, workspace_tab_entries,
-    workspace_terminal_tabs, workspace_visible_panes, workstation_banner_header_height,
-    zoom_projection,
+    banner_fit_size, collect_pane_sizes, collect_terminal_tabs, composite_rgb,
+    constrained_sidebar_width, default_sidebar_width, effective_split_ratio, element_key,
+    find_pane, find_split_rect, focus_resync_for, format_bytes, format_history_date, gpui_binding,
+    history_label, history_scope_key, history_warning_text, migrated_sidebar_width,
+    next_terminal_poll_delay_ms, paced_subscriptions, pane_update_requires_repaint,
+    parse_hex_color, plain_history_line, prepare_paste, product_name, readable_text_color,
+    render_sidebar_toggle_icon, render_terminal_profile_mark, resolved_terminal_accent,
+    resolved_workspace_color, rgba_with_alpha, selection_span, sidebar_width_for_visibility,
+    split_child_dimensions, split_control_id, split_element_key, split_placement_at,
+    split_target_for_drag, split_target_for_drag_ids, tab_identity_presentation,
+    terminal_input_bytes, terminal_modifiers, terminal_mouse_button, terminal_point_at,
+    terminal_run_display_text, terminal_tab_count_label, terminal_tab_secondary_label,
+    visible_panes, workspace_is_selectable, workspace_layout_for_focused_pane,
+    workspace_pixel_size, workspace_tab_entries, workspace_terminal_tabs, workspace_visible_panes,
+    workstation_banner_header_height, zoom_projection,
 };
 use theme::{AppTheme, BuiltInTheme};
-use typography::TerminalFontProfile;
+use typography::{TerminalCellMetrics, TerminalFontProfile, adjusted_terminal_zoom_level};
 use ui_state::UiStateStore;
 use view_models::{
     ArchivedView, CloseConfirmation, ColorPickerState, ColorTarget, CommandPaletteState,
@@ -94,11 +94,13 @@ use view_models::{
 };
 
 actions!(
-    nah_app,
+    hh_app,
     [
         NewWorkspace,
         ToggleSidebar,
         NewTab,
+        TerminalZoomIn,
+        TerminalZoomOut,
         SplitRight,
         SplitDown,
         FocusLeft,
@@ -128,6 +130,17 @@ const TITLEBAR_HEIGHT: f32 = 38.0;
 const APP_CHROME_HEIGHT: f32 = TITLEBAR_HEIGHT;
 const MACOS_TRAFFIC_LIGHT_SAFE_INSET: f32 = 78.0;
 const WORKSTATION_BANNER_ASPECT_RATIO: f32 = 3.0;
+/// Pixel size of the bundled banner asset, asserted against the packaged file
+/// by `bundled_workstation_banner_dimensions_match_the_packaged_asset`.
+const BUNDLED_BANNER_PIXEL_WIDTH: u32 = 2172;
+const BUNDLED_BANNER_PIXEL_HEIGHT: u32 = 724;
+/// Rail-header bounds. The lower bound keeps a very wide image visible; the
+/// upper bound stops a square or tall image from consuming the workstation list.
+const WORKSTATION_BANNER_MIN_HEIGHT: f32 = 36.0;
+const WORKSTATION_BANNER_MAX_HEIGHT: f32 = 260.0;
+/// Budget the settings preview fits inside, borders excluded.
+const SETTINGS_BANNER_PREVIEW_MAX_WIDTH: f32 = 420.0;
+const SETTINGS_BANNER_PREVIEW_MAX_HEIGHT: f32 = 220.0;
 const PANE_HEADER_HEIGHT: f32 = 29.0;
 const SPLIT_DIVIDER_SIZE: f32 = 4.0;
 const TERMINAL_HORIZONTAL_PADDING: f32 = 18.0;
@@ -149,8 +162,8 @@ const PTY_RESIZE_DEBOUNCE_MS: u64 = 16;
 /// four-way split cannot multiply the focused pane's payload every 33 ms.
 const SECONDARY_PANE_INTERVAL: Duration = Duration::from_millis(120);
 const TAB_COLOR_ALPHA: u8 = 0xd0;
-const STABLE_PRODUCT_NAME: &str = "Not a Harness";
-const DEVELOPMENT_PRODUCT_NAME: &str = "Not a Harness Dev";
+const STABLE_PRODUCT_NAME: &str = "Harness Harlot";
+const DEVELOPMENT_PRODUCT_NAME: &str = "Harness Harlot Dev";
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
     AppearanceColor::new(0x62, 0xad, 0xff),
@@ -197,8 +210,28 @@ fn session_notify(client: &SharedSessionClient, request: &ClientRequest) -> anyh
     result
 }
 
+/// A banner ready to render: decoded-image handle plus its pixel dimensions,
+/// which drive rail-header height and preview sizing.
+#[derive(Clone, Debug)]
+struct BannerArtwork {
+    image: Arc<Image>,
+    width: u32,
+    height: u32,
+}
+
+impl BannerArtwork {
+    // Banner dimensions are capped at 8,192 px, so both integer values are
+    // exactly representable as f32.
+    #[allow(clippy::cast_precision_loss)]
+    fn aspect_ratio(&self) -> f32 {
+        self.width as f32 / self.height.max(1) as f32
+    }
+}
+
+// These flags represent independent UI interactions, not one state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
-struct NahApp {
+struct HhApp {
     focus_handle: FocusHandle,
     /// Screen traffic only: pane updates, targeted pane snapshots, history
     /// status. Kept separate so a keystroke never waits behind a screen payload.
@@ -206,6 +239,7 @@ struct NahApp {
     /// Everything else, including terminal input and selection updates.
     control_client: SharedSessionClient,
     terminal_font: TerminalFontProfile,
+    terminal_zoom_levels: HashMap<Uuid, i8>,
     keymap: ResolvedKeymap,
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
@@ -247,6 +281,8 @@ struct NahApp {
     history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
     custom_icons: Vec<CustomIcon>,
+    workstation_banner: Option<BannerArtwork>,
+    workstation_banner_hidden: bool,
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
     selection_drag: Option<SelectionDrag>,
@@ -256,7 +292,7 @@ struct NahApp {
     workspace_input_bounds: [Option<Bounds<Pixels>>; 2],
 }
 
-impl NahApp {
+impl HhApp {
     fn new(window: &mut Window, keymap: ResolvedKeymap, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
@@ -265,7 +301,7 @@ impl NahApp {
         let ui_state_store = match UiStateStore::from_default_path() {
             Ok(store) => Some(store),
             Err(error) => {
-                eprintln!("Not a Harness UI state unavailable: {error:#}");
+                eprintln!("Harness Harlot UI state unavailable: {error:#}");
                 None
             }
         };
@@ -275,7 +311,7 @@ impl NahApp {
                 .and_then(|store| match store.load_workspace_sidebar_width() {
                     Ok(width) => width,
                     Err(error) => {
-                        eprintln!("Not a Harness UI state ignored: {error:#}");
+                        eprintln!("Harness Harlot UI state ignored: {error:#}");
                         None
                     }
                 });
@@ -285,8 +321,31 @@ impl NahApp {
             && let Some(store) = &ui_state_store
             && let Err(error) = store.save_workspace_sidebar_width(preferred_sidebar_width)
         {
-            eprintln!("Not a Harness sidebar default correction was not persisted: {error:#}");
+            eprintln!("Harness Harlot sidebar default correction was not persisted: {error:#}");
         }
+        let workstation_banner =
+            ui_state_store
+                .as_ref()
+                .and_then(|store| match store.load_workstation_banner() {
+                    Ok(stored) => stored.map(|stored| BannerArtwork {
+                        image: Arc::new(Image::from_bytes(ImageFormat::Png, stored.png)),
+                        width: stored.width,
+                        height: stored.height,
+                    }),
+                    Err(error) => {
+                        eprintln!("Harness Harlot custom workstation banner ignored: {error:#}");
+                        None
+                    }
+                });
+        let workstation_banner_hidden = ui_state_store.as_ref().is_some_and(|store| {
+            match store.load_workstation_banner_hidden() {
+                Ok(hidden) => hidden,
+                Err(error) => {
+                    eprintln!("Harness Harlot banner visibility ignored: {error:#}");
+                    false
+                }
+            }
+        });
         let stream_client = Arc::new(Mutex::new(SessionClient::connect().ok()));
         let control_client = Arc::new(Mutex::new(SessionClient::connect().ok()));
         let mut app = Self {
@@ -294,6 +353,7 @@ impl NahApp {
             stream_client,
             control_client,
             terminal_font,
+            terminal_zoom_levels: HashMap::new(),
             keymap,
             snapshot: None,
             screens: HashMap::new(),
@@ -331,6 +391,8 @@ impl NahApp {
             history_clear_confirmation: None,
             color_picker: None,
             custom_icons: load_custom_icons(),
+            workstation_banner,
+            workstation_banner_hidden,
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
             selection_drag: None,
@@ -547,6 +609,8 @@ impl NahApp {
                     self.split_ratios.retain(|id, _| {
                         live_panes.contains(&id.first) && live_panes.contains(&id.second)
                     });
+                    self.terminal_zoom_levels
+                        .retain(|pane_id, _| live_panes.contains(pane_id));
                     self.pane_states = pane_states
                         .into_iter()
                         .map(|state| (state.pane_id, state))
@@ -1031,6 +1095,7 @@ impl NahApp {
             Err(error) => self.report(&error),
         }
         self.last_sizes.clear();
+        self.sync_pty_sizes(cx);
         cx.notify();
     }
 
@@ -1136,6 +1201,8 @@ impl NahApp {
             }
             Err(error) => self.report(&error),
         }
+        self.last_sizes.clear();
+        self.sync_pty_sizes(cx);
         cx.notify();
     }
 
@@ -1380,6 +1447,116 @@ impl NahApp {
                     this.set_pane_custom_icon(pane_id, Some(icon_id), cx);
                 }
                 Err(error) => {
+                    this.report(&error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn choose_workstation_banner(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.ui_state_store.clone() else {
+            self.report(&anyhow::anyhow!(
+                "application state is unavailable; cannot save a custom banner"
+            ));
+            cx.notify();
+            return;
+        };
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose workstation banner".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match selection.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.report(&error);
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(error) => {
+                    let error = anyhow::anyhow!("workstation banner picker failed: {error}");
+                    let _ = this.update(cx, |this, cx| {
+                        this.report(&error);
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let Some(path) = path else {
+                return;
+            };
+            let result = cx
+                .background_spawn(async move { store.import_workstation_banner(&path) })
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(stored) => {
+                    this.workstation_banner = Some(BannerArtwork {
+                        image: Arc::new(Image::from_bytes(ImageFormat::Png, stored.png)),
+                        width: stored.width,
+                        height: stored.height,
+                    });
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.report(&error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn reset_workstation_banner(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.ui_state_store.clone() else {
+            self.report(&anyhow::anyhow!(
+                "application state is unavailable; cannot reset the custom banner"
+            ));
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { store.reset_workstation_banner() })
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.workstation_banner = None;
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.report(&error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_workstation_banner_visibility(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.ui_state_store.clone() else {
+            self.report(&anyhow::anyhow!(
+                "application state is unavailable; cannot save the banner visibility"
+            ));
+            cx.notify();
+            return;
+        };
+        let hidden = !self.workstation_banner_hidden;
+        self.workstation_banner_hidden = hidden;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { store.save_workstation_banner_hidden(hidden) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.workstation_banner_hidden = !hidden;
                     this.report(&error);
                     cx.notify();
                 }
@@ -1841,6 +2018,8 @@ impl NahApp {
             AppCommand::NewWorkspace => self.new_workspace(cx),
             AppCommand::ToggleSidebar => self.toggle_sidebar(cx),
             AppCommand::NewTab => self.new_tab(cx),
+            AppCommand::TerminalZoomIn => self.adjust_terminal_zoom(1, cx),
+            AppCommand::TerminalZoomOut => self.adjust_terminal_zoom(-1, cx),
             AppCommand::SplitRight => self.split(SplitAxis::Horizontal, cx),
             AppCommand::SplitDown => self.split(SplitAxis::Vertical, cx),
             AppCommand::FocusLeft | AppCommand::FocusUp => self.focus_direction(false, cx),
@@ -1857,6 +2036,38 @@ impl NahApp {
                 }
             }
         }
+    }
+
+    fn terminal_metrics(&self, pane_id: Uuid) -> TerminalCellMetrics {
+        self.terminal_font.metrics_for_zoom_level(
+            self.terminal_zoom_levels
+                .get(&pane_id)
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn adjust_terminal_zoom(&mut self, delta: i8, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.focused_pane else {
+            return;
+        };
+        let current = self
+            .terminal_zoom_levels
+            .get(&pane_id)
+            .copied()
+            .unwrap_or_default();
+        let next = adjusted_terminal_zoom_level(current, delta);
+        if next == current {
+            return;
+        }
+        if next == 0 {
+            self.terminal_zoom_levels.remove(&pane_id);
+        } else {
+            self.terminal_zoom_levels.insert(pane_id, next);
+        }
+        self.last_sizes.clear();
+        self.sync_pty_sizes(cx);
+        cx.notify();
     }
 
     fn toggle_pane_zoom(&mut self, cx: &mut Context<Self>) {
@@ -2300,10 +2511,9 @@ impl NahApp {
         event: &ScrollWheelEvent,
         cx: &mut Context<Self>,
     ) {
-        let pixels = event
-            .delta
-            .pixel_delta(px(self.terminal_font.metrics.line_height));
-        let lines = (f32::from(pixels.y) / self.terminal_font.metrics.line_height).round() as i32;
+        let metrics = self.terminal_metrics(pane_id);
+        let pixels = event.delta.pixel_delta(px(metrics.line_height));
+        let lines = (f32::from(pixels.y) / metrics.line_height).round() as i32;
         let lines = if lines == 0 {
             if pixels.y < px(0.0) { -1 } else { 1 }
         } else {
@@ -2347,7 +2557,7 @@ impl NahApp {
     fn load_archived_page(
         &mut self,
         pane_id: Uuid,
-        cursor: Option<nah_protocol::HistoryCursor>,
+        cursor: Option<hh_protocol::HistoryCursor>,
         direction: HistoryPageDirection,
         cx: &mut Context<Self>,
     ) {
@@ -2903,7 +3113,7 @@ impl NahApp {
         let width = self.preferred_sidebar_width;
         cx.background_spawn(async move {
             if let Err(error) = store.save_workspace_sidebar_width(width) {
-                eprintln!("Not a Harness sidebar width was not persisted: {error:#}");
+                eprintln!("Harness Harlot sidebar width was not persisted: {error:#}");
             }
         })
         .detach();
@@ -2945,7 +3155,7 @@ impl NahApp {
             projected.as_ref().unwrap_or(layout),
             self.workspace_pixels.0,
             self.workspace_pixels.1,
-            self.terminal_font.metrics,
+            &|pane_id| self.terminal_metrics(pane_id),
             &self.split_ratios,
             &mut sizes,
         );
@@ -2972,24 +3182,31 @@ impl NahApp {
             };
             let result = cx
                 .background_spawn(async move {
+                    let mut first_error = None;
                     for (pane_id, columns, rows) in sizes {
-                        match session_call(
+                        let failure = match session_call(
                             &client,
                             &ClientRequest::ResizePane {
                                 pane_id,
                                 columns,
                                 rows,
                             },
-                        )? {
-                            ServiceResponse::Ack => {}
-                            response => {
-                                return Err(anyhow::anyhow!(
-                                    "unexpected resize response for {pane_id}: {response:?}"
-                                ));
-                            }
+                        ) {
+                            Ok(ServiceResponse::Ack) => None,
+                            Ok(response) => Some(anyhow::anyhow!(
+                                "unexpected resize response for {pane_id}: {response:?}"
+                            )),
+                            Err(error) => Some(error.context(format!("resize pane {pane_id}"))),
+                        };
+                        if first_error.is_none() {
+                            first_error = failure;
                         }
                     }
-                    Ok(())
+                    if let Some(error) = first_error {
+                        Err(error)
+                    } else {
+                        Ok(())
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, _| {
@@ -3015,12 +3232,24 @@ impl NahApp {
             .history_status
             .as_ref()
             .is_some_and(|status| status.warning.is_some());
+        let banner = self
+            .workstation_banner
+            .clone()
+            .unwrap_or_else(workstation_banner_artwork);
         let pinned_workspace_count = workspaces
             .iter()
             .filter(|workspace| workspace.pinned)
             .count();
         let workstation_count = workspaces.len().saturating_sub(pinned_workspace_count);
         let sidebar_content_width = self.sidebar_pixels - SIDEBAR_RESIZE_HIT_WIDTH;
+        let banner_aspect_ratio = banner.aspect_ratio();
+        let banner_header_height =
+            workstation_banner_header_height(sidebar_content_width, banner_aspect_ratio);
+        let (banner_width, banner_height) = banner_fit_size(
+            sidebar_content_width,
+            banner_header_height,
+            banner_aspect_ratio,
+        );
         div()
             .w(px(sidebar_content_width))
             .h_full()
@@ -3032,28 +3261,36 @@ impl NahApp {
             .border_color(rgb(THEME.border))
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .id("workstation-banner")
-                    .relative()
-                    .w_full()
-                    // The artwork is exactly 3:1. Matching the rail width to
-                    // that aspect ratio keeps the complete branded design
-                    // visible at every resizable width, rather than clipping
-                    // its top and bottom with a fixed-height cover crop.
-                    .h(px(workstation_banner_header_height(sidebar_content_width)))
-                    .flex_none()
-                    .overflow_hidden()
-                    .bg(rgb(THEME.terminal))
+            .when(!self.workstation_banner_hidden, |element| {
+                element
                     .child(
-                        img(workstation_banner_image())
-                            .id("workstation-banner-image")
+                        div()
+                            .id("workstation-banner")
+                            .relative()
                             .w_full()
-                            .h_full()
-                            .object_fit(gpui::ObjectFit::Contain),
-                    ),
-            )
-            .child(div().h(px(1.0)).flex_none().bg(rgb(THEME.border)))
+                            // The header follows the banner's own aspect ratio, clamped between
+                            // WORKSTATION_BANNER_MIN_HEIGHT and
+                            // WORKSTATION_BANNER_MAX_HEIGHT, so any uploaded shape shows whole.
+                            // The image gets explicit pixel dimensions: percentage sizing here
+                            // rendered a cropped image because gpui injects an aspect ratio
+                            // during img layout.
+                            .h(px(banner_header_height))
+                            .flex_none()
+                            .overflow_hidden()
+                            .bg(rgb(THEME.terminal))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                img(banner.image)
+                                    .id("workstation-banner-image")
+                                    .w(px(banner_width))
+                                    .h(px(banner_height))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).flex_none().bg(rgb(THEME.border)))
+            })
             .child(
                 div()
                     .h(px(40.0))
@@ -4270,7 +4507,7 @@ impl NahApp {
                 PaneControlIcon::Add,
                 "New terminal tab (⌘T)",
                 cx,
-                NahApp::new_tab_at,
+                HhApp::new_tab_at,
             ))
             .child(self.pane_control(
                 active,
@@ -4367,6 +4604,7 @@ impl NahApp {
     ) -> AnyElement {
         let focused = self.focused_pane == Some(active);
         let terminal_accent = self.terminal_accent(active).as_rgb();
+        let metrics = self.terminal_metrics(active);
         let screen = self.screens.get(&active);
         let archived = self.archived_views.get(&active);
         let exited = self
@@ -4396,6 +4634,7 @@ impl NahApp {
                             columns: screen.columns,
                             selection: None,
                         },
+                        metrics,
                         cx,
                     )
                 })
@@ -4418,6 +4657,7 @@ impl NahApp {
                                     columns: screen.columns,
                                     selection: screen.selection,
                                 },
+                                metrics,
                                 cx,
                             )
                         })
@@ -4476,8 +4716,8 @@ impl NahApp {
                         rgb(THEME.terminal)
                     })
                     .font(self.terminal_font.font(false, false))
-                    .text_size(px(self.terminal_font.metrics.font_size))
-                    .line_height(px(self.terminal_font.metrics.line_height))
+                    .text_size(px(metrics.font_size))
+                    .line_height(px(metrics.line_height))
                     .text_color(rgb(THEME.foreground))
                     .children(rendered_lines)
                     .when_some(archived, |element, view| {
@@ -4513,15 +4753,14 @@ impl NahApp {
                         |element| {
                             let cursor = screen.and_then(|screen| screen.cursor);
                             element.when_some(cursor, |element, cursor| {
-                                let span = self.terminal_font.metrics.span(cursor.column, 1);
+                                let span = metrics.span(cursor.column, 1);
                                 element.child(
                                     div()
                                         .absolute()
                                         .left(px(span.x))
-                                        .top(px(f32::from(cursor.row)
-                                            * self.terminal_font.metrics.line_height))
+                                        .top(px(f32::from(cursor.row) * metrics.line_height))
                                         .font(self.terminal_font.font(false, false))
-                                        .text_size(px(self.terminal_font.metrics.font_size))
+                                        .text_size(px(metrics.font_size))
                                         .text_color(rgb(THEME.foreground))
                                         .border_b_1()
                                         .border_color(rgb(terminal_accent))
@@ -4591,6 +4830,7 @@ impl NahApp {
         &self,
         line: &TerminalLine,
         render: TerminalLineRender,
+        metrics: TerminalCellMetrics,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let TerminalLineRender {
@@ -4607,7 +4847,7 @@ impl NahApp {
             .iter()
             .map(|style| {
                 let columns = style.columns;
-                let element = self.render_terminal_run(style, start_column, columns);
+                let element = self.render_terminal_run(style, metrics, start_column, columns);
                 start_column = start_column.saturating_add(columns);
                 element
             })
@@ -4615,7 +4855,6 @@ impl NahApp {
         let cursor_column = cursor
             .filter(|cursor| usize::from(cursor.row) == row)
             .map(|cursor| cursor.column);
-        let metrics = self.terminal_font.metrics;
         let pane_accent = self.terminal_accent(pane_id).as_rgb();
         div()
             .relative()
@@ -4720,6 +4959,7 @@ impl NahApp {
     fn render_terminal_run(
         &self,
         style: &TerminalRun,
+        metrics: TerminalCellMetrics,
         start_column: u16,
         columns: u16,
     ) -> AnyElement {
@@ -4730,7 +4970,6 @@ impl NahApp {
         let strikethrough = style.attributes.contains(TerminalAttributes::STRIKETHROUGH);
         let foreground = THEME.terminal_color(style.foreground, bold, dim);
         let background = THEME.terminal_color(style.background, false, false);
-        let metrics = self.terminal_font.metrics;
         let span = metrics.span(start_column, columns);
         let glyph_top = (metrics.baseline - metrics.ascent).max(0.0);
         let glyph_height = metrics.ascent + metrics.descent;
@@ -5803,6 +6042,181 @@ impl NahApp {
             .into_any_element()
     }
 
+    fn render_workstation_banner_setting(&self, cx: &mut Context<Self>) -> AnyElement {
+        let custom = self.workstation_banner.is_some();
+        let hidden = self.workstation_banner_hidden;
+        let banner = self
+            .workstation_banner
+            .clone()
+            .unwrap_or_else(workstation_banner_artwork);
+        let (preview_width, preview_height) = banner_fit_size(
+            SETTINGS_BANNER_PREVIEW_MAX_WIDTH - 2.0,
+            SETTINGS_BANNER_PREVIEW_MAX_HEIGHT - 2.0,
+            banner.aspect_ratio(),
+        );
+        div()
+            .pt(px(4.0))
+            .border_t_1()
+            .border_color(rgb(THEME.border))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .pt(px(6.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child("Workstation banner"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .px(px(7.0))
+                                    .py(px(3.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(if custom {
+                                        THEME.accent_soft
+                                    } else {
+                                        THEME.surface
+                                    }))
+                                    .font_family(".SystemUIFont")
+                                    .text_xs()
+                                    .text_color(rgb(THEME.foreground))
+                                    .child(if custom { "Custom" } else { "Default" }),
+                            )
+                            .child(
+                                div()
+                                    .id("workstation-banner-visible")
+                                    .px(px(8.0))
+                                    .py(px(4.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .bg(rgb(if hidden {
+                                        THEME.surface
+                                    } else {
+                                        THEME.accent_soft
+                                    }))
+                                    .font_family(".SystemUIFont")
+                                    .text_xs()
+                                    .text_color(rgb(THEME.foreground))
+                                    .hover(|element| element.bg(rgb(THEME.elevated)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_workstation_banner_visibility(cx);
+                                    }))
+                                    .child(if hidden { "Hidden" } else { "Shown" }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.muted))
+                    .child(
+                        "Shown at the top of the workstation sidebar. Any aspect ratio is shown whole; the rail header matches the image and is capped at 260 px tall.",
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(preview_width + 2.0))
+                    .h(px(preview_height + 2.0))
+                    .flex_none()
+                    .overflow_hidden()
+                    .rounded(px(6.0))
+                    .bg(rgb(THEME.terminal))
+                    .border_1()
+                    .border_color(rgb(THEME.border))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(banner.image)
+                            .id("settings-workstation-banner-preview")
+                            .w(px(preview_width))
+                            .h(px(preview_height))
+                            .object_fit(gpui::ObjectFit::Contain),
+                    ),
+            )
+            .when(hidden, |element| {
+                element.child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .text_xs()
+                        .text_color(rgb(THEME.muted))
+                        .child(
+                            "Hidden from the workstation sidebar. The image stays saved for when you show it again.",
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .id("choose-workstation-banner")
+                            .px(px(9.0))
+                            .py(px(5.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .bg(rgb(THEME.accent_soft))
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.foreground))
+                            .hover(|element| element.bg(rgb(THEME.selection)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.choose_workstation_banner(cx);
+                            }))
+                            .child(if custom {
+                                "Replace image…"
+                            } else {
+                                "Choose image…"
+                            }),
+                    )
+                    .when(custom, |element| {
+                        element.child(
+                            div()
+                                .id("reset-workstation-banner")
+                                .px(px(9.0))
+                                .py(px(5.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .bg(rgb(THEME.surface))
+                                .font_family(".SystemUIFont")
+                                .text_xs()
+                                .text_color(rgb(THEME.foreground))
+                                .hover(|element| element.bg(rgb(THEME.elevated)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reset_workstation_banner(cx);
+                                }))
+                                .child("Use default"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .font_family("SF Mono")
+                    .text_xs()
+                    .text_color(rgb(THEME.dim))
+                    .child(
+                        "PNG, JPEG, WebP, or GIF · 12 MiB maximum · copied to private local storage",
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_appearance_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let appearance = self
             .snapshot
@@ -5910,6 +6324,7 @@ impl NahApp {
                         appearance.default_workspace_color,
                         cx,
                     ))
+                    .child(self.render_workstation_banner_setting(cx))
                     .child(
                         div()
                             .pt(px(2.0))
@@ -6892,7 +7307,7 @@ impl NahApp {
                         .text_sm()
                         .text_color(rgb(THEME.muted))
                         .child(
-                            "The workstation connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Not a Harness stores no credentials or SSH config contents.",
+                            "The workstation connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Harness Harlot stores no credentials or SSH config contents.",
                         ),
                     )
                 })
@@ -6963,7 +7378,7 @@ impl NahApp {
                         .text_sm()
                         .text_color(rgb(THEME.muted))
                         .child(
-                            "This starts the installed OpenSSH client now and saves safe workstation metadata locally for later reconnect. Not a Harness adds no SSH options, stores no credentials, and does not change your config, agent, forwarding, or host-key policy.",
+                            "This starts the installed OpenSSH client now and saves safe workstation metadata locally for later reconnect. Harness Harlot adds no SSH options, stores no credentials, and does not change your config, agent, forwarding, or host-key policy.",
                         ),
                 )
                 .when_some(error, |element, message| {
@@ -7852,7 +8267,7 @@ impl NahApp {
     }
 }
 
-impl Render for NahApp {
+impl Render for HhApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_window_geometry(window);
 
@@ -7896,7 +8311,7 @@ impl Render for NahApp {
 
         div()
             .key_context(if self.modal.command_palette().is_some() {
-                "NahPalette"
+                "HhPalette"
             } else {
                 ROOT_KEY_CONTEXT
             })
@@ -7952,6 +8367,14 @@ impl Render for NahApp {
                 this.execute_command(AppCommand::NewTab, cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|this, _: &TerminalZoomIn, _, cx| {
+                this.execute_command(AppCommand::TerminalZoomIn, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &TerminalZoomOut, _, cx| {
+                this.execute_command(AppCommand::TerminalZoomOut, cx);
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(|this, _: &SplitRight, _, cx| {
                 this.execute_command(AppCommand::SplitRight, cx);
                 cx.stop_propagation();
@@ -7992,15 +8415,13 @@ impl Render for NahApp {
                 this.execute_command(AppCommand::ReattachPane, cx);
                 cx.stop_propagation();
             }))
-            .on_action(
-                cx.listener(|_: &mut NahApp, _: &ConsumeChordPrefix, _, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_action(cx.listener(NahApp::copy_terminal))
-            .on_action(cx.listener(NahApp::paste_terminal))
-            .on_action(cx.listener(NahApp::find_terminal))
-            .on_action(cx.listener(NahApp::find_next_terminal))
+            .on_action(cx.listener(|_: &mut HhApp, _: &ConsumeChordPrefix, _, cx| {
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(HhApp::copy_terminal))
+            .on_action(cx.listener(HhApp::paste_terminal))
+            .on_action(cx.listener(HhApp::find_terminal))
+            .on_action(cx.listener(HhApp::find_next_terminal))
             .child(
                 div()
                     .absolute()
@@ -8047,7 +8468,7 @@ impl Render for NahApp {
     }
 }
 
-impl EntityInputHandler for NahApp {
+impl EntityInputHandler for HhApp {
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -8194,9 +8615,14 @@ impl EntityInputHandler for NahApp {
                 ),
             ));
         }
+        let line_height = self
+            .focused_pane
+            .map_or(self.terminal_font.metrics.line_height, |pane_id| {
+                self.terminal_metrics(pane_id).line_height
+            });
         Some(Bounds::new(
             bounds.bottom_left(),
-            size(px(1.0), px(self.terminal_font.metrics.line_height)),
+            size(px(1.0), px(line_height)),
         ))
     }
 
@@ -8226,7 +8652,7 @@ impl EntityInputHandler for NahApp {
 }
 
 struct WorkspaceTextInputElement {
-    input: Entity<NahApp>,
+    input: Entity<HhApp>,
     field: WorkspaceCreationField,
     placeholder: &'static str,
 }
@@ -8436,7 +8862,7 @@ impl Element for WorkspaceTextInputElement {
 }
 
 struct TerminalInputElement {
-    input: Entity<NahApp>,
+    input: Entity<HhApp>,
 }
 
 impl IntoElement for TerminalInputElement {
@@ -8509,7 +8935,7 @@ impl Element for TerminalInputElement {
 /// resize capture must continue to receive drag and release events outside the
 /// divider (and even outside the window bounds when the platform delivers them).
 struct SidebarResizeCaptureElement {
-    input: Entity<NahApp>,
+    input: Entity<HhApp>,
 }
 
 impl IntoElement for SidebarResizeCaptureElement {
@@ -8584,7 +9010,7 @@ impl Element for SidebarResizeCaptureElement {
 /// One hit surface per terminal row keeps pointer semantics exact without
 /// forcing GPUI/Taffy to lay out an element for every visible grid cell.
 struct TerminalPointerElement {
-    input: Entity<NahApp>,
+    input: Entity<HhApp>,
     pane_id: Uuid,
     row: u16,
     columns: u16,
@@ -8704,7 +9130,7 @@ impl Element for TerminalPointerElement {
 /// terminal sessions. A future updater must instead defer until the service is
 /// explicitly quiescent (see `docs/macos-release.md`).
 fn ensure_bundled_session_service() {
-    if std::env::var_os("NAH_DISABLE_BUNDLED_SERVICE").is_some()
+    if std::env::var_os("HH_DISABLE_BUNDLED_SERVICE").is_some()
         || SessionClient::connect()
             .and_then(|mut client| client.call(&ClientRequest::GetSnapshot))
             .is_ok()
@@ -8712,9 +9138,16 @@ fn ensure_bundled_session_service() {
         return;
     }
 
+    if SessionClient::legacy_service_is_listening() {
+        eprintln!(
+            "Harness Harlot found an older session service with live PTYs at the legacy socket; refusing to start a second service. Close those sessions and stop the old service before relaunching this version."
+        );
+        return;
+    }
+
     let Some(service) = std::env::current_exe()
         .ok()
-        .and_then(|executable| executable.parent().map(|parent| parent.join("nah-service")))
+        .and_then(|executable| executable.parent().map(|parent| parent.join("hh-service")))
     else {
         return;
     };
@@ -8722,7 +9155,7 @@ fn ensure_bundled_session_service() {
         return;
     }
     if let Err(error) = Command::new(service).spawn() {
-        eprintln!("Not a Harness could not start its bundled session service: {error}");
+        eprintln!("Harness Harlot could not start its bundled session service: {error}");
         return;
     }
 
@@ -8735,11 +9168,11 @@ fn ensure_bundled_session_service() {
             return;
         }
     }
-    eprintln!("Not a Harness session service did not become ready within one second");
+    eprintln!("Harness Harlot session service did not become ready within one second");
 }
 
 fn development_build() -> bool {
-    std::env::var("NAH_DEVELOPMENT_BUILD").as_deref() == Ok("1")
+    std::env::var(DEVELOPMENT_BUILD_ENV).as_deref() == Ok("1")
 }
 
 /// Prefer the copy packaged inside a native macOS bundle. The source-tree path
@@ -8753,13 +9186,13 @@ fn workstation_banner_path() -> PathBuf {
             .map(|contents_directory| {
                 contents_directory
                     .join("Resources")
-                    .join("notaharness-banner.png")
+                    .join("harnessharlot-banner.png")
             })
     });
     bundled.filter(|path| path.is_file()).unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("assets")
-            .join("notaharness-banner.png")
+            .join("harnessharlot-banner.png")
     })
 }
 
@@ -8767,32 +9200,49 @@ fn workstation_banner_path() -> PathBuf {
 /// rebuilt in place. The same user-owned artwork remains packaged as a bundle
 /// resource; this stable in-process source prevents an asynchronous file-load
 /// miss from leaving the rail header blank after a relaunch.
-fn workstation_banner_image() -> Arc<Image> {
-    static BANNER: OnceLock<Arc<Image>> = OnceLock::new();
-    BANNER
-        .get_or_init(|| {
-            Arc::new(Image::from_bytes(
-                ImageFormat::Png,
-                include_bytes!("../assets/notaharness-banner.png").to_vec(),
-            ))
-        })
-        .clone()
+fn workstation_banner_artwork() -> BannerArtwork {
+    static BANNER: LazyLock<BannerArtwork> = LazyLock::new(|| BannerArtwork {
+        image: Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../assets/harnessharlot-banner.png").to_vec(),
+        )),
+        width: BUNDLED_BANNER_PIXEL_WIDTH,
+        height: BUNDLED_BANNER_PIXEL_HEIGHT,
+    });
+    BANNER.clone()
 }
 
 /// Sets the live Dock icon explicitly. `AppKit` otherwise retains the generic
 /// placeholder selected while a development bundle is being rebuilt in place.
 #[cfg(target_os = "macos")]
 fn install_macos_dock_icon(development_build: bool) {
-    nah_macos_icon::install_dock_icon(development_build);
+    hh_macos_icon::install_dock_icon(development_build);
 }
 
 #[cfg(not(target_os = "macos"))]
 fn install_macos_dock_icon(_: bool) {}
 
+#[cfg(target_os = "macos")]
+fn exclude_history_from_backup() {
+    let Some(history) = hh_protocol::state_directory().map(|directory| directory.join("history"))
+    else {
+        return;
+    };
+    if history.is_dir()
+        && let Err(error) = hh_macos_icon::exclude_directory_from_backup(&history)
+    {
+        eprintln!("Harness Harlot could not exclude local history from backups: {error}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exclude_history_from_backup() {}
+
 fn main() {
     let development_build = development_build();
     let product_name = product_name(development_build);
     ensure_bundled_session_service();
+    exclude_history_from_backup();
     Application::new()
         .with_assets(AgentIconAssets)
         .run(move |cx: &mut App| {
@@ -8800,7 +9250,7 @@ fn main() {
             let keymap = match AppConfig::load().and_then(|config| config.resolve_keymap()) {
                 Ok(keymap) => keymap,
                 Err(error) => {
-                    eprintln!("Not a Harness config ignored: {error}");
+                    eprintln!("Harness Harlot config ignored: {error}");
                     AppConfig::default()
                         .resolve_keymap()
                         .expect("built-in keymap must be valid")
@@ -8834,9 +9284,9 @@ fn main() {
                     window_min_size: Some(size(px(720.0), px(460.0))),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| NahApp::new(window, keymap.clone(), cx)),
+                |window, cx| cx.new(|cx| HhApp::new(window, keymap.clone(), cx)),
             )
-            .expect("open Not a Harness window");
+            .expect("open Harness Harlot window");
             cx.activate(true);
         });
 }
@@ -8851,7 +9301,21 @@ mod tests {
         assert!(banner.is_file(), "banner is missing: {}", banner.display());
         assert_eq!(
             banner.file_name().and_then(|name| name.to_str()),
-            Some("notaharness-banner.png")
+            Some("harnessharlot-banner.png")
+        );
+    }
+
+    #[test]
+    fn bundled_workstation_banner_dimensions_match_the_packaged_asset() {
+        let bytes = include_bytes!("../assets/harnessharlot-banner.png");
+        let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+            .with_guessed_format()
+            .expect("guess bundled banner format")
+            .into_dimensions()
+            .expect("read bundled banner dimensions");
+        assert_eq!(
+            dimensions,
+            (BUNDLED_BANNER_PIXEL_WIDTH, BUNDLED_BANNER_PIXEL_HEIGHT)
         );
     }
 }
