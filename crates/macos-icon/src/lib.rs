@@ -1,7 +1,7 @@
 //! Minimal macOS `AppKit` and `Foundation` integration for the desktop process.
 
 use objc2::AnyThread as _;
-use objc2_app_kit::{NSApplication, NSImage};
+use objc2_app_kit::{NSApplication, NSDockTile, NSImage};
 use objc2_foundation::{
     NSBundle, NSNumber, NSString, NSURL, NSURLIsExcludedFromBackupKey, ns_string,
 };
@@ -39,6 +39,22 @@ pub fn install_dock_icon(development_build: bool) {
             return;
         };
         app.setApplicationIconImage(Some(&icon));
+    }
+}
+
+/// Updates the running application's Dock tile badge.
+pub fn set_dock_badge(label: Option<&str>) {
+    let label = label.map(NSString::from_str);
+    // SAFETY: AppKit owns the shared application and Dock tile. AppKit copies
+    // the NSString badge value before this function returns.
+    #[allow(unsafe_code)]
+    unsafe {
+        let Some(app) = NSApp else {
+            eprintln!("Harness Harlot could not access the macOS application instance");
+            return;
+        };
+        let dock_tile: objc2::rc::Retained<NSDockTile> = app.dockTile();
+        dock_tile.setBadgeLabel(label.as_deref());
     }
 }
 

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::Term;
@@ -19,14 +20,21 @@ pub const SCROLLBACK_HISTORY_LIMIT: usize = 2_000;
 const MAX_SAFE_TITLE_CHARS: usize = 80;
 const MAX_STYLE_RUNS_PER_LINE: usize = 128;
 const MAX_TOTAL_STYLE_RUNS: usize = 3_000;
+const MAX_OSC_NOTIFICATION_BYTES: usize = 512;
+const MAX_OSC_SEQUENCE_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Default)]
-struct TitleListener {
+struct TermEventListener {
     title: Arc<Mutex<Option<String>>>,
+    bells: Arc<AtomicU64>,
 }
 
-impl EventListener for TitleListener {
+impl EventListener for TermEventListener {
     fn send_event(&self, event: Event) {
+        if matches!(event, Event::Bell) {
+            self.bells.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let next = match event {
             Event::Title(title)
                 if title.chars().count() <= MAX_SAFE_TITLE_CHARS
@@ -42,6 +50,114 @@ impl EventListener for TitleListener {
         {
             *title = next;
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct OscNotificationScanner {
+    state: OscScanState,
+}
+
+#[derive(Debug, Default)]
+enum OscScanState {
+    #[default]
+    Ground,
+    Escape,
+    Osc {
+        bytes: Vec<u8>,
+        escape_pending: bool,
+    },
+}
+
+impl OscNotificationScanner {
+    fn scan(&mut self, input: &[u8], messages: &mut Vec<String>) {
+        for &byte in input {
+            let state = std::mem::take(&mut self.state);
+            self.state = match state {
+                OscScanState::Ground if byte == b'\x1b' => OscScanState::Escape,
+                OscScanState::Ground => OscScanState::Ground,
+                OscScanState::Escape if byte == b']' => OscScanState::Osc {
+                    bytes: Vec::new(),
+                    escape_pending: false,
+                },
+                OscScanState::Escape if byte == b'\x1b' => OscScanState::Escape,
+                OscScanState::Escape => OscScanState::Ground,
+                OscScanState::Osc {
+                    bytes,
+                    escape_pending: true,
+                } if byte == b'\\' => {
+                    Self::finish(&bytes, messages);
+                    OscScanState::Ground
+                }
+                OscScanState::Osc {
+                    mut bytes,
+                    escape_pending,
+                } if byte == b'\x07' => {
+                    if escape_pending && bytes.len() < MAX_OSC_SEQUENCE_BYTES {
+                        bytes.push(b'\x1b');
+                    }
+                    Self::finish(&bytes, messages);
+                    OscScanState::Ground
+                }
+                OscScanState::Osc {
+                    mut bytes,
+                    escape_pending,
+                } => {
+                    if escape_pending {
+                        if bytes.len() >= MAX_OSC_SEQUENCE_BYTES {
+                            continue;
+                        }
+                        bytes.push(b'\x1b');
+                    }
+                    if byte == b'\x1b' {
+                        OscScanState::Osc {
+                            bytes,
+                            escape_pending: true,
+                        }
+                    } else if bytes.len() >= MAX_OSC_SEQUENCE_BYTES {
+                        OscScanState::Ground
+                    } else {
+                        bytes.push(byte);
+                        OscScanState::Osc {
+                            bytes,
+                            escape_pending: false,
+                        }
+                    }
+                }
+            };
+        }
+    }
+
+    fn finish(sequence: &[u8], messages: &mut Vec<String>) {
+        let raw = if let Some(message) = sequence.strip_prefix(b"9;") {
+            message.to_vec()
+        } else if let Some(payload) = sequence.strip_prefix(b"777;notify;") {
+            let Some(separator) = payload.iter().position(|byte| *byte == b';') else {
+                return;
+            };
+            let (title, body_with_separator) = payload.split_at(separator);
+            let body = &body_with_separator[1..];
+            if body.is_empty() {
+                title.to_vec()
+            } else {
+                let mut message = Vec::with_capacity(title.len().saturating_add(body.len() + 2));
+                message.extend_from_slice(title);
+                message.extend_from_slice(b": ");
+                message.extend_from_slice(body);
+                message
+            }
+        } else {
+            return;
+        };
+        let message = String::from_utf8_lossy(&raw);
+        let mut cleaned = String::new();
+        for character in message.chars().filter(|character| !character.is_control()) {
+            if cleaned.len().saturating_add(character.len_utf8()) > MAX_OSC_NOTIFICATION_BYTES {
+                break;
+            }
+            cleaned.push(character);
+        }
+        messages.push(cleaned);
     }
 }
 
@@ -68,8 +184,11 @@ impl Dimensions for TerminalSize {
 /// Owns terminal parsing and screen state without tying it to a UI toolkit.
 pub struct TerminalModel {
     parser: ansi::Processor,
-    terminal: Term<TitleListener>,
+    terminal: Term<TermEventListener>,
     title: Arc<Mutex<Option<String>>>,
+    bells: Arc<AtomicU64>,
+    scanner: OscNotificationScanner,
+    pending_messages: Vec<String>,
     last_search: Option<(String, Point, Point)>,
 }
 
@@ -97,8 +216,9 @@ impl TerminalModel {
             columns,
             screen_lines,
         };
-        let listener = TitleListener::default();
+        let listener = TermEventListener::default();
         let title = Arc::clone(&listener.title);
+        let bells = Arc::clone(&listener.bells);
         Self {
             parser: ansi::Processor::new(),
             terminal: Term::new(
@@ -111,12 +231,24 @@ impl TerminalModel {
                 listener,
             ),
             title,
+            bells,
+            scanner: OscNotificationScanner::default(),
+            pending_messages: Vec::new(),
             last_search: None,
         }
     }
 
     pub fn process_output(&mut self, bytes: &[u8]) {
+        self.scanner.scan(bytes, &mut self.pending_messages);
         self.parser.advance(&mut self.terminal, bytes);
+    }
+
+    pub fn bell_count(&self) -> u64 {
+        self.bells.load(Ordering::Relaxed)
+    }
+
+    pub fn take_notification_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_messages)
     }
 
     /// Resizes the terminal's visible grid while preserving its parser state.
@@ -139,7 +271,7 @@ impl TerminalModel {
     }
 
     #[cfg(test)]
-    fn terminal(&self) -> &Term<TitleListener> {
+    fn terminal(&self) -> &Term<TermEventListener> {
         &self.terminal
     }
 
@@ -563,6 +695,52 @@ mod tests {
         let oversized = format!("\x1b]0;{}\x07", "x".repeat(MAX_SAFE_TITLE_CHARS + 1));
         model.process_output(oversized.as_bytes());
         assert_eq!(model.terminal_title(), None);
+    }
+    #[test]
+    fn counts_terminal_bells() {
+        let mut model = TerminalModel::new(20, 3);
+        model.process_output(b"\x07");
+
+        assert_eq!(model.bell_count(), 1);
+    }
+
+    #[test]
+    fn captures_split_osc_9_notifications() {
+        let mut model = TerminalModel::new(20, 3);
+        model.process_output(b"\x1b]9;approval ");
+        assert!(model.take_notification_messages().is_empty());
+
+        model.process_output(b"needed\x07");
+        assert_eq!(
+            model.take_notification_messages(),
+            vec!["approval needed".to_owned()]
+        );
+    }
+
+    #[test]
+    fn captures_osc_777_title_and_body() {
+        let mut model = TerminalModel::new(20, 3);
+        model.process_output(b"\x1b]777;notify;Claude;needs approval\x1b\\");
+
+        assert_eq!(
+            model.take_notification_messages(),
+            vec!["Claude: needs approval".to_owned()]
+        );
+    }
+
+    #[test]
+    fn abandons_oversized_osc_notifications_and_recovers() {
+        let mut model = TerminalModel::new(20, 3);
+        let oversized = format!("\x1b]9;{}", "x".repeat(MAX_OSC_SEQUENCE_BYTES + 1));
+        model.process_output(oversized.as_bytes());
+        model.process_output(b"\x07");
+        assert!(model.take_notification_messages().is_empty());
+
+        model.process_output(b"\x1b]9;recovered\x07");
+        assert_eq!(
+            model.take_notification_messages(),
+            vec!["recovered".to_owned()]
+        );
     }
 
     #[test]

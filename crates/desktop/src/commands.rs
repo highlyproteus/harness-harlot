@@ -25,10 +25,11 @@ pub enum AppCommand {
     TogglePaneZoom,
     EqualizePanes,
     ReattachPane,
+    ShowNotifications,
 }
 
 impl AppCommand {
-    const COUNT: usize = 15;
+    const COUNT: usize = 16;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +149,13 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         category: "Pane",
         default_bindings: &["cmd-shift-r"],
     },
+    CommandDescriptor {
+        command: AppCommand::ShowNotifications,
+        id: "app.notifications",
+        title: "Show Notifications",
+        category: "Application",
+        default_bindings: &[],
+    },
 ];
 
 const fn str_eq(left: &str, right: &str) -> bool {
@@ -174,7 +182,10 @@ const fn check_registry() {
         assert!(descriptor.command as usize == outer);
         assert!(!descriptor.id.is_empty());
         assert!(!descriptor.title.is_empty());
-        assert!(!descriptor.default_bindings.is_empty());
+        assert!(
+            !descriptor.default_bindings.is_empty()
+                || descriptor.command as u8 == AppCommand::ShowNotifications as u8
+        );
         let mut inner = outer + 1;
         while inner < COMMAND_DESCRIPTORS.len() {
             let other = &COMMAND_DESCRIPTORS[inner];

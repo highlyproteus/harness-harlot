@@ -46,6 +46,7 @@ async fn client_can_handshake_and_fetch_snapshot() {
                     snapshot_revision: Some(snapshot.revision),
                     pane_revisions: Vec::new(),
                     subscribed_panes: vec![target_pane],
+                    notifications_after: 0,
                 },
             )
             .await

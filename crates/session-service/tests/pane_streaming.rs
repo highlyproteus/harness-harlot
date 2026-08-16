@@ -13,7 +13,7 @@ fn stream_delivers_only_changed_subscribed_panes_without_cross_pane_churn() {
     let second = registry.create_pane(first, SplitAxis::Horizontal).unwrap();
 
     let initial = registry
-        .pane_updates(None, &[], &[first, second], true)
+        .pane_updates(None, &[], &[first, second], true, 0)
         .unwrap();
     assert_eq!(initial.screens.len(), 2);
     let initial_cursors =
@@ -25,6 +25,7 @@ fn stream_delivers_only_changed_subscribed_panes_without_cross_pane_churn() {
             &initial_cursors,
             &[first, second],
             true,
+            0,
         )
         .unwrap();
     assert!(unchanged.snapshot.is_none());
@@ -37,7 +38,7 @@ fn stream_delivers_only_changed_subscribed_panes_without_cross_pane_churn() {
     wait_for_revision_after(&registry, first, revision_for(&initial_cursors, first));
 
     let changed = registry
-        .pane_updates(None, &initial_cursors, &[first, second], true)
+        .pane_updates(None, &initial_cursors, &[first, second], true, 0)
         .unwrap();
     assert_eq!(
         changed
@@ -62,7 +63,9 @@ fn stream_delivers_only_changed_subscribed_panes_without_cross_pane_churn() {
 fn cold_pane_keeps_draining_and_refocus_resyncs_without_output_loss() {
     let registry = SessionRegistry::new().unwrap();
     let pane_id = first_pane(&registry);
-    let initial = registry.pane_updates(None, &[], &[pane_id], true).unwrap();
+    let initial = registry
+        .pane_updates(None, &[], &[pane_id], true, 0)
+        .unwrap();
     let initial_revision = initial.screens[0].revision;
     let cursor = [PaneRevisionCursor {
         pane_id,
@@ -77,7 +80,7 @@ fn cold_pane_keeps_draining_and_refocus_resyncs_without_output_loss() {
         .unwrap();
     wait_for_bounded_screen_text(&registry, pane_id, "RMUX_COLD_FINAL");
 
-    let cold = registry.pane_updates(None, &cursor, &[], true).unwrap();
+    let cold = registry.pane_updates(None, &cursor, &[], true, 0).unwrap();
     assert!(cold.screens.is_empty(), "cold panes must not repaint");
     let cold_state = cold
         .pane_states
@@ -102,7 +105,7 @@ fn cold_pane_keeps_draining_and_refocus_resyncs_without_output_loss() {
         revision: resynced.revision,
     }];
     let live = registry
-        .pane_updates(None, &caught_up, &[pane_id], true)
+        .pane_updates(None, &caught_up, &[pane_id], true, 0)
         .unwrap();
     assert!(live.screens.is_empty());
     assert!(live.pane_states.iter().all(|state| !state.dirty));
@@ -119,7 +122,7 @@ fn receiver_reconnect_with_no_cursors_gets_one_current_resync() {
     wait_for_screen_text(&registry, second, "RMUX_RECONNECT_SECOND");
 
     let reconnected = registry
-        .pane_updates(None, &[], &[first, second], true)
+        .pane_updates(None, &[], &[first, second], true, 0)
         .unwrap();
     assert!(reconnected.snapshot.is_some());
     assert_eq!(reconnected.screens.len(), 2);
@@ -141,6 +144,7 @@ fn receiver_reconnect_with_no_cursors_gets_one_current_resync() {
             &cursors,
             &[first, second],
             true,
+            0,
         )
         .unwrap();
     assert!(settled.snapshot.is_none());
@@ -168,7 +172,7 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
     }
     thread::sleep(Duration::from_millis(200));
 
-    let initial = registry.pane_updates(None, &[], &panes, true).unwrap();
+    let initial = registry.pane_updates(None, &[], &panes, true, 0).unwrap();
     let matrix_cursors = cursors(&initial.screens);
     assert_eq!(initial.screens.len(), panes.len());
     assert!(initial.diagnostics.service_memory_bytes > 0);
@@ -179,6 +183,7 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
             &matrix_cursors,
             &panes,
             true,
+            0,
         )
         .unwrap();
     assert_eq!(idle.diagnostics.screen_bytes, 0);
@@ -188,14 +193,14 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
         .unwrap();
     wait_for_revision_after(&registry, first, revision_for(&matrix_cursors, first));
     let active = registry
-        .pane_updates(None, &matrix_cursors, &[first], true)
+        .pane_updates(None, &matrix_cursors, &[first], true, 0)
         .unwrap();
     assert_eq!(active.screens.len(), 1);
     assert_eq!(active.screens[0].pane_id, first);
 
     let cold_cursors = cursors(&active.screens);
     let cold = registry
-        .pane_updates(None, &cold_cursors, &[], true)
+        .pane_updates(None, &cold_cursors, &[], true, 0)
         .unwrap();
     assert_eq!(cold.diagnostics.screen_bytes, 0);
     assert_eq!(cold.diagnostics.screens_delivered, 0);
@@ -226,7 +231,9 @@ fn local_activity_matrix_smoke_reports_bounded_change_only_delivery() {
 fn byte_accounting_is_opt_in_and_does_not_change_delivery() {
     let registry = SessionRegistry::new().unwrap();
     let first = first_pane(&registry);
-    let initial = registry.pane_updates(None, &[], &[first], false).unwrap();
+    let initial = registry
+        .pane_updates(None, &[], &[first], false, 0)
+        .unwrap();
     assert_eq!(initial.diagnostics.screen_bytes, 0);
     let settled = settle_pane_cursors(&registry, cursors(&initial.screens), &[first]);
 
@@ -236,7 +243,7 @@ fn byte_accounting_is_opt_in_and_does_not_change_delivery() {
     wait_for_revision_after(&registry, first, revision_for(&settled, first));
 
     let unmeasured = registry
-        .pane_updates(None, &settled, &[first], false)
+        .pane_updates(None, &settled, &[first], false, 0)
         .unwrap();
     assert_eq!(unmeasured.screens.len(), 1);
     assert_eq!(unmeasured.diagnostics.screens_delivered, 1);
@@ -247,7 +254,7 @@ fn byte_accounting_is_opt_in_and_does_not_change_delivery() {
     assert_eq!(unmeasured.diagnostics.snapshot_bytes, 0);
 
     let measured = registry
-        .pane_updates(None, &settled, &[first], true)
+        .pane_updates(None, &settled, &[first], true, 0)
         .unwrap();
     assert_eq!(measured.screens.len(), 1);
     assert!(measured.diagnostics.screen_bytes > 0);
@@ -274,7 +281,7 @@ fn keystroke_echo_reaches_a_subscribed_pane_promptly() {
             )
             .unwrap();
     }
-    let initial = registry.pane_updates(None, &[], &panes, false).unwrap();
+    let initial = registry.pane_updates(None, &[], &panes, false, 0).unwrap();
     let settled = settle_pane_cursors(&registry, cursors(&initial.screens), &panes);
 
     let started = Instant::now();
@@ -285,7 +292,7 @@ fn keystroke_echo_reaches_a_subscribed_pane_promptly() {
     let mut preparation_micros = 0;
     loop {
         let update = registry
-            .pane_updates(None, &settled, &panes, false)
+            .pane_updates(None, &settled, &panes, false, 0)
             .unwrap();
         preparation_micros = preparation_micros.max(update.diagnostics.preparation_micros);
         if update
@@ -337,7 +344,7 @@ fn settle_pane_cursors(
     let mut quiet_since = Instant::now();
     loop {
         let update = registry
-            .pane_updates(None, &current, pane_ids, true)
+            .pane_updates(None, &current, pane_ids, true, 0)
             .unwrap();
         if update.screens.is_empty() {
             if quiet_since.elapsed() >= Duration::from_millis(50) {
@@ -370,7 +377,7 @@ fn revision_for(cursors: &[PaneRevisionCursor], pane_id: Uuid) -> u64 {
 fn wait_for_revision_after(registry: &SessionRegistry, pane_id: Uuid, revision: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let update = registry.pane_updates(None, &[], &[], true).unwrap();
+        let update = registry.pane_updates(None, &[], &[], true, 0).unwrap();
         if update
             .pane_states
             .iter()

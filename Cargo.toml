@@ -25,7 +25,7 @@ gpui = "0.2.2"
 image = "0.25.10"
 libc = "0.2.175"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile", "NSImage"] }
 objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSError", "NSString", "NSURL", "NSValue"] }
 time = { version = "0.3.41", features = ["macros", "parsing"] }
 parking_lot = "0.12"
