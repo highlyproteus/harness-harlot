@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 pub const SOCKET_ENV: &str = "HH_SOCKET";
 pub const STATE_DIR_ENV: &str = "HH_STATE_DIR";
 pub const CONFIG_ENV: &str = "HH_CONFIG";
@@ -539,6 +539,27 @@ pub struct PaneStreamState {
     #[serde(default)]
     pub exited: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationKind {
+    Completed,
+    Attention,
+    Message,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionNotification {
+    pub id: u64,
+    pub pane_id: Uuid,
+    pub workspace_id: Uuid,
+    pub kind: NotificationKind,
+    pub message: Option<String>,
+    pub pane_title: String,
+    pub workspace_title: String,
+    pub profile: TerminalProfile,
+    pub at_ms: u64,
+    pub read: bool,
+}
 
 /// Per-response, content-free measurements for the pane stream hot path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -810,7 +831,13 @@ pub enum ClientRequest {
         snapshot_revision: Option<u64>,
         pane_revisions: Vec<PaneRevisionCursor>,
         subscribed_panes: Vec<Uuid>,
+        notifications_after: u64,
     },
+    GetNotifications,
+    MarkNotificationsRead {
+        ids: Vec<u64>,
+    },
+    ClearNotifications,
     GetPaneSnapshot {
         pane_id: Uuid,
     },
@@ -1093,7 +1120,11 @@ pub enum ServiceResponse {
         snapshot: Option<SessionSnapshot>,
         screens: Vec<TerminalScreen>,
         pane_states: Vec<PaneStreamState>,
+        notifications: Vec<SessionNotification>,
         diagnostics: StreamDiagnostics,
+    },
+    Notifications {
+        items: Vec<SessionNotification>,
     },
     PaneSnapshot {
         screen: TerminalScreen,

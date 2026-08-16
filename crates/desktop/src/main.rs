@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
@@ -30,13 +30,13 @@ use hh_desktop::SessionClient;
 use hh_protocol::{
     AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, DropPlacement, HistoryArchiveStatus,
     HistoryCleanupPolicy, HistoryClearScope, HistoryPageDirection, HistoryPageFlags,
-    HistoryRetention, HistorySettings, HistoryWarning, MAX_SSH_INPUT_LEN, Pane, PaneLayout,
-    PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionSnapshot, SplitAxis,
-    StreamDiagnostics, TerminalAttributes, TerminalColor, TerminalHistoryPage, TerminalLine,
-    TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
-    TerminalProfile, TerminalRun, TerminalScreen, TerminalSelection, TerminalSelectionKind,
-    TmuxScanScope, TmuxSession, TmuxSessionId, Workspace, WorkspaceConnection,
-    WorkspaceConnectionStatus, normalize_ssh_input, validate_ssh_host,
+    HistoryRetention, HistorySettings, HistoryWarning, MAX_SSH_INPUT_LEN, NotificationKind, Pane,
+    PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse, SessionNotification,
+    SessionSnapshot, SplitAxis, StreamDiagnostics, TerminalAttributes, TerminalColor,
+    TerminalHistoryPage, TerminalLine, TerminalModes, TerminalModifiers, TerminalMouseAction,
+    TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalRun, TerminalScreen,
+    TerminalSelection, TerminalSelectionKind, TmuxScanScope, TmuxSession, TmuxSessionId, Workspace,
+    WorkspaceConnection, WorkspaceConnectionStatus, normalize_ssh_input, validate_ssh_host,
 };
 use parking_lot::Mutex;
 use unicode_width::UnicodeWidthChar;
@@ -66,15 +66,16 @@ use helpers::{
     history_label, history_scope_key, history_warning_text, migrated_sidebar_width,
     next_terminal_poll_delay_ms, paced_subscriptions, pane_update_requires_repaint,
     parse_hex_color, plain_history_line, prepare_paste, product_name, readable_text_color,
-    render_sidebar_toggle_icon, render_terminal_profile_mark, resolved_terminal_accent,
-    resolved_workspace_color, rgba_with_alpha, selection_span, sidebar_width_for_visibility,
-    split_child_dimensions, split_control_id, split_element_key, split_placement_at,
-    split_target_for_drag, split_target_for_drag_ids, tab_identity_presentation,
-    terminal_input_bytes, terminal_modifiers, terminal_mouse_button, terminal_point_at,
-    terminal_run_display_text, terminal_tab_count_label, terminal_tab_secondary_label,
-    visible_panes, workspace_is_selectable, workspace_layout_for_focused_pane,
-    workspace_pixel_size, workspace_tab_entries, workspace_terminal_tabs, workspace_visible_panes,
-    workstation_banner_header_height, zoom_projection,
+    render_sidebar_toggle_icon, render_terminal_profile_icon, render_terminal_profile_mark,
+    resolved_terminal_accent, resolved_workspace_color, rgba_with_alpha, selection_span,
+    sidebar_width_for_visibility, split_child_dimensions, split_control_id, split_element_key,
+    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
+    tab_identity_presentation, terminal_input_bytes, terminal_modifiers, terminal_mouse_button,
+    terminal_point_at, terminal_run_display_text, terminal_tab_count_label,
+    terminal_tab_secondary_label, visible_panes, workspace_is_selectable,
+    workspace_layout_for_focused_pane, workspace_pixel_size, workspace_tab_entries,
+    workspace_terminal_tabs, workspace_visible_panes, workstation_banner_header_height,
+    zoom_projection,
 };
 use theme::{AppTheme, BuiltInTheme};
 use typography::{TerminalCellMetrics, TerminalFontProfile, adjusted_terminal_zoom_level};
@@ -109,6 +110,7 @@ actions!(
         FocusDown,
         ShowCommandPalette,
         TogglePaneZoom,
+        ShowNotifications,
         EqualizePanes,
         ReattachPane,
         ConsumeChordPrefix,
@@ -244,11 +246,14 @@ struct HhApp {
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
     pane_states: HashMap<Uuid, PaneStreamState>,
+    notifications: Vec<SessionNotification>,
+    notifications_latest_id: u64,
     /// When each pane's screen was last applied, used to pace on-screen panes
     /// other than the focused one.
     last_delivery: HashMap<Uuid, Instant>,
     /// Last time output was delivered or the user acted, driving the deep-idle
     /// polling tier.
+    window_active: bool,
     last_activity: Instant,
     stream_diagnostics: StreamDiagnostics,
     active_workspace: Option<Uuid>,
@@ -358,11 +363,14 @@ impl HhApp {
             snapshot: None,
             screens: HashMap::new(),
             pane_states: HashMap::new(),
+            notifications: Vec::new(),
+            notifications_latest_id: 0,
             last_delivery: HashMap::new(),
             last_activity: Instant::now(),
             stream_diagnostics: StreamDiagnostics::default(),
             active_workspace: None,
             expanded_workspaces: HashSet::new(),
+            window_active: window.is_window_active(),
             collapsed_groups: HashSet::new(),
             workstation_groups: WorkstationGroupExpansion::default(),
             focused_pane: None,
@@ -403,6 +411,7 @@ impl HhApp {
         };
         app.update_window_geometry(window);
         app.refresh_state();
+        app.refresh_notifications();
         if app.focused_pane.is_some() && app.screens.is_empty() {
             app.refresh_state();
         }
@@ -416,7 +425,14 @@ impl HhApp {
         .detach();
 
         cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() {
+            this.window_active = window.is_window_active();
+            if this.window_active {
+                if let Some(pane_id) = this.focused_pane
+                    && this.auto_read_pane_notifications(pane_id)
+                {
+                    cx.notify();
+                }
+            } else {
                 this.cancel_sidebar_resize(window, cx);
             }
         })
@@ -524,6 +540,7 @@ impl HhApp {
             snapshot_revision: self.snapshot.as_ref().map(|snapshot| snapshot.revision),
             pane_revisions,
             subscribed_panes,
+            notifications_after: self.notifications_latest_id,
         }
     }
 
@@ -534,6 +551,7 @@ impl HhApp {
                 snapshot,
                 screens,
                 pane_states,
+                notifications: notification_deltas,
                 diagnostics,
             }) => {
                 let apply_started = Instant::now();
@@ -616,12 +634,42 @@ impl HhApp {
                         .map(|state| (state.pane_id, state))
                         .collect();
                 }
+                let notifications_changed = if notification_deltas
+                    .iter()
+                    .any(|notification| notification.id <= self.notifications_latest_id)
+                {
+                    self.notifications.clear();
+                    self.notifications_latest_id = 0;
+                    self.refresh_notifications()
+                } else if notification_deltas.is_empty() {
+                    false
+                } else {
+                    self.notifications_latest_id = notification_deltas
+                        .iter()
+                        .map(|notification| notification.id)
+                        .max()
+                        .unwrap_or(self.notifications_latest_id);
+                    self.notifications.extend(notification_deltas);
+                    let overflow = self.notifications.len().saturating_sub(200);
+                    if overflow > 0 {
+                        self.notifications.drain(..overflow);
+                    }
+                    if self.window_active
+                        && let Some(pane_id) = self.focused_pane
+                    {
+                        self.auto_read_pane_notifications(pane_id);
+                    } else {
+                        self.sync_dock_badge();
+                    }
+                    true
+                };
                 self.stream_diagnostics = diagnostics;
                 let connection_changed = self.connection_error.take().is_some();
                 self.connection_error = None;
                 let mut state_changed =
                     pane_update_requires_repaint(snapshot_changed, screens_applied)
-                        || connection_changed;
+                        || connection_changed
+                        || notifications_changed;
                 if let Some(pane_id) = focus_resync {
                     state_changed |= self.focus_pane_with_snapshot(pane_id);
                 }
@@ -643,8 +691,9 @@ impl HhApp {
     }
 
     fn focus_pane_with_snapshot(&mut self, pane_id: Uuid) -> bool {
+        let notifications_changed = self.auto_read_pane_notifications(pane_id);
         if self.focused_pane == Some(pane_id) {
-            return false;
+            return notifications_changed;
         }
         match self.stream_call(&ClientRequest::GetPaneSnapshot { pane_id }) {
             Ok(ServiceResponse::PaneSnapshot {
@@ -677,15 +726,15 @@ impl HhApp {
                 self.last_delivery.insert(pane_id, delivered_at);
                 self.stream_diagnostics = diagnostics;
                 self.connection_error = None;
-                changed
+                changed || notifications_changed
             }
             Ok(response) => {
                 self.report_unexpected(&response);
-                false
+                notifications_changed
             }
             Err(error) => {
                 self.report(&error);
-                false
+                notifications_changed
             }
         }
     }
@@ -834,6 +883,138 @@ impl HhApp {
         self.history_editor = None;
         self.history_clear_confirmation = None;
         let _ = self.refresh_history_status();
+        cx.notify();
+    }
+
+    fn open_notifications(&mut self, cx: &mut Context<Self>) {
+        self.modal = Modal::Notifications;
+        self.color_picker = None;
+        self.history_editor = None;
+        self.history_clear_confirmation = None;
+        self.refresh_notifications();
+        cx.notify();
+    }
+
+    fn refresh_notifications(&mut self) -> bool {
+        let previous = self.notifications.clone();
+        match self.call(&ClientRequest::GetNotifications) {
+            Ok(ServiceResponse::Notifications { items }) => {
+                self.notifications_latest_id =
+                    items.last().map_or(0, |notification| notification.id);
+                self.notifications = items;
+                self.connection_error = None;
+                self.sync_dock_badge();
+            }
+            Ok(response) => self.report_unexpected(&response),
+            Err(error) => self.report(&error),
+        }
+        self.notifications != previous
+    }
+
+    fn unread_notification_count(&self) -> usize {
+        self.notifications
+            .iter()
+            .filter(|notification| !notification.read)
+            .count()
+    }
+
+    fn sync_dock_badge(&self) {
+        let unread = self.unread_notification_count();
+        if unread == 0 {
+            set_macos_dock_badge(None);
+        } else {
+            let label = unread.to_string();
+            set_macos_dock_badge(Some(&label));
+        }
+    }
+
+    fn mark_notification_ids_read(&mut self, ids: &[u64]) -> bool {
+        if ids.is_empty() {
+            return false;
+        }
+        match self.call(&ClientRequest::MarkNotificationsRead { ids: ids.to_vec() }) {
+            Ok(ServiceResponse::Ack) => {
+                let ids = ids.iter().copied().collect::<HashSet<_>>();
+                for notification in &mut self.notifications {
+                    if ids.contains(&notification.id) {
+                        notification.read = true;
+                    }
+                }
+                self.connection_error = None;
+                self.sync_dock_badge();
+                true
+            }
+            Ok(response) => {
+                self.report_unexpected(&response);
+                false
+            }
+            Err(error) => {
+                self.report(&error);
+                false
+            }
+        }
+    }
+
+    fn auto_read_pane_notifications(&mut self, pane_id: Uuid) -> bool {
+        let ids = self
+            .notifications
+            .iter()
+            .filter(|notification| notification.pane_id == pane_id && !notification.read)
+            .map(|notification| notification.id)
+            .collect::<Vec<_>>();
+        self.mark_notification_ids_read(&ids)
+    }
+
+    fn mark_all_notifications_read(&mut self, cx: &mut Context<Self>) {
+        let ids = self
+            .notifications
+            .iter()
+            .filter(|notification| !notification.read)
+            .map(|notification| notification.id)
+            .collect::<Vec<_>>();
+        if self.mark_notification_ids_read(&ids) {
+            cx.notify();
+        }
+    }
+
+    fn clear_notifications(&mut self, cx: &mut Context<Self>) {
+        match self.call(&ClientRequest::ClearNotifications) {
+            Ok(ServiceResponse::Ack) => {
+                self.notifications.clear();
+                self.connection_error = None;
+                self.sync_dock_badge();
+            }
+            Ok(response) => self.report_unexpected(&response),
+            Err(error) => self.report(&error),
+        }
+        cx.notify();
+    }
+
+    fn open_notification(
+        &mut self,
+        notification_id: u64,
+        pane_id: Uuid,
+        workspace_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let pane_exists = self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .is_some_and(|workspace| {
+                    workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| find_pane(&tab.layout, pane_id).is_some())
+                })
+        });
+        if pane_exists {
+            self.select_workspace_tab(workspace_id, pane_id, cx);
+            self.modal = Modal::None;
+        } else {
+            self.mark_notification_ids_read(&[notification_id]);
+        }
         cx.notify();
     }
 
@@ -2035,6 +2216,7 @@ impl HhApp {
                     self.reattach_pane(pane_id, cx);
                 }
             }
+            AppCommand::ShowNotifications => self.open_notifications(cx),
         }
     }
 
@@ -2912,7 +3094,7 @@ impl HhApp {
                 self.handle_palette_key(event, cx);
                 return;
             }
-            Modal::AppearanceSettings => {
+            Modal::AppearanceSettings | Modal::Notifications => {
                 if keystroke.key == "escape" {
                     self.modal = Modal::None;
                     cx.notify();
@@ -3232,6 +3414,12 @@ impl HhApp {
             .history_status
             .as_ref()
             .is_some_and(|status| status.warning.is_some());
+        let unread_notifications = self.unread_notification_count();
+        let unread_label = if unread_notifications > 99 {
+            "99+".to_owned()
+        } else {
+            unread_notifications.to_string()
+        };
         let banner = self
             .workstation_banner
             .clone()
@@ -3325,6 +3513,56 @@ impl HhApp {
                                 .into()
                             })
                             .child("＋"),
+                    )
+                    .child(
+                        div()
+                            .id("notifications")
+                            .relative()
+                            .flex_none()
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(THEME.elevated))
+                                    .text_color(rgb(THEME.foreground))
+                            })
+                            .tooltip(|_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: "Notifications".to_owned(),
+                                })
+                                .into()
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.open_notifications(cx)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child("🔔")
+                            .when(unread_notifications > 0, |element| {
+                                element.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(-3.0))
+                                        .right(px(-5.0))
+                                        .min_w(px(15.0))
+                                        .h(px(14.0))
+                                        .px(px(3.0))
+                                        .rounded_full()
+                                        .bg(rgb(THEME.danger))
+                                        .font_family(".SystemUIFont")
+                                        .text_size(px(9.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xffffff))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(unread_label),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -6339,6 +6577,254 @@ impl HhApp {
             .into_any_element()
     }
 
+    fn render_notifications(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self
+            .notifications
+            .iter()
+            .rev()
+            .cloned()
+            .map(|notification| {
+                let notification_id = notification.id;
+                let pane_id = notification.pane_id;
+                let workspace_id = notification.workspace_id;
+                let unread = !notification.read;
+                let text_color = if unread {
+                    THEME.foreground
+                } else {
+                    THEME.muted
+                };
+                let (kind_label, kind_color) = match notification.kind {
+                    NotificationKind::Completed => ("Completed", THEME.ansi[2]),
+                    NotificationKind::Attention => ("Needs attention", THEME.danger),
+                    NotificationKind::Message => ("Message", THEME.accent),
+                };
+                let primary = format!(
+                    "{} — {}",
+                    notification.pane_title, notification.workspace_title
+                );
+                let relative_time = format_relative_time(notification.at_ms);
+                div()
+                    .id(("notification-row", notification_id))
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .bg(rgb(THEME.surface))
+                    .border_l(if unread { px(3.0) } else { px(0.0) })
+                    .border_color(rgb(THEME.accent))
+                    .hover(|element| element.bg(rgb(THEME.elevated)))
+                    .flex()
+                    .items_start()
+                    .gap(px(10.0))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_notification(notification_id, pane_id, workspace_id, cx);
+                    }))
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(render_terminal_profile_icon(
+                                notification.profile,
+                                text_color,
+                                18.0,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .child(
+                                        div()
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded_full()
+                                            .bg(rgba(rgba_with_alpha(kind_color, 0x28)))
+                                            .font_family(".SystemUIFont")
+                                            .text_size(px(10.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(rgb(kind_color))
+                                            .child(kind_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .flex_1()
+                                            .truncate()
+                                            .font_family(".SystemUIFont")
+                                            .text_sm()
+                                            .font_weight(if unread {
+                                                gpui::FontWeight::SEMIBOLD
+                                            } else {
+                                                gpui::FontWeight::NORMAL
+                                            })
+                                            .text_color(rgb(text_color))
+                                            .child(primary),
+                                    ),
+                            )
+                            .when_some(notification.message, |element, message| {
+                                element.child(
+                                    div()
+                                        .font_family(".SystemUIFont")
+                                        .text_sm()
+                                        .text_color(rgb(if unread {
+                                            THEME.muted
+                                        } else {
+                                            THEME.dim
+                                        }))
+                                        .child(message),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .pt(px(2.0))
+                            .font_family("SF Mono")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child(relative_time),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let empty = rows.is_empty();
+        div()
+            .id("notifications-workspace-surface")
+            .size_full()
+            .min_h(px(0.0))
+            .bg(rgb(THEME.terminal))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(PANE_HEADER_HEIGHT))
+                    .flex_none()
+                    .px(px(10.0))
+                    .bg(rgb(THEME.surface))
+                    .border_b_1()
+                    .border_color(rgb(THEME.border))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .text_center()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.muted))
+                            .child("🔔"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(THEME.foreground))
+                            .child("Notifications"),
+                    )
+                    .child(
+                        div()
+                            .id("mark-all-notifications-read")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(THEME.elevated))
+                                    .text_color(rgb(THEME.foreground))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mark_all_notifications_read(cx);
+                            }))
+                            .child("Mark all read"),
+                    )
+                    .child(
+                        div()
+                            .id("clear-notifications")
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(THEME.elevated))
+                                    .text_color(rgb(THEME.danger))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_notifications(cx);
+                            }))
+                            .child("Clear"),
+                    )
+                    .child(
+                        div()
+                            .id("close-notifications")
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| {
+                                element
+                                    .bg(rgb(THEME.elevated))
+                                    .text_color(rgb(THEME.foreground))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = Modal::None;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("notifications-workspace-content")
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px(px(20.0))
+                    .py(px(18.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .when(empty, |element| {
+                        element.items_center().justify_center().child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .text_sm()
+                                .text_color(rgb(THEME.dim))
+                                .child("No notifications yet."),
+                        )
+                    })
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
     fn render_history_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let status = self.history_status.clone().unwrap_or(HistoryArchiveStatus {
             settings: HistorySettings::default(),
@@ -8050,8 +8536,9 @@ impl HhApp {
             .size_full()
             .bg(rgba(0x00000070))
             .flex()
+            .items_start()
             .justify_center()
-            .pt(px(92.0))
+            .pt(px(110.0))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -8251,6 +8738,8 @@ impl HhApp {
         };
         let workspace_content = if matches!(self.modal, Modal::AppearanceSettings) {
             self.render_appearance_settings(cx)
+        } else if matches!(self.modal, Modal::Notifications) {
+            self.render_notifications(cx)
         } else {
             workspace_content
         };
@@ -8285,7 +8774,9 @@ impl Render for HhApp {
             self.focus_handle.focus(window);
         }
         let modal_element = match &self.modal {
-            Modal::None | Modal::AppearanceSettings | Modal::Search(_) => None,
+            Modal::None | Modal::AppearanceSettings | Modal::Notifications | Modal::Search(_) => {
+                None
+            }
             Modal::CommandPalette(palette) => Some(self.render_command_palette(palette, cx)),
             Modal::WorkspaceCreation(dialog) => {
                 Some(self.render_workspace_creation_dialog(dialog, cx))
@@ -8413,6 +8904,10 @@ impl Render for HhApp {
             }))
             .on_action(cx.listener(|this, _: &ReattachPane, _, cx| {
                 this.execute_command(AppCommand::ReattachPane, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &ShowNotifications, _, cx| {
+                this.execute_command(AppCommand::ShowNotifications, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|_: &mut HhApp, _: &ConsumeChordPrefix, _, cx| {
@@ -9006,6 +9501,33 @@ impl Element for SidebarResizeCaptureElement {
         });
     }
 }
+
+fn format_relative_time(at_ms: u64) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let elapsed_seconds = now_ms.saturating_sub(at_ms) / 1_000;
+    if elapsed_seconds < 60 {
+        "now".to_owned()
+    } else if elapsed_seconds < 60 * 60 {
+        format!("{}m ago", elapsed_seconds / 60)
+    } else if elapsed_seconds < 24 * 60 * 60 {
+        format!("{}h ago", elapsed_seconds / (60 * 60))
+    } else {
+        format!("{}d ago", elapsed_seconds / (24 * 60 * 60))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_dock_badge(label: Option<&str>) {
+    hh_macos_icon::set_dock_badge(label);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_macos_dock_badge(_: Option<&str>) {}
 
 /// One hit surface per terminal row keeps pointer semantics exact without
 /// forcing GPUI/Taffy to lay out an element for every visible grid cell.

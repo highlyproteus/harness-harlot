@@ -15,7 +15,9 @@ fn real_pty_output_is_archived_and_lazily_loaded_without_expanding_live_history(
     let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
     let snapshot = registry.snapshot().unwrap();
     let pane_id = leaf(&snapshot.workspaces[0].tabs[0].layout);
-    let initial = registry.pane_updates(None, &[], &[pane_id], true).unwrap();
+    let initial = registry
+        .pane_updates(None, &[], &[pane_id], true, 0)
+        .unwrap();
     let initial_cursor = PaneRevisionCursor {
         pane_id,
         revision: initial.screens[0].revision,
@@ -53,6 +55,7 @@ fn real_pty_output_is_archived_and_lazily_loaded_without_expanding_live_history(
             &[initial_cursor],
             &[pane_id],
             true,
+            0,
         )
         .unwrap();
     let integrated_snapshot = integrated.snapshot.expect("identity changed desired state");

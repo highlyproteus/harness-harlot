@@ -972,6 +972,9 @@ pub(super) fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
         AppCommand::ReattachPane => {
             KeyBinding::new(&binding.sequence, ReattachPane, Some(ROOT_KEY_CONTEXT))
         }
+        AppCommand::ShowNotifications => {
+            KeyBinding::new(&binding.sequence, ShowNotifications, Some(ROOT_KEY_CONTEXT))
+        }
     }
 }
 pub(super) fn product_name(development_build: bool) -> &'static str {

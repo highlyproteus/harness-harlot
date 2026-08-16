@@ -911,6 +911,7 @@ pub(super) enum Modal {
     GroupMenu(GroupMenu),
     WorkspaceConnectionInfo(WorkspaceConnectionInfo),
     AppearanceSettings,
+    Notifications,
 }
 
 impl Modal {

@@ -19,14 +19,14 @@ use hh_protocol::{
     AppearanceColor, ClientRequest, DropPlacement, HistoryArchiveStatus, HistoryClearScope,
     HistoryCursor, HistoryPageDirection, HistorySettings, MAX_FRAME_SIZE, MAX_PANES,
     MAX_TERMINAL_CELLS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS,
-    MIN_TERMINAL_ROWS, PROTOCOL_VERSION, Pane, PaneLayout, PaneRevisionCursor, PaneStreamState,
-    ServiceResponse, SessionSnapshot, SplitAxis, StreamDiagnostics, Tab, TerminalHistoryPage,
-    TerminalIdentity, TerminalIdentitySource, TerminalModes, TerminalModifiers,
-    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile, TerminalScreen,
-    TerminalSelectionKind, TmuxScanScope, TmuxSession, TmuxSessionAttachIssue, TmuxSessionId,
-    Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove,
-    terminal_profile_for_command, terminal_profile_for_executable, terminal_profile_for_title,
-    validate_ssh_host,
+    MIN_TERMINAL_ROWS, NotificationKind, PROTOCOL_VERSION, Pane, PaneLayout, PaneRevisionCursor,
+    PaneStreamState, ServiceResponse, SessionNotification, SessionSnapshot, SplitAxis,
+    StreamDiagnostics, Tab, TerminalHistoryPage, TerminalIdentity, TerminalIdentitySource,
+    TerminalModes, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
+    TerminalProfile, TerminalScreen, TerminalSelectionKind, TmuxScanScope, TmuxSession,
+    TmuxSessionAttachIssue, TmuxSessionId, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus, WorkspacePinMove, terminal_profile_for_command,
+    terminal_profile_for_executable, terminal_profile_for_title, validate_ssh_host,
 };
 use hh_terminal_model::TerminalModel;
 use parking_lot::{Mutex, RwLock};
@@ -58,6 +58,8 @@ const TMUX_PROBE_MAX_BYTES: usize = 64 * 1024;
 const TMUX_PROBE_MAX_SESSIONS: usize = 64;
 const TMUX_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_TMUX_ATTACH_SESSIONS: usize = 32;
+const MAX_RAW_PANE_EVENTS: usize = 32;
+const MAX_NOTIFICATIONS: usize = 200;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -69,6 +71,13 @@ const TMUX_REMOTE_LIST_COMMAND: &str = "exec tmux list-sessions -F 'S\t#{session
 #[cfg(debug_assertions)]
 const LOCAL_SSH_TEST_SEAM_ENV: &str = "HH_TEST_LOCAL_SSH_SEAM";
 
+#[derive(Debug)]
+struct RawPaneEvent {
+    kind: NotificationKind,
+    message: Option<String>,
+    at_ms: u64,
+}
+
 struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -76,6 +85,7 @@ struct PtySession {
     reader: Mutex<Option<thread::JoinHandle<()>>>,
     terminal: Arc<Mutex<TerminalModel>>,
     revision: Arc<AtomicU64>,
+    events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
     _history: Arc<HistorySink>,
 }
 
@@ -214,19 +224,50 @@ impl PtySession {
             usize::from(INITIAL_ROWS),
         )));
         let revision = Arc::new(AtomicU64::new(0));
+        let events = Arc::new(Mutex::new(VecDeque::new()));
         let reader_terminal = Arc::clone(&terminal);
         let reader_revision = Arc::clone(&revision);
+        let reader_events = Arc::clone(&events);
         let reader_history = Arc::clone(&history);
         let reader = thread::Builder::new()
             .name(format!("rmux-pty-{pane_id}"))
             .spawn(move || {
                 let mut buffer = [0_u8; 16 * 1024];
+                let mut previous_bell_count = 0;
                 loop {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(read) => {
                             let mut terminal = reader_terminal.lock();
                             terminal.process_output(&buffer[..read]);
+                            let bell_count = terminal.bell_count();
+                            let messages = terminal.take_notification_messages();
+                            drop(terminal);
+                            if (bell_count > previous_bell_count || !messages.is_empty())
+                                && let Some(mut events) = reader_events.try_lock()
+                            {
+                                if bell_count > previous_bell_count {
+                                    push_raw_pane_event(
+                                        &mut events,
+                                        RawPaneEvent {
+                                            kind: NotificationKind::Attention,
+                                            message: None,
+                                            at_ms: history::now_ms(),
+                                        },
+                                    );
+                                }
+                                for message in messages {
+                                    push_raw_pane_event(
+                                        &mut events,
+                                        RawPaneEvent {
+                                            kind: NotificationKind::Message,
+                                            message: Some(message),
+                                            at_ms: history::now_ms(),
+                                        },
+                                    );
+                                }
+                            }
+                            previous_bell_count = bell_count;
                             reader_revision.fetch_add(1, Ordering::Release);
                             reader_history.record(&buffer[..read]);
                         }
@@ -245,6 +286,7 @@ impl PtySession {
             terminal,
             revision,
             _history: history,
+            events,
         }))
     }
 
@@ -402,6 +444,12 @@ impl PtySession {
         self.terminal.lock().terminal_title()
     }
 }
+fn push_raw_pane_event(events: &mut VecDeque<RawPaneEvent>, event: RawPaneEvent) {
+    if events.len() == MAX_RAW_PANE_EVENTS {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
 
 #[derive(Debug)]
 struct RuntimePane {
@@ -501,6 +549,8 @@ fn runtime_kind_for_workspace(connection: &WorkspaceConnection) -> RuntimePaneKi
 struct RegistryState {
     snapshot: SessionSnapshot,
     panes: HashMap<Uuid, RuntimePane>,
+    notifications: VecDeque<SessionNotification>,
+    next_notification_id: u64,
     next_terminal_number: u32,
     next_group_number: u32,
     system: System,
@@ -521,6 +571,74 @@ impl RegistryState {
             profile_override: None,
             custom_icon: None,
         }
+    }
+}
+
+impl RegistryState {
+    fn drain_pane_events(&mut self) {
+        let pending = self
+            .panes
+            .iter()
+            .filter_map(|(pane_id, runtime)| {
+                let mut events = runtime.session.events.try_lock()?;
+                (!events.is_empty()).then(|| (*pane_id, events.drain(..).collect::<Vec<_>>()))
+            })
+            .collect::<Vec<_>>();
+        for (pane_id, events) in pending {
+            for event in events {
+                self.append_notification(pane_id, event.kind, event.message, event.at_ms);
+            }
+        }
+    }
+
+    fn append_notification(
+        &mut self,
+        pane_id: Uuid,
+        kind: NotificationKind,
+        message: Option<String>,
+        at_ms: u64,
+    ) {
+        if kind == NotificationKind::Attention
+            && let Some(existing) = self.notifications.iter_mut().rev().find(|notification| {
+                notification.pane_id == pane_id
+                    && notification.kind == NotificationKind::Attention
+                    && !notification.read
+            })
+        {
+            existing.at_ms = at_ms;
+            return;
+        }
+        let Some(workspace_id) = workspace_id_for_pane(&self.snapshot, pane_id) else {
+            return;
+        };
+        let Some(workspace) = self
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        let Some(pane) = find_pane_in_snapshot(&self.snapshot, pane_id) else {
+            return;
+        };
+        let notification = SessionNotification {
+            id: self.next_notification_id,
+            pane_id,
+            workspace_id,
+            kind,
+            message,
+            pane_title: pane.title.clone(),
+            workspace_title: workspace.title.clone(),
+            profile: pane.identity.profile,
+            at_ms,
+            read: false,
+        };
+        self.next_notification_id = self.next_notification_id.saturating_add(1);
+        if self.notifications.len() == MAX_NOTIFICATIONS {
+            self.notifications.pop_front();
+        }
+        self.notifications.push_back(notification);
     }
 }
 
@@ -579,6 +697,7 @@ pub struct PaneUpdateBatch {
     pub snapshot: Option<SessionSnapshot>,
     pub screens: Vec<TerminalScreen>,
     pub pane_states: Vec<PaneStreamState>,
+    pub notifications: Vec<SessionNotification>,
     pub diagnostics: StreamDiagnostics,
 }
 
@@ -652,6 +771,8 @@ impl SessionRegistry {
             state: Arc::new(RwLock::new(RegistryState {
                 snapshot: recovered.snapshot,
                 panes,
+                notifications: VecDeque::new(),
+                next_notification_id: 1,
                 next_terminal_number,
                 next_group_number: 1,
                 last_identity_refresh: None,
@@ -678,6 +799,8 @@ impl SessionRegistry {
         Ok(Self {
             state: Arc::new(RwLock::new(RegistryState {
                 snapshot,
+                notifications: VecDeque::new(),
+                next_notification_id: 1,
                 panes: HashMap::from([(
                     pane_id,
                     RuntimePane {
@@ -733,6 +856,7 @@ impl SessionRegistry {
         pane_revisions: &[PaneRevisionCursor],
         subscribed_panes: &[Uuid],
         measure_bytes: bool,
+        notifications_after: u64,
     ) -> Result<PaneUpdateBatch> {
         if pane_revisions.len() > MAX_PANES || subscribed_panes.len() > MAX_PANES {
             bail!("pane update request exceeds the {MAX_PANES}-pane limit");
@@ -743,6 +867,33 @@ impl SessionRegistry {
             .map(|cursor| (cursor.pane_id, cursor.revision))
             .collect::<HashMap<_, _>>();
         let subscribed = subscribed_panes.iter().copied().collect::<HashSet<_>>();
+        let (has_pending_events, has_finished_reader) = {
+            let state = self.state.read();
+            let has_pending_events = state.panes.values().any(|runtime| {
+                runtime
+                    .session
+                    .events
+                    .try_lock()
+                    .is_some_and(|events| !events.is_empty())
+            });
+            let has_finished_reader = state.panes.values().any(|runtime| {
+                runtime.exit_status.is_none()
+                    && runtime
+                        .session
+                        .reader
+                        .lock()
+                        .as_ref()
+                        .is_some_and(thread::JoinHandle::is_finished)
+            });
+            (has_pending_events, has_finished_reader)
+        };
+        if has_pending_events || has_finished_reader {
+            let mut state = self.state.write();
+            if has_finished_reader {
+                refresh_runtime_metadata(&mut state, false)?;
+            }
+            state.drain_pane_events();
+        }
         let state = self.state.read();
 
         let session_revision = state.snapshot.revision;
@@ -777,6 +928,12 @@ impl SessionRegistry {
                 exited: runtime.exit_status.is_some(),
             });
         }
+        let notifications = state
+            .notifications
+            .iter()
+            .filter(|notification| notification.id > notifications_after)
+            .cloned()
+            .collect();
         drop(state);
 
         pane_states.sort_unstable_by_key(|pane| pane.pane_id);
@@ -819,8 +976,32 @@ impl SessionRegistry {
             snapshot,
             screens,
             pane_states,
+            notifications,
             diagnostics,
         })
+    }
+
+    pub fn notifications(&self) -> Result<Vec<SessionNotification>> {
+        let mut state = self.state.write();
+        refresh_runtime_metadata(&mut state, false)?;
+        state.drain_pane_events();
+        Ok(state.notifications.iter().cloned().collect())
+    }
+
+    pub fn mark_notifications_read(&self, ids: &[u64]) {
+        let ids = ids.iter().copied().collect::<HashSet<_>>();
+        let mut state = self.state.write();
+        for notification in &mut state.notifications {
+            if ids.contains(&notification.id) {
+                notification.read = true;
+            }
+        }
+    }
+
+    pub fn clear_notifications(&self) {
+        let mut state = self.state.write();
+        state.drain_pane_events();
+        state.notifications.clear();
     }
 
     /// Returns one current screen for deterministic focus/reconnect resync.
@@ -2933,6 +3114,14 @@ fn refresh_runtime_metadata(state: &mut RegistryState, force_process_refresh: bo
                 status.as_deref(),
                 &shell_label,
             );
+            if status.is_some() {
+                state.append_notification(
+                    pane_id,
+                    NotificationKind::Completed,
+                    None,
+                    history::now_ms(),
+                );
+            }
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
     }
@@ -4102,12 +4291,25 @@ fn handle_request(sessions: &SessionRegistry, request: ClientRequest) -> Result<
             snapshot_revision,
             pane_revisions,
             subscribed_panes,
+            notifications_after,
         } => handle_get_updates(
             sessions,
             snapshot_revision,
             &pane_revisions,
             &subscribed_panes,
+            notifications_after,
         ),
+        ClientRequest::GetNotifications => Ok(ServiceResponse::Notifications {
+            items: sessions.notifications()?,
+        }),
+        ClientRequest::MarkNotificationsRead { ids } => {
+            sessions.mark_notifications_read(&ids);
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ClearNotifications => {
+            sessions.clear_notifications();
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::GetPaneSnapshot { pane_id } => handle_get_pane_snapshot(sessions, pane_id),
         ClientRequest::CreatePane { target_pane, axis } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.create_pane(target_pane, axis)?,
@@ -4373,14 +4575,21 @@ fn handle_get_updates(
     snapshot_revision: Option<u64>,
     pane_revisions: &[PaneRevisionCursor],
     subscribed_panes: &[Uuid],
+    notifications_after: u64,
 ) -> Result<ServiceResponse> {
-    let update =
-        sessions.pane_updates(snapshot_revision, pane_revisions, subscribed_panes, false)?;
+    let update = sessions.pane_updates(
+        snapshot_revision,
+        pane_revisions,
+        subscribed_panes,
+        false,
+        notifications_after,
+    )?;
     Ok(ServiceResponse::Updates {
         session_revision: update.session_revision,
         snapshot: update.snapshot,
         screens: update.screens,
         pane_states: update.pane_states,
+        notifications: update.notifications,
         diagnostics: update.diagnostics,
     })
 }
@@ -4931,7 +5140,7 @@ mod tests {
             .unwrap();
 
         let update = registry
-            .pane_updates(Some(before.revision), &[], &[], true)
+            .pane_updates(Some(before.revision), &[], &[], true, 0)
             .unwrap();
         let delivered = update
             .snapshot
@@ -5627,7 +5836,7 @@ mod tests {
         let subscriptions = vec![Uuid::nil(); MAX_PANES + 1];
         assert!(
             registry
-                .pane_updates(None, &[], &subscriptions, false)
+                .pane_updates(None, &[], &subscriptions, false, 0)
                 .is_err()
         );
         let revisions = vec![
@@ -5637,7 +5846,11 @@ mod tests {
             };
             MAX_PANES + 1
         ];
-        assert!(registry.pane_updates(None, &revisions, &[], false).is_err());
+        assert!(
+            registry
+                .pane_updates(None, &revisions, &[], false, 0)
+                .is_err()
+        );
     }
 
     #[test]
