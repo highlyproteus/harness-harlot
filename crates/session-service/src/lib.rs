@@ -167,6 +167,7 @@ impl PtySession {
                 archive,
             );
         }
+        #[cfg(debug_assertions)]
         if std::env::var_os(LOCAL_SSH_TEST_SEAM_ENV).is_some() {
             return Self::spawn_local(
                 pane_id,
