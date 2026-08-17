@@ -74,14 +74,14 @@ impl OscNotificationScanner {
         for &byte in input {
             let state = std::mem::take(&mut self.state);
             self.state = match state {
-                OscScanState::Ground if byte == b'\x1b' => OscScanState::Escape,
-                OscScanState::Ground => OscScanState::Ground,
+                OscScanState::Ground | OscScanState::Escape if byte == b'\x1b' => {
+                    OscScanState::Escape
+                }
                 OscScanState::Escape if byte == b']' => OscScanState::Osc {
                     bytes: Vec::new(),
                     escape_pending: false,
                 },
-                OscScanState::Escape if byte == b'\x1b' => OscScanState::Escape,
-                OscScanState::Escape => OscScanState::Ground,
+                OscScanState::Ground | OscScanState::Escape => OscScanState::Ground,
                 OscScanState::Osc {
                     bytes,
                     escape_pending: true,

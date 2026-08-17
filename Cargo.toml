@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/desktop",
+  "crates/cef-view",
   "crates/macos-icon",
   "crates/protocol",
   "crates/session-service",
@@ -29,6 +30,7 @@ objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile", 
 objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSError", "NSString", "NSURL", "NSValue"] }
 time = { version = "0.3.41", features = ["macros", "parsing"] }
 parking_lot = "0.12"
+raw-window-handle = "0.6.2"
 portable-pty = "0.9.0"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.219", features = ["derive"] }

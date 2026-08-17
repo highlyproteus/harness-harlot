@@ -1,0 +1,35 @@
+[package]
+name = "hh-cef-view"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Feature-gated Chromium Embedded Framework view for Harness Harlot"
+
+[features]
+default = []
+cef = [
+  "dep:cef",
+  "dep:dispatch2",
+  "dep:image",
+  "dep:objc2",
+  "dep:objc2-app-kit",
+  "dep:objc2-foundation",
+]
+
+[dependencies]
+anyhow.workspace = true
+cef = { version = "=151.6.0", optional = true }
+dispatch2 = { version = "0.3.1", optional = true }
+image = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-app-kit = { workspace = true, optional = true, features = ["NSView"] }
+objc2-foundation = { workspace = true, optional = true, features = ["NSGeometry"] }
+
+[[bin]]
+name = "hh-cef-helper"
+path = "src/bin/hh-cef-helper.rs"
+required-features = ["cef"]
+
+[lints]
+workspace = true

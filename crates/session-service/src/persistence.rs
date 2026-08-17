@@ -7,14 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    AppearanceColor, AppearanceSettings, Pane, PaneLayout, SessionSnapshot, SplitAxis, Tab,
-    TerminalIdentity, TerminalProfile, Workspace, WorkspaceConnection, WorkspaceConnectionStatus,
-    validate_ssh_host,
+    AppearanceColor, AppearanceSettings, MAX_BROWSER_URL_LEN, Pane, PaneKind, PaneLayout,
+    SessionSnapshot, SplitAxis, Tab, TerminalIdentity, TerminalProfile, Workspace,
+    WorkspaceConnection, WorkspaceConnectionStatus, validate_ssh_host, validate_workspace_dir,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 7;
+const SCHEMA_VERSION: u16 = 10;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 const MAX_WORKSPACES: usize = 16;
@@ -248,6 +248,8 @@ struct DesiredWorkspace {
     order: u32,
     #[serde(default)]
     connection: WorkspaceConnection,
+    #[serde(default)]
+    working_dir: Option<String>,
     tabs: Vec<DesiredTab>,
 }
 
@@ -258,6 +260,16 @@ struct DesiredTab {
     title: String,
     #[serde(default)]
     custom_title: Option<String>,
+    #[serde(default)]
+    project_dir: Option<String>,
+    #[serde(default)]
+    color: Option<AppearanceColor>,
+    #[serde(default)]
+    custom_icon: Option<String>,
+    #[serde(default)]
+    parent_tab: Option<Uuid>,
+    #[serde(default)]
+    pinned: bool,
     layout: DesiredLayout,
 }
 
@@ -283,6 +295,8 @@ enum DesiredLayout {
 #[serde(deny_unknown_fields)]
 struct DesiredPane {
     id: Uuid,
+    #[serde(default)]
+    kind: PaneKind,
     /// Compatibility fallback for schema-v1 readers. Live detected identity is
     /// deliberately projected to "Terminal" instead of being persisted here.
     title: String,
@@ -324,6 +338,7 @@ impl DesiredState {
                             }
                         }
                     },
+                    working_dir: workspace.working_dir.clone(),
                     tabs: workspace
                         .tabs
                         .iter()
@@ -332,6 +347,11 @@ impl DesiredState {
                                 id: tab.id,
                                 title: tab.title.clone(),
                                 custom_title: tab.custom_title.clone(),
+                                project_dir: tab.project_dir.clone(),
+                                color: tab.color,
+                                custom_icon: tab.custom_icon.clone(),
+                                parent_tab: tab.parent_tab,
+                                pinned: tab.pinned,
                                 layout: DesiredLayout::from_runtime(
                                     &tab.layout,
                                     cwd_by_pane,
@@ -384,6 +404,7 @@ impl DesiredState {
                         }
                     }
                 },
+                working_dir: workspace.working_dir,
                 tabs: workspace
                     .tabs
                     .into_iter()
@@ -391,6 +412,11 @@ impl DesiredState {
                         id: tab.id,
                         title: tab.title,
                         custom_title: tab.custom_title,
+                        project_dir: tab.project_dir,
+                        color: tab.color,
+                        custom_icon: tab.custom_icon,
+                        parent_tab: tab.parent_tab,
+                        pinned: tab.pinned,
                         layout: tab
                             .layout
                             .into_runtime(&mut cwd_by_pane, &mut offline_panes),
@@ -433,14 +459,39 @@ impl DesiredState {
                 }
                 WorkspaceConnection::Local => {}
             }
+            if let Some(working_dir) = &workspace.working_dir {
+                validate_workspace_dir(working_dir).map_err(|message| anyhow::anyhow!(message))?;
+            }
             if workspace.tabs.len() > MAX_TABS_PER_WORKSPACE {
                 bail!("workstation must contain at most {MAX_TABS_PER_WORKSPACE} tabs");
             }
+            let tabs_by_id = workspace
+                .tabs
+                .iter()
+                .map(|tab| (tab.id, tab))
+                .collect::<HashMap<_, _>>();
             for tab in &workspace.tabs {
                 validate_id(tab.id, &mut ids)?;
                 validate_title(&tab.title, "tab")?;
                 if let Some(name) = &tab.custom_title {
                     validate_title(name, "group")?;
+                }
+                if let Some(project_dir) = &tab.project_dir {
+                    validate_workspace_dir(project_dir)
+                        .map_err(|message| anyhow::anyhow!(message))?;
+                }
+                if let Some(icon) = &tab.custom_icon {
+                    validate_custom_icon_id(icon)?;
+                }
+                if let Some(parent_id) = tab.parent_tab {
+                    let valid_parent = parent_id != tab.id
+                        && tab.project_dir.is_none()
+                        && tabs_by_id.get(&parent_id).is_some_and(|parent| {
+                            parent.parent_tab.is_none() && parent.project_dir.is_some()
+                        });
+                    if !valid_parent {
+                        bail!("tab {} has an invalid parent tab", tab.id);
+                    }
                 }
                 tab.layout.validate(1, &mut ids, &mut panes)?;
             }
@@ -558,16 +609,22 @@ impl DesiredPane {
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
         allow_offline: bool,
     ) -> Result<Self> {
-        let local_cwd = cwd_by_pane.get(&pane.id).cloned();
-        if local_cwd.is_none() && !allow_offline {
+        let local_cwd = matches!(pane.kind, PaneKind::Terminal)
+            .then(|| cwd_by_pane.get(&pane.id).cloned())
+            .flatten();
+        if matches!(pane.kind, PaneKind::Terminal) && local_cwd.is_none() && !allow_offline {
             bail!("pane {} has no safe local CWD metadata", pane.id);
         }
         Ok(Self {
             id: pane.id,
+            kind: pane.kind.clone(),
             title: pane
                 .custom_title
                 .clone()
-                .unwrap_or_else(|| "Terminal".to_owned()),
+                .unwrap_or_else(|| match &pane.kind {
+                    PaneKind::Terminal => "Terminal".to_owned(),
+                    PaneKind::Browser { .. } => pane.title.clone(),
+                }),
             color: pane.color,
             custom_title: pane.custom_title.clone(),
             profile_override: pane.profile_override,
@@ -581,23 +638,30 @@ impl DesiredPane {
         cwd_by_pane: &mut HashMap<Uuid, PathBuf>,
         offline_panes: &mut HashSet<Uuid>,
     ) -> Pane {
-        if let Some(local_cwd) = self.local_cwd {
-            cwd_by_pane.insert(self.id, local_cwd);
-        } else {
-            offline_panes.insert(self.id);
+        if matches!(self.kind, PaneKind::Terminal) {
+            if let Some(local_cwd) = self.local_cwd {
+                cwd_by_pane.insert(self.id, local_cwd);
+            } else {
+                offline_panes.insert(self.id);
+            }
         }
-        let custom_title = self
-            .custom_title
-            .or_else(|| legacy_custom_title(&self.title));
+        let custom_title = self.custom_title.or_else(|| {
+            matches!(self.kind, PaneKind::Terminal)
+                .then(|| legacy_custom_title(&self.title))
+                .flatten()
+        });
         let title = custom_title
             .clone()
-            .or_else(|| {
-                self.profile_override
-                    .map(|profile| profile.display_name().to_owned())
+            .or_else(|| match &self.kind {
+                PaneKind::Terminal => self
+                    .profile_override
+                    .map(|profile| profile.display_name().to_owned()),
+                PaneKind::Browser { .. } => Some(self.title.clone()),
             })
             .unwrap_or_else(|| "Terminal".to_owned());
         Pane {
             id: self.id,
+            kind: self.kind,
             title,
             shell: String::new(),
             color: self.color,
@@ -616,6 +680,27 @@ impl DesiredPane {
         }
         if let Some(custom_icon) = &self.custom_icon {
             validate_custom_icon_id(custom_icon)?;
+        }
+        match &self.kind {
+            PaneKind::Terminal => {}
+            PaneKind::Browser { url } => {
+                if url.len() > MAX_BROWSER_URL_LEN {
+                    bail!("browser URL exceeds the {MAX_BROWSER_URL_LEN}-byte limit");
+                }
+                if url != "about:blank" {
+                    let parsed =
+                        url::Url::parse(url).context("persisted browser URL is invalid")?;
+                    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                        bail!("persisted browser URL must be an HTTP(S) URL with a host");
+                    }
+                }
+                if url.chars().any(char::is_whitespace) || url.chars().any(char::is_control) {
+                    bail!("persisted browser URL contains invalid whitespace");
+                }
+                if self.local_cwd.is_some() {
+                    bail!("browser panes may not persist terminal CWD metadata");
+                }
+            }
         }
         if let Some(local_cwd) = &self.local_cwd {
             if !local_cwd.is_absolute() {
@@ -754,6 +839,7 @@ mod tests {
         };
         let second = Pane {
             id: Uuid::new_v4(),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "Remote two".to_owned(),
             shell: "ssh".to_owned(),
             color: None,

@@ -10,6 +10,10 @@ description = "Native Harness Harlot terminal workspace desktop"
 name = "hh"
 path = "src/main.rs"
 
+[features]
+default = []
+browser = ["dep:hh-cef-view", "hh-cef-view/cef"]
+
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
@@ -25,8 +29,9 @@ unicode-width.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+hh-cef-view = { path = "../cef-view", optional = true }
 hh-macos-icon = { version = "0.1.0", path = "../macos-icon" }
-
+raw-window-handle.workspace = true
 [dev-dependencies]
 sha2.workspace = true
 
