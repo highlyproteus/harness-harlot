@@ -36,7 +36,7 @@ fn validate_socket_path(path: &Path, allow_legacy_temp_parent: bool) -> Result<(
         );
     }
     let private_parent =
-        parent_metadata.uid() == expected_uid && parent_metadata.mode() & 0o077 == 0;
+        parent_metadata.uid() == expected_uid && parent_metadata.mode().trailing_zeros() >= 6;
     let accepted_legacy_parent = allow_legacy_temp_parent && parent == std::env::temp_dir();
     if !private_parent && !accepted_legacy_parent {
         bail!(

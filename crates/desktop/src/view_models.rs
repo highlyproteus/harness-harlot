@@ -24,6 +24,8 @@ pub(super) struct WorkspaceDrag {
 pub(super) struct TabDrag {
     pub(super) workspace_id: Uuid,
     pub(super) tab_id: Uuid,
+    pub(super) pane_id: Option<Uuid>,
+    pub(super) from_group: bool,
     pub(super) title: String,
     pub(super) position: Point<Pixels>,
 }
@@ -32,6 +34,7 @@ pub(super) struct TabDrag {
 pub(super) struct TabDropPreview {
     pub(super) target_tab_id: Uuid,
     pub(super) after: bool,
+    pub(super) into_group: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +153,37 @@ pub(super) struct WorkspaceMenu {
 pub(super) struct GroupMenu {
     pub(super) tab_id: Uuid,
     pub(super) position: Point<Pixels>,
+    pub(super) icon_picker_open: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CreateMenuTarget {
+    Global,
+    TabStrip {
+        workspace_id: Uuid,
+        target_tab: Option<Uuid>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CreateMenu {
+    pub(super) position: Point<Pixels>,
+    pub(super) target: CreateMenuTarget,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DirEditorTarget {
+    WorkspaceDefault(Uuid),
+    NewProject(Uuid),
+    ProjectDir(Uuid),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DirEditor {
+    pub(super) target: DirEditorTarget,
+    pub(super) value: String,
+    pub(super) replace_on_type: bool,
+    pub(super) suggestions: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,6 +192,7 @@ pub(super) enum ColorTarget {
     DefaultWorkspace,
     Pane(Uuid),
     Workspace(Uuid),
+    Tab(Uuid),
 }
 
 #[derive(Clone, Debug)]
@@ -187,21 +222,6 @@ pub(super) enum RenameTarget {
     Pane,
     Workspace,
     Group,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct WorkstationGroupExpansion {
-    pub(super) pinned: bool,
-    pub(super) ordinary: bool,
-}
-
-impl Default for WorkstationGroupExpansion {
-    fn default() -> Self {
-        Self {
-            pinned: true,
-            ordinary: true,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -252,6 +272,15 @@ pub(super) struct CloseConfirmation {
     pub(super) pane_id: Uuid,
     pub(super) title: String,
     pub(super) leaves_workspace_empty: bool,
+    pub(super) is_browser: bool,
+}
+#[derive(Clone, Debug)]
+pub(super) struct TabCloseConfirmation {
+    pub(super) tab_id: Uuid,
+    pub(super) title: String,
+    pub(super) is_project: bool,
+    pub(super) child_count: usize,
+    pub(super) terminal_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -770,6 +799,7 @@ impl CloseConfirmation {
         Self {
             pane_id: pane.id,
             title: pane.title.clone(),
+            is_browser: matches!(pane.kind, hh_protocol::PaneKind::Browser { .. }),
             leaves_workspace_empty,
         }
     }
@@ -786,6 +816,7 @@ pub(super) enum PaneControlIcon {
     Add,
     SplitRight,
     SplitDown,
+    Web,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -883,6 +914,8 @@ pub(super) enum DialogAction {
     DeleteWorkspace,
     DisconnectWorkspace,
     ClosePane,
+    ConfirmDirEditor,
+    CloseTab,
 }
 pub(super) struct DialogSpec {
     pub(super) title: String,
@@ -899,6 +932,7 @@ pub(super) enum Modal {
     CommandPalette(CommandPaletteState),
     WorkspaceCreation(WorkspaceCreationDialog),
     WorkspaceRename(WorkspaceRenameEditor),
+    DirEditor(DirEditor),
     PaneRename(RenameEditor),
     GroupRename(GroupRenameEditor),
     Search(SearchEditor),
@@ -906,12 +940,13 @@ pub(super) enum Modal {
     TmuxPicker(TmuxSessionPicker),
     WorkspaceDisconnect(WorkspaceDisconnectConfirmation),
     Close(CloseConfirmation),
+    TabClose(TabCloseConfirmation),
     TabMenu(TabMenu),
     WorkspaceMenu(WorkspaceMenu),
+    CreateMenu(CreateMenu),
     GroupMenu(GroupMenu),
     WorkspaceConnectionInfo(WorkspaceConnectionInfo),
     AppearanceSettings,
-    Notifications,
 }
 
 impl Modal {
@@ -952,6 +987,20 @@ impl Modal {
 
     pub(super) fn workspace_rename(&self) -> Option<&WorkspaceRenameEditor> {
         let Self::WorkspaceRename(editor) = self else {
+            return None;
+        };
+        Some(editor)
+    }
+
+    pub(super) fn dir_editor(&self) -> Option<&DirEditor> {
+        let Self::DirEditor(editor) = self else {
+            return None;
+        };
+        Some(editor)
+    }
+
+    pub(super) fn dir_editor_mut(&mut self) -> Option<&mut DirEditor> {
+        let Self::DirEditor(editor) = self else {
             return None;
         };
         Some(editor)
@@ -1065,6 +1114,7 @@ mod tests {
     fn per_tab_close_requires_an_explicit_confirmation_for_the_exact_terminal() {
         let pane = Pane {
             id: Uuid::new_v4(),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "build".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1078,6 +1128,7 @@ mod tests {
 
         assert_eq!(confirmation.pane_id, pane.id);
         assert_eq!(confirmation.title, "build");
+        assert!(!confirmation.is_browser);
         assert!(confirmation.leaves_workspace_empty);
         assert_eq!(
             confirmation.request(),

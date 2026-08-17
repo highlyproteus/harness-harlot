@@ -64,8 +64,7 @@ fn process_exit_reaches_updates_as_a_completion_notification() {
     loop {
         let update = registry.pane_updates(None, &[], &[], false, 0).unwrap();
         if update.notifications.iter().any(|notification| {
-            notification.pane_id == pane_id
-                && notification.kind == NotificationKind::Completed
+            notification.pane_id == pane_id && notification.kind == NotificationKind::Completed
         }) {
             break;
         }

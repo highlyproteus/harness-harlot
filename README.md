@@ -72,8 +72,9 @@ The first usable milestone includes:
 - terminal rendering/input through the Alacritty terminal engine adapter;
 - configured-host SSH workstations implemented by running system OpenSSH inside daemon-owned PTYs;
 - crash/reconnect and session-lifecycle tests on macOS and Linux.
+- macOS-only Chromium browser tabs in full workspace tabs (not terminal splits).
 
-Explicitly deferred: embedded web browsing, mobile access, generic remote-control UI, worktree/diff review, and AI-specific integrations. SSH terminal workstations are part of the early MVP; an optional remote `rmuxd` for durable reattachment comes later.
+Explicitly deferred: browser support outside macOS, mobile access, generic remote-control UI, worktree/diff review, and AI-specific integrations. SSH terminal workstations are part of the early MVP; an optional remote `rmuxd` for durable reattachment comes later.
 
 ### Workstation terminology and saved-state compatibility
 
@@ -94,23 +95,87 @@ cargo run -p hh-desktop
 ```
 
 On macOS, `scripts/build-macos-app.sh` creates the debug
-`target/debug/Harness Harlot.app`; pass `release` for a release bundle. The
-bundle includes the desktop, its service, the Harness Harlot icon, and license
-notices. The update verifier is distributed beside the app only inside a
-release DMG; release-signing code is never bundled. The display name,
-executable, and bundle identifier are
-`Harness Harlot`, `hh`, and `com.harnessharlot.desktop`. The desktop starts its bundled
-service only when a local service is unavailable; closing the desktop leaves
-active terminal sessions alone.
+`target/debug/Harness Harlot.app`; pass `release` for
+`target/release/Harness Harlot.app`. The default invocation remains CEF-free:
 
-For side-by-side local development inspection, `scripts/build-macos-dev-app.sh`
-creates `target/debug/Harness Harlot Dev.app` with bundle identifier
-`com.harnessharlot.desktop.dev`, executable `hh-dev`, and the separate monochrome
-development icon. The Dev launcher automatically uses a separate socket plus
-durable `Harness Harlot Dev` state and `hh-dev` configuration, so saved Dev
-workstations survive a Dev relaunch without reading or writing stable app data.
-Explicit `HH_SOCKET`, `HH_STATE_DIR`, and `HH_CONFIG` values still take
-precedence for disposable test launches.
+```bash
+scripts/build-macos-app.sh debug
+scripts/build-macos-app.sh release
+```
+
+The bundle includes the desktop, its service, the Harness Harlot icon, and
+license notices. The update verifier is distributed beside the app only inside
+a release DMG; release-signing code is never bundled. The display name,
+executable, and bundle identifier are `Harness Harlot`, `hh`, and
+`com.harnessharlot.desktop`. The desktop starts its bundled service only when a
+local service is unavailable; closing the desktop leaves active terminal
+sessions alone.
+
+For side-by-side local development inspection,
+`scripts/build-macos-dev-app.sh debug` creates
+`target/debug/Harness Harlot Dev.app` with bundle identifier
+`com.harnessharlot.desktop.dev`, native executable `hh`, and the separate
+monochrome development icon. Pass `release` for
+`target/release/Harness Harlot Dev.app`. The Dev bundle marks `hh` as a
+development build through its `Info.plist`, so it automatically uses a separate
+socket plus durable `Harness Harlot Dev` state and `hh-dev`
+configuration, so saved Dev workstations survive a Dev relaunch without
+reading or writing stable app data. Explicit `HH_SOCKET`, `HH_STATE_DIR`, and
+`HH_CONFIG` values still take precedence for disposable test launches.
+
+### macOS Chromium browser bundles
+
+Embedded browser tabs use Chromium Embedded Framework (CEF) and are supported
+only in the bundled macOS app. CEF requires `cmake` and `ninja` on `PATH`, plus
+an unpacked CEF distribution selected explicitly with `CEF_PATH`. That
+directory must contain `CREDITS.html` and the framework at
+`Release/Chromium Embedded Framework.framework` (a flattened root-level
+framework is also accepted). No repository script assumes a machine-local
+absolute path. Build browser-enabled bundles with the trailing `--browser`
+flag:
+
+```bash
+brew install cmake ninja
+export CEF_PATH="$HOME/.local/share/cef"
+scripts/build-macos-dev-app.sh debug --browser
+open "target/debug/Harness Harlot Dev.app"
+
+scripts/build-macos-dev-app.sh release --browser
+scripts/build-macos-app.sh debug --browser
+scripts/build-macos-app.sh release --browser
+scripts/sign-macos-app.sh "Developer ID Application: Example Corp (TEAMID)" \
+  "target/release/Harness Harlot.app"
+```
+
+The browser build copies the framework, its Chromium third-party credits, the
+generic CEF subprocess helper, and the GPU, Renderer, Plugin, and Alerts role
+helpers into `Contents/Frameworks`. The checked-in CEF BSD license becomes
+`Contents/Resources/licenses/CEF-LICENSE.txt`, and the staged distribution's
+Chromium notices become `Contents/Resources/licenses/CEF-CREDITS.html`. The
+signing script signs framework libraries,
+the framework, helper executables and apps, the session service, desktop
+executable, optional Dev launcher, and outer app in inside-out order; GPU and
+Renderer helpers receive only the JIT entitlement required by Chromium.
+
+Development bundles use ad-hoc signatures and deliberately omit hardened
+runtime so the separately signed upstream CEF framework can load. Chromium's
+subprocess sandbox remains enabled. Developer ID release bundles additionally
+enable hardened runtime and keep the narrow helper JIT entitlement described
+above.
+
+CEF cannot run from a bare macOS executable, so
+`cargo run -p hh-desktop --features browser` does not provide an embedded
+browser; use one of the app bundle commands above. The runtime uses CEF's mock
+keychain to avoid a Chromium Safe Storage prompt from the subprocess helpers;
+browser profile data is therefore protected by the app-state directory's
+filesystem permissions rather than the macOS Keychain. Browser profiles and
+cache stay local and isolated under the app state directory's `browser-cache`
+directory: `~/Library/Application Support/Harness Harlot/browser-cache` for
+stable builds and `~/Library/Application Support/Harness Harlot Dev/browser-cache`
+for Dev builds. `HH_STATE_DIR` relocates that root. Browser tabs are full tabs
+and cannot be mixed into terminal splits. While a Chromium child view owns
+focus, app-global GPUI shortcuts do not fire; click a GPUI surface to restore
+them. No browser support is promised for Linux or other platforms.
 
 The technical package, crate, and executable prefix is `hh`. The built
 executables are `hh-service` and `hh`. Set `HH_SOCKET` in both processes to

@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 26;
 pub const SOCKET_ENV: &str = "HH_SOCKET";
 pub const STATE_DIR_ENV: &str = "HH_STATE_DIR";
 pub const CONFIG_ENV: &str = "HH_CONFIG";
@@ -21,6 +21,106 @@ pub const DEVELOPMENT_BUILD_ENV: &str = "HH_DEVELOPMENT_BUILD";
 pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 pub const MAX_SSH_HOST_LEN: usize = 253;
 pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;
+/// Maximum UTF-8 byte length accepted for a browser URL on the wire.
+pub const MAX_BROWSER_URL_LEN: usize = 8 * 1024;
+pub const DEFAULT_BROWSER_URL: &str = "about:blank";
+
+#[derive(Debug, Error)]
+pub enum BrowserUrlError {
+    #[error("browser URL cannot be empty")]
+    Empty,
+    #[error("browser URL exceeds the {MAX_BROWSER_URL_LEN}-byte limit")]
+    TooLong,
+    #[error("browser URL may not contain whitespace or control characters")]
+    WhitespaceOrControl,
+    #[error("browser URL is invalid")]
+    Invalid(#[source] url::ParseError),
+    #[error("browser URL must use HTTP or HTTPS")]
+    UnsupportedScheme,
+    #[error("browser URL must include a host")]
+    MissingHost,
+}
+
+/// Normalizes a browser URL, adding an HTTPS scheme when one is omitted.
+///
+/// # Errors
+///
+/// Returns an error when the input is empty, too long, contains whitespace or
+/// control characters, cannot be parsed, uses an unsupported scheme, or lacks
+/// a host.
+pub fn normalize_browser_url(input: &str) -> Result<String, BrowserUrlError> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(BrowserUrlError::Empty);
+    }
+    if raw.len() > MAX_BROWSER_URL_LEN {
+        return Err(BrowserUrlError::TooLong);
+    }
+    if raw.chars().any(char::is_control) || raw.chars().any(char::is_whitespace) {
+        return Err(BrowserUrlError::WhitespaceOrControl);
+    }
+    if raw == DEFAULT_BROWSER_URL {
+        return Ok(raw.to_owned());
+    }
+    let candidate = if raw.contains("://") {
+        raw.to_owned()
+    } else {
+        format!("https://{raw}")
+    };
+    let parsed = url::Url::parse(&candidate).map_err(BrowserUrlError::Invalid)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(BrowserUrlError::UnsupportedScheme);
+    }
+    if parsed.host_str().is_none() {
+        return Err(BrowserUrlError::MissingHost);
+    }
+    let normalized = parsed.to_string();
+    if normalized.len() > MAX_BROWSER_URL_LEN {
+        return Err(BrowserUrlError::TooLong);
+    }
+    Ok(normalized)
+}
+
+/// Normalizes a browser URL or returns [`DEFAULT_BROWSER_URL`] when omitted.
+///
+/// # Errors
+///
+/// Returns the same validation errors as [`normalize_browser_url`] when a
+/// non-empty URL is provided.
+pub fn normalize_browser_url_or_default(input: Option<&str>) -> Result<String, BrowserUrlError> {
+    let input = input.unwrap_or(DEFAULT_BROWSER_URL);
+    if input.trim().is_empty() {
+        return Ok(DEFAULT_BROWSER_URL.to_owned());
+    }
+    normalize_browser_url(input)
+}
+
+pub const MAX_WORKSPACE_DIR_BYTES: usize = 4096;
+
+/// Validates a workspace working directory for protocol transport.
+///
+/// # Errors
+///
+/// Returns an error when the path is empty, relative, too long, or contains a
+/// control character.
+pub fn validate_workspace_dir(dir: &str) -> Result<(), String> {
+    if dir.is_empty() {
+        return Err("working directory cannot be empty".to_owned());
+    }
+    if !dir.starts_with('/') {
+        return Err("working directory must be absolute".to_owned());
+    }
+    if dir.len() > MAX_WORKSPACE_DIR_BYTES {
+        return Err(format!(
+            "working directory exceeds the {MAX_WORKSPACE_DIR_BYTES}-byte limit"
+        ));
+    }
+    if dir.chars().any(char::is_control) {
+        return Err("working directory may not contain control characters".to_owned());
+    }
+    Ok(())
+}
+
 pub const MAX_PANES: usize = 32;
 pub const MIN_TERMINAL_COLUMNS: u16 = 2;
 pub const MIN_TERMINAL_ROWS: u16 = 1;
@@ -89,6 +189,7 @@ impl SessionSnapshot {
             id: Uuid::new_v4(),
             title: "Terminal 1".to_owned(),
             shell: "shell".to_owned(),
+            kind: PaneKind::Terminal,
             color: None,
             identity: TerminalIdentity::default(),
             custom_title: None,
@@ -99,6 +200,11 @@ impl SessionSnapshot {
             id: Uuid::new_v4(),
             title: "Shell".to_owned(),
             custom_title: None,
+            project_dir: None,
+            color: None,
+            custom_icon: None,
+            parent_tab: None,
+            pinned: false,
             layout: PaneLayout::Leaf { pane },
         };
 
@@ -114,6 +220,7 @@ impl SessionSnapshot {
                 order: 1,
                 active_terminal_count: 1,
                 connection: WorkspaceConnection::Local,
+                working_dir: None,
                 tabs: vec![tab],
             }],
         }
@@ -137,6 +244,8 @@ pub struct Workspace {
     pub active_terminal_count: u32,
     #[serde(default)]
     pub connection: WorkspaceConnection,
+    #[serde(default)]
+    pub working_dir: Option<String>,
     pub tabs: Vec<Tab>,
 }
 
@@ -253,6 +362,16 @@ pub struct Tab {
     pub title: String,
     #[serde(default)]
     pub custom_title: Option<String>,
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    #[serde(default)]
+    pub color: Option<AppearanceColor>,
+    #[serde(default)]
+    pub custom_icon: Option<String>,
+    #[serde(default)]
+    pub parent_tab: Option<Uuid>,
+    #[serde(default)]
+    pub pinned: bool,
     pub layout: PaneLayout,
 }
 
@@ -281,11 +400,23 @@ pub enum SplitAxis {
     Vertical,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaneKind {
+    #[default]
+    Terminal,
+    Browser {
+        url: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: Uuid,
     pub title: String,
     pub shell: String,
+    #[serde(default)]
+    pub kind: PaneKind,
     #[serde(default)]
     pub color: Option<AppearanceColor>,
     /// Ephemeral resolved identity projected by the local session service.
@@ -854,8 +985,46 @@ pub enum ClientRequest {
     CreateWorkspaceTab {
         workspace_id: Uuid,
     },
+    CreateBrowserTab {
+        workspace_id: Uuid,
+        url: Option<String>,
+    },
+    CreateGroupBrowser {
+        target_pane: Uuid,
+        url: Option<String>,
+    },
     CreateWorkspaceGroup {
         workspace_id: Uuid,
+        #[serde(default)]
+        parent_tab: Option<Uuid>,
+    },
+    SetWorkspaceWorkingDir {
+        workspace_id: Uuid,
+        working_dir: Option<String>,
+    },
+    CreateWorkspaceProject {
+        workspace_id: Uuid,
+        working_dir: String,
+        title: Option<String>,
+    },
+    SetTabWorkingDir {
+        tab_id: Uuid,
+        working_dir: String,
+    },
+    SetTabColor {
+        tab_id: Uuid,
+        color: Option<AppearanceColor>,
+    },
+    SetTabCustomIcon {
+        tab_id: Uuid,
+        icon: Option<String>,
+    },
+    CloseTab {
+        tab_id: Uuid,
+    },
+    ListRemoteDirectory {
+        workspace_id: Uuid,
+        path: String,
     },
     ConnectSsh {
         target_pane: Uuid,
@@ -886,10 +1055,29 @@ pub enum ClientRequest {
         source_pane: Uuid,
         target_pane: Uuid,
     },
+    MovePaneToGroup {
+        source_pane: Uuid,
+        target_tab: Uuid,
+    },
+    MovePaneToNewTab {
+        source_pane: Uuid,
+        target_tab: Uuid,
+        after: bool,
+        #[serde(default)]
+        parent_tab: Option<Uuid>,
+    },
     ReorderTab {
         tab_id: Uuid,
         target_tab_id: Uuid,
         after: bool,
+    },
+    MoveTabToProject {
+        tab_id: Uuid,
+        project_tab: Uuid,
+    },
+    SetTabPinned {
+        tab_id: Uuid,
+        pinned: bool,
     },
     RenamePane {
         pane_id: Uuid,
@@ -917,6 +1105,11 @@ pub enum ClientRequest {
     /// pane this is a plain re-`attach-session`; it never creates a session.
     ReattachPane {
         pane_id: Uuid,
+    },
+    SetBrowserState {
+        pane_id: Uuid,
+        url: String,
+        title: Option<String>,
     },
     SetDefaultTerminalAccent {
         color: AppearanceColor,
@@ -1148,6 +1341,10 @@ pub enum ServiceResponse {
     TmuxSessionsAttached {
         pane_ids: Vec<Uuid>,
         skipped: Vec<TmuxSessionAttachIssue>,
+    },
+    RemoteDirectory {
+        path: String,
+        entries: Vec<String>,
     },
     Ack,
     SelectionText {
@@ -1487,15 +1684,311 @@ mod tests {
     }
 
     #[test]
+    fn stale_protocol_versions_remain_detectable_before_dispatch() {
+        let stale_version = PROTOCOL_VERSION - 1;
+        let request: ClientRequest = serde_json::from_value(serde_json::json!({
+            "type": "hello",
+            "protocol_version": stale_version,
+        }))
+        .unwrap();
+
+        let ClientRequest::Hello { protocol_version } = request else {
+            panic!("expected hello request");
+        };
+        assert_ne!(protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn pane_kinds_use_stable_tagged_json_and_round_trip() {
+        let terminal = PaneKind::Terminal;
+        assert_eq!(
+            serde_json::to_value(&terminal).unwrap(),
+            serde_json::json!({ "type": "terminal" })
+        );
+        assert_eq!(
+            serde_json::from_value::<PaneKind>(serde_json::to_value(&terminal).unwrap()).unwrap(),
+            terminal
+        );
+
+        let browser = PaneKind::Browser {
+            url: "https://example.com/path".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&browser).unwrap(),
+            serde_json::json!({
+                "type": "browser",
+                "url": "https://example.com/path",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<PaneKind>(serde_json::to_value(&browser).unwrap()).unwrap(),
+            browser
+        );
+    }
+
+    #[test]
+    fn browser_pane_kind_round_trips_on_the_pane_model() {
+        let pane: Pane = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000002",
+            "title": "Example",
+            "shell": "",
+            "kind": {
+                "type": "browser",
+                "url": "https://example.com",
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(
+            pane.kind,
+            PaneKind::Browser {
+                url: "https://example.com".to_owned(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<Pane>(serde_json::to_value(&pane).unwrap()).unwrap(),
+            pane
+        );
+    }
+
+    fn assert_request_json_round_trips(
+        cases: impl IntoIterator<Item = (ClientRequest, serde_json::Value)>,
+    ) {
+        for (request, expected) in cases {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(encoded, expected);
+            assert_eq!(
+                serde_json::from_value::<ClientRequest>(encoded).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn browser_and_tab_movement_requests_use_stable_snake_case_tags_and_round_trip() {
+        let workspace_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let tab_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let cases = [
+            (
+                ClientRequest::CreateBrowserTab {
+                    workspace_id,
+                    url: Some("https://example.com".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "create_browser_tab",
+                    "workspace_id": workspace_id,
+                    "url": "https://example.com",
+                }),
+            ),
+            (
+                ClientRequest::SetBrowserState {
+                    pane_id,
+                    url: "https://example.com/next".to_owned(),
+                    title: Some("Example".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "set_browser_state",
+                    "pane_id": pane_id,
+                    "url": "https://example.com/next",
+                    "title": "Example",
+                }),
+            ),
+            (
+                ClientRequest::MovePaneToGroup {
+                    source_pane: pane_id,
+                    target_tab: tab_id,
+                },
+                serde_json::json!({
+                    "type": "move_pane_to_group",
+                    "source_pane": pane_id,
+                    "target_tab": tab_id,
+                }),
+            ),
+            (
+                ClientRequest::MovePaneToNewTab {
+                    source_pane: pane_id,
+                    target_tab: tab_id,
+                    after: true,
+                    parent_tab: None,
+                },
+                serde_json::json!({
+                    "type": "move_pane_to_new_tab",
+                    "source_pane": pane_id,
+                    "target_tab": tab_id,
+                    "after": true,
+                    "parent_tab": null,
+                }),
+            ),
+            (
+                ClientRequest::MoveTabToProject {
+                    tab_id,
+                    project_tab: workspace_id,
+                },
+                serde_json::json!({
+                    "type": "move_tab_to_project",
+                    "tab_id": tab_id,
+                    "project_tab": workspace_id,
+                }),
+            ),
+            (
+                ClientRequest::SetTabPinned {
+                    tab_id,
+                    pinned: true,
+                },
+                serde_json::json!({
+                    "type": "set_tab_pinned",
+                    "tab_id": tab_id,
+                    "pinned": true,
+                }),
+            ),
+            (
+                ClientRequest::CloseTab { tab_id },
+                serde_json::json!({
+                    "type": "close_tab",
+                    "tab_id": tab_id,
+                }),
+            ),
+        ];
+
+        assert_request_json_round_trips(cases);
+    }
+
+    #[test]
+    fn working_directory_and_tab_metadata_requests_use_stable_snake_case_tags_and_round_trip() {
+        let workspace_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let tab_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let cases = [
+            (
+                ClientRequest::SetWorkspaceWorkingDir {
+                    workspace_id,
+                    working_dir: Some("/srv/app".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "set_workspace_working_dir",
+                    "workspace_id": workspace_id,
+                    "working_dir": "/srv/app",
+                }),
+            ),
+            (
+                ClientRequest::CreateWorkspaceProject {
+                    workspace_id,
+                    working_dir: "/srv/project".to_owned(),
+                    title: None,
+                },
+                serde_json::json!({
+                    "type": "create_workspace_project",
+                    "workspace_id": workspace_id,
+                    "working_dir": "/srv/project",
+                    "title": null,
+                }),
+            ),
+            (
+                ClientRequest::SetTabWorkingDir {
+                    tab_id,
+                    working_dir: "/srv/project".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "set_tab_working_dir",
+                    "tab_id": tab_id,
+                    "working_dir": "/srv/project",
+                }),
+            ),
+            (
+                ClientRequest::SetTabColor {
+                    tab_id,
+                    color: Some(AppearanceColor::new(0x12, 0x34, 0x56)),
+                },
+                serde_json::json!({
+                    "type": "set_tab_color",
+                    "tab_id": tab_id,
+                    "color": { "red": 0x12, "green": 0x34, "blue": 0x56 },
+                }),
+            ),
+            (
+                ClientRequest::SetTabCustomIcon {
+                    tab_id,
+                    icon: Some("00000000-0000-4000-8000-000000000004.png".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "set_tab_custom_icon",
+                    "tab_id": tab_id,
+                    "icon": "00000000-0000-4000-8000-000000000004.png",
+                }),
+            ),
+            (
+                ClientRequest::ListRemoteDirectory {
+                    workspace_id,
+                    path: "/srv/pro".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "list_remote_directory",
+                    "workspace_id": workspace_id,
+                    "path": "/srv/pro",
+                }),
+            ),
+        ];
+
+        assert_request_json_round_trips(cases);
+    }
+
+    #[test]
+    fn browser_urls_share_one_normalization_contract() {
+        assert_eq!(
+            normalize_browser_url(" example.com/docs ").unwrap(),
+            "https://example.com/docs"
+        );
+        assert_eq!(
+            normalize_browser_url("http://example.com").unwrap(),
+            "http://example.com/"
+        );
+        assert_eq!(
+            normalize_browser_url(DEFAULT_BROWSER_URL).unwrap(),
+            DEFAULT_BROWSER_URL
+        );
+        assert_eq!(
+            normalize_browser_url_or_default(None).unwrap(),
+            DEFAULT_BROWSER_URL
+        );
+        assert_eq!(
+            normalize_browser_url_or_default(Some("   ")).unwrap(),
+            DEFAULT_BROWSER_URL
+        );
+        assert!(matches!(
+            normalize_browser_url(""),
+            Err(BrowserUrlError::Empty)
+        ));
+        assert!(matches!(
+            normalize_browser_url("https://example.com/a b"),
+            Err(BrowserUrlError::WhitespaceOrControl)
+        ));
+        assert!(matches!(
+            normalize_browser_url("file:///tmp/example"),
+            Err(BrowserUrlError::UnsupportedScheme)
+        ));
+        assert!(matches!(
+            normalize_browser_url("https://"),
+            Err(BrowserUrlError::Invalid(_))
+        ));
+        assert!(matches!(
+            normalize_browser_url(&format!(
+                "https://example.com/{}",
+                "a".repeat(MAX_BROWSER_URL_LEN)
+            )),
+            Err(BrowserUrlError::TooLong)
+        ));
+    }
+
+    #[test]
     fn seeded_snapshot_has_a_visible_pane() {
         let snapshot = SessionSnapshot::seeded();
         assert_eq!(snapshot.workspaces.len(), 1);
         assert_eq!(snapshot.workspaces[0].title, "Workstation 1");
         assert_eq!(snapshot.workspaces[0].tabs.len(), 1);
-        assert!(matches!(
-            snapshot.workspaces[0].tabs[0].layout,
-            PaneLayout::Leaf { .. }
-        ));
+        let PaneLayout::Leaf { pane } = &snapshot.workspaces[0].tabs[0].layout else {
+            panic!("expected leaf");
+        };
+        assert_eq!(pane.kind, PaneKind::Terminal);
     }
 
     #[test]
@@ -1514,7 +2007,8 @@ mod tests {
                             "pane": {
                                 "id": "00000000-0000-0000-0000-000000000003",
                                 "title": "Terminal 1",
-                                "shell": "zsh"
+                                "shell": "zsh",
+                                "kind": { "type": "terminal" }
                             }
                         }
                     }]
@@ -1529,9 +2023,35 @@ mod tests {
             panic!("expected leaf");
         };
         assert_eq!(pane.color, None);
+        assert_eq!(pane.kind, PaneKind::Terminal);
         assert_eq!(pane.identity, TerminalIdentity::default());
         assert_eq!(pane.custom_title, None);
         assert_eq!(pane.profile_override, None);
+        assert_eq!(snapshot.workspaces[0].working_dir, None);
+        assert_eq!(snapshot.workspaces[0].tabs[0].project_dir, None);
+    }
+
+    #[test]
+    fn workspace_and_project_directories_round_trip() {
+        let mut snapshot = SessionSnapshot::seeded();
+        snapshot.workspaces[0].working_dir = Some("/srv/workstation".to_owned());
+        snapshot.workspaces[0].tabs[0].project_dir = Some("/srv/project".to_owned());
+
+        let restored: SessionSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+
+        assert_eq!(restored, snapshot);
+    }
+
+    #[test]
+    fn workspace_directories_require_absolute_non_controlled_paths() {
+        assert!(validate_workspace_dir("/srv/project").is_ok());
+        assert!(validate_workspace_dir("").is_err());
+        assert!(validate_workspace_dir("relative").is_err());
+        assert!(validate_workspace_dir("/srv/\nproject").is_err());
+        assert!(
+            validate_workspace_dir(&format!("/{}", "x".repeat(MAX_WORKSPACE_DIR_BYTES))).is_err()
+        );
     }
 
     #[test]

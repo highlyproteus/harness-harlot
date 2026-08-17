@@ -7,7 +7,7 @@
   <key>CFBundleDisplayName</key>
   <string>Harness Harlot Dev</string>
   <key>CFBundleExecutable</key>
-  <string>hh-dev</string>
+  <string>hh</string>
   <key>CFBundleIdentifier</key>
   <string>com.harnessharlot.desktop.dev</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -22,6 +22,11 @@
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
   <string>1</string>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>HH_DEVELOPMENT_BUILD</key>
+    <string>1</string>
+  </dict>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>

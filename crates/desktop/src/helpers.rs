@@ -1,5 +1,17 @@
 use super::*;
 
+pub(super) fn abbreviate_home(path: &str) -> String {
+    let Ok(home) = std::env::var("HOME") else {
+        return path.to_owned();
+    };
+    if path == home {
+        return "~".to_owned();
+    }
+    path.strip_prefix(&home)
+        .filter(|suffix| suffix.starts_with('/'))
+        .map_or_else(|| path.to_owned(), |suffix| format!("~{suffix}"))
+}
+
 pub(super) fn terminal_point_at(
     position: Point<Pixels>,
     bounds: Bounds<Pixels>,
@@ -296,6 +308,17 @@ pub(super) fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
         }
     }
 }
+pub(super) fn inactive_stack_contains(layout: &PaneLayout, pane_id: Uuid) -> bool {
+    match layout {
+        PaneLayout::Leaf { .. } => false,
+        PaneLayout::Stack { panes, active } => {
+            *active != pane_id && panes.iter().any(|pane| pane.id == pane_id)
+        }
+        PaneLayout::Split { first, second, .. } => {
+            inactive_stack_contains(first, pane_id) || inactive_stack_contains(second, pane_id)
+        }
+    }
+}
 
 pub(super) fn collect_terminal_tabs<'a>(layout: &'a PaneLayout, panes: &mut Vec<&'a Pane>) {
     match layout {
@@ -315,34 +338,279 @@ pub(super) fn workspace_terminal_tabs(workspace: &Workspace) -> Vec<&Pane> {
     }
     panes
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkspaceTabScope {
+    Workstation,
+    Project(Uuid),
+}
+
+pub(super) struct WorkspaceTabSet<'a> {
+    pub(super) scope: WorkspaceTabScope,
+    pub(super) tabs: Vec<&'a hh_protocol::Tab>,
+}
+
+pub(super) fn workspace_scope_for_tab(workspace: &Workspace, tab_id: Uuid) -> WorkspaceTabScope {
+    let Some(tab) = workspace.tabs.iter().find(|tab| tab.id == tab_id) else {
+        return WorkspaceTabScope::Workstation;
+    };
+    if tab.project_dir.is_some() {
+        WorkspaceTabScope::Project(tab.id)
+    } else if let Some(parent_id) = tab.parent_tab.filter(|parent_id| {
+        workspace
+            .tabs
+            .iter()
+            .any(|parent| parent.id == *parent_id && parent.project_dir.is_some())
+    }) {
+        WorkspaceTabScope::Project(parent_id)
+    } else {
+        WorkspaceTabScope::Workstation
+    }
+}
+
+/// Tabs shown in the persistent strip above the viewport.
+///
+/// A workstation displays root tabs as projects, groups, then loose panes,
+/// preserving insertion order within each category. Project scope is an explicit
+/// drill-down containing that project root and its direct children.
+pub(super) fn workspace_tab_set(
+    workspace: &Workspace,
+    requested_scope: WorkspaceTabScope,
+) -> WorkspaceTabSet<'_> {
+    let scope = match requested_scope {
+        WorkspaceTabScope::Project(project_id)
+            if workspace
+                .tabs
+                .iter()
+                .any(|tab| tab.id == project_id && tab.project_dir.is_some()) =>
+        {
+            requested_scope
+        }
+        WorkspaceTabScope::Workstation | WorkspaceTabScope::Project(_) => {
+            WorkspaceTabScope::Workstation
+        }
+    };
+    let tabs = match scope {
+        WorkspaceTabScope::Workstation => {
+            let mut tabs = workspace
+                .tabs
+                .iter()
+                .filter(|tab| tab.parent_tab.is_none())
+                .collect::<Vec<_>>();
+            tabs.sort_by_key(|tab| workspace_tab_rank(tab));
+            tabs
+        }
+        WorkspaceTabScope::Project(project_id) => workspace
+            .tabs
+            .iter()
+            .filter(|tab| tab.id == project_id)
+            .chain(
+                workspace
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.parent_tab == Some(project_id)),
+            )
+            .collect(),
+    };
+    WorkspaceTabSet { scope, tabs }
+}
+
+pub(super) fn click_suppression_active(deadline: &mut Option<Instant>, now: Instant) -> bool {
+    deadline.take().is_some_and(|deadline| now <= deadline)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HeaderDropZone {
+    Before,
+    Into,
+    After,
+}
+
+/// Middle half of a header row nests into it; top/bottom quarters reorder.
+pub(super) fn header_drop_zone(
+    position_y: f32,
+    bounds_top: f32,
+    bounds_bottom: f32,
+) -> HeaderDropZone {
+    let height = (bounds_bottom - bounds_top).max(1.0);
+    let fraction = ((position_y - bounds_top) / height).clamp(0.0, 1.0);
+    if fraction < 0.25 {
+        HeaderDropZone::Before
+    } else if fraction > 0.75 {
+        HeaderDropZone::After
+    } else {
+        HeaderDropZone::Into
+    }
+}
+
+/// Collapsible sidebar sections rendered inside one workstation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SidebarSection {
+    Pinned,
+    Projects,
+}
+
+impl SidebarSection {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "Pinned",
+            Self::Projects => "Projects",
+        }
+    }
+
+    pub(super) fn element_id(self) -> &'static str {
+        match self {
+            Self::Pinned => "sidebar-pinned-section",
+            Self::Projects => "sidebar-projects-section",
+        }
+    }
+}
+
+pub(super) fn workspace_tab_focus_target(
+    tab: &hh_protocol::Tab,
+    focused_pane: Option<Uuid>,
+) -> Option<Uuid> {
+    focused_pane
+        .filter(|pane_id| find_pane(&tab.layout, *pane_id).is_some())
+        .or_else(|| visible_panes(&tab.layout).first().copied())
+}
+/// Pane a strip-tab click should focus, resolved from the current snapshot.
+pub(super) fn workspace_tab_click_target(
+    workspace: &Workspace,
+    tab_id: Uuid,
+    focused_pane: Option<Uuid>,
+) -> Option<Uuid> {
+    let tab = workspace.tabs.iter().find(|tab| tab.id == tab_id)?;
+    workspace_tab_focus_target(tab, focused_pane)
+}
+
+/// Strip tab that should render as active for the focused pane.
+///
+/// Workstation scope maps a pane inside a project's child tab to the project
+/// root; project scope highlights the child tab itself.
+pub(super) fn workspace_strip_active_tab(
+    workspace: &Workspace,
+    scope: WorkspaceTabScope,
+    focused_pane: Option<Uuid>,
+) -> Option<Uuid> {
+    let pane_id = focused_pane?;
+    let tab = workspace
+        .tabs
+        .iter()
+        .find(|tab| find_pane(&tab.layout, pane_id).is_some())?;
+    match scope {
+        WorkspaceTabScope::Workstation => Some(
+            tab.parent_tab
+                .filter(|parent| {
+                    workspace
+                        .tabs
+                        .iter()
+                        .any(|candidate| candidate.id == *parent)
+                })
+                .unwrap_or(tab.id),
+        ),
+        WorkspaceTabScope::Project(_) => Some(tab.id),
+    }
+}
+pub(super) fn workspace_tab_standalone_pane(tab: &hh_protocol::Tab) -> Option<&Pane> {
+    if tab.project_dir.is_some() || tab.parent_tab.is_some() || tab.custom_title.is_some() {
+        return None;
+    }
+    let mut panes = Vec::new();
+    collect_terminal_tabs(&tab.layout, &mut panes);
+    (panes.len() == 1).then(|| panes[0])
+}
+
+/// Root-tab display rank: projects first, then groups, then loose panes.
+pub(super) fn workspace_tab_rank(tab: &hh_protocol::Tab) -> u8 {
+    if tab.project_dir.is_some() {
+        0
+    } else if workspace_tab_standalone_pane(tab).is_none() {
+        1
+    } else {
+        2
+    }
+}
 
 /// One sidebar entry per tab. `group_label` is `Some` exactly when the tab
 /// must render as a group: it holds several terminals, or the user named it.
 pub(super) struct WorkstationTabEntry<'a> {
     pub(super) tab_id: Uuid,
     pub(super) group_label: Option<String>,
+    pub(super) project_dir: Option<String>,
+    pub(super) color: Option<AppearanceColor>,
+    pub(super) custom_icon: Option<String>,
+    pub(super) pinned: bool,
     pub(super) panes: Vec<&'a Pane>,
+    pub(super) children: Vec<WorkstationTabEntry<'a>>,
 }
 
 pub(super) fn workspace_tab_entries(workspace: &Workspace) -> Vec<WorkstationTabEntry<'_>> {
-    workspace
+    fn make_entry(tab: &hh_protocol::Tab) -> WorkstationTabEntry<'_> {
+        let mut panes = Vec::new();
+        collect_terminal_tabs(&tab.layout, &mut panes);
+        let group_label = (panes.len() >= 2
+            || tab.custom_title.is_some()
+            || tab.project_dir.is_some())
+        .then(|| {
+            tab.custom_title
+                .clone()
+                .unwrap_or_else(|| tab.title.clone())
+        });
+        WorkstationTabEntry {
+            tab_id: tab.id,
+            group_label,
+            project_dir: tab.project_dir.clone(),
+            color: tab.color,
+            custom_icon: tab.custom_icon.clone(),
+            pinned: tab.pinned,
+            panes,
+            children: Vec::new(),
+        }
+    }
+    let mut root_tabs = workspace
         .tabs
         .iter()
-        .map(|tab| {
-            let mut panes = Vec::new();
-            collect_terminal_tabs(&tab.layout, &mut panes);
-            let group_label = (panes.len() >= 2 || tab.custom_title.is_some()).then(|| {
-                tab.custom_title
-                    .clone()
-                    .unwrap_or_else(|| tab.title.clone())
-            });
-            WorkstationTabEntry {
-                tab_id: tab.id,
-                group_label,
-                panes,
-            }
+        .filter(|tab| {
+            tab.parent_tab.is_none()
+                || !workspace
+                    .tabs
+                    .iter()
+                    .any(|candidate| Some(candidate.id) == tab.parent_tab)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    root_tabs.sort_by_key(|tab| workspace_tab_rank(tab));
+    let mut roots = root_tabs.into_iter().map(make_entry).collect::<Vec<_>>();
+    for tab in workspace.tabs.iter().filter(|tab| {
+        tab.parent_tab.is_some()
+            && workspace
+                .tabs
+                .iter()
+                .any(|candidate| Some(candidate.id) == tab.parent_tab)
+    }) {
+        if let Some(parent) = roots
+            .iter_mut()
+            .find(|entry| Some(entry.tab_id) == tab.parent_tab)
+        {
+            parent.children.push(make_entry(tab));
+        }
+    }
+    roots
+}
+
+/// Sidebar display partitions inside one workstation: pinned roots,
+/// unpinned projects, then unpinned free-floating tabs; relative order kept.
+pub(super) fn partition_workstation_entries(
+    entries: Vec<WorkstationTabEntry<'_>>,
+) -> (
+    Vec<WorkstationTabEntry<'_>>,
+    Vec<WorkstationTabEntry<'_>>,
+    Vec<WorkstationTabEntry<'_>>,
+) {
+    let (pinned, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| entry.pinned);
+    let (projects, floating): (Vec<_>, Vec<_>) = rest
+        .into_iter()
+        .partition(|entry| entry.project_dir.is_some());
+    (pinned, projects, floating)
 }
 
 /// Visible panes across every tab of one workstation, in tab order.
@@ -364,15 +632,24 @@ pub(super) fn workspace_visible_panes(workspace: &Workspace) -> Vec<Uuid> {
 pub(super) enum FocusResync {
     /// The focused pane is still on screen somewhere in the workstation.
     Keep,
+    /// The pane still exists, but a stale snapshot shows a sibling stack tab.
+    Reassert(Uuid),
     /// The focused pane is gone; fall back to the workstation's first pane.
     Switch(Uuid),
     /// The workstation has no visible pane left.
     Clear,
 }
 
-pub(super) fn focus_resync_for(visible: &[Uuid], focused: Option<Uuid>) -> FocusResync {
+pub(super) fn focus_resync_for(
+    visible: &[Uuid],
+    focused: Option<Uuid>,
+    focused_exists: bool,
+) -> FocusResync {
     if focused.is_some_and(|pane_id| visible.contains(&pane_id)) {
         return FocusResync::Keep;
+    }
+    if let Some(pane_id) = focused.filter(|_| focused_exists) {
+        return FocusResync::Reassert(pane_id);
     }
     visible
         .first()
@@ -400,6 +677,13 @@ pub(super) fn terminal_tab_count_label(count: usize) -> String {
 }
 
 pub(super) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
+    if matches!(&pane.kind, PaneKind::Browser { .. }) {
+        return TabIdentityPresentation {
+            label: pane.title.clone(),
+            profile: TerminalProfile::Terminal,
+            detail: "Chromium browser tab".to_owned(),
+        };
+    }
     let detection_detail = match pane.identity.source {
         hh_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
         hh_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
@@ -432,7 +716,9 @@ pub(super) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation 
 }
 
 pub(super) fn terminal_tab_secondary_label(pane: &Pane) -> Option<&str> {
-    pane.custom_title.is_none().then_some(pane.shell.as_str())
+    matches!(&pane.kind, PaneKind::Terminal)
+        .then(|| pane.custom_title.is_none().then_some(pane.shell.as_str()))
+        .flatten()
 }
 
 pub(super) const IDENTITY_MARK_SIZE: f32 = 22.0;
@@ -502,6 +788,45 @@ pub(super) fn render_sidebar_toggle_icon(sidebar_visible: bool) -> AnyElement {
                 .h(px(5.0))
                 .rounded(px(1.0))
                 .bg(rgb(THEME.muted)),
+        )
+        .into_any_element()
+}
+
+pub(super) fn render_bell_icon(color: u32) -> AnyElement {
+    div()
+        .relative()
+        .w(px(14.0))
+        .h(px(14.0))
+        .child(
+            div()
+                .absolute()
+                .left(px(3.0))
+                .top(px(1.0))
+                .w(px(8.0))
+                .h(px(8.0))
+                .rounded_tl(px(4.0))
+                .rounded_tr(px(4.0))
+                .border_1()
+                .border_color(rgb(color)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(1.0))
+                .top(px(9.0))
+                .w(px(12.0))
+                .h(px(1.0))
+                .bg(rgb(color)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(6.0))
+                .top(px(11.0))
+                .w(px(2.0))
+                .h(px(2.0))
+                .rounded_full()
+                .bg(rgb(color)),
         )
         .into_any_element()
 }
@@ -936,6 +1261,9 @@ pub(super) fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
             KeyBinding::new(&binding.sequence, ToggleSidebar, Some(ROOT_KEY_CONTEXT))
         }
         AppCommand::NewTab => KeyBinding::new(&binding.sequence, NewTab, Some(ROOT_KEY_CONTEXT)),
+        AppCommand::NewBrowserTab => {
+            KeyBinding::new(&binding.sequence, NewBrowserTab, Some(ROOT_KEY_CONTEXT))
+        }
         AppCommand::TerminalZoomIn => {
             KeyBinding::new(&binding.sequence, TerminalZoomIn, Some(ROOT_KEY_CONTEXT))
         }
@@ -1039,6 +1367,59 @@ pub(super) fn append_rename_text(value: &mut String, replace_on_type: &mut bool,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_drop_zone_splits_quarter_half_quarter() {
+        assert_eq!(header_drop_zone(10.0, 0.0, 100.0), HeaderDropZone::Before);
+        assert_eq!(header_drop_zone(50.0, 0.0, 100.0), HeaderDropZone::Into);
+        assert_eq!(header_drop_zone(90.0, 0.0, 100.0), HeaderDropZone::After);
+        assert_eq!(header_drop_zone(25.0, 0.0, 100.0), HeaderDropZone::Into);
+        assert_eq!(header_drop_zone(75.0, 0.0, 100.0), HeaderDropZone::Into);
+    }
+
+    #[test]
+    fn sidebar_partitions_pinned_then_projects_then_floating() {
+        let entry = |tab_id: u128, project_dir: Option<&str>, pinned: bool| WorkstationTabEntry {
+            tab_id: Uuid::from_u128(tab_id),
+            group_label: None,
+            project_dir: project_dir.map(str::to_owned),
+            color: None,
+            custom_icon: None,
+            pinned,
+            panes: Vec::new(),
+            children: Vec::new(),
+        };
+        let (pinned, projects, floating) = partition_workstation_entries(vec![
+            entry(10, Some("/tmp/project-a"), false),
+            entry(20, None, true),
+            entry(30, None, false),
+            entry(40, Some("/tmp/project-d"), true),
+            entry(50, None, true),
+        ]);
+
+        assert_eq!(
+            pinned.iter().map(|entry| entry.tab_id).collect::<Vec<_>>(),
+            [
+                Uuid::from_u128(20),
+                Uuid::from_u128(40),
+                Uuid::from_u128(50)
+            ]
+        );
+        assert_eq!(
+            projects
+                .iter()
+                .map(|entry| entry.tab_id)
+                .collect::<Vec<_>>(),
+            [Uuid::from_u128(10)]
+        );
+        assert_eq!(
+            floating
+                .iter()
+                .map(|entry| entry.tab_id)
+                .collect::<Vec<_>>(),
+            [Uuid::from_u128(30)]
+        );
+    }
     #[test]
     fn empty_offline_ssh_workspace_is_selectable_only_for_its_reopen_affordance() {
         let mut snapshot = SessionSnapshot::seeded();
@@ -1072,6 +1453,7 @@ mod tests {
             let label = profile.display_name();
             let pane = Pane {
                 id: Uuid::new_v4(),
+                kind: hh_protocol::PaneKind::Terminal,
                 title: label.to_owned(),
                 shell: "zsh".to_owned(),
                 color: None,
@@ -1113,6 +1495,7 @@ mod tests {
     fn renamed_tab_hides_shell_metadata_that_would_displace_its_name() {
         let mut pane = Pane {
             id: Uuid::new_v4(),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "Release terminal".to_owned(),
             shell: "ssh release@long-production-host.example.com".to_owned(),
             color: None,
@@ -1135,6 +1518,7 @@ mod tests {
     fn workspace_rail_lists_every_terminal_tab_across_stacks_and_splits() {
         let make_pane = |id: u128, title: &str, profile: TerminalProfile| Pane {
             id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Terminal,
             title: title.to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1182,9 +1566,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_tab_projection_preserves_tab_order_and_group_identity() {
+    fn workspace_tab_projection_orders_groups_before_loose_tabs() {
         let make_pane = |id: u128| Pane {
             id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Terminal,
             title: format!("Terminal {id}"),
             shell: "zsh".to_owned(),
             color: None,
@@ -1199,18 +1584,33 @@ mod tests {
                 id: Uuid::from_u128(10),
                 title: "Single".to_owned(),
                 custom_title: None,
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
                 layout: PaneLayout::Leaf { pane: make_pane(1) },
             },
             hh_protocol::Tab {
                 id: Uuid::from_u128(20),
                 title: "Named".to_owned(),
                 custom_title: Some("Group 1".to_owned()),
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
                 layout: PaneLayout::Leaf { pane: make_pane(2) },
             },
             hh_protocol::Tab {
                 id: Uuid::from_u128(30),
                 title: "Stacked".to_owned(),
                 custom_title: None,
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
                 layout: PaneLayout::Stack {
                     panes: vec![make_pane(3), make_pane(4)],
                     active: Uuid::from_u128(3),
@@ -1220,6 +1620,11 @@ mod tests {
                 id: Uuid::from_u128(40),
                 title: "Split".to_owned(),
                 custom_title: None,
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
                 layout: PaneLayout::Split {
                     axis: SplitAxis::Horizontal,
                     ratio: 0.5,
@@ -1236,24 +1641,381 @@ mod tests {
                 .iter()
                 .map(|entry| entry.group_label.as_deref())
                 .collect::<Vec<_>>(),
-            vec![None, Some("Group 1"), Some("Stacked"), Some("Split")]
+            vec![Some("Group 1"), Some("Stacked"), Some("Split"), None]
         );
         assert_eq!(
             entries
                 .iter()
                 .map(|entry| entry.panes.len())
                 .collect::<Vec<_>>(),
-            vec![1, 1, 2, 2]
+            vec![1, 2, 2, 1]
         );
         assert_eq!(
             entries.iter().map(|entry| entry.tab_id).collect::<Vec<_>>(),
             vec![
-                Uuid::from_u128(10),
                 Uuid::from_u128(20),
                 Uuid::from_u128(30),
-                Uuid::from_u128(40)
+                Uuid::from_u128(40),
+                Uuid::from_u128(10)
             ]
         );
+    }
+    #[test]
+    fn workstation_strip_orders_projects_then_groups_then_loose_tabs() {
+        let make_pane = |id: u128| Pane {
+            id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Terminal,
+            title: format!("Terminal {id}"),
+            shell: "zsh".to_owned(),
+            color: None,
+            identity: hh_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        let make_leaf_tab =
+            |tab_id: u128, pane_id: u128, project_dir: Option<&str>| hh_protocol::Tab {
+                id: Uuid::from_u128(tab_id),
+                title: format!("Tab {tab_id}"),
+                custom_title: None,
+                project_dir: project_dir.map(str::to_owned),
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
+                layout: PaneLayout::Leaf {
+                    pane: make_pane(pane_id),
+                },
+            };
+        let first_loose_id = Uuid::from_u128(10);
+        let group_id = Uuid::from_u128(20);
+        let project_id = Uuid::from_u128(30);
+        let last_loose_id = Uuid::from_u128(40);
+        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
+        workspace.tabs = vec![
+            make_leaf_tab(10, 1, None),
+            hh_protocol::Tab {
+                id: group_id,
+                title: "Group".to_owned(),
+                custom_title: None,
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
+                layout: PaneLayout::Stack {
+                    panes: vec![make_pane(2), make_pane(3)],
+                    active: Uuid::from_u128(2),
+                },
+            },
+            make_leaf_tab(30, 4, Some("/tmp/project")),
+            make_leaf_tab(40, 5, None),
+        ];
+        let expected = vec![project_id, group_id, first_loose_id, last_loose_id];
+
+        assert_eq!(
+            workspace_tab_set(&workspace, WorkspaceTabScope::Workstation)
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            workspace_tab_entries(&workspace)
+                .iter()
+                .map(|entry| entry.tab_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn strip_click_target_resolves_from_current_snapshot() {
+        let make_pane = |id: u128| Pane {
+            id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Terminal,
+            title: format!("Terminal {id}"),
+            shell: "zsh".to_owned(),
+            color: None,
+            identity: hh_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        let group_id = Uuid::from_u128(30);
+        let focused_group_pane = Uuid::from_u128(1);
+        let active_group_pane = Uuid::from_u128(2);
+        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
+        workspace.tabs = vec![
+            hh_protocol::Tab {
+                id: group_id,
+                title: "Group".to_owned(),
+                custom_title: None,
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
+                layout: PaneLayout::Stack {
+                    panes: vec![make_pane(1), make_pane(2)],
+                    active: active_group_pane,
+                },
+            },
+            hh_protocol::Tab {
+                id: Uuid::from_u128(40),
+                title: "Loose".to_owned(),
+                custom_title: None,
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
+                layout: PaneLayout::Leaf { pane: make_pane(3) },
+            },
+        ];
+
+        assert_eq!(
+            workspace_tab_click_target(&workspace, group_id, None),
+            Some(active_group_pane)
+        );
+        assert_eq!(
+            workspace_tab_click_target(&workspace, group_id, Some(focused_group_pane)),
+            Some(focused_group_pane)
+        );
+        let recovered_active_pane = Uuid::from_u128(5);
+        workspace.tabs[0].layout = PaneLayout::Stack {
+            panes: vec![make_pane(4), make_pane(5)],
+            active: recovered_active_pane,
+        };
+        assert_eq!(
+            workspace_tab_click_target(&workspace, group_id, Some(focused_group_pane)),
+            Some(recovered_active_pane)
+        );
+        assert_eq!(
+            workspace_tab_click_target(&workspace, Uuid::from_u128(999), None),
+            None
+        );
+    }
+
+    #[test]
+    fn strip_active_tab_maps_project_children_to_the_project_root() {
+        let make_pane = |id: u128| Pane {
+            id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Terminal,
+            title: format!("Terminal {id}"),
+            shell: "zsh".to_owned(),
+            color: None,
+            identity: hh_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        let make_tab =
+            |tab_id: u128, pane_id: u128, project_dir: Option<&str>, parent_tab: Option<Uuid>| {
+                hh_protocol::Tab {
+                    id: Uuid::from_u128(tab_id),
+                    title: format!("Tab {tab_id}"),
+                    custom_title: None,
+                    project_dir: project_dir.map(str::to_owned),
+                    color: None,
+                    custom_icon: None,
+                    parent_tab,
+                    pinned: false,
+                    layout: PaneLayout::Leaf {
+                        pane: make_pane(pane_id),
+                    },
+                }
+            };
+        let loose_id = Uuid::from_u128(10);
+        let project_id = Uuid::from_u128(30);
+        let child_id = Uuid::from_u128(40);
+        let child_pane_id = Uuid::from_u128(4);
+        let loose_pane_id = Uuid::from_u128(1);
+        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
+        workspace.tabs = vec![
+            make_tab(30, 3, Some("/tmp/project"), None),
+            make_tab(40, 4, None, Some(project_id)),
+            make_tab(10, 1, None, None),
+        ];
+
+        assert_eq!(
+            workspace_strip_active_tab(
+                &workspace,
+                WorkspaceTabScope::Workstation,
+                Some(child_pane_id)
+            ),
+            Some(project_id)
+        );
+        assert_eq!(
+            workspace_strip_active_tab(
+                &workspace,
+                WorkspaceTabScope::Project(project_id),
+                Some(child_pane_id)
+            ),
+            Some(child_id)
+        );
+        assert_eq!(
+            workspace_strip_active_tab(
+                &workspace,
+                WorkspaceTabScope::Workstation,
+                Some(loose_pane_id)
+            ),
+            Some(loose_id)
+        );
+        assert_eq!(
+            workspace_strip_active_tab(&workspace, WorkspaceTabScope::Workstation, None),
+            None
+        );
+    }
+
+    #[test]
+    fn viewport_tab_strip_keeps_explicit_workstation_and_project_scopes() {
+        let make_pane = |id: u128| Pane {
+            id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Terminal,
+            title: format!("Terminal {id}"),
+            shell: "zsh".to_owned(),
+            color: None,
+            identity: hh_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        let make_tab =
+            |tab_id: u128, pane_id: u128, project_dir: Option<&str>, parent_tab: Option<Uuid>| {
+                hh_protocol::Tab {
+                    id: Uuid::from_u128(tab_id),
+                    title: format!("Tab {tab_id}"),
+                    custom_title: None,
+                    project_dir: project_dir.map(str::to_owned),
+                    color: None,
+                    custom_icon: None,
+                    parent_tab,
+                    pinned: false,
+                    layout: PaneLayout::Leaf {
+                        pane: make_pane(pane_id),
+                    },
+                }
+            };
+        let project_id = Uuid::from_u128(30);
+        let other_project_id = Uuid::from_u128(50);
+        let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
+        workspace.tabs = vec![
+            make_tab(10, 1, None, None),
+            make_tab(20, 2, None, None),
+            make_tab(30, 3, Some("/tmp/project-a"), None),
+            make_tab(40, 4, None, Some(project_id)),
+            make_tab(50, 5, Some("/tmp/project-b"), None),
+            make_tab(60, 6, None, Some(other_project_id)),
+        ];
+
+        let workstation = workspace_tab_set(&workspace, WorkspaceTabScope::Workstation);
+        assert_eq!(workstation.scope, WorkspaceTabScope::Workstation);
+        assert_eq!(
+            workstation
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![
+                project_id,
+                other_project_id,
+                Uuid::from_u128(10),
+                Uuid::from_u128(20)
+            ]
+        );
+        assert_eq!(
+            workspace_scope_for_tab(&workspace, Uuid::from_u128(20)),
+            WorkspaceTabScope::Workstation
+        );
+        for tab_id in [project_id, Uuid::from_u128(40)] {
+            assert_eq!(
+                workspace_scope_for_tab(&workspace, tab_id),
+                WorkspaceTabScope::Project(project_id)
+            );
+        }
+
+        let project = workspace_tab_set(&workspace, WorkspaceTabScope::Project(project_id));
+        assert_eq!(project.scope, WorkspaceTabScope::Project(project_id));
+        assert_eq!(
+            project.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![project_id, Uuid::from_u128(40)]
+        );
+        let fallback =
+            workspace_tab_set(&workspace, WorkspaceTabScope::Project(Uuid::from_u128(999)));
+        assert_eq!(fallback.scope, WorkspaceTabScope::Workstation);
+        assert_eq!(
+            workspace_tab_focus_target(&workspace.tabs[3], Some(Uuid::from_u128(4))),
+            Some(Uuid::from_u128(4))
+        );
+    }
+    #[test]
+    fn only_unnamed_single_pane_tabs_render_without_a_secondary_strip() {
+        let make_pane = |id: u128| Pane {
+            id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Browser {
+                url: "https://example.com".to_owned(),
+            },
+            title: format!("Pane {id}"),
+            shell: String::new(),
+            color: None,
+            identity: hh_protocol::TerminalIdentity::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        let mut tab = hh_protocol::Tab {
+            id: Uuid::from_u128(10),
+            title: "Example".to_owned(),
+            custom_title: None,
+            project_dir: None,
+            color: None,
+            custom_icon: None,
+            parent_tab: None,
+            pinned: false,
+            layout: PaneLayout::Leaf { pane: make_pane(1) },
+        };
+
+        assert_eq!(
+            workspace_tab_standalone_pane(&tab).map(|pane| pane.id),
+            Some(Uuid::from_u128(1))
+        );
+        tab.layout = PaneLayout::Stack {
+            panes: vec![make_pane(2)],
+            active: Uuid::from_u128(2),
+        };
+        assert_eq!(
+            workspace_tab_standalone_pane(&tab).map(|pane| pane.id),
+            Some(Uuid::from_u128(2))
+        );
+
+        tab.custom_title = Some("Named group".to_owned());
+        assert!(workspace_tab_standalone_pane(&tab).is_none());
+        tab.custom_title = None;
+        tab.project_dir = Some("/tmp/project".to_owned());
+        assert!(workspace_tab_standalone_pane(&tab).is_none());
+        tab.project_dir = None;
+        tab.parent_tab = Some(Uuid::from_u128(99));
+        assert!(workspace_tab_standalone_pane(&tab).is_none());
+        tab.parent_tab = None;
+        tab.layout = PaneLayout::Stack {
+            panes: vec![make_pane(3), make_pane(4)],
+            active: Uuid::from_u128(3),
+        };
+        assert!(workspace_tab_standalone_pane(&tab).is_none());
+    }
+
+    #[test]
+    fn expired_drag_suppression_never_eats_the_next_sidebar_click() {
+        let now = Instant::now();
+        let mut expired = Some(now.checked_sub(Duration::from_millis(1)).unwrap());
+        assert!(!click_suppression_active(&mut expired, now));
+        assert_eq!(expired, None);
+
+        let mut immediate = Some(now + Duration::from_millis(1));
+        assert!(click_suppression_active(&mut immediate, now));
+        assert_eq!(immediate, None);
     }
     #[test]
     fn runtime_tmux_tab_panes_stay_visible_to_focus_bookkeeping() {
@@ -1264,9 +2026,15 @@ mod tests {
             id: Uuid::from_u128(0x88),
             title: "buzz".to_owned(),
             custom_title: None,
+            project_dir: None,
+            color: None,
+            custom_icon: None,
+            parent_tab: None,
+            pinned: false,
             layout: PaneLayout::Leaf {
                 pane: Pane {
                     id: tmux_pane,
+                    kind: hh_protocol::PaneKind::Terminal,
                     title: "tmux buzz".to_owned(),
                     shell: "tmux".to_owned(),
                     color: None,
@@ -1284,7 +2052,7 @@ mod tests {
         let visible = workspace_visible_panes(&workspace);
         assert_eq!(visible, vec![initial, tmux_pane]);
         assert_eq!(
-            focus_resync_for(&visible, Some(tmux_pane)),
+            focus_resync_for(&visible, Some(tmux_pane), true),
             FocusResync::Keep
         );
         assert_eq!(
@@ -1295,14 +2063,28 @@ mod tests {
         // A pane that really vanished still falls back to the first tab, and an
         // empty workstation clears focus outright.
         assert_eq!(
-            focus_resync_for(&visible, Some(Uuid::from_u128(0x99))),
+            focus_resync_for(&visible, Some(Uuid::from_u128(0x99)), false),
             FocusResync::Switch(initial)
         );
         assert_eq!(
-            focus_resync_for(&visible, None),
+            focus_resync_for(&visible, None, false),
             FocusResync::Switch(initial)
         );
-        assert_eq!(focus_resync_for(&[], Some(tmux_pane)), FocusResync::Clear);
+        assert_eq!(
+            focus_resync_for(&[], Some(tmux_pane), false),
+            FocusResync::Clear
+        );
+    }
+
+    #[test]
+    fn inactive_inner_tab_reasserts_focus_instead_of_falling_back() {
+        let active = Uuid::from_u128(1);
+        let requested = Uuid::from_u128(2);
+
+        assert_eq!(
+            focus_resync_for(&[active], Some(requested), true),
+            FocusResync::Reassert(requested)
+        );
     }
 
     #[test]
@@ -1558,6 +2340,7 @@ mod tests {
     fn pane_geometry_tracks_narrow_medium_and_wide_windows_without_fixed_columns() {
         let pane = Pane {
             id: Uuid::from_u128(10),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1711,6 +2494,7 @@ mod tests {
     fn split_geometry_accounts_for_the_divider_and_each_panes_chrome() {
         let first = Pane {
             id: Uuid::from_u128(21),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "Terminal 1".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1721,6 +2505,7 @@ mod tests {
         };
         let second = Pane {
             id: Uuid::from_u128(22),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "Terminal 2".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1768,6 +2553,7 @@ mod tests {
     fn pane_size_projection_uses_each_active_terminal_zoom() {
         let first = Pane {
             id: Uuid::from_u128(21),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "First".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1778,6 +2564,7 @@ mod tests {
         };
         let second = Pane {
             id: Uuid::from_u128(22),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "Second".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1882,6 +2669,7 @@ mod tests {
     fn focused_workspace_tab_layout_is_rendered_instead_of_the_first_tab() {
         let pane = |id, title: &str| Pane {
             id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Terminal,
             title: title.to_owned(),
             shell: "tmux".to_owned(),
             color: None,
@@ -1901,11 +2689,17 @@ mod tests {
             order: 0,
             active_terminal_count: 2,
             connection: WorkspaceConnection::Local,
+            working_dir: None,
             tabs: vec![
                 hh_protocol::Tab {
                     id: Uuid::from_u128(10),
                     title: "SSH".to_owned(),
                     custom_title: None,
+                    project_dir: None,
+                    color: None,
+                    custom_icon: None,
+                    parent_tab: None,
+                    pinned: false,
                     layout: PaneLayout::Leaf {
                         pane: first.clone(),
                     },
@@ -1914,6 +2708,11 @@ mod tests {
                     id: Uuid::from_u128(20),
                     title: "tmux".to_owned(),
                     custom_title: None,
+                    project_dir: None,
+                    color: None,
+                    custom_icon: None,
+                    parent_tab: None,
+                    pinned: false,
                     layout: PaneLayout::Leaf { pane: tmux.clone() },
                 },
             ],
@@ -1932,6 +2731,7 @@ mod tests {
     fn zoom_is_a_projection_that_does_not_mutate_canonical_layout() {
         let first = Pane {
             id: Uuid::from_u128(101),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "one".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1942,6 +2742,7 @@ mod tests {
         };
         let second = Pane {
             id: Uuid::from_u128(102),
+            kind: hh_protocol::PaneKind::Terminal,
             title: "two".to_owned(),
             shell: "zsh".to_owned(),
             color: None,
@@ -1977,6 +2778,7 @@ mod tests {
     fn equalize_is_a_controlled_mutation_over_all_current_split_identities() {
         let pane = |id| Pane {
             id: Uuid::from_u128(id),
+            kind: hh_protocol::PaneKind::Terminal,
             title: format!("pane {id}"),
             shell: "zsh".to_owned(),
             color: None,

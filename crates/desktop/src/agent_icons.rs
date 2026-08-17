@@ -301,7 +301,7 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 12] = [
         accessible_name: "tmux",
         asset: Some(svg(
             "agent-icons/tmux.svg",
-            "bdc956f2193c3cf4a49d304b76f43d6c6e69670224a45e0422b3e8066de8e358",
+            "39f20507b6b23cbbeeb6a1e57520f76cc0af0712dfcabaa89d88774123480acb",
         )),
         notice_key: "tmux",
     },
@@ -317,7 +317,7 @@ pub fn agent_icon_definition(profile: TerminalProfile) -> &'static AgentIconDefi
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgentIconAssets;
 
-const EMBEDDED_ASSETS: [(&str, &[u8]); 11] = [
+const EMBEDDED_ASSETS: [(&str, &[u8]); 12] = [
     (
         "agent-icons/hermes-agent.png",
         include_bytes!("../assets/agent-icons/hermes-agent.png"),
@@ -357,6 +357,10 @@ const EMBEDDED_ASSETS: [(&str, &[u8]); 11] = [
     (
         "agent-icons/tmux.svg",
         include_bytes!("../assets/agent-icons/tmux.svg"),
+    ),
+    (
+        "agent-icons/browser-globe.svg",
+        include_bytes!("../assets/agent-icons/browser-globe.svg"),
     ),
     (
         "agent-icons/tmux-LICENSE.txt",

@@ -13,6 +13,7 @@ pub enum AppCommand {
     NewWorkspace,
     ToggleSidebar,
     NewTab,
+    NewBrowserTab,
     TerminalZoomIn,
     TerminalZoomOut,
     SplitRight,
@@ -29,7 +30,7 @@ pub enum AppCommand {
 }
 
 impl AppCommand {
-    const COUNT: usize = 16;
+    const COUNT: usize = 17;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +65,13 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         title: "New Terminal Tab",
         category: "Terminal",
         default_bindings: &["cmd-t"],
+    },
+    CommandDescriptor {
+        command: AppCommand::NewBrowserTab,
+        id: "workspace.new-browser-tab",
+        title: "New Browser Tab",
+        category: "Workstation",
+        default_bindings: &[],
     },
     CommandDescriptor {
         command: AppCommand::TerminalZoomIn,
@@ -184,7 +192,10 @@ const fn check_registry() {
         assert!(!descriptor.title.is_empty());
         assert!(
             !descriptor.default_bindings.is_empty()
-                || descriptor.command as u8 == AppCommand::ShowNotifications as u8
+                || matches!(
+                    descriptor.command,
+                    AppCommand::NewBrowserTab | AppCommand::ShowNotifications
+                )
         );
         let mut inner = outer + 1;
         while inner < COMMAND_DESCRIPTORS.len() {
@@ -399,6 +410,9 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
         score -= i32::try_from(index).unwrap_or(i32::MAX) / 8;
         previous_match = Some(index);
         let Some(next) = needle_chars.next() else {
+            if needle == haystack {
+                score += 20;
+            }
             return Some(score);
         };
         wanted = next;
@@ -509,7 +523,7 @@ mod tests {
         let matches = palette_matches("", usize::MAX);
         assert_eq!(matches.len(), COMMAND_DESCRIPTORS.len());
         assert_eq!(matches[0].command, AppCommand::NewWorkspace);
-        assert_eq!(matches[13].command, AppCommand::EqualizePanes);
+        assert_eq!(matches[14].command, AppCommand::EqualizePanes);
 
         let matches = palette_matches("eq pane", 8);
         assert_eq!(

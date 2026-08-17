@@ -60,6 +60,8 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [bytes 1.12.1](https://github.com/tokio-rs/bytes) — MIT
 - [cbindgen 0.28.0](https://github.com/mozilla/cbindgen) — MPL-2.0
 - [cc 1.4.2](https://github.com/rust-lang/cc-rs) — MIT OR Apache-2.0
+- [cef 151.6.0+151.3.18](https://github.com/tauri-apps/cef-rs) — Apache-2.0 OR MIT
+- [cef-dll-sys 151.6.0+151.3.18](https://github.com/tauri-apps/cef-rs) — Apache-2.0 OR MIT
 - [cexpr 0.6.0](https://github.com/jethrogb/rust-cexpr) — Apache-2.0 OR MIT
 - [cfg-if 1.0.4](https://github.com/rust-lang/cfg-if) — MIT OR Apache-2.0
 - [cfg_aliases 0.1.1](https://github.com/katharostech/cfg_aliases) — MIT
