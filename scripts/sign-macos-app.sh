@@ -37,11 +37,14 @@ sign_code() {
   identifier=$2
   entitlements=${3:-}
   if [ "$identity" = "-" ]; then
+    # Ad-hoc signatures have no shared Team ID. Enabling the hardened runtime
+    # here makes macOS library validation reject the separately signed CEF
+    # framework. Developer ID builds below retain hardened runtime enforcement.
     if [ -n "$entitlements" ]; then
-      codesign --force --options runtime --entitlements "$entitlements" \
+      codesign --force --entitlements "$entitlements" \
         --identifier "$identifier" --sign - "$code_path"
     else
-      codesign --force --options runtime --identifier "$identifier" --sign - "$code_path"
+      codesign --force --identifier "$identifier" --sign - "$code_path"
     fi
   elif [ -n "$entitlements" ]; then
     codesign --force --options runtime --timestamp --entitlements "$entitlements" \
