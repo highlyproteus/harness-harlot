@@ -89,6 +89,9 @@ jobs:
           scripts/test-release-fixture.sh
           scripts/test-community-macos-release.sh
           scripts/test-update-tool.sh
+      - name: Reclaim build space for Linux release fixtures
+        if: runner.os == 'Linux'
+        run: cargo clean
       - name: Verify Linux release and updater fixtures
         if: runner.os == 'Linux'
         run: |
