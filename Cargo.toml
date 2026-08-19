@@ -21,7 +21,7 @@ license = "MIT"
 [workspace.dependencies]
 alacritty_terminal = "0.26.0"
 anyhow = "1.0.99"
-base64 = "0.22.1"
+base64 = "0.23.1"
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
 futures = "0.3"
 flate2 = "1.1.9"
