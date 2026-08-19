@@ -47,16 +47,6 @@ pub fn update_manifest_name(platform: &str, architecture: &str) -> String {
     }
 }
 
-/// Whether this build may replace an installed application automatically.
-///
-/// Community macOS artifacts intentionally stop at authenticated update
-/// notification. Their manual installer is the explicit Gatekeeper trust
-/// boundary.
-#[must_use]
-pub fn automatic_install_supported(platform: &str) -> bool {
-    !(cfg!(feature = "community-macos") && platform == "macos")
-}
-
 /// One key compiled into a production client. Key IDs are part of the signed
 /// manifest and select exactly one corresponding verifying key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -674,6 +664,14 @@ mod tests {
             .unwrap()
             .expect("newer Linux release");
         assert_eq!(update.artifact.format, "tar.gz");
+        assert!(!update.requires_service_restart);
+
+        let mut protocol_manifest = manifest.clone();
+        protocol_manifest.session_service.protocol_version += 1;
+        let protocol_update = select_verified_update(&protocol_manifest, &current)
+            .unwrap()
+            .expect("newer Linux protocol release");
+        assert!(protocol_update.requires_service_restart);
 
         let current = CurrentRelease {
             platform: "macos",
@@ -822,24 +820,21 @@ mod tests {
     }
 
     #[test]
-    fn community_macos_feed_and_install_policy_are_isolated() {
+    fn community_macos_feed_is_isolated() {
         assert_eq!(
             update_manifest_name("linux", "arm64"),
             "manifest-linux-arm64.update.json"
         );
-        assert!(automatic_install_supported("linux"));
         if cfg!(feature = "community-macos") {
             assert_eq!(
                 update_manifest_name("macos", "arm64"),
                 "manifest-macos-community-arm64.update.json"
             );
-            assert!(!automatic_install_supported("macos"));
         } else {
             assert_eq!(
                 update_manifest_name("macos", "arm64"),
                 "manifest-macos-arm64.update.json"
             );
-            assert!(automatic_install_supported("macos"));
         }
     }
 

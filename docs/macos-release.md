@@ -9,9 +9,9 @@ can select the other mode's artifact.
 ## What is implemented now
 
 - `scripts/build-macos-app.sh release --browser --community` builds the
-  no-cost app with CEF, a production verifier, and the compile-time
-  notify-only update policy. `scripts/build-macos-app.sh release --browser`
-  retains the Developer ID layout.
+  no-cost app with CEF, a production verifier, and the signed staged-swap
+  updater. `scripts/build-macos-app.sh release --browser` retains the
+  Developer ID layout.
 - `scripts/package-macos-release.sh VERSION BUILD --community` signs nested
   code ad hoc, emits a `*-community.dmg`, and publishes
   `manifest-macos-community-ARCH.update.json`. It requires the signed tag,
@@ -22,11 +22,13 @@ can select the other mode's artifact.
 - The attested `install-community-macos.sh` authenticates release inputs with
   GitHub provenance before mounting a DMG, then uses the bundled verifier to
   validate the Ed25519 manifest and exact artifact bytes.
-- Community apps notify about newer community releases but both the UI and
-  `hh-update-tool install` refuse automatic replacement. Developer ID builds
-  retain the verified staged-swap updater once `TRUSTED_APPLE_TEAM_ID` is set.
-- Every manifest requires a quiescent session service. Manual community
-  replacement and automatic Developer ID replacement must not strand live PTYs.
+- Community and Developer ID apps install newer releases from the in-app
+  update button. Community updates require the compiled Ed25519 trust root,
+  exact artifact hash, and valid ad-hoc bundle signatures; Developer ID
+  updates additionally require the pinned Apple Team ID.
+- The session service only needs to become quiescent when its protocol changes.
+  Routine updates preserve live PTYs while replacing the app around the
+  compatible running service.
 
 The package script refuses any dirty checkout, including untracked files.
 Every production mode requires a signed tag, pinned CEF, and the distinct
@@ -50,9 +52,11 @@ tradeoff visible instead of weakening the Developer ID checks:
 3. The verifier from that authenticated DMG checks the owner-held Ed25519
    signature and exact DMG size/SHA-256. Ad-hoc code signatures are then checked
    for bundle integrity and exact bundle identity/architecture.
-4. Installation targets `~/Applications`; an existing Developer ID app is not
-   silently replaced by a community app. Automatic update installation remains
-   disabled, so every future replacement repeats the explicit trust step.
+4. First installation targets `~/Applications`; an existing Developer ID app
+   is not silently replaced by a community app. Later replacements remain on
+   the isolated community feed and use the in-app updater, whose compiled
+   Ed25519 key authenticates the manifest and exact DMG before ad-hoc signature
+   verification and atomic replacement.
 
 The installer never removes quarantine, disables Gatekeeper, uses `sudo`, or
 pipes network content into a shell. If Gatekeeper blocks the first launch, use
@@ -134,29 +138,30 @@ release, verify its GitHub attestation, and run it with the explicit
 `--acknowledge-unnotarized` flag. The script verifies all release attestations,
 the Ed25519 manifest, exact DMG bytes, ad-hoc signatures, bundle identifier,
 primary executable set, and CPU architecture before staging. It refuses a
-running desktop, asks the current managed service to persist and stop only
-after all terminal sessions have ended, and never overwrites a Developer ID
-app. A failed staged replacement restores the prior community bundle. Updates
-stay notify-only and repeat this manual process.
+running desktop and never overwrites a Developer ID app. A failed staged
+replacement restores the prior community bundle.
 
-Developer ID installation uses `install.sh` after the Team ID is configured.
-Before an automatic update, the UI queries the service for active panes and
-shows **Update after sessions end** whenever a PTY or SSH workstation is live.
-Once the user has ended all terminal sessions, that installer:
+After first installation, both modes update from the sidebar button. The app
+selects only its channel-specific signed manifest and architecture-specific
+artifact. If the manifest changes the session-service protocol, the UI asks
+the user to end active terminals first; otherwise the compatible service and
+its PTYs remain live across the app replacement. The updater then:
 
-1. Downloads and verifies signed metadata, exact DMG size/hash, Developer ID
-   Team ID, hardened runtime, notarization, and bundle identifier.
-2. Waits for the desktop process to exit, asks the quiescent session service to
-   persist and stop, and stages the app on the destination filesystem.
+1. Downloads and verifies the signed metadata and exact DMG size/hash.
+   Community builds require valid ad-hoc signatures with no Team ID; Developer
+   ID builds require the pinned Apple Team ID.
+2. Waits for the desktop process to exit and stops the service only when the
+   protocol changes.
 3. Replaces the app bundle and command link as an ordered transaction, retains
    the prior app as `Harness Harlot.previous.app`, and launches the new desktop.
-4. On replacement or relaunch failure, restores and validates the prior app and
-   command link.
+4. On replacement or relaunch failure, restores and validates the prior app
+   and command link.
 
-Rollback requires no live service-owned PTYs. Desired-state recovery can
-recreate local shells after a service stop, but it does not preserve arbitrary
-live processes, SSH authentication, or terminal output; release notes must say
-this plainly.
+Routine app-only rollback leaves the compatible service and its PTYs running.
+A protocol-changing update waits until the service owns no live PTYs because
+desired-state recovery can recreate local shells after a service stop but
+cannot preserve arbitrary live processes, SSH authentication, or terminal
+output; release notes must identify such migrations plainly.
 
 Linux releases use the verified `.tar.gz` and `hh-update-tool install-local`
 flow instead of a DMG. The unprivileged installer stages the application at
@@ -183,9 +188,10 @@ instructions.
   `Harness-Harlot.icns`.
 - [ ] For community artifacts, verify ad-hoc signatures, all GitHub
   attestations, the distinct community manifest name, manual first launch, and
-  notify-only update behavior on both architectures.
+  automatic update/rollback on both architectures.
 - [ ] If `HH_ENABLE_APPLE_SIGNING=true`, sign, notarize, staple, verify the
-  pinned Team ID, and exercise automatic update/rollback on both architectures.
+  pinned Team ID, and exercise the same automatic update/rollback path on both
+  architectures.
 - [ ] Publish versioned artifacts and regenerate
   `manifest-macos-community-ARCH.update.json` in every release. When Developer
   ID packaging is enabled, regenerate `manifest-macos-ARCH.update.json` in the
@@ -214,8 +220,9 @@ Ordered owner steps from a staged repository to a real no-cost release:
    commit and signed tags appear on GitHub.
 5. **Store the required GitHub secrets**:
    - `RELEASE_TAG_GPG_PUBLIC_KEY` — public key for tag signing
-   - `HH_UPDATE_SIGNING_SEED` — contents of `~/.ssh/hh-update-signing-seed`
-   - `HH_UPDATE_PUBLIC_KEY` — `W3xGpnOmpqVPsaJDWI8LF25g3/Y24DkuHJWkOldH9DE=`
+   - `HH_UPDATE_SIGNING_SEED` — contents of
+     `~/.config/harness-harlot/hh-stable-2026.seed`
+   - `HH_UPDATE_PUBLIC_KEY` — `Cy/alHdZ5R7fSJEeuvqu1UXH9j5O0f34hWv4Rv8TFwo=`
 6. **Store the required GitHub variable**:
    `HH_UPDATE_KEY_ID=hh-stable-2026`. Leave
    `HH_ENABLE_APPLE_SIGNING` unset or `false`.
@@ -225,8 +232,9 @@ Ordered owner steps from a staged repository to a real no-cost release:
    publishes community macOS plus Linux artifacts without an Apple account.
 8. **Verify from a clean Mac.** Attest and run
    `install-community-macos.sh --acknowledge-unnotarized`, exercise first launch
-   and Open Anyway if macOS asks, then confirm a newer fixture is notification
-   only.
+   and Open Anyway if macOS asks, then publish a newer fixture and confirm the
+   in-app update button verifies, swaps, rolls back on induced failure, and
+   relaunches successfully.
 
 Optional Developer ID upgrade, when funding/credentials become available:
 
@@ -243,8 +251,9 @@ Optional Developer ID upgrade, when funding/credentials become available:
 
 ### Update-key custody
 
-`~/.ssh/hh-update-signing-seed` is the stable-channel signing seed. Keep an
-offline copy (password manager or printed). Rotation: generate a new seed,
+`~/.config/harness-harlot/hh-stable-2026.seed` is the stable-channel signing
+seed. Keep an offline copy (password manager or printed). Rotation: generate a
+new seed,
 add a second `TrustedKey` entry with a new `key_id` (e.g.
 `hh-stable-2027`), publish one release signed with both keys' manifests if
 needed, then remove the retired key in the next release. Never place the

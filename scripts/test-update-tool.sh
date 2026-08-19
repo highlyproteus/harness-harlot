@@ -89,6 +89,9 @@ ln -s "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh" "$work/home
 
 cat > "$work/mock-bin/codesign" <<'EOF'
 #!/bin/sh
+case " $* " in
+  *" -d "*) printf 'Signature=adhoc\nTeamIdentifier=not set\n' >&2 ;;
+esac
 exit 0
 EOF
 cat > "$work/mock-bin/hdiutil" <<'EOF'
@@ -128,6 +131,20 @@ install_fixture() {
     --current-version 0.1.0 --prefix "$work/home/Applications"
 }
 
+install_community_fixture() {
+  HOME="$work/home" \
+  HH_SOCKET="$work/session.sock" \
+  PATH="$work/mock-bin:$PATH" \
+  HH_UPDATE_FIXTURE_APP="$work/mounted-app" \
+  HH_UPDATE_FIXTURE_OPEN_LOG="$work/open.log" \
+  HH_UPDATE_FIXTURE_OPEN_FAIL=0 \
+  "$repository_root/target/release/hh-update-tool" install \
+    --fixture --key-id test-only-v1 --public-key "$public_key" \
+    --host updates.example.invalid \
+    --manifest "$manifest" --signature "$signature" --artifact "$artifact" \
+    --current-version 0.1.0 --prefix "$work/home/Applications"
+}
+
 install_fixture
 [ "$("$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh")" = new ]
 [ "$("$work/home/Applications/Harness Harlot.previous.app/Contents/MacOS/hh")" = old ]
@@ -144,4 +161,8 @@ fi
 [ ! -e "$work/home/Applications/Harness Harlot.previous.app" ]
 [ "$(readlink "$work/home/.local/bin/hh")" = "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh" ]
 
-echo "hh-update-tool fixture installs atomically and rolls back post-swap failures"
+install_community_fixture
+[ "$("$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh")" = new ]
+[ "$("$work/home/Applications/Harness Harlot.previous.app/Contents/MacOS/hh")" = current-before-failure ]
+
+echo "hh-update-tool fixtures install Developer ID and ad-hoc updates atomically and roll back post-swap failures"

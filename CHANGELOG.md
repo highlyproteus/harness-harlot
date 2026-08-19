@@ -4,6 +4,15 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.2] - 2026-08-19
+
+### Changed
+
+- macOS community releases now install verified updates from the in-app update
+  button with the same staged swap, rollback, and relaunch flow as Linux.
+- Updates preserve live terminal sessions when the bundled service protocol is
+  unchanged; protocol migrations still wait for sessions to end.
+
 ## [0.1.1] - 2026-08-19
 
 ### Fixed

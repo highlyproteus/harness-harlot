@@ -2,6 +2,11 @@
 set -eu
 
 repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+version=$(
+  cd "$repository_root"
+  cargo metadata --locked --format-version 1 --no-deps |
+    plutil -extract packages.0.version raw -o - -
+)
 case "$(uname -m)" in
   arm64) architecture=arm64 ;;
   x86_64) architecture=x86_64 ;;
@@ -28,11 +33,11 @@ distribution=$(
   HH_ALLOW_DIRTY_TEST_PACKAGE=1 \
   HH_UPDATE_SIGNING_KEY_FILE="$key" \
   HH_UPDATE_PUBLIC_KEY="$public_key" \
-  "$repository_root/scripts/package-macos-release.sh" 0.1.0 1 --community | sed -n '$p'
+  "$repository_root/scripts/package-macos-release.sh" "$version" 1 --community | sed -n '$p'
 )
 
 case "$(basename "$distribution")" in
-  TESTONLY-Harness-Harlot-0.1.0-b1-macos-"$architecture"-community) ;;
+  TESTONLY-Harness-Harlot-"$version"-b1-macos-"$architecture"-community) ;;
   *) echo "community fixture artifact name is not isolated" >&2; exit 1 ;;
 esac
 manifest="$distribution/manifest-macos-community-${architecture}.update.json"
@@ -46,13 +51,18 @@ case "$artifact" in
 esac
 
 app="$repository_root/target/release/Harness Harlot.app"
-if "$app/Contents/MacOS/hh-update-tool" install >"$work/automatic-install.out" 2>&1; then
-  echo "community updater allowed automatic macOS replacement" >&2
+case "$architecture" in
+  arm64) other_architecture=x86_64 ;;
+  x86_64) other_architecture=arm64 ;;
+esac
+if "$app/Contents/MacOS/hh-update-tool" install \
+  --architecture "$other_architecture" --current-version 0.0.0 \
+  >"$work/automatic-install.out" 2>&1; then
+  echo "community updater accepted a non-native architecture" >&2
   exit 1
 fi
-grep -F "automatic update installation is unavailable for unnotarized community macOS builds" \
-  "$work/automatic-install.out" >/dev/null
+grep -F "production update architecture must match" "$work/automatic-install.out" >/dev/null
 HH_SOCKET="$work/no-service.sock" \
   "$app/Contents/MacOS/hh-update-tool" prepare-community-install
 
-echo "community fixture isolates its feed, requires explicit trust, and disables automatic replacement"
+echo "community fixture isolates its feed, requires first-install trust, and enables automatic replacement"

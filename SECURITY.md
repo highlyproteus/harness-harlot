@@ -77,6 +77,7 @@ Suspected key compromise is not an in-band rotation. Publish a new installer tru
 - The stable feed uses a single Ed25519 signing key, not threshold signatures.
 - Rollback cannot restore live processes, SSH authentication, or terminal output.
 - Reproducible byte-identical DMGs are not claimed; signed provenance must accompany any public release as its build record.
-- Community macOS installation explicitly trusts the repository's GitHub
-  Actions provenance and requires a per-app Gatekeeper override; it is not
-  equivalent to Apple notarization.
+- Community macOS first installation explicitly trusts the repository's GitHub
+  Actions provenance and requires a per-app Gatekeeper override. Later in-app
+  updates trust the compiled Ed25519 key plus exact artifact hashing and ad-hoc
+  code-signature integrity; they are not equivalent to Apple notarization.

@@ -21,7 +21,7 @@ use hh_protocol::{
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use hh_updater::fetch::{fetch_available_update, runtime_architecture, runtime_platform};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use hh_updater::{CurrentRelease, TRUSTED_UPDATE_KEYS, automatic_install_supported, current_build};
+use hh_updater::{CurrentRelease, TRUSTED_UPDATE_KEYS, current_build};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 #[cfg(all(target_os = "macos", feature = "browser"))]
@@ -171,8 +171,7 @@ const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AvailableUpdateBanner {
     version: String,
-    requires_quiescent: bool,
-    install_supported: bool,
+    requires_service_restart: bool,
     installing: bool,
 }
 
@@ -182,15 +181,13 @@ impl AvailableUpdateBanner {
     fn label(&self) -> String {
         if self.installing {
             "Updating…".to_owned()
-        } else if self.install_supported {
-            format!("Update to {}", self.version)
         } else {
-            format!("{} available — install manually", self.version)
+            format!("Update to {}", self.version)
         }
     }
 
     fn can_install(&self) -> bool {
-        self.install_supported && !self.installing
+        !self.installing
     }
 }
 struct SessionState {
@@ -640,10 +637,7 @@ impl HhApp {
                                     });
                             let banner = AvailableUpdateBanner {
                                 version: update.version,
-                                requires_quiescent: update.requires_quiescent_service,
-                                install_supported: automatic_install_supported(
-                                    update.artifact.platform.as_str(),
-                                ),
+                                requires_service_restart: update.requires_service_restart,
                                 installing,
                             };
                             if this.editor.update_available.as_ref() != Some(&banner) {
@@ -920,22 +914,21 @@ mod tests {
     };
 
     #[test]
-    fn community_update_banner_is_notify_only() {
-        let community = AvailableUpdateBanner {
+    fn update_banner_starts_install_when_idle() {
+        let available = AvailableUpdateBanner {
             version: "0.2.0".to_owned(),
-            requires_quiescent: true,
-            install_supported: false,
+            requires_service_restart: true,
             installing: false,
         };
-        assert_eq!(community.label(), "0.2.0 available — install manually");
-        assert!(!community.can_install());
+        assert_eq!(available.label(), "Update to 0.2.0");
+        assert!(available.can_install());
 
-        let developer_id = AvailableUpdateBanner {
-            install_supported: true,
-            ..community
+        let installing = AvailableUpdateBanner {
+            installing: true,
+            ..available
         };
-        assert_eq!(developer_id.label(), "Update to 0.2.0");
-        assert!(developer_id.can_install());
+        assert_eq!(installing.label(), "Updating…");
+        assert!(!installing.can_install());
     }
 
     #[test]

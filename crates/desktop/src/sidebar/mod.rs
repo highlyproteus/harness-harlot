@@ -300,21 +300,13 @@ impl HhApp {
         if update.installing {
             return;
         }
-        if !update.install_supported {
-            self.session.connection_error = Some(
-                "This unnotarized community build only notifies about updates; download and run install-community-macos.sh from the GitHub release"
-                    .to_owned(),
-            );
-            cx.notify();
-            return;
-        }
         let has_live_terminals = self.session.snapshot.as_ref().is_some_and(|snapshot| {
             snapshot
                 .workspaces
                 .iter()
                 .any(|workspace| workspace.active_terminal_count > 0)
         });
-        if update.requires_quiescent && has_live_terminals {
+        if update.requires_service_restart && has_live_terminals {
             self.session.connection_error = Some(
                 "Close all terminals, then update — live sessions must end before the service restarts"
                     .to_owned(),

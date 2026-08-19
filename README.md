@@ -70,6 +70,10 @@ gh release download --repo highlyproteus/harness-harlot --pattern install-commun
 chmod +x install-community-macos.sh && ./install-community-macos.sh --acknowledge-unnotarized
 ```
 
+The script is needed only for the first community install. Future macOS and
+Linux releases appear as an in-app **Update** button that verifies the signed
+artifact, swaps the application with rollback, and relaunches automatically.
+
 ### Linux
 
 Download the `.tar.gz` for your architecture from the [latest release](https://github.com/highlyproteus/harness-harlot/releases/latest), or install from the terminal:

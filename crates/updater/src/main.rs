@@ -13,15 +13,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
+#[cfg(target_os = "macos")]
+use hh_updater::TRUSTED_APPLE_TEAM_ID;
 #[cfg(feature = "fixture")]
 use hh_updater::fetch::OwnedUpdate;
 use hh_updater::fetch::{
     download_verified, fetch_available_update, runtime_architecture, runtime_platform,
 };
 use hh_updater::{
-    CurrentRelease, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, TRUSTED_APPLE_TEAM_ID, UpdateManifest,
-    automatic_install_supported, current_build, verify_artifact_file,
-    verify_manifest_with_trusted_keys,
+    CurrentRelease, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, UpdateManifest, current_build,
+    verify_artifact_file, verify_manifest_with_trusted_keys,
 };
 #[cfg(feature = "fixture")]
 use hh_updater::{
@@ -37,6 +38,12 @@ const BUNDLE_ID: &str = "com.harnessharlot.desktop";
 const MACOS_APP_NAME: &str = "Harness Harlot.app";
 #[cfg(target_os = "macos")]
 const MACOS_BACKUP_NAME: &str = "Harness Harlot.previous.app";
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosAppIdentity<'a> {
+    CommunityAdHoc,
+    DeveloperId(&'a str),
+}
 const LINUX_APP_NAME: &str = "harness-harlot";
 const LINUX_BACKUP_NAME: &str = "harness-harlot.previous";
 const LINUX_ARCHIVE_ROOT: &str = "Harness-Harlot";
@@ -186,10 +193,6 @@ fn run_install(arguments: &[String]) -> Result<()> {
         fixture || platform == native_platform,
         "production update platform must match the running system"
     );
-    ensure!(
-        fixture || automatic_install_supported(&platform),
-        "automatic update installation is unavailable for unnotarized community macOS builds; use install-community-macos.sh"
-    );
     let native_architecture = runtime_architecture()?;
     let architecture = optional_string_option(arguments, "--architecture")?
         .unwrap_or_else(|| native_architecture.to_owned());
@@ -225,6 +228,7 @@ fn run_install(arguments: &[String]) -> Result<()> {
         println!("up to date");
         return Ok(());
     };
+    let requires_service_restart = update.requires_service_restart;
 
     let home = env::var_os("HOME")
         .map(PathBuf::from)
@@ -275,23 +279,32 @@ fn run_install(arguments: &[String]) -> Result<()> {
 
     match platform.as_str() {
         "macos" => {
-            let team_id = if fixture {
-                string_option(arguments, "--team-id")?
-            } else {
-                TRUSTED_APPLE_TEAM_ID
-                    .context("update install is not release-configured")?
-                    .to_owned()
-            };
-            ensure!(
-                !team_id.is_empty()
-                    && team_id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
-                "invalid expected Apple Team ID"
-            );
             #[cfg(target_os = "macos")]
             {
-                install_dmg(&package, &prefix, &home, &team_id)
+                let team_id = if fixture {
+                    optional_string_option(arguments, "--team-id")?
+                } else if cfg!(feature = "community-macos") {
+                    None
+                } else {
+                    Some(
+                        TRUSTED_APPLE_TEAM_ID
+                            .context("update install is not release-configured")?
+                            .to_owned(),
+                    )
+                };
+                let identity = if let Some(team_id) = team_id.as_deref() {
+                    ensure!(
+                        !team_id.is_empty()
+                            && team_id
+                                .bytes()
+                                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+                        "invalid expected Apple Team ID"
+                    );
+                    MacosAppIdentity::DeveloperId(team_id)
+                } else {
+                    MacosAppIdentity::CommunityAdHoc
+                };
+                install_dmg(&package, &prefix, &home, identity, requires_service_restart)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -299,7 +312,7 @@ fn run_install(arguments: &[String]) -> Result<()> {
             }
         }
 
-        "linux" => install_linux_archive(&package, &prefix, &home),
+        "linux" => install_linux_archive(&package, &prefix, &home, requires_service_restart),
         _ => bail!("unsupported install platform {platform}"),
     }
 }
@@ -385,7 +398,7 @@ fn run_install_local(arguments: &[String]) -> Result<()> {
         .context("stage local Linux installation")?;
     let encoder = archive.into_inner().context("finish local Linux archive")?;
     encoder.finish().context("finish local Linux compression")?;
-    install_linux_archive(&archive_path, &prefix, &home)
+    install_linux_archive(&archive_path, &prefix, &home, true)
 }
 
 #[cfg(feature = "fixture")]
@@ -419,16 +432,18 @@ fn load_fixture_update(
         Some(OwnedUpdate {
             version: selected.manifest.version.clone(),
             artifact: selected.artifact.clone(),
-            requires_quiescent_service: selected
-                .manifest
-                .session_service
-                .requires_quiescent_service,
+            requires_service_restart: selected.requires_service_restart,
         }),
         Some((artifact_path, selected.artifact.clone())),
     ))
 }
 
-fn install_linux_archive(package: &Path, prefix: &Path, home: &Path) -> Result<()> {
+fn install_linux_archive(
+    package: &Path,
+    prefix: &Path,
+    home: &Path,
+    restart_service: bool,
+) -> Result<()> {
     fs::create_dir_all(prefix)
         .with_context(|| format!("create install prefix {}", prefix.display()))?;
     let bin_directory = home.join(".local/bin");
@@ -481,7 +496,7 @@ fn install_linux_archive(package: &Path, prefix: &Path, home: &Path) -> Result<(
     extract_linux_archive(package, &extraction.path)?;
     let extracted = extraction.path.join(LINUX_ARCHIVE_ROOT);
     validate_linux_install(&extracted)?;
-    if current_installed {
+    if current_installed && restart_service {
         stop_managed_service(&app.join("bin/hh-service"))?;
     }
     let mut old_moved = false;
@@ -898,9 +913,14 @@ fn validate_linux_managed_link(link: &Path, expected_target: &Path) -> Result<bo
     );
     Ok(true)
 }
-
 #[cfg(target_os = "macos")]
-fn install_dmg(dmg: &Path, prefix: &Path, home: &Path, team_id: &str) -> Result<()> {
+fn install_dmg(
+    dmg: &Path,
+    prefix: &Path,
+    home: &Path,
+    identity: MacosAppIdentity<'_>,
+    restart_service: bool,
+) -> Result<()> {
     fs::create_dir_all(prefix)
         .with_context(|| format!("create install prefix {}", prefix.display()))?;
     let bin_directory = home.join(".local/bin");
@@ -909,7 +929,7 @@ fn install_dmg(dmg: &Path, prefix: &Path, home: &Path, team_id: &str) -> Result<
 
     let mut mount = MountedDmg::attach(dmg, TemporaryDirectory::new()?)?;
     let mounted_app = mount.path().join(MACOS_APP_NAME);
-    validate_managed_app(&mounted_app, team_id)?;
+    validate_managed_app(&mounted_app, identity)?;
 
     let app = prefix.join(MACOS_APP_NAME);
     let backup = prefix.join(MACOS_BACKUP_NAME);
@@ -921,14 +941,16 @@ fn install_dmg(dmg: &Path, prefix: &Path, home: &Path, team_id: &str) -> Result<
         [mounted_app.as_os_str(), staging.as_os_str()],
         "stage mounted update app",
     )?;
-    validate_managed_app(&staging, team_id)?;
+    validate_managed_app(&staging, identity)?;
     validate_managed_link(&link, &app)?;
     if path_exists(&app)? {
-        validate_managed_app(&app, team_id)?;
-        stop_managed_service(&app.join("Contents/MacOS/hh-service"))?;
+        validate_managed_app(&app, identity)?;
+        if restart_service {
+            stop_managed_service(&app.join("Contents/MacOS/hh-service"))?;
+        }
     }
     if path_exists(&backup)? {
-        validate_managed_app(&backup, team_id)?;
+        validate_managed_app(&backup, identity)?;
         fs::remove_dir_all(&backup)
             .with_context(|| format!("remove previous backup {}", backup.display()))?;
     }
@@ -958,7 +980,7 @@ fn install_dmg(dmg: &Path, prefix: &Path, home: &Path, team_id: &str) -> Result<
         }
         symlink(app.join("Contents/MacOS/hh"), &link)
             .with_context(|| format!("create command link {}", link.display()))?;
-        validate_managed_app(&app, team_id)?;
+        validate_managed_app(&app, identity)?;
         ensure!(
             path_exists(&link)?,
             "updated command link is missing: {}",
@@ -998,7 +1020,7 @@ fn install_dmg(dmg: &Path, prefix: &Path, home: &Path, team_id: &str) -> Result<
                     .with_context(|| format!("remove staging app {}", staging.display()))?;
             }
             if had_app {
-                validate_managed_app(&app, team_id)?;
+                validate_managed_app(&app, identity)?;
                 ensure!(
                     path_exists(&link)?,
                     "restored command link is missing: {}",
@@ -1027,7 +1049,7 @@ fn install_dmg(dmg: &Path, prefix: &Path, home: &Path, team_id: &str) -> Result<
 }
 
 #[cfg(target_os = "macos")]
-fn validate_managed_app(candidate: &Path, team_id: &str) -> Result<()> {
+fn validate_managed_app(candidate: &Path, identity: MacosAppIdentity<'_>) -> Result<()> {
     let metadata = fs::symlink_metadata(candidate)
         .with_context(|| format!("inspect app {}", candidate.display()))?;
     ensure!(
@@ -1063,20 +1085,52 @@ fn validate_managed_app(candidate: &Path, team_id: &str) -> Result<()> {
         "app has no hh executable: {}",
         candidate.display()
     );
-    let requirement =
-        format!("=anchor apple generic and certificate leaf[subject.OU] = \"{team_id}\"");
-    run_status(
-        "codesign",
-        [
-            "--verify".as_ref(),
-            "--deep".as_ref(),
-            "--strict".as_ref(),
-            "-R".as_ref(),
-            requirement.as_ref(),
-            candidate.as_os_str(),
-        ],
-        "verify app signature and Apple Team ID",
-    )
+    match identity {
+        MacosAppIdentity::CommunityAdHoc => {
+            run_status(
+                "codesign",
+                [
+                    "--verify".as_ref(),
+                    "--deep".as_ref(),
+                    "--strict".as_ref(),
+                    candidate.as_os_str(),
+                ],
+                "verify ad-hoc app signature",
+            )?;
+            let details = run_output(
+                "codesign",
+                ["-d".as_ref(), "--verbose=4".as_ref(), candidate.as_os_str()],
+                "read ad-hoc app signature identity",
+            )?;
+            let details =
+                String::from_utf8(details.stderr).context("decode app signature identity")?;
+            ensure!(
+                details.lines().any(|line| line.trim() == "Signature=adhoc")
+                    && details
+                        .lines()
+                        .any(|line| line.trim() == "TeamIdentifier=not set"),
+                "community update app is not ad-hoc signed: {}",
+                candidate.display()
+            );
+            Ok(())
+        }
+        MacosAppIdentity::DeveloperId(team_id) => {
+            let requirement =
+                format!("=anchor apple generic and certificate leaf[subject.OU] = \"{team_id}\"");
+            run_status(
+                "codesign",
+                [
+                    "--verify".as_ref(),
+                    "--deep".as_ref(),
+                    "--strict".as_ref(),
+                    "-R".as_ref(),
+                    requirement.as_ref(),
+                    candidate.as_os_str(),
+                ],
+                "verify app signature and Apple Team ID",
+            )
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
