@@ -40,7 +40,42 @@ Start the app from the desktop launcher or run:
 ~/.local/bin/hh
 ```
 
-The package includes `hh`, `hh-service`, `hh-update-tool`, the desktop launcher, icon, license notices, and its installer. Browser tabs remain macOS-only; Linux packages contain the native terminal workspace.
+The package includes `hh`, `hh-service`, `hh-update-tool`, `hh-cef-helper`, the pinned CEF runtime, the desktop launcher, icon, license notices, and its installer.
+
+## Chromium browser support
+
+Browser tabs are supported on X11 and on Wayland desktops through XWayland.
+Ubuntu, Fedora, and Arch default desktop installations provide a qualifying
+XWayland session. A browser-enabled build checks `DISPLAY` at process entry; if
+it is non-empty, Harness Harlot removes `WAYLAND_DISPLAY` before GPUI starts so
+GPUI selects its X11 backend and CEF can embed an X11 child window. A
+Wayland-only session without XWayland continues to run terminals and reports
+that browser tabs require X11 or XWayland.
+
+CEF resolves `libcef.so` beside `hh` and `hh-cef-helper` through an `$ORIGIN`
+rpath. This also works when `hh` is launched through the managed
+`~/.local/bin/hh` symlink. Browser profile and cache data stays owner-local
+under `$XDG_STATE_HOME/hh/browser-cache` or
+`~/.local/state/hh/browser-cache`; `HH_STATE_DIR` relocates the state root.
+
+The user-local installer does not install a setuid sandbox helper. Chromium
+therefore uses unprivileged user namespaces. Harness Harlot disables browser
+tabs, without starting a helper or adding `--no-sandbox`, when either
+`apparmor_restrict_unprivileged_userns=1` or
+`unprivileged_userns_clone=0`. Terminal panes remain available.
+
+Install CEF's dynamic runtime dependencies with the distribution packages:
+
+```text
+Ubuntu 22.04: libgtk-3-0 libnss3 libasound2 libgbm1
+Ubuntu 24.04+: libgtk-3-0t64 libnss3 libasound2t64 libgbm1
+Fedora:       gtk3 nss alsa-lib mesa-libgbm
+Arch:         gtk3 nss alsa-lib mesa
+```
+
+The installer and updater run `ldd` against packaged `libcef.so` and print a
+non-fatal warning listing unresolved libraries. A missing optional desktop
+dependency does not invalidate an otherwise authenticated installation.
 
 ## Automatic updates
 
@@ -74,7 +109,18 @@ The release manifest and archive are signed with the same offline Ed25519 update
 - `HH_UPDATE_PUBLIC_KEY`: matching base64 public key
 - `HH_UPDATE_KEY_ID`: production key ID
 - `HH_UPDATE_BASE_URL`: immutable HTTPS release directory
+- `CEF_PATH`: unpacked, architecture-matched Linux CEF distribution
 
-The script refuses a dirty tree and test-only keys/hosts in production. It emits immutable versioned assets plus `manifest-linux-ARCH.update.json` and `.sig` stable aliases under `target/release-dist/linux-ARCH/`.
+The script refuses a dirty tree and test-only keys/hosts in production. It builds
+the desktop with the `browser` feature, packages the CEF runtime flat beside the
+binaries, and emits immutable versioned assets plus
+`manifest-linux-ARCH.update.json` and `.sig` stable aliases under
+`target/release-dist/linux-ARCH/`.
 
-`.github/workflows/release.yml` runs the package job for x86_64 and arm64 inside Ubuntu 22.04 containers, attests the outputs, and publishes them with the macOS assets. Release approval still requires a real Wayland and X11 GPU smoke test on both architectures; container compilation does not replace that visual/runtime gate.
+`.github/workflows/release.yml` downloads and SHA-1-verifies the CEF 151 minimal
+archive pinned to `cef = 151.6.0`, then runs the package job for x86_64 and arm64
+inside Ubuntu 22.04 containers, attests the outputs, and publishes them with the
+macOS assets. CI compiles the Linux browser feature against the same pinned
+archive. Release approval still requires real X11 and Wayland-plus-XWayland GPU
+smoke tests on both architectures; container compilation does not replace that
+visual/runtime gate.

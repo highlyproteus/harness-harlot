@@ -57,6 +57,7 @@ else
   : "${HH_UPDATE_KEY_ID:?set HH_UPDATE_KEY_ID for a publishable package}"
   : "${HH_UPDATE_BASE_URL:?set HH_UPDATE_BASE_URL for a publishable package}"
   : "${HH_RELEASE_TAG:?set HH_RELEASE_TAG to the signed annotated tag for this release}"
+  : "${CEF_PATH:?set CEF_PATH to the unpacked Linux CEF distribution}"
   key_id=$HH_UPDATE_KEY_ID
   base_url=$HH_UPDATE_BASE_URL
   if [ "$key_id" = "test-only-v1" ]; then
@@ -96,7 +97,12 @@ if [ "$test_mode" != 1 ]; then
   fi
 fi
 
-cargo build --locked --release -p hh-desktop --bin hh
+if [ "$test_mode" = 1 ]; then
+  cargo build --locked --release -p hh-desktop --bin hh
+else
+  cargo build --locked --release -p hh-desktop --features browser --bin hh
+  cargo build --locked --release -p hh-cef-view --features cef --bin hh-cef-helper
+fi
 cargo build --locked --release -p hh-session-service --bin hh-service
 updater_features=fetch
 if [ "$test_mode" = 1 ]; then
@@ -125,6 +131,40 @@ install -m 0755 "$repository_root/packaging/linux/install.sh" "$root/install.sh"
 install -m 0755 "$release_binary_directory/hh" "$root/bin/hh"
 install -m 0755 "$release_binary_directory/hh-service" "$root/bin/hh-service"
 install -m 0755 "$release_binary_directory/hh-update-tool" "$root/bin/hh-update-tool"
+if [ "$test_mode" != 1 ]; then
+  install -m 0755 "$release_binary_directory/hh-cef-helper" "$root/bin/hh-cef-helper"
+  cef_release_directory=$CEF_PATH
+  cef_resources_directory=$CEF_PATH
+  if [ -f "$CEF_PATH/Release/libcef.so" ]; then
+    cef_release_directory="$CEF_PATH/Release"
+    cef_resources_directory="$CEF_PATH/Resources"
+  elif [ ! -f "$CEF_PATH/libcef.so" ]; then
+    echo "CEF_PATH contains neither libcef.so nor Release/libcef.so: $CEF_PATH" >&2
+    exit 2
+  fi
+  for cef_directory in "$cef_release_directory" "$cef_resources_directory"; do
+    [ -d "$cef_directory" ] || continue
+    for cef_file in "$cef_directory"/*; do
+      [ -f "$cef_file" ] || continue
+      cef_name=$(basename "$cef_file")
+      if [ "$cef_name" = chrome-sandbox ]; then
+        install -m 0755 "$cef_file" "$root/bin/$cef_name"
+      else
+        install -m 0644 "$cef_file" "$root/bin/$cef_name"
+      fi
+    done
+  done
+  if [ -d "$cef_resources_directory/locales" ]; then
+    mkdir -p "$root/bin/locales"
+    for cef_locale in "$cef_resources_directory/locales"/*; do
+      [ -f "$cef_locale" ] || continue
+      install -m 0644 "$cef_locale" "$root/bin/locales/$(basename "$cef_locale")"
+    done
+  fi
+  test -f "$root/bin/libcef.so"
+  test -f "$root/bin/icudtl.dat"
+  test -d "$root/bin/locales"
+fi
 install -m 0644 "$repository_root/packaging/linux/com.harnessharlot.desktop.desktop" "$root/share/applications/com.harnessharlot.desktop.desktop"
 install -m 0644 "$repository_root/packaging/linux/com.harnessharlot.desktop.png" "$root/share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png"
 install -m 0644 "$repository_root/LICENSE" "$root/share/licenses/harness-harlot/LICENSE"

@@ -18,13 +18,21 @@ The project aims to acknowledge a complete report within 7 days, coordinate a fi
 
 Harness Harlot is an unsandboxed terminal emulator. It intentionally starts shells, creates PTYs, accesses the user's files, and can run SSH and tmux. Hardened runtime and minimal entitlements reduce ambient risk; they do not turn a terminal into a sandbox.
 
+CEF renderer, GPU, and utility subprocesses remain inside Chromium's sandbox.
+macOS uses the bundled CEF sandbox integration. User-local Linux packages rely
+on unprivileged user namespaces because they cannot install a setuid
+`chrome-sandbox`; browser tabs are disabled when the kernel restricts those
+namespaces. Harness Harlot never falls back to `--no-sandbox`. Browser profile
+data is local under the owner-only application-state directory's
+`browser-cache` subtree.
+
 Processes running as the same local user are not a security boundary. Socket ownership, permissions, peer credentials, frame bounds, and timeouts provide defense in depth against cross-account access and confused-deputy failures. A malicious process already running as the user can access that user's files and interfere with their terminal sessions.
 
 Terminal history is stored on-device under the Harness Harlot application-state directory. It is enabled by default with the product's existing indefinite, 5-GiB policy. PTY output can include echoed commands and secrets printed by programs. File permissions and storage validation reduce accidental exposure; terminal output cannot be reliably scrubbed of secrets.
 
 History chunk checksums detect accidental corruption and bit rot. They are not cryptographic tamper evidence against a process running as the user.
 
-First-party Rust denies `unsafe_code` workspace-wide. Item-level allows are confined to two macOS bridge crates: seven sites in `crates/cef-view/src/cef_impl.rs` for Objective-C runtime bridging behind the `cef` feature, and four sites in `crates/macos-icon/src/lib.rs` for AppKit/Foundation calls. Every site has a local `SAFETY` justification; third-party dependencies may contain unsafe code.
+First-party Rust denies `unsafe_code` workspace-wide. Item-level allows are limited to seven Objective-C bridge sites in `crates/cef-view/src/cef_macos.rs`, four AppKit/Foundation sites in `crates/macos-icon/src/lib.rs`, and the process-entry Linux environment update that selects GPUI's X11 backend in `crates/desktop/src/browser.rs`. Every site has a local `SAFETY` justification; third-party dependencies may contain unsafe code.
 
 ## Release trust status
 
@@ -44,9 +52,10 @@ two deliberately isolated trust modes:
    configured after paid Developer Program enrollment.
 
 The feeds and artifact names differ, preventing a Developer ID client from
-selecting a community DMG or the reverse. App bundles contain `hh`,
-`hh-service`, and `hh-update-tool`; release signing tools and fixture keys are
-never bundled.
+selecting a community DMG or the reverse. macOS app bundles contain `hh`,
+`hh-service`, and `hh-update-tool`. Linux archives additionally contain
+`hh-cef-helper` and the pinned CEF runtime. Release signing tools and fixture
+keys are never bundled.
 
 ## Release-key rotation
 
