@@ -3,7 +3,7 @@ set -eu
 
 # Release engineering must set both values before publishing this script.
 EXPECTED_TEAM_ID=''
-UPDATE_BASE_URL='https://github.com/HighlyProtean/harness-harlot/releases/download'
+UPDATE_BASE_URL='https://github.com/highlyproteus/harness-harlot/releases/download'
 BUNDLE_ID='com.harnessharlot.desktop'
 
 usage() {

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPOSITORY='HighlyProtean/harness-harlot'
+REPOSITORY='highlyproteus/harness-harlot'
 BUNDLE_ID='com.harnessharlot.desktop'
 
 usage() {

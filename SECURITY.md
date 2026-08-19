@@ -10,7 +10,7 @@
 
 ## Reporting a vulnerability
 
-Use [GitHub private vulnerability reporting](https://github.com/HighlyProtean/harness-harlot/security/advisories/new) on the release mirror. Do not open a public issue for an unpatched vulnerability. Include the affected version, reproduction steps, impact, and any proposed mitigation.
+Use [GitHub private vulnerability reporting](https://github.com/highlyproteus/harness-harlot/security/advisories/new) on the release mirror. Do not open a public issue for an unpatched vulnerability. Include the affected version, reproduction steps, impact, and any proposed mitigation.
 
 The project aims to acknowledge a complete report within 7 days, coordinate a fix and release, and publish a disclosure within 90 days. Active exploitation or broad user risk may require a shorter timeline.
 

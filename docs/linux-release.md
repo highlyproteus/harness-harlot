@@ -14,7 +14,7 @@ GitHub Actions publishes a build-provenance attestation for every asset. Verify 
 
 ```bash
 gh attestation verify Harness-Harlot-*-linux-*.tar.gz \
-  --repo HighlyProtean/harness-harlot
+  --repo highlyproteus/harness-harlot
 ```
 
 Then extract and run the unprivileged installer:

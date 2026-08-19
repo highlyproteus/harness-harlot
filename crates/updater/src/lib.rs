@@ -78,7 +78,7 @@ pub const UPDATE_HOST: Option<&str> = Some("github.com");
 /// Stable manifest location; `releases/latest/download` resolves to the
 /// newest non-prerelease GitHub release without knowing its tag.
 pub const UPDATE_MANIFEST_BASE: Option<&str> =
-    Some("https://github.com/HighlyProtean/harness-harlot/releases/latest/download");
+    Some("https://github.com/highlyproteus/harness-harlot/releases/latest/download");
 /// Apple Developer Team ID, required by the in-app installer gate. Stays
 /// fail-closed (None) until Apple Developer Program enrollment completes.
 pub const TRUSTED_APPLE_TEAM_ID: Option<&str> = None;

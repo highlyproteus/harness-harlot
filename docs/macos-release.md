@@ -198,15 +198,15 @@ Ordered owner steps from a staged repository to a real no-cost release:
 
 1. **Add the repository SSH key.** Add `~/.ssh/highly_ssh.pub` to both
    gitlab.com → Preferences → SSH Keys on the `highlyproteus` account and
-   github.com → Settings → SSH keys on the `HighlyProtean` account.
+   github.com → Settings → SSH keys on the `highlyproteus` account.
 2. **Create both repositories.** Create
    `gitlab.com/highlyproteus/harness-harlot` as the canonical source and
-   `github.com/HighlyProtean/harness-harlot` as the downstream release mirror.
+   `github.com/highlyproteus/harness-harlot` as the downstream release mirror.
    Local `origin` points to GitLab; the read-only `github` remote exists only
    for inspection and release diagnostics.
 3. **Configure the GitLab push mirror.** Under GitLab **Settings → Repository →
    Mirroring repositories**, push-mirror to
-   `https://github.com/HighlyProtean/harness-harlot.git`. Authenticate with a
+   `https://github.com/highlyproteus/harness-harlot.git`. Authenticate with a
    narrowly scoped GitHub fine-grained token granting repository Contents and
    Workflows read/write. Do not push commits directly to the GitHub mirror.
 4. **Commit and push the canonical repository.** Run
