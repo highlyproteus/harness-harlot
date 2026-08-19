@@ -1,40 +1,46 @@
 //! Embedded browser panes: CEF wiring, URL editing, and navigation.
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use anyhow::Context as _;
 #[cfg(all(target_os = "macos", feature = "browser"))]
+use gpui::Window;
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use gpui::canvas;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, div, px, rgb,
 };
-#[cfg(all(target_os = "macos", feature = "browser"))]
-use gpui::{AppContext, Image, ImageFormat, Window};
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+use gpui::{AppContext, Image, ImageFormat};
 use hh_protocol::{ClientRequest, Pane, PaneKind, ServiceResponse};
 #[cfg(all(target_os = "macos", feature = "browser"))]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use std::cell::RefCell;
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use std::collections::HashSet;
 #[cfg(all(target_os = "macos", feature = "browser"))]
 use std::ffi::c_void;
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use std::rc::Rc;
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+use std::sync::Arc;
 #[cfg(all(target_os = "macos", feature = "browser"))]
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
+#[cfg(all(target_os = "linux", feature = "browser"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::PANE_HEADER_HEIGHT;
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::helpers::split_placement_at;
 use crate::helpers::{
     collect_terminal_tabs, element_key, find_pane, workspace_tab_standalone_pane,
 };
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::session::session_call;
 use crate::view_models::Modal;
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::view_models::{DragDestination, PaneDrag, TabDrag};
 use crate::{HhApp, THEME};
 use uuid::Uuid;
@@ -47,7 +53,7 @@ pub(crate) struct BrowserUrlEditor {
     pub(crate) invalid: bool,
 }
 
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub(crate) struct BrowserShared {
@@ -60,7 +66,7 @@ pub(crate) struct BrowserShared {
     pub(crate) dirty: bool,
 }
 
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 #[derive(Debug)]
 pub(crate) struct BrowserPaneView {
     pub(crate) pane: Rc<hh_cef_view::BrowserPane>,
@@ -74,16 +80,61 @@ pub(crate) struct BrowserPaneView {
 }
 
 #[cfg(all(target_os = "macos", feature = "browser"))]
-pub(crate) static BROWSER_COMMAND_AVAILABLE: LazyLock<bool> = LazyLock::new(hh_cef_view::preflight);
+static BROWSER_COMMAND_AVAILABLE: LazyLock<bool> = LazyLock::new(hh_cef_view::preflight);
+
+#[cfg(all(target_os = "linux", feature = "browser"))]
+static BROWSER_X11_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(target_os = "macos", feature = "browser"))]
 pub(crate) fn browser_command_available() -> bool {
     *BROWSER_COMMAND_AVAILABLE
 }
 
-#[cfg(not(all(target_os = "macos", feature = "browser")))]
+#[cfg(all(target_os = "linux", feature = "browser"))]
+pub(crate) fn browser_command_available() -> bool {
+    BROWSER_X11_AVAILABLE.load(Ordering::Acquire)
+        && hh_cef_view::preflight()
+        && hh_cef_view::sandbox_available()
+}
+
+#[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
 pub(crate) fn browser_command_available() -> bool {
     false
+}
+
+#[cfg(all(target_os = "linux", feature = "browser"))]
+pub(crate) fn configure_linux_browser_backend() {
+    let x11_available = std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty());
+    BROWSER_X11_AVAILABLE.store(x11_available, Ordering::Release);
+    if x11_available {
+        // SAFETY: This runs at process entry, before GPUI starts worker threads
+        // or reads the compositor environment.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "browser"))]
+pub(crate) fn browser_unavailable_reason() -> &'static str {
+    "Browser tabs require the bundled macOS app"
+}
+
+#[cfg(all(target_os = "linux", feature = "browser"))]
+pub(crate) fn browser_unavailable_reason() -> &'static str {
+    if !BROWSER_X11_AVAILABLE.load(Ordering::Acquire) {
+        "Browser tabs require an X11 or XWayland session"
+    } else if !hh_cef_view::sandbox_available() {
+        "Browser tabs require unprivileged user namespaces; this kernel restricts them"
+    } else {
+        "Browser tabs require the packaged Linux install"
+    }
+}
+
+#[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
+pub(crate) fn browser_unavailable_reason() -> &'static str {
+    "Browser tabs require the bundled macOS app"
 }
 
 #[cfg(all(target_os = "macos", feature = "browser"))]
@@ -106,7 +157,12 @@ pub(crate) fn prepare_cef_process() {
     hh_cef_view::install_nsapp_protocol();
 }
 
-#[cfg(not(all(target_os = "macos", feature = "browser")))]
+#[cfg(all(target_os = "linux", feature = "browser"))]
+pub(crate) fn prepare_cef_process() {
+    let _ = hh_cef_view::preflight();
+}
+
+#[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
 pub(crate) fn prepare_cef_process() {}
 
 impl HhApp {
@@ -153,8 +209,7 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) {
         if !browser_command_available() {
-            self.session.connection_error =
-                Some("Browser tabs require the bundled macOS app".to_owned());
+            self.session.connection_error = Some(browser_unavailable_reason().to_owned());
             self.editor.modal = Modal::None;
             cx.notify();
             return;
@@ -333,7 +388,7 @@ impl HhApp {
             },
             Box::new(move |this, cx, result| match result {
                 Ok(ServiceResponse::Ack) => {
-                    #[cfg(all(target_os = "macos", feature = "browser"))]
+                    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
                     if let Some(view) = this.browser.browser_views.get(&pane_id) {
                         view.pane.navigate(&url);
                     }
@@ -347,27 +402,27 @@ impl HhApp {
         );
     }
     pub(crate) fn browser_back(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        #[cfg(all(target_os = "macos", feature = "browser"))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         if let Some(view) = self.browser.browser_views.get(&pane_id) {
             view.pane.back();
         }
-        #[cfg(not(all(target_os = "macos", feature = "browser")))]
+        #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
         let _ = pane_id;
         cx.notify();
     }
 
     pub(crate) fn browser_forward(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        #[cfg(all(target_os = "macos", feature = "browser"))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         if let Some(view) = self.browser.browser_views.get(&pane_id) {
             view.pane.forward();
         }
-        #[cfg(not(all(target_os = "macos", feature = "browser")))]
+        #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
         let _ = pane_id;
         cx.notify();
     }
 
     pub(crate) fn browser_reload(&mut self, pane_id: Uuid, loading: bool, cx: &mut Context<Self>) {
-        #[cfg(all(target_os = "macos", feature = "browser"))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         if let Some(view) = self.browser.browser_views.get(&pane_id) {
             if loading {
                 view.pane.stop();
@@ -375,19 +430,22 @@ impl HhApp {
                 view.pane.reload();
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "browser")))]
+        #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
         let _ = (pane_id, loading);
         cx.notify();
     }
 
-    #[cfg(all(target_os = "macos", feature = "browser"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn ensure_browser_view(
         &mut self,
         pane_id: Uuid,
         url: &str,
         width: f32,
         height: f32,
+        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
+        let _ = cx;
         if !self.browser.browser_runtime_initialized {
             let cache_dir = hh_protocol::state_directory()
                 .ok_or_else(|| anyhow::anyhow!("app state directory is unavailable"))?
@@ -397,8 +455,31 @@ impl HhApp {
             hh_cef_view::init_runtime(&cache_dir)?;
             self.browser.browser_runtime_initialized = true;
             self.browser.browser_runtime_error = None;
+            #[cfg(target_os = "linux")]
+            cx.spawn(async move |this, cx| {
+                loop {
+                    gpui::Timer::after(std::time::Duration::from_millis(10)).await;
+                    let keep_pumping = this
+                        .update(cx, |this, _| {
+                            if this.browser.browser_runtime_initialized {
+                                hh_cef_view::pump_runtime();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if !keep_pumping {
+                        break;
+                    }
+                }
+            })
+            .detach();
         }
-        if !self.browser.browser_views.contains_key(&pane_id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.browser.browser_views.entry(pane_id)
+        {
+            #[cfg(target_os = "macos")]
             let parent_view = self
                 .browser
                 .browser_parent_view
@@ -452,30 +533,31 @@ impl HhApp {
                     }
                 }),
             };
+            let rect = hh_cef_view::BrowserRect {
+                x: 0.0,
+                y: 0.0,
+                width: width.max(1.0),
+                height: (height - PANE_HEADER_HEIGHT - 38.0).max(1.0),
+            };
+            #[cfg(target_os = "macos")]
             let browser = Rc::new(hh_cef_view::BrowserPane::create(
                 parent_view,
-                hh_cef_view::BrowserRect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: width.max(1.0),
-                    height: (height - PANE_HEADER_HEIGHT - 38.0).max(1.0),
-                },
+                rect,
                 url,
                 callbacks,
             )?);
-            self.browser.browser_views.insert(
-                pane_id,
-                BrowserPaneView {
-                    pane: browser,
-                    shared,
-                    last_snapshot_url: url.to_owned(),
-                    synced_url: url.to_owned(),
-                    synced_title: None,
-                    focused: false,
-                    pending_state: None,
-                    in_flight_state: None,
-                },
-            );
+            #[cfg(target_os = "linux")]
+            let browser = Rc::new(hh_cef_view::BrowserPane::create(rect, url, callbacks)?);
+            entry.insert(BrowserPaneView {
+                pane: browser,
+                shared,
+                last_snapshot_url: url.to_owned(),
+                synced_url: url.to_owned(),
+                synced_title: None,
+                focused: false,
+                pending_state: None,
+                in_flight_state: None,
+            });
         }
         if let Some(view) = self.browser.browser_views.get_mut(&pane_id) {
             if view.last_snapshot_url != url {
@@ -487,7 +569,7 @@ impl HhApp {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "browser"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn sync_browser_view_presentation(&mut self, visible: &HashSet<Uuid>) {
         let content_visible =
             matches!(self.editor.modal, Modal::None) && self.layout.dragging_pane.is_none();
@@ -506,7 +588,7 @@ impl HhApp {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "browser"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn sync_browser_callback_state(&mut self) -> bool {
         let browser_ids = self
             .session
@@ -560,7 +642,7 @@ impl HhApp {
         changed
     }
 
-    #[cfg(all(target_os = "macos", feature = "browser"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn flush_browser_state_updates(&mut self, cx: &mut Context<Self>) {
         let updates = self
             .browser
@@ -664,12 +746,12 @@ impl HhApp {
         .detach();
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "browser")))]
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
     pub(crate) fn sync_browser_callback_state(&mut self) -> bool {
         false
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "browser")))]
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
     pub(crate) fn flush_browser_state_updates(&mut self, _cx: &mut Context<Self>) {}
 
     pub(crate) fn render_browser_toolbar(
@@ -833,7 +915,7 @@ impl HhApp {
             .into_any_element()
     }
 
-    #[cfg(all(target_os = "macos", feature = "browser"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn browser_views_url(&self, pane_id: Uuid) -> Option<String> {
         self.browser
             .browser_views
@@ -848,7 +930,7 @@ impl HhApp {
             })
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "browser")))]
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
     pub(crate) fn browser_views_url(&self, pane_id: Uuid) -> Option<String> {
         self.pane_metadata(pane_id)
             .and_then(|pane| match pane.kind {
@@ -857,7 +939,7 @@ impl HhApp {
             })
     }
 
-    #[cfg(all(target_os = "macos", feature = "browser"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn render_browser_workspace(
         &mut self,
         pane: &Pane,
@@ -885,7 +967,7 @@ impl HhApp {
                         .into_any_element();
                 }
             };
-        if let Err(error) = self.ensure_browser_view(pane.id, &url, width, height) {
+        if let Err(error) = self.ensure_browser_view(pane.id, &url, width, height, cx) {
             self.browser.browser_runtime_error = Some(format!("{error:#}"));
         }
         let state = self.browser.browser_views.get(&pane.id).map(|view| {
@@ -1000,7 +1082,7 @@ impl HhApp {
             .into_any_element()
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "browser")))]
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
     pub(crate) fn render_browser_workspace(
         &mut self,
         pane: &Pane,
@@ -1040,9 +1122,7 @@ impl HhApp {
                 div()
                     .min_h(px(0.0))
                     .flex_1()
-                    .child(self.render_browser_placeholder(
-                        "Browser tabs require the bundled macOS Chromium build",
-                    )),
+                    .child(self.render_browser_placeholder(browser_unavailable_reason())),
             )
             .into_any_element()
     }

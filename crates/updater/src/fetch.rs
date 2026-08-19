@@ -173,7 +173,8 @@ pub fn download_verified(update: &OwnedUpdate, dest_dir: &Path) -> Result<PathBu
 
     let result = (|| -> Result<()> {
         let response = ureq::AgentBuilder::new()
-            .timeout(NETWORK_TIMEOUT)
+            .timeout_connect(NETWORK_TIMEOUT)
+            .timeout_read(NETWORK_TIMEOUT)
             .https_only(true)
             .build()
             .get(&update.artifact.url)

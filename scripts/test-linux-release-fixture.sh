@@ -27,7 +27,7 @@ HH_UPDATE_PUBLIC_KEY="$public_key" \
   "$repository_root/scripts/package-linux-release.sh" 0.1.0 97 >/dev/null
 
 case "$(uname -m)" in
-  aarch64) architecture=arm64 ;;
+  aarch64 | arm64) architecture=arm64 ;;
   x86_64) architecture=x86_64 ;;
   *) echo "unsupported Linux test architecture" >&2; exit 1 ;;
 esac
@@ -72,6 +72,10 @@ for required in \
 do
   grep -Fx "$required" "$archive_list" >/dev/null
 done
+if grep -Fx "Harness-Harlot/bin/libcef.so" "$archive_list" >/dev/null; then
+  echo "CEF runtime leaked into the CEF-free Linux release fixture" >&2
+  exit 1
+fi
 if tar -tvzf "$artifact" | grep -E '^[lhcbps]' >/dev/null; then
   echo "Linux release archive contains a link or special file" >&2
   exit 1

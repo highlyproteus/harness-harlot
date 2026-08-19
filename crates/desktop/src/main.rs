@@ -64,8 +64,12 @@ mod view_models;
 
 use agent_icons::{AgentIconAssets, CustomIcon, load_custom_icons};
 use appearance::BannerArtwork;
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+use browser::BrowserPaneView;
+#[cfg(all(target_os = "linux", feature = "browser"))]
+use browser::configure_linux_browser_backend;
 #[cfg(all(target_os = "macos", feature = "browser"))]
-use browser::{BrowserPaneView, native_nsview};
+use browser::native_nsview;
 use browser::{BrowserUrlEditor, prepare_cef_process};
 use commands::{AppConfig, ROOT_KEY_CONTEXT, ResolvedKeymap};
 use helpers::{
@@ -362,21 +366,33 @@ impl EditorUi {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 struct BrowserUi {
     browser_views: HashMap<Uuid, BrowserPaneView>,
+    #[cfg(target_os = "macos")]
     browser_parent_view: Option<*mut c_void>,
     browser_runtime_initialized: bool,
     browser_runtime_error: Option<String>,
     cef_shutdown_subscription: Option<gpui::Subscription>,
 }
 
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 impl BrowserUi {
+    #[cfg(target_os = "macos")]
     fn new(browser_parent_view: Option<*mut c_void>) -> Self {
         Self {
             browser_views: HashMap::new(),
             browser_parent_view,
+            browser_runtime_initialized: false,
+            browser_runtime_error: None,
+            cef_shutdown_subscription: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn new() -> Self {
+        Self {
+            browser_views: HashMap::new(),
             browser_runtime_initialized: false,
             browser_runtime_error: None,
             cef_shutdown_subscription: None,
@@ -395,7 +411,7 @@ struct HhApp {
     sidebar: SidebarUi,
     layout: LayoutUi,
     editor: EditorUi,
-    #[cfg(all(target_os = "macos", feature = "browser"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     browser: BrowserUi,
 }
 
@@ -488,6 +504,8 @@ impl HhApp {
             editor: EditorUi::new(workspace_input_focus),
             #[cfg(all(target_os = "macos", feature = "browser"))]
             browser: BrowserUi::new(browser_parent_view),
+            #[cfg(all(target_os = "linux", feature = "browser"))]
+            browser: BrowserUi::new(),
         };
         app.update_window_geometry(window);
         app.initial_state_fetch(cx);
@@ -507,7 +525,7 @@ impl HhApp {
             pipeline::PipelineLane::from_receiver(control_rx),
             |app: &HhApp| &app.session.control_client,
         );
-        #[cfg(all(target_os = "macos", feature = "browser"))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         {
             app.browser.cef_shutdown_subscription = Some(cx.on_app_quit(|this, _| {
                 this.browser.browser_views.clear();
@@ -839,6 +857,8 @@ fn install_panic_log() {
 
 fn main() {
     install_panic_log();
+    #[cfg(all(target_os = "linux", feature = "browser"))]
+    configure_linux_browser_backend();
     prepare_cef_process();
     let development_build = development_build();
     let product_name = product_name(development_build);

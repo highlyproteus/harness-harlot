@@ -519,6 +519,7 @@ fn install_linux_archive(package: &Path, prefix: &Path, home: &Path) -> Result<(
                 .with_context(|| format!("install integration link {}", link.display()))?;
         }
         validate_linux_install(&app)?;
+        warn_missing_linux_cef_dependencies(&app);
         for (link, target, _, _) in &links {
             ensure!(
                 validate_linux_managed_link(link, target)?,
@@ -625,7 +626,7 @@ fn extract_linux_archive(package: &Path, destination: &Path) -> Result<()> {
                 .to_str()
                 .context("Linux update archive path is not UTF-8")?;
             ensure!(
-                expected.contains(relative_text),
+                linux_install_file_allowed(relative_text, &expected),
                 "Linux update archive contains unexpected file {relative_text}"
             );
             unpacked_bytes = unpacked_bytes
@@ -645,15 +646,17 @@ fn extract_linux_archive(package: &Path, destination: &Path) -> Result<()> {
         );
     }
     ensure!(
-        extracted.len() == expected.len(),
+        expected.iter().all(|path| extracted.contains(*path)),
         "Linux update archive is missing required files"
     );
+    validate_linux_cef_files(&extracted)?;
     Ok(())
 }
 
 fn linux_install_directories() -> HashSet<&'static str> {
     [
         "bin",
+        "bin/locales",
         "share",
         "share/applications",
         "share/icons",
@@ -683,6 +686,48 @@ fn linux_install_files() -> HashSet<&'static str> {
     ]
     .into_iter()
     .collect()
+}
+
+fn linux_install_file_allowed(relative: &str, required: &HashSet<&str>) -> bool {
+    if required.contains(relative) {
+        return true;
+    }
+    let Some(bin_path) = relative.strip_prefix("bin/") else {
+        return false;
+    };
+    !bin_path.is_empty()
+        && (!bin_path.contains('/')
+            || bin_path
+                .strip_prefix("locales/")
+                .is_some_and(|locale| !locale.is_empty() && !locale.contains('/')))
+}
+
+fn validate_linux_cef_files(files: &HashSet<String>) -> Result<()> {
+    let cef_present = files.contains("bin/libcef.so") || files.contains("bin/hh-cef-helper");
+    if !cef_present {
+        return Ok(());
+    }
+    for required in [
+        "bin/hh-cef-helper",
+        "bin/libcef.so",
+        "bin/icudtl.dat",
+        "bin/v8_context_snapshot.bin",
+    ] {
+        ensure!(
+            files.contains(required),
+            "Linux browser package is missing {required}"
+        );
+    }
+    ensure!(
+        files.iter().any(|path| {
+            path.starts_with("bin/locales/")
+                && Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pak"))
+        }),
+        "Linux browser package has no CEF locales"
+    );
+    Ok(())
 }
 
 fn validate_linux_install(app: &Path) -> Result<()> {
@@ -738,7 +783,7 @@ fn validate_linux_install(app: &Path) -> Result<()> {
                 .context("application path is not UTF-8")?
                 .to_owned();
             ensure!(
-                expected.contains(relative.as_str()),
+                linux_install_file_allowed(&relative, &expected),
                 "application contains unexpected file {relative}"
             );
             ensure!(
@@ -748,7 +793,12 @@ fn validate_linux_install(app: &Path) -> Result<()> {
             );
             if !matches!(
                 relative.as_str(),
-                "install.sh" | "bin/hh" | "bin/hh-service" | "bin/hh-update-tool"
+                "install.sh"
+                    | "bin/hh"
+                    | "bin/hh-service"
+                    | "bin/hh-update-tool"
+                    | "bin/hh-cef-helper"
+                    | "bin/chrome-sandbox"
             ) {
                 ensure!(
                     metadata.mode() & 0o111 == 0,
@@ -762,9 +812,10 @@ fn validate_linux_install(app: &Path) -> Result<()> {
         }
     }
     ensure!(
-        discovered.len() == expected.len(),
+        expected.iter().all(|path| discovered.contains(*path)),
         "application is missing required files"
     );
+    validate_linux_cef_files(&discovered)?;
     for executable in [
         "install.sh",
         "bin/hh",
@@ -778,6 +829,17 @@ fn validate_linux_install(app: &Path) -> Result<()> {
             "application executable {executable} is not executable"
         );
     }
+    for executable in ["bin/hh-cef-helper", "bin/chrome-sandbox"] {
+        let path = app.join(executable);
+        if path.is_file() {
+            let metadata = fs::metadata(&path)
+                .with_context(|| format!("inspect application executable {executable}"))?;
+            ensure!(
+                metadata.mode() & 0o111 != 0,
+                "application executable {executable} is not executable"
+            );
+        }
+    }
     let marker = fs::read_to_string(app.join("share/harness-harlot/install-id"))
         .context("read application install marker")?;
     ensure!(
@@ -785,6 +847,37 @@ fn validate_linux_install(app: &Path) -> Result<()> {
         "application install marker is invalid"
     );
     Ok(())
+}
+
+fn warn_missing_linux_cef_dependencies(app: &Path) {
+    let libcef = app.join("bin/libcef.so");
+    if !libcef.is_file() {
+        return;
+    }
+    let output = match Command::new("ldd").arg(&libcef).output() {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("warning: could not inspect CEF runtime dependencies with ldd: {error}");
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let missing = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| line.contains("not found"))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    eprintln!("warning: CEF runtime dependencies are missing:");
+    for dependency in missing {
+        eprintln!("  {dependency}");
+    }
+    eprintln!(
+        "install the distribution's GTK3/NSS/ALSA/GBM packages (Ubuntu 22.04: libgtk-3-0 libnss3 libasound2 libgbm1; Ubuntu 24.04+: libgtk-3-0t64 libnss3 libasound2t64 libgbm1; Fedora: gtk3 nss alsa-lib mesa-libgbm; Arch: gtk3 nss alsa-lib mesa)"
+    );
 }
 
 fn validate_linux_managed_link(link: &Path, expected_target: &Path) -> Result<bool> {
@@ -1255,6 +1348,24 @@ mod tests {
                 .to_string()
                 .contains("application contains unexpected directory unexpected")
         );
+    }
+
+    #[test]
+    fn linux_browser_runtime_requires_helper_data_and_locale() {
+        let mut files = HashSet::from(["bin/libcef.so".to_owned()]);
+        assert!(validate_linux_cef_files(&files).is_err());
+
+        files.extend(
+            [
+                "bin/hh-cef-helper",
+                "bin/icudtl.dat",
+                "bin/v8_context_snapshot.bin",
+                "bin/locales/en-US.pak",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        validate_linux_cef_files(&files).unwrap();
     }
 
     #[test]

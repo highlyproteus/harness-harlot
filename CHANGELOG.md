@@ -11,7 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Persistent terminal workstations with restartable native desktop views, split panes, and daemon-owned local shell sessions.
 - SSH workstations through system OpenSSH and local or remote tmux session attachment.
 - On-device terminal history archival with recovery, integrity checks, search, and bounded storage controls.
-- Chromium browser tabs in both Developer ID and unnotarized community macOS application bundles.
+- Chromium browser tabs in both macOS application bundles and packaged Linux
+  releases through X11 or XWayland.
 - An Ed25519-signed update channel with CPU-specific artifacts, desktop update
   notifications, one-click or command-line installation for trusted
   Developer ID/Linux packages, and notify-only community macOS updates.

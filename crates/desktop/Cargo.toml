@@ -39,6 +39,7 @@ hh-updater = { path = "../updater", features = ["fetch"] }
 raw-window-handle.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+hh-cef-view = { path = "../cef-view", optional = true }
 hh-updater = { path = "../updater", features = ["fetch"] }
 
 [dev-dependencies]

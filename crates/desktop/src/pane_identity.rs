@@ -219,7 +219,7 @@ impl HhApp {
                 .into_any_element();
         }
         if pane.kind.is_browser() {
-            #[cfg(all(target_os = "macos", feature = "browser"))]
+            #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
             if let Some(favicon) = self
                 .browser
                 .browser_views

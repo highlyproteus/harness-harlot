@@ -3,31 +3,22 @@
 #![allow(clippy::transmute_ptr_to_ptr)]
 
 use std::cell::RefCell;
-use std::ffi::c_void;
-use std::path::{Path, PathBuf};
 use std::rc::{Rc as StdRc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, ensure};
+use anyhow::ensure;
 use cef::*;
-use dispatch2::{DispatchQueue, DispatchTime};
 use image::ImageEncoder as _;
-use objc2::ffi;
-use objc2::msg_send;
-use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
-use objc2::{MainThreadMarker, ProtocolType as _, sel};
-use objc2_app_kit::NSView;
-use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 use super::{BrowserRect, Callbacks};
+#[cfg(target_os = "linux")]
+use crate::cef_linux as platform;
+#[cfg(target_os = "macos")]
+use crate::cef_macos as platform;
 
-static PROTOCOL_INSTALL: Once = Once::new();
-static HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
-static TERMINATED: AtomicBool = AtomicBool::new(false);
-static LIBRARY: OnceLock<library_loader::LibraryLoader> = OnceLock::new();
+pub(crate) static INITIALIZED: AtomicBool = AtomicBool::new(false);
+pub(crate) static TERMINATED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static CEF_APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -78,8 +69,8 @@ struct BrowserPresentation {
 struct BrowserState {
     browser: Option<Browser>,
     creation_pending: bool,
-    parent_view: *mut c_void,
-    pending_bounds: Option<NSRect>,
+    parent: platform::ParentHandle,
+    pending_bounds: Option<(BrowserRect, f32)>,
     pending_url: Option<String>,
     presentation: BrowserPresentation,
     favicon_url: Option<String>,
@@ -279,12 +270,12 @@ wrap_life_span_handler! {
             let Some(browser) = browser.cloned() else {
                 return;
             };
-            let (parent_view, bounds, pending_url, visible, focused, close_requested) = {
+            let (parent, bounds, pending_url, visible, focused, close_requested) = {
                 let mut state = self.state.borrow_mut();
                 state.creation_pending = false;
                 state.browser = Some(browser.clone());
                 (
-                    state.parent_view,
+                    state.parent,
                     state.pending_bounds.take(),
                     state.pending_url.take(),
                     state.presentation.visible,
@@ -298,12 +289,10 @@ wrap_life_span_handler! {
                 }
                 return;
             }
-            with_native_view(&browser, |view| {
-                if let Some(bounds) = bounds {
-                    view.setFrame(bounds);
-                }
-                view.setHidden(!visible);
-            });
+            if let Some((rect, parent_height)) = bounds {
+                platform::apply_bounds(&browser, rect, parent_height);
+            }
+            platform::set_visible(&browser, visible);
             if let Some(url) = pending_url
                 && let Some(frame) = browser.main_frame()
             {
@@ -313,7 +302,7 @@ wrap_life_span_handler! {
                 host.set_focus(i32::from(focused));
             }
             if !focused {
-                restore_parent_focus(parent_view);
+                platform::focus_parent(parent);
             }
         }
         fn do_close(&self, _browser: Option<&mut Browser>) -> i32 {
@@ -374,25 +363,44 @@ impl BrowserPane {
     ///
     /// Returns an error when called off the main thread, before CEF
     /// initialization, with a null parent view, or when CEF rejects creation.
+    #[cfg(target_os = "macos")]
     pub fn create(
-        parent_view: *mut c_void,
+        parent: platform::ParentHandle,
         rect: BrowserRect,
         url: &str,
         callbacks: Callbacks,
     ) -> anyhow::Result<Self> {
-        ensure!(
-            MainThreadMarker::new().is_some(),
-            "browser panes must be created on the macOS main thread"
-        );
+        ensure!(!parent.is_null(), "browser parent NSView is null");
+        Self::create_with_parent(parent, rect, url, callbacks)
+    }
+
+    /// Creates a child browser attached to the application's X11 window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before CEF initialization, when the parent X11 window
+    /// cannot be found, or when CEF rejects creation.
+    #[cfg(target_os = "linux")]
+    pub fn create(rect: BrowserRect, url: &str, callbacks: Callbacks) -> anyhow::Result<Self> {
+        let parent = platform::find_parent_window()?;
+        Self::create_with_parent(parent, rect, url, callbacks)
+    }
+
+    fn create_with_parent(
+        parent: platform::ParentHandle,
+        rect: BrowserRect,
+        url: &str,
+        callbacks: Callbacks,
+    ) -> anyhow::Result<Self> {
+        platform::ensure_main_thread()?;
         ensure!(
             INITIALIZED.load(Ordering::Acquire),
             "CEF runtime is not initialized"
         );
-        ensure!(!parent_view.is_null(), "browser parent NSView is null");
         let state = StdRc::new(RefCell::new(BrowserState {
             browser: None,
             creation_pending: true,
-            parent_view,
+            parent,
             pending_bounds: None,
             pending_url: None,
             presentation: BrowserPresentation {
@@ -404,8 +412,7 @@ impl BrowserPane {
         }));
         let callbacks = StdRc::new(callbacks);
         let mut client = HhBrowserClient::new(state.clone(), callbacks);
-        let bounds = cef_rect(rect);
-        let window_info = WindowInfo::default().set_as_child(parent_view.cast(), &bounds);
+        let window_info = platform::create_window_info(parent, rect);
         let created = browser_host_create_browser(
             Some(&window_info),
             Some(&mut client),
@@ -424,14 +431,13 @@ impl BrowserPane {
     }
 
     pub fn set_bounds(&self, rect: BrowserRect, parent_height: f32) {
-        let bounds = appkit_rect(rect, parent_height);
         let browser = {
             let mut state = self.state.borrow_mut();
-            state.pending_bounds = Some(bounds);
+            state.pending_bounds = Some((rect, parent_height));
             state.browser.clone()
         };
         if let Some(browser) = browser {
-            with_native_view(&browser, |view| view.setFrame(bounds));
+            platform::apply_bounds(&browser, rect, parent_height);
         }
     }
 
@@ -445,7 +451,7 @@ impl BrowserPane {
             state.browser.clone()
         };
         if let Some(browser) = browser {
-            with_native_view(&browser, |view| view.setHidden(!visible));
+            platform::set_visible(&browser, visible);
         }
     }
 
@@ -485,10 +491,10 @@ impl BrowserPane {
     }
 
     pub fn focus(&self, focused: bool) {
-        let (browser, parent_view) = {
+        let (browser, parent) = {
             let mut state = self.state.borrow_mut();
             state.presentation.focused = focused;
-            (state.browser.clone(), state.parent_view)
+            (state.browser.clone(), state.parent)
         };
         if let Some(browser) = browser
             && let Some(host) = browser.host()
@@ -496,27 +502,27 @@ impl BrowserPane {
             host.set_focus(i32::from(focused));
         }
         if !focused {
-            restore_parent_focus(parent_view);
+            platform::focus_parent(parent);
         }
     }
 
     pub fn close(&self) {
-        let (browser, parent_view) = {
+        let (browser, parent) = {
             let mut state = self.state.borrow_mut();
             if state.presentation.close_requested {
                 return;
             }
             state.presentation.close_requested = true;
             state.presentation.visible = false;
-            (state.browser.clone(), state.parent_view)
+            (state.browser.clone(), state.parent)
         };
         if let Some(browser) = browser {
-            with_native_view(&browser, |view| view.setHidden(true));
+            platform::set_visible(&browser, false);
             if let Some(host) = browser.host() {
                 host.close_browser(1);
             }
         }
-        restore_parent_focus(parent_view);
+        platform::focus_parent(parent);
     }
 
     fn with_browser(&self, action: impl FnOnce(&Browser)) {
@@ -538,99 +544,13 @@ impl Drop for BrowserPane {
     }
 }
 
-fn restore_parent_focus(parent_view: *mut c_void) {
-    if parent_view.is_null() {
-        return;
-    }
-    // SAFETY: The parent GPUI NSView and its NSWindow outlive every browser pane.
-    #[allow(unsafe_code)]
-    unsafe {
-        let parent = parent_view.cast::<AnyObject>();
-        let window: *mut AnyObject = msg_send![parent, window];
-        if !window.is_null() {
-            let _: Bool = msg_send![window, makeFirstResponder: parent];
-        }
-    }
-}
-
-/// Returns whether the bundled CEF framework is present beside this executable.
-pub fn preflight() -> bool {
-    framework_path().is_some_and(|path| path.is_dir())
-}
-
-/// Runs CEF's subprocess split before any application/UI initialization.
-pub fn early_process_split() -> Option<i32> {
-    if !preflight() {
-        return None;
-    }
-    let executable = std::env::current_exe().ok()?;
-    let loader = library_loader::LibraryLoader::new(&executable, false);
-    if !loader.load() {
-        return None;
-    }
-    if api_hash(sys::CEF_API_VERSION_LAST, 0).is_null() {
-        return None;
-    }
+pub(crate) fn initialize_with_settings(settings: &Settings) -> anyhow::Result<()> {
     let args = cef::args::Args::new();
-    let result = execute_process(
-        Some(args.as_main_args()),
-        None::<&mut App>,
-        std::ptr::null_mut(),
-    );
-    if result >= 0 {
-        return Some(result);
-    }
-    let _ = LIBRARY.set(loader);
-    None
-}
-
-/// Initializes the process-wide external-message-pump runtime on the main thread.
-///
-/// # Errors
-///
-/// Returns an error when called off the main thread, after shutdown, without a
-/// loadable CEF framework and helper, or when cache or runtime initialization
-/// fails.
-pub fn init_runtime(cache_dir: &Path) -> anyhow::Result<()> {
-    ensure!(
-        MainThreadMarker::new().is_some(),
-        "CEF runtime must be initialized on the macOS main thread"
-    );
-    ensure!(
-        !TERMINATED.load(Ordering::Acquire),
-        "CEF runtime cannot be initialized again after shutdown"
-    );
-    if INITIALIZED.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    ensure!(preflight(), "CEF framework is absent from the app bundle");
-    ensure!(
-        LIBRARY.get().is_some(),
-        "CEF early process split did not run"
-    );
-    std::fs::create_dir_all(cache_dir)
-        .with_context(|| format!("create browser cache directory {}", cache_dir.display()))?;
-    let cache_dir = cache_dir
-        .canonicalize()
-        .with_context(|| format!("resolve browser cache directory {}", cache_dir.display()))?;
-    let subprocess_path =
-        helper_executable_path().context("resolve bundled CEF helper executable")?;
-    ensure!(
-        subprocess_path.is_file(),
-        "CEF helper executable is absent at {}",
-        subprocess_path.display()
-    );
-    let args = cef::args::Args::new();
-    let settings = Settings {
-        external_message_pump: 1,
-        root_cache_path: CefString::from(cache_dir.to_string_lossy().as_ref()),
-        ..Default::default()
-    };
     let mut app = HhCefApp::new();
     ensure!(
         initialize(
             Some(args.as_main_args()),
-            Some(&settings),
+            Some(settings),
             Some(&mut app),
             std::ptr::null_mut(),
         ) != 0,
@@ -638,18 +558,13 @@ pub fn init_runtime(cache_dir: &Path) -> anyhow::Result<()> {
     );
     CEF_APP.with(|stored| *stored.borrow_mut() = Some(app));
     INITIALIZED.store(true, Ordering::Release);
-    schedule_message_pump();
     Ok(())
 }
-
-fn schedule_message_pump() {
-    let when = DispatchTime::try_from(Duration::from_millis(10)).unwrap_or(DispatchTime::NOW);
-    let _ = DispatchQueue::main().after(when, || {
-        if INITIALIZED.load(Ordering::Acquire) {
-            do_message_loop_work();
-            schedule_message_pump();
-        }
-    });
+#[cfg(target_os = "linux")]
+pub fn pump_runtime() {
+    if INITIALIZED.load(Ordering::Acquire) && platform::ensure_main_thread().is_ok() {
+        do_message_loop_work();
+    }
 }
 
 /// Closes every live child browser and shuts CEF down when close callbacks drain.
@@ -660,7 +575,7 @@ fn schedule_message_pump() {
 /// CEF's state for process teardown is safer than calling `cef_shutdown` with a
 /// live browser or hanging application termination indefinitely.
 pub fn shutdown_runtime() {
-    if MainThreadMarker::new().is_none() || !INITIALIZED.load(Ordering::Acquire) {
+    if platform::ensure_main_thread().is_err() || !INITIALIZED.load(Ordering::Acquire) {
         return;
     }
     BROWSERS.with(|browsers| {
@@ -706,118 +621,7 @@ pub fn shutdown_runtime() {
     TERMINATED.store(true, Ordering::Release);
 }
 
-/// Adds CEF's required application protocol methods to GPUI's `NSApplication`.
-///
-/// # Panics
-///
-/// Panics when GPUI has not registered its application class before setup.
-pub fn install_nsapp_protocol() {
-    PROTOCOL_INSTALL.call_once(|| {
-        let class =
-            AnyClass::get(c"GPUIApplication").expect("GPUIApplication must exist before CEF setup");
-        // SAFETY: GPUI registers this NSApplication subclass in its constructor
-        // before main. These method ABIs and encodings exactly match CefAppProtocol.
-        #[allow(unsafe_code)]
-        unsafe {
-            let class_ptr = std::ptr::from_ref(class).cast_mut();
-            let is_handling: Imp = std::mem::transmute::<
-                unsafe extern "C-unwind" fn(*mut AnyObject, Sel) -> Bool,
-                Imp,
-            >(is_handling_send_event);
-            let set_handling: Imp = std::mem::transmute::<
-                unsafe extern "C-unwind" fn(*mut AnyObject, Sel, Bool),
-                Imp,
-            >(set_handling_send_event);
-            let send_event: Imp = std::mem::transmute::<
-                unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject),
-                Imp,
-            >(send_event);
-            ensure_method(class_ptr, sel!(isHandlingSendEvent), is_handling, c"B@:");
-            ensure_method(
-                class_ptr,
-                sel!(setHandlingSendEvent:),
-                set_handling,
-                c"v@:B",
-            );
-            ensure_method(class_ptr, sel!(sendEvent:), send_event, c"v@:@");
-            if let Some(protocol) = <dyn cef::application_mac::CefAppProtocol>::protocol() {
-                let _ = ffi::class_addProtocol(class_ptr, std::ptr::from_ref(protocol));
-            }
-        }
-    });
-}
-
-#[allow(unsafe_code)]
-unsafe fn ensure_method(
-    class: *mut AnyClass,
-    selector: Sel,
-    implementation: Imp,
-    encoding: &std::ffi::CStr,
-) {
-    if !unsafe { ffi::class_addMethod(class, selector, implementation, encoding.as_ptr()) }
-        .as_bool()
-    {
-        let class = unsafe { class.as_ref() }.expect("GPUIApplication class disappeared");
-        assert!(
-            class.instance_method(selector).is_some(),
-            "failed to add {selector}"
-        );
-    }
-}
-
-#[allow(unsafe_code)]
-unsafe extern "C-unwind" fn is_handling_send_event(_: *mut AnyObject, _: Sel) -> Bool {
-    Bool::from(HANDLING_SEND_EVENT.load(Ordering::Relaxed))
-}
-
-#[allow(unsafe_code)]
-unsafe extern "C-unwind" fn set_handling_send_event(_: *mut AnyObject, _: Sel, handling: Bool) {
-    HANDLING_SEND_EVENT.store(handling.as_bool(), Ordering::Relaxed);
-}
-
-#[allow(unsafe_code)]
-unsafe extern "C-unwind" fn send_event(this: *mut AnyObject, _: Sel, event: *mut AnyObject) {
-    let was_handling = HANDLING_SEND_EVENT.swap(true, Ordering::Relaxed);
-    let superclass = AnyClass::get(c"GPUIApplication")
-        .and_then(AnyClass::superclass)
-        .expect("GPUIApplication has no superclass");
-    let mut context = ffi::objc_super {
-        receiver: this,
-        super_class: superclass,
-    };
-    let send_super = unsafe {
-        std::mem::transmute::<
-            Imp,
-            unsafe extern "C-unwind" fn(*mut ffi::objc_super, Sel, *mut AnyObject),
-        >(ffi::objc_msgSendSuper as Imp)
-    };
-    unsafe { send_super(&raw mut context, sel!(sendEvent:), event) };
-    if !was_handling {
-        HANDLING_SEND_EVENT.store(false, Ordering::Relaxed);
-    }
-}
-
-fn framework_path() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let contents = executable.parent()?.parent()?;
-    Some(contents.join("Frameworks/Chromium Embedded Framework.framework"))
-}
-
-fn helper_executable_path() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let contents = executable.parent()?.parent()?;
-    let executable_name = executable.file_name()?.to_str()?;
-    let helper_name = format!("{executable_name} Helper");
-    Some(
-        contents
-            .join("Frameworks")
-            .join(format!("{helper_name}.app"))
-            .join("Contents/MacOS")
-            .join(helper_name),
-    )
-}
-
-fn cef_rect(rect: BrowserRect) -> Rect {
+pub(crate) fn cef_rect(rect: BrowserRect) -> Rect {
     Rect {
         x: cef_coordinate(rect.x),
         y: cef_coordinate(rect.y),
@@ -844,52 +648,18 @@ fn cef_extent(value: f32) -> i32 {
     rounded_clamped_i32(value, 1, 1)
 }
 
-fn appkit_rect(rect: BrowserRect, parent_height: f32) -> NSRect {
-    let x = bounded_f64(rect.x, -f64::from(i32::MAX), f64::from(i32::MAX));
-    let y = bounded_f64(rect.y, -f64::from(i32::MAX), f64::from(i32::MAX));
-    let width = bounded_f64(rect.width, 0.0, f64::from(i32::MAX));
-    let height = bounded_f64(rect.height, 0.0, f64::from(i32::MAX));
-    let parent_height = bounded_f64(parent_height, 0.0, f64::from(i32::MAX));
-    NSRect::new(
-        NSPoint::new(
-            x,
-            (parent_height - y - height).clamp(-f64::from(i32::MAX), f64::from(i32::MAX)),
-        ),
-        NSSize::new(width, height),
-    )
-}
-
-fn bounded_f64(value: f32, minimum: f64, maximum: f64) -> f64 {
+#[cfg(target_os = "macos")]
+pub(crate) fn bounded_f64(value: f32, minimum: f64, maximum: f64) -> f64 {
     if value.is_finite() {
         f64::from(value).clamp(minimum, maximum)
     } else {
         0.0
     }
 }
-fn with_native_view(browser: &Browser, action: impl FnOnce(&NSView)) {
-    let Some(host) = browser.host() else {
-        return;
-    };
-    let handle = host.window_handle();
-    if handle.is_null() {
-        return;
-    }
-    // SAFETY: CEF documents a windowed browser's macOS handle as its retained
-    // child NSView. The callback cannot retain the borrowed view.
-    #[allow(unsafe_code)]
-    unsafe {
-        if let Some(view) = handle.cast::<NSView>().as_ref() {
-            action(view);
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserRect, appkit_rect, cef_rect};
-    fn assert_close(actual: f64, expected: f64) {
-        assert!((actual - expected).abs() < f64::EPSILON);
-    }
+    use super::{BrowserRect, cef_rect};
 
     #[test]
     fn rect_conversion_sanitizes_invalid_and_empty_values() {
@@ -900,19 +670,5 @@ mod tests {
             height: 0.0,
         });
         assert_eq!((cef.x, cef.y, cef.width, cef.height), (0, 0, 1, 1));
-
-        let appkit = appkit_rect(
-            BrowserRect {
-                x: f32::NAN,
-                y: 10.0,
-                width: -1.0,
-                height: 20.0,
-            },
-            100.0,
-        );
-        assert_close(appkit.origin.x, 0.0);
-        assert_close(appkit.origin.y, 70.0);
-        assert_close(appkit.size.width, 0.0);
-        assert_close(appkit.size.height, 20.0);
     }
 }

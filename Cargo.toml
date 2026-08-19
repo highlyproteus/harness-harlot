@@ -47,6 +47,7 @@ tar = "0.4.46"
 unicode-width = "0.2.2"
 url = "2.5.8"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+x11rb = "0.13"
 zeroize = "1.8.1"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 

@@ -10,13 +10,13 @@ use hh_protocol::{
     AppearanceColor, DropPlacement, HistoryPageFlags, Pane, PaneLayout, SplitAxis,
     TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, Workspace, WorkspaceConnection,
 };
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use std::collections::HashSet;
 
 use crate::browser::browser_command_available;
 use crate::commands::AppCommand;
 use crate::elements::TerminalPointerElement;
-#[cfg(all(target_os = "macos", feature = "browser"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::helpers::visible_panes;
 use crate::helpers::{
     IDENTITY_MARK_SIZE, WorkspaceTabScope, collect_terminal_tabs, composite_rgb,
@@ -1386,7 +1386,7 @@ impl HhApp {
                 .and_then(|pane_id| zoom_projection(layout, pane_id))
                 .unwrap_or_else(|| layout.clone())
         });
-        #[cfg(all(target_os = "macos", feature = "browser"))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         let mut visible_browsers: HashSet<Uuid> = layout
             .as_ref()
             .map(|layout| {
@@ -1482,11 +1482,11 @@ impl HhApp {
                 .into_any_element()
         };
         let showing_appearance_settings = matches!(self.editor.modal, Modal::AppearanceSettings);
-        #[cfg(all(target_os = "macos", feature = "browser"))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         if showing_appearance_settings {
             visible_browsers.clear();
         }
-        #[cfg(all(target_os = "macos", feature = "browser"))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         self.sync_browser_view_presentation(&visible_browsers);
         let workspace_content = if showing_appearance_settings {
             self.render_appearance_settings(cx)

@@ -1,6 +1,6 @@
 # Harness Harlot
 
-Harness Harlot is a lightweight native terminal workstation for local and SSH work. Packaged stable releases target macOS plus glibc-based Linux on x86_64 and arm64; embedded Chromium browser tabs remain macOS-only. It is not an agent harness or runtime: terminals and agents run as ordinary shell workloads while Harness Harlot stays out of the way and avoids competing for their CPU or memory. It takes behavior-level inspiration from a compact terminal rail, tab, split-pane, and freely rearrangeable pane experience while deliberately separating session lifetime from desktop UI lifetime.
+Harness Harlot is a lightweight native terminal workstation for local and SSH work. Packaged stable releases target macOS plus glibc-based Linux on x86_64 and arm64, with embedded Chromium browser tabs on both platforms. It is not an agent harness or runtime: terminals and agents run as ordinary shell workloads while Harness Harlot stays out of the way and avoids competing for their CPU or memory. It takes behavior-level inspiration from a compact terminal rail, tab, split-pane, and freely rearrangeable pane experience while deliberately separating session lifetime from desktop UI lifetime.
 
 The repository now contains runnable local terminals plus a thin system-SSH checkpoint: the GPUI client opens the user's configured shell, sends keyboard and mouse input to service-owned PTYs, renders ANSI SGR color and style from the Alacritty grid, supports selection/copy/paste, bounded scrollback and literal search, resizes PTYs, and creates pane-local tabs and splits. The daemon persists a restricted local desired-state snapshot for fresh-shell recovery and, separately, can keep an owner-only chunked archive of future PTY output for lazy upward scroll/search. An explicit two-step SSH action can launch the installed OpenSSH client in the same kind of daemon-owned PTY. Unicode shaping and broader platform soak remain roadmap work.
 
@@ -72,9 +72,9 @@ The first usable milestone includes:
 - terminal rendering/input through the Alacritty terminal engine adapter;
 - configured-host SSH workstations implemented by running system OpenSSH inside daemon-owned PTYs;
 - crash/reconnect and session-lifecycle tests on macOS and Linux.
-- macOS-only Chromium browser tabs in full workspace tabs (not terminal splits), included in release DMGs.
+- Chromium browser tabs in full workspace tabs (not terminal splits), included in packaged macOS and Linux releases.
 
-Explicitly deferred: browser support outside macOS, mobile access, generic remote-control UI, worktree/diff review, and AI-specific integrations. SSH terminal workstations are part of the early MVP; an optional remote `rmuxd` for durable reattachment comes later.
+Explicitly deferred: mobile access, generic remote-control UI, worktree/diff review, and AI-specific integrations. SSH terminal workstations are part of the early MVP; an optional remote `rmuxd` for durable reattachment comes later.
 
 ### Workstation terminology and saved-state compatibility
 
@@ -126,9 +126,9 @@ reading or writing stable app data. Explicit `HH_SOCKET`, `HH_STATE_DIR`, and
 
 ### macOS Chromium browser bundles
 
-Embedded browser tabs use Chromium Embedded Framework (CEF) and are supported
-only in the bundled macOS app. Published release DMGs include the pinned CEF
-runtime for their CPU architecture. Local browser-bundle builds require `cmake`
+Embedded browser tabs use Chromium Embedded Framework (CEF). Published macOS
+release DMGs include the pinned CEF runtime for their CPU architecture. Local
+macOS browser-bundle builds require `cmake`
 and `ninja` on `PATH`, plus an unpacked CEF distribution selected explicitly
 with `CEF_PATH`. That directory must contain `CREDITS.html` and the framework at
 `Release/Chromium Embedded Framework.framework` (a flattened root-level
@@ -177,7 +177,7 @@ stable builds and `~/Library/Application Support/Harness Harlot Dev/browser-cach
 for Dev builds. `HH_STATE_DIR` relocates that root. Browser tabs are full tabs
 and cannot be mixed into terminal splits. While a Chromium child view owns
 focus, app-global GPUI shortcuts do not fire; click a GPUI surface to restore
-them. No browser support is promised for Linux or other platforms.
+them. Linux packaging and runtime requirements are described below.
 
 The technical package, crate, and executable prefix is `hh`. The built
 executables are `hh`, `hh-service`, and `hh-update-tool`. Set `HH_SOCKET` in the
@@ -206,6 +206,33 @@ stages the package, gracefully stops the service only after all terminals have
 ended, swaps the application with rollback, and relaunches it. See
 [Linux releases](docs/linux-release.md) for exact assets, verification,
 installation paths, command-line updates, and release automation.
+
+### Linux Chromium browser tabs
+
+Published Linux archives include the pinned CEF runtime and `hh-cef-helper`.
+Browser tabs run under X11, including XWayland on the default Wayland sessions
+shipped by Ubuntu, Fedora, and Arch. When `DISPLAY` is available, a
+browser-enabled build removes `WAYLAND_DISPLAY` before GPUI initialization so
+the whole app uses its X11 backend and CEF can embed a child window. A
+Wayland-only session without XWayland keeps terminal support but reports that
+browser tabs require X11 or XWayland.
+
+Chromium remains sandboxed. The user-local package cannot install a setuid
+`chrome-sandbox`, so Linux browser tabs require unprivileged user namespaces.
+Kernels that disable them get a browser-unavailable message; Harness Harlot
+never retries with `--no-sandbox`. Install the CEF runtime libraries with the
+distribution's packages:
+
+```text
+Ubuntu 22.04: libgtk-3-0 libnss3 libasound2 libgbm1
+Ubuntu 24.04+: libgtk-3-0t64 libnss3 libasound2t64 libgbm1
+Fedora:       gtk3 nss alsa-lib mesa-libgbm
+Arch:         gtk3 nss alsa-lib mesa
+```
+
+Browser profile and cache data stays under
+`$XDG_STATE_HOME/hh/browser-cache` (normally
+`~/.local/state/hh/browser-cache`). `HH_STATE_DIR` relocates that root.
 
 ## macOS releases and updates
 
