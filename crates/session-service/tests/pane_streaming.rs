@@ -134,7 +134,8 @@ fn receiver_reconnect_with_no_cursors_gets_one_current_resync() {
             .is_some_and(|screen| screen_contains(screen, "RMUX_RECONNECT_SECOND"))
     );
 
-    let cursors = cursors(&reconnected.screens);
+    let cursors =
+        settle_pane_cursors(&registry, cursors(&reconnected.screens), &[first, second]);
     let settled = registry
         .pane_updates(
             reconnected

@@ -27,7 +27,9 @@ jobs:
         with:
           toolchain: "1.96"
       - name: Install security tools
-        run: cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2 cargo-about@0.9.1
+        run: |
+          cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2
+          cargo install --locked cargo-about@0.9.1 --features cli
       - run: cargo audit
       - run: cargo deny check
       - name: Verify generated dependency notices
