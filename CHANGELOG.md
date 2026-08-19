@@ -4,7 +4,15 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0] - Unreleased
+## [0.1.1] - 2026-08-19
+
+### Fixed
+
+- The update feed, installers, and documentation now point at the
+  `highlyproteus/harness-harlot` repository.
+- Update verification trusts the owner-held `hh-stable-2026` signing key.
+
+## [0.1.0] - 2026-08-19
 
 ### Added
 
