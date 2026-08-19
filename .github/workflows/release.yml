@@ -143,7 +143,7 @@ jobs:
           fi
       - name: Attest packaged release files
         if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: target/release-dist/**/*
       - name: Upload packaged release files
@@ -270,7 +270,7 @@ jobs:
           export HH_UPDATE_SIGNING_KEY_FILE="$key_file"
           scripts/package-linux-release.sh "$version" "$GITHUB_RUN_NUMBER"
       - name: Attest packaged Linux release files
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: target/release-dist/**/*
       - name: Upload packaged Linux release files
@@ -302,7 +302,7 @@ jobs:
           cargo cyclonedx --format json --all --all-features --target all --override-filename bom
           tar -czf "Harness-Harlot-${GITHUB_REF_NAME}-sbom.cdx.tar.gz" crates/*/bom.json
       - name: Attest SBOM archive
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: Harness-Harlot-*-sbom.cdx.tar.gz
       - name: Upload SBOM archive
@@ -313,7 +313,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Attest community bootstrap installer
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: install-community-macos.sh
       - name: Upload community bootstrap installer
