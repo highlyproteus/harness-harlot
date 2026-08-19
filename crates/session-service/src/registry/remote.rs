@@ -586,6 +586,14 @@ mod tests {
             &registry.history,
         )
         .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.exit_status().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "failed tmux fixture did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let tmux_session = tmux_session("$10", "logs");
 
         let error = registry
