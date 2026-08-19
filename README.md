@@ -5,9 +5,8 @@
 <h1 align="center">Harness Harlot</h1>
 
 <p align="center">
-  A lightweight native terminal workstation for local and SSH work, with embedded Chromium browser tabs.
-  <br>
-  Terminals live in a persistent background service, so closing the app never kills your sessions.
+  A lightweight native terminal workstation for local and SSH work,
+  with tabs, splits, groups, tmux integration, and embedded browser tabs.
 </p>
 
 <p align="center">
@@ -30,41 +29,57 @@
 
 ---
 
-## What it does
+## Workstations
 
-- **Workstations.** A workstation is a machine: your local computer or an SSH host. Each workstation has its own working directory — change it from the workstation menu and every new terminal in that workstation opens there from then on. Rename workstations, recolor them, and pin the ones you use most.
-- **Terminals, tabs, and splits.** Fast native terminals with tabs, split panes, drag-to-rearrange layouts, selection/copy/paste, scrollback, and search. Rename any terminal, give it its own color, and known agent CLIs (Codex, Claude Code, Cursor, Aider, and more) are labeled with their icons automatically.
-- **Groups.** A group displays several terminals together in one view — and can include a browser pane alongside them — so one glance covers a whole task.
-- **Browser tabs.** Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profile directory.
-- **tmux integration.** Scan the local or remote tmux server from the workstation menu and open selected sessions as tabs, attached exactly like a hand-run `tmux attach-session`. tmux stays in charge of its own windows and panes; nothing is scanned in the background.
-- **SSH the safe way.** SSH workstations launch your installed OpenSSH client — your `~/.ssh/config`, keys, agents, and host verification are always the authority. Saved SSH workstations reconnect into their saved layout; credentials are never stored.
-- **Sessions outlive the window.** The desktop app is just a view. Close it, reopen it, or restart it — the service keeps your terminals running and the layout comes right back.
-- **Optional terminal history archive.** Beyond the live scrollback, an opt-in owner-only disk archive lets you scroll and search older output, with explicit quotas and retention you control.
+A workstation is a machine — your local computer or an SSH host.
+
+- Each workstation has its own working directory. Change it from the workstation menu and every new terminal in that workstation opens there from then on.
+- Rename workstations, give them their own colors, and pin the ones you use most.
+- SSH workstations launch your installed OpenSSH client, so your `~/.ssh/config`, keys, agents, and host verification are always the authority. Saved SSH workstations reconnect into their saved layout; credentials are never stored.
+
+## Terminals
+
+- Fast native terminals with tabs, split panes, drag-to-rearrange layouts, selection/copy/paste, scrollback, and search.
+- Rename any terminal tab, pick its color, or give it its own icon.
+- Known agent CLIs — Codex, Claude Code, Cursor, Aider, Gemini, and more — are recognized and labeled with their official icons automatically.
+- Your terminals keep running if the app closes, crashes, or updates. They live in a small local session service, so reopening the app puts you right back where you were. Ending a session is always explicit: close its tab or exit the shell.
+- Optional terminal history archive: beyond live scrollback, an opt-in owner-only disk archive lets you scroll and search older output, with quotas and retention you control.
+
+## Groups
+
+A group displays several terminals together in one view — and can include a browser pane alongside them — so one glance covers a whole task.
+
+## Browser tabs
+
+Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profile directory.
+
+## tmux
+
+- Scan the local or remote tmux server from the workstation menu and open selected sessions as tabs.
+- Sessions attach exactly like a hand-run `tmux attach-session`: tmux stays in charge of its own windows and panes, and detaching leaves the session running on the server.
+- Nothing is scanned in the background — only when you ask.
 
 ## Install
 
 ### macOS
 
-Download the community DMG installer from the [latest release](https://github.com/highlyproteus/harness-harlot/releases/latest), or install from the terminal with verified provenance:
+Download the DMG from the [latest release](https://github.com/highlyproteus/harness-harlot/releases/latest), or install from the terminal:
 
 ```bash
 gh release download --repo highlyproteus/harness-harlot --pattern install-community-macos.sh
-gh attestation verify install-community-macos.sh --repo highlyproteus/harness-harlot
-chmod +x install-community-macos.sh
-./install-community-macos.sh --acknowledge-unnotarized
+chmod +x install-community-macos.sh && ./install-community-macos.sh --acknowledge-unnotarized
 ```
-
-Community builds are integrity-signed but not Apple-notarized, so the first launch may need **System Settings → Privacy & Security → Open Anyway**. In-app update checks report new releases; rerun the installer to update.
 
 ### Linux
 
-Download the architecture-matched `.tar.gz` from the [latest release](https://github.com/highlyproteus/harness-harlot/releases/latest), verify its GitHub build-provenance attestation, extract it, and run:
+Download the `.tar.gz` for your architecture from the [latest release](https://github.com/highlyproteus/harness-harlot/releases/latest), or install from the terminal:
 
 ```bash
-./Harness-Harlot/install.sh
+gh release download --repo highlyproteus/harness-harlot --pattern "*linux-$(uname -m).tar.gz"
+tar -xzf Harness-Harlot-*-linux-*.tar.gz && ./Harness-Harlot/install.sh
 ```
 
-No `sudo` required — everything installs under `~/.local`. Built on Ubuntu 22.04 (glibc 2.35 baseline) for x86_64 and arm64. Browser tabs need these distribution packages:
+No `sudo` required — everything installs under `~/.local`, and the in-app update button verifies, stages, and swaps updates with rollback. Built on Ubuntu 22.04 (glibc 2.35 baseline) for x86_64 and arm64. Browser tabs need these distribution packages:
 
 ```text
 Ubuntu 22.04:  libgtk-3-0 libnss3 libasound2 libgbm1
@@ -73,13 +88,15 @@ Fedora:        gtk3 nss alsa-lib mesa-libgbm
 Arch:          gtk3 nss alsa-lib mesa
 ```
 
-Browser tabs run under X11, including XWayland on the default Ubuntu, Fedora, and Arch Wayland sessions. The in-app update button verifies, stages, and swaps the install with rollback. Details: [Linux releases](docs/linux-release.md).
+Details: [Linux releases](docs/linux-release.md) · [macOS releases](docs/macos-release.md).
 
 ## Run locally
 
 Requirements: Rust 1.96 or newer.
 
 ```bash
+git clone https://github.com/highlyproteus/harness-harlot.git
+cd harness-harlot
 cargo run -p hh-session-service
 ```
 
