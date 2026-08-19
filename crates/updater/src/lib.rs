@@ -70,7 +70,7 @@ pub struct TrustedKey {
 /// enters the repository or CI as a file.
 pub const TRUSTED_UPDATE_KEYS: &[TrustedKey] = &[TrustedKey {
     key_id: "hh-stable-2026",
-    public_key_base64: "W3xGpnOmpqVPsaJDWI8LF25g3/Y24DkuHJWkOldH9DE=",
+    public_key_base64: "Cy/alHdZ5R7fSJEeuvqu1UXH9j5O0f34hWv4Rv8TFwo=",
 }];
 /// The immutable production update host. Only artifact URLs on this host
 /// are accepted by the verifier.
