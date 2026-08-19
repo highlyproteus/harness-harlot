@@ -148,7 +148,7 @@ jobs:
           subject-path: target/release-dist/**/*
       - name: Upload packaged release files
         if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-macos-${{ matrix.release_mode }}-${{ matrix.architecture }}
           path: target/release-dist/**/*
@@ -274,7 +274,7 @@ jobs:
         with:
           subject-path: target/release-dist/**/*
       - name: Upload packaged Linux release files
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-linux-${{ matrix.architecture }}
           path: target/release-dist/**/*
@@ -306,7 +306,7 @@ jobs:
         with:
           subject-path: Harness-Harlot-*-sbom.cdx.tar.gz
       - name: Upload SBOM archive
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-sbom
           path: Harness-Harlot-*-sbom.cdx.tar.gz
@@ -317,7 +317,7 @@ jobs:
         with:
           subject-path: install-community-macos.sh
       - name: Upload community bootstrap installer
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-community-installer
           path: install-community-macos.sh
