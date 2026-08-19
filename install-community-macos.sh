@@ -241,5 +241,5 @@ open "$app"
 install_in_progress=0
 
 echo "installed unnotarized community build at $app"
-echo "Future releases install from the in-app Update button."
+echo "Automatic replacement is disabled. Future releases appear as manual update notifications."
 echo "If macOS blocks first launch, use System Settings > Privacy & Security > Open Anyway."

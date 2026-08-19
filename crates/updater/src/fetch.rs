@@ -27,7 +27,7 @@ static DOWNLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct OwnedUpdate {
     pub version: String,
     pub artifact: ReleaseArtifact,
-    pub requires_service_restart: bool,
+    pub requires_quiescent_service: bool,
 }
 
 /// Returns the stable update feed's platform spelling.
@@ -95,7 +95,7 @@ pub fn fetch_available_update(current: &CurrentRelease<'_>) -> Result<Option<Own
     Ok(selected.map(|update| OwnedUpdate {
         version: update.manifest.version.clone(),
         artifact: update.artifact.clone(),
-        requires_service_restart: update.requires_service_restart,
+        requires_quiescent_service: update.manifest.session_service.requires_quiescent_service,
     }))
 }
 
