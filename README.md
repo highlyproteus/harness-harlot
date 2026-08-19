@@ -1,6 +1,6 @@
 # Harness Harlot
 
-Harness Harlot is a lightweight native terminal workstation for local and SSH work. macOS is the first supported release target; Linux currently has compile/test coverage but still needs real Wayland/X11 GPU-session validation before it is advertised as a packaged release. It is not an agent harness or runtime: terminals and agents run as ordinary shell workloads while Harness Harlot stays out of the way and avoids competing for their CPU or memory. It takes behavior-level inspiration from a compact terminal rail, tab, split-pane, and freely rearrangeable pane experience while deliberately separating session lifetime from desktop UI lifetime.
+Harness Harlot is a lightweight native terminal workstation for local and SSH work. Packaged stable releases target macOS plus glibc-based Linux on x86_64 and arm64; embedded Chromium browser tabs remain macOS-only. It is not an agent harness or runtime: terminals and agents run as ordinary shell workloads while Harness Harlot stays out of the way and avoids competing for their CPU or memory. It takes behavior-level inspiration from a compact terminal rail, tab, split-pane, and freely rearrangeable pane experience while deliberately separating session lifetime from desktop UI lifetime.
 
 The repository now contains runnable local terminals plus a thin system-SSH checkpoint: the GPUI client opens the user's configured shell, sends keyboard and mouse input to service-owned PTYs, renders ANSI SGR color and style from the Alacritty grid, supports selection/copy/paste, bounded scrollback and literal search, resizes PTYs, and creates pane-local tabs and splits. The daemon persists a restricted local desired-state snapshot for fresh-shell recovery and, separately, can keep an owner-only chunked archive of future PTY output for lazy upward scroll/search. An explicit two-step SSH action can launch the installed OpenSSH client in the same kind of daemon-owned PTY. Unicode shaping and broader platform soak remain roadmap work.
 
@@ -72,7 +72,7 @@ The first usable milestone includes:
 - terminal rendering/input through the Alacritty terminal engine adapter;
 - configured-host SSH workstations implemented by running system OpenSSH inside daemon-owned PTYs;
 - crash/reconnect and session-lifecycle tests on macOS and Linux.
-- macOS-only Chromium browser tabs in full workspace tabs (not terminal splits).
+- macOS-only Chromium browser tabs in full workspace tabs (not terminal splits), included in release DMGs.
 
 Explicitly deferred: browser support outside macOS, mobile access, generic remote-control UI, worktree/diff review, and AI-specific integrations. SSH terminal workstations are part of the early MVP; an optional remote `rmuxd` for durable reattachment comes later.
 
@@ -103,11 +103,12 @@ scripts/build-macos-app.sh debug
 scripts/build-macos-app.sh release
 ```
 
-The bundle includes the desktop, its service, the Harness Harlot icon, and
-license notices. The update verifier is distributed beside the app only inside
-a release DMG; release-signing code is never bundled. The display name,
-executable, and bundle identifier are `Harness Harlot`, `hh`, and
-`com.harnessharlot.desktop`. The desktop starts its bundled service only when a
+The bundle includes the desktop, its session service, the signed
+`hh-update-tool`, the Harness Harlot icon, and license notices. A second copy of
+the update tool sits at the release DMG root for bootstrap installs;
+release-signing code is never bundled. The display name, executable, and bundle
+identifier are `Harness Harlot`, `hh`, and `com.harnessharlot.desktop`. The
+desktop starts its bundled service only when a
 local service is unavailable; closing the desktop leaves active terminal
 sessions alone.
 
@@ -126,12 +127,13 @@ reading or writing stable app data. Explicit `HH_SOCKET`, `HH_STATE_DIR`, and
 ### macOS Chromium browser bundles
 
 Embedded browser tabs use Chromium Embedded Framework (CEF) and are supported
-only in the bundled macOS app. CEF requires `cmake` and `ninja` on `PATH`, plus
-an unpacked CEF distribution selected explicitly with `CEF_PATH`. That
-directory must contain `CREDITS.html` and the framework at
+only in the bundled macOS app. Published release DMGs include the pinned CEF
+runtime for their CPU architecture. Local browser-bundle builds require `cmake`
+and `ninja` on `PATH`, plus an unpacked CEF distribution selected explicitly
+with `CEF_PATH`. That directory must contain `CREDITS.html` and the framework at
 `Release/Chromium Embedded Framework.framework` (a flattened root-level
 framework is also accepted). No repository script assumes a machine-local
-absolute path. Build browser-enabled bundles with the trailing `--browser`
+absolute path. Build local browser-enabled bundles with the trailing `--browser`
 flag:
 
 ```bash
@@ -152,10 +154,10 @@ generic CEF subprocess helper, and the GPU, Renderer, Plugin, and Alerts role
 helpers into `Contents/Frameworks`. The checked-in CEF BSD license becomes
 `Contents/Resources/licenses/CEF-LICENSE.txt`, and the staged distribution's
 Chromium notices become `Contents/Resources/licenses/CEF-CREDITS.html`. The
-signing script signs framework libraries,
-the framework, helper executables and apps, the session service, desktop
-executable, optional Dev launcher, and outer app in inside-out order; GPU and
-Renderer helpers receive only the JIT entitlement required by Chromium.
+signing script signs framework libraries, the framework, helper executables and
+apps, the session service, update tool, desktop executable, optional Dev
+launcher, and outer app in inside-out order; GPU and Renderer helpers receive
+only the JIT entitlement required by Chromium.
 
 Development bundles use ad-hoc signatures and deliberately omit hardened
 runtime so the separately signed upstream CEF framework can load. Chromium's
@@ -178,21 +180,67 @@ focus, app-global GPUI shortcuts do not fire; click a GPUI surface to restore
 them. No browser support is promised for Linux or other platforms.
 
 The technical package, crate, and executable prefix is `hh`. The built
-executables are `hh-service` and `hh`. Set `HH_SOCKET` in both processes to
-override the default socket path. The default is an owner-only
+executables are `hh`, `hh-service`, and `hh-update-tool`. Set `HH_SOCKET` in the
+desktop and service processes to override the default socket path. The default is an owner-only
 `run/hh-session.sock` under the application state directory.
 `HH_DISABLE_BUNDLED_SERVICE=1` keeps desktop
 startup from launching a sibling service for focused development tests.
 
+## Linux installation and updates
+
+Linux release archives are built on Ubuntu 22.04 with a glibc 2.35 baseline.
+Download the architecture-matched `.tar.gz` from GitHub Releases, verify its
+GitHub build-provenance attestation, extract it, and run:
+
+```bash
+./Harness-Harlot/install.sh
+```
+
+No `sudo`, Apple ID, Apple certificate, Gatekeeper step, or notarization is
+involved. The installer places the application under
+`~/.local/lib/harness-harlot` and creates managed command, desktop-entry, and
+icon links below `~/.local`. Packaged builds use the same signed stable update
+feed as macOS, but select `manifest-linux-ARCH.update.json` and a signed
+`.tar.gz`. Clicking the sidebar update button closes the desktop, verifies and
+stages the package, gracefully stops the service only after all terminals have
+ended, swaps the application with rollback, and relaunches it. See
+[Linux releases](docs/linux-release.md) for exact assets, verification,
+installation paths, command-line updates, and release automation.
+
 ## macOS releases and updates
 
-Harness Harlot has one stable channel. It does not make update network requests
-yet. The checked-in release scripts make versioned DMGs and signed metadata,
-sign nested code inside-out, and require notarization/stapling in production
-mode. Production trust values, Apple credentials, and an immutable public host
-are intentionally not configured in source. See the [macOS release foundation](docs/macos-release.md) for the
-credential/hosting handoff, update safety rule for active PTYs, rollback
-behavior, Sparkle assessment, and release checklist.
+The no-cost macOS channel ships an explicitly labeled **community** DMG. It is
+ad-hoc signed for bundle integrity, but it is not Apple-notarized and does not
+claim a Developer ID identity. First launch can therefore require Apple's
+**System Settings → Privacy & Security → Open Anyway** override. The bootstrap
+installer requires GitHub CLI, authenticates every downloaded input with GitHub
+build-provenance attestations before mounting the DMG, then verifies the
+owner-signed Ed25519 manifest and exact DMG hash:
+
+```bash
+gh release download --repo HighlyProtean/harness-harlot --pattern install-community-macos.sh
+gh attestation verify install-community-macos.sh --repo HighlyProtean/harness-harlot
+chmod +x install-community-macos.sh
+./install-community-macos.sh --acknowledge-unnotarized
+```
+End every terminal session and quit Harness Harlot before running the installer.
+It refuses a running desktop, asks the current managed service to persist and
+stop, and aborts rather than replacing an app while a PTY is live.
+
+Community builds check the distinct
+`manifest-macos-community-ARCH.update.json` feed after launch and every 24
+hours. The sidebar reports newer releases, but cannot replace the app
+automatically; download and run the attested community installer again. This
+manual boundary prevents an unnotarized build from silently changing executable
+code. Do not use `xattr -d`, `spctl --master-disable`, or `curl | sh`.
+
+The separate Developer ID path remains available once an owner can enroll in
+Apple's paid program. Those builds use the normal architecture manifest,
+notarization/stapling, pinned Team-ID verification, and verified staged-swap
+updates after all live terminal sessions end. The two feeds and artifact names
+cannot select each other's DMGs. See the
+[macOS release foundation](docs/macos-release.md) for both trust models,
+credential handoff, rollback behavior, and release checks.
 
 ### Command bindings
 
@@ -223,6 +271,13 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+GitLab is the canonical source repository at
+[`highlyproteus/harness-harlot`](https://gitlab.com/highlyproteus/harness-harlot).
+GitLab push-mirrors signed commits and tags to
+[`HighlyProtean/harness-harlot`](https://github.com/HighlyProtean/harness-harlot),
+which remains the read-only GitHub release, attestation, and update host. Changes
+must land in GitLab; do not push divergent commits directly to the GitHub mirror.
 
 See [the project plan](index.html), the [identity migration notes](docs/identity-migration.md),
 and [`tasks/rust-mux`](tasks/rust-mux) for phased implementation details. The

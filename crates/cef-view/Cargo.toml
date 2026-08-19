@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Feature-gated Chromium Embedded Framework view for Harness Harlot"
+publish = false
 
 [features]
 default = []
@@ -19,6 +20,8 @@ cef = [
 
 [dependencies]
 anyhow.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
 cef = { version = "=151.6.0", optional = true }
 dispatch2 = { version = "0.3.1", optional = true }
 image = { workspace = true, optional = true }

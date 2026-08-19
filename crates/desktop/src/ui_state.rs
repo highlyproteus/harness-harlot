@@ -1,12 +1,10 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Read as _, Write as _};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs::{self, File};
+use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use image::GenericImageView as _;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 const SCHEMA_VERSION: u16 = 1;
 const MAX_UI_STATE_BYTES: u64 = 16 * 1024;
@@ -78,7 +76,7 @@ impl UiStateStore {
     /// Rewrites the whole file, preserving every field this caller did not change.
     fn write_state(&self, state: PersistedUiState) -> Result<()> {
         let bytes = serde_json::to_vec(&state).context("encode UI state")?;
-        atomic_write_private(&self.path, &bytes, "UI state")
+        hh_protocol::atomic_write_private(&self.path, &bytes).context("write UI state")
     }
 
     pub(crate) fn load_workspace_sidebar_width(&self) -> Result<Option<f32>> {
@@ -131,7 +129,11 @@ impl UiStateStore {
         if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
             bail!("saved workstation banner is not a PNG");
         }
-        let (width, height) = decode_workstation_banner(&bytes)?.dimensions();
+        let (width, height) = image::ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .context("detect workstation banner image format")?
+            .into_dimensions()
+            .context("read workstation banner dimensions")?;
         Ok(Some(StoredBanner {
             png: bytes,
             width,
@@ -140,30 +142,12 @@ impl UiStateStore {
     }
 
     pub(crate) fn import_workstation_banner(&self, source: &Path) -> Result<StoredBanner> {
-        let metadata = fs::symlink_metadata(source).with_context(|| {
-            format!("read workstation banner metadata from {}", source.display())
-        })?;
-        if !metadata.file_type().is_file() {
-            bail!("workstation banner must be a regular file, not a symlink");
-        }
-        if metadata.len() > MAX_WORKSTATION_BANNER_BYTES {
-            bail!("workstation banner must be 12 MiB or smaller");
-        }
-        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(source)
-            .with_context(|| format!("open workstation banner {}", source.display()))?
-            .take(MAX_WORKSTATION_BANNER_BYTES + 1)
-            .read_to_end(&mut bytes)
+        let bytes = hh_protocol::read_private_file(source, MAX_WORKSTATION_BANNER_BYTES)
             .with_context(|| format!("read workstation banner from {}", source.display()))?;
-        if bytes.len() as u64 > MAX_WORKSTATION_BANNER_BYTES {
-            bail!("workstation banner must be 12 MiB or smaller");
-        }
         let stored = canonical_workstation_banner(&bytes)?;
         let path = self.workstation_banner_path()?;
-        atomic_write_private(&path, &stored.png, "workstation banner")?;
+        hh_protocol::atomic_write_private(&path, &stored.png)
+            .with_context(|| format!("write workstation banner {}", path.display()))?;
         Ok(stored)
     }
 
@@ -198,105 +182,118 @@ fn default_ui_state_path() -> Result<PathBuf> {
     let directory = hh_protocol::state_directory().context("HOME is not set")?;
     Ok(directory.join("ui-state.json"))
 }
-fn decode_workstation_banner(bytes: &[u8]) -> Result<image::DynamicImage> {
-    let mut reader = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .context("detect workstation banner image format")?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_WORKSTATION_BANNER_DIMENSION);
-    limits.max_image_height = Some(MAX_WORKSTATION_BANNER_DIMENSION);
-    limits.max_alloc = Some(MAX_WORKSTATION_BANNER_PIXELS * 8);
-    reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .context("decode bounded workstation banner image")?;
-    let (width, height) = decoded.dimensions();
-    if width == 0
-        || height == 0
-        || width > MAX_WORKSTATION_BANNER_DIMENSION
-        || height > MAX_WORKSTATION_BANNER_DIMENSION
-        || u64::from(width) * u64::from(height) > MAX_WORKSTATION_BANNER_PIXELS
-    {
-        bail!(
-            "workstation banner dimensions must be at most {MAX_WORKSTATION_BANNER_DIMENSION}x{MAX_WORKSTATION_BANNER_DIMENSION} and {MAX_WORKSTATION_BANNER_PIXELS} pixels"
-        );
-    }
-    Ok(decoded)
+/// Bounded-decode and canonical-PNG-re-encode limits for one stored image.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CanonicalPngLimits {
+    /// Lowercase label used in user-facing error messages.
+    pub what: &'static str,
+    pub max_dimension: u32,
+    pub max_pixels: u64,
+    /// Decoder allocation cap in bytes.
+    pub max_alloc: u64,
 }
 
-fn canonical_workstation_banner(bytes: &[u8]) -> Result<StoredBanner> {
-    let decoded = decode_workstation_banner(bytes)?;
+/// One bounded-decoded image re-encoded as a canonical PNG.
+#[derive(Clone, Debug)]
+pub(crate) struct CanonicalPng {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn bounded_image_reader<'a>(
+    bytes: &'a [u8],
+    limits: &CanonicalPngLimits,
+) -> Result<image::ImageReader<Cursor<&'a [u8]>>> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .with_context(|| format!("detect {} image format", limits.what))?;
+    let mut image_limits = image::Limits::default();
+    image_limits.max_image_width = Some(limits.max_dimension);
+    image_limits.max_image_height = Some(limits.max_dimension);
+    image_limits.max_alloc = Some(limits.max_alloc);
+    reader.limits(image_limits);
+    Ok(reader)
+}
+
+fn validate_image_dimensions(width: u32, height: u32, limits: &CanonicalPngLimits) -> Result<()> {
+    if width == 0
+        || height == 0
+        || width > limits.max_dimension
+        || height > limits.max_dimension
+        || u64::from(width) * u64::from(height) > limits.max_pixels
+    {
+        bail!(
+            "{} dimensions must be at most {}x{} and {} pixels",
+            limits.what,
+            limits.max_dimension,
+            limits.max_dimension,
+            limits.max_pixels
+        );
+    }
+    Ok(())
+}
+
+/// Decodes one bounded raster image and re-encodes it as a canonical PNG.
+///
+/// Dimensions are validated against `limits` both before decoding (via the
+/// decoder's own limits) and after decoding, so an oversized image is
+/// rejected before a large allocation can occur.
+pub(crate) fn decode_canonical_png(
+    bytes: &[u8],
+    limits: &CanonicalPngLimits,
+) -> Result<CanonicalPng> {
+    let dimensions_reader = bounded_image_reader(bytes, limits)?;
+    let (header_width, header_height) = dimensions_reader
+        .into_dimensions()
+        .with_context(|| format!("read bounded {} image dimensions", limits.what))?;
+    validate_image_dimensions(header_width, header_height, limits)?;
+
+    let decoded = bounded_image_reader(bytes, limits)?
+        .decode()
+        .with_context(|| format!("decode bounded {} image", limits.what))?;
     let (width, height) = decoded.dimensions();
+    validate_image_dimensions(width, height, limits)?;
     let mut canonical = Cursor::new(Vec::new());
     decoded
         .write_to(&mut canonical, image::ImageFormat::Png)
-        .context("encode canonical workstation banner PNG")?;
-    let canonical = canonical.into_inner();
-    if canonical.len() as u64 > MAX_WORKSTATION_BANNER_BYTES {
-        bail!("encoded workstation banner must be 12 MiB or smaller");
-    }
-    Ok(StoredBanner {
-        png: canonical,
+        .with_context(|| format!("encode canonical {} PNG", limits.what))?;
+    Ok(CanonicalPng {
+        png: canonical.into_inner(),
         width,
         height,
     })
 }
 
-fn atomic_write_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("{label} path has no parent directory"))?;
-    ensure_private_directory(parent)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("private-state");
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-    let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-            .with_context(|| format!("create temporary {label} {}", temporary.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("write {label}"))?;
-        file.sync_all()
-            .with_context(|| format!("sync {label} contents"))?;
-        fs::rename(&temporary, path).with_context(|| {
-            format!(
-                "atomically replace {} with {}",
-                path.display(),
-                temporary.display()
-            )
-        })?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("sync {label} directory"))?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(temporary);
+fn canonical_workstation_banner(bytes: &[u8]) -> Result<StoredBanner> {
+    let limits = CanonicalPngLimits {
+        what: "workstation banner",
+        max_dimension: MAX_WORKSTATION_BANNER_DIMENSION,
+        max_pixels: MAX_WORKSTATION_BANNER_PIXELS,
+        max_alloc: MAX_WORKSTATION_BANNER_PIXELS * 8,
+    };
+    let canonical = decode_canonical_png(bytes, &limits)?;
+    if canonical.png.len() as u64 > MAX_WORKSTATION_BANNER_BYTES {
+        bail!("encoded workstation banner must be 12 MiB or smaller");
     }
-    write_result
-}
-
-fn ensure_private_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("create UI state directory {}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect UI state directory {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("UI state directory must be a real directory");
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("restrict UI state directory {}", path.display()))?;
-    Ok(())
+    Ok(StoredBanner {
+        png: canonical.png,
+        width: canonical.width,
+        height: canonical.height,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{
+        CanonicalPngLimits, Cursor, Path, PathBuf, UiStateStore, WORKSTATION_BANNER_FILE_NAME,
+        decode_canonical_png,
+    };
+
+    use uuid::Uuid;
 
     fn temp_store(label: &str) -> (PathBuf, UiStateStore) {
         let root = std::env::temp_dir().join(format!("hh-ui-{label}-{}", Uuid::new_v4()));
@@ -334,9 +331,35 @@ mod tests {
     }
 
     #[test]
+    fn image_pixel_limit_is_enforced_independently_of_dimensions() {
+        let bytes = banner_bytes(image::ImageFormat::Png);
+        let error = decode_canonical_png(
+            &bytes,
+            &CanonicalPngLimits {
+                what: "test image",
+                max_dimension: 300,
+                max_pixels: 29_999,
+                max_alloc: 1_048_576,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test image dimensions"));
+    }
+
+    fn create_owner_only_directory(path: &Path) {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .unwrap();
+    }
+
+    #[test]
     fn workstation_banner_is_copied_canonically_and_can_be_reset() {
         let (root, store) = temp_store("banner-round-trip");
-        fs::create_dir_all(&root).unwrap();
+        create_owner_only_directory(&root);
         let source = root.join("selected.jpg");
         fs::write(&source, banner_bytes(image::ImageFormat::Jpeg)).unwrap();
 
@@ -362,7 +385,7 @@ mod tests {
     #[test]
     fn invalid_banner_does_not_replace_the_saved_selection() {
         let (root, store) = temp_store("banner-invalid");
-        fs::create_dir_all(&root).unwrap();
+        create_owner_only_directory(&root);
         let valid = root.join("valid.png");
         fs::write(&valid, banner_bytes(image::ImageFormat::Png)).unwrap();
         let saved = store.import_workstation_banner(&valid).unwrap();

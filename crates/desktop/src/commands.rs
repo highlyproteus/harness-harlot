@@ -159,7 +159,7 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
     },
     CommandDescriptor {
         command: AppCommand::ShowNotifications,
-        id: "app.notifications",
+        id: "app.session.notifications",
         title: "Show Notifications",
         category: "Application",
         default_bindings: &[],
@@ -422,7 +422,10 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AppCommand, AppConfig, COMMAND_DESCRIPTORS, Keystroke, check_registry, descriptor,
+        palette_matches,
+    };
 
     #[test]
     fn registry_is_complete_unique_and_stably_addressable() {

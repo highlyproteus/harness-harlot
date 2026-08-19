@@ -1,9 +1,16 @@
-use super::{
-    ClientRequest, Context, DropPlacement, HashSet, IntoElement, MAX_SSH_INPUT_LEN, MouseButton,
-    Pane, ParentElement, Pixels, Point, Range, Render, SplitAxis, Styled, THEME,
-    TerminalHistoryPage, TerminalPoint, TerminalProfile, TerminalSelection, TmuxScanScope,
-    TmuxSession, TmuxSessionId, Uuid, Window, div, normalize_ssh_input, px, rgb, validate_ssh_host,
+use gpui::{IntoElement, ParentElement, Pixels, Point, Render, Styled, Window, div, px, rgb};
+use hh_protocol::{
+    ClientRequest, DropPlacement, MAX_SSH_INPUT_LEN, Pane, SplitAxis, TerminalHistoryPage,
+    TerminalPoint, TerminalProfile, TerminalSelection, TmuxScanScope, TmuxSession, TmuxSessionId,
+    normalize_ssh_input, validate_ssh_host,
 };
+use std::collections::HashSet;
+use std::ops::Range;
+use uuid::Uuid;
+
+use gpui::{Context, MouseButton};
+
+use crate::THEME;
 
 #[derive(Clone, Debug)]
 pub(super) struct PaneDrag {
@@ -52,67 +59,51 @@ pub(super) struct TabIdentityPresentation {
 
 impl Render for PaneDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .absolute()
-            .left(self.position.x - px(70.0))
-            .top(self.position.y - px(14.0))
-            .w(px(140.0))
-            .h(px(28.0))
-            .bg(rgb(THEME.elevated))
-            .border_1()
-            .border_color(rgb(THEME.border_strong))
-            .flex()
-            .items_center()
-            .justify_center()
-            .font_family("SF Mono")
-            .text_xs()
-            .text_color(rgb(THEME.foreground))
-            .child(self.title.clone())
+        drag_ghost(&self.title, self.position, true)
     }
 }
 
 impl Render for WorkspaceDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .absolute()
-            .left(self.position.x - px(82.0))
-            .top(self.position.y - px(14.0))
-            .w(px(164.0))
-            .h(px(28.0))
-            .rounded(px(5.0))
-            .bg(rgb(THEME.elevated))
-            .border_1()
-            .border_color(rgb(THEME.accent))
-            .flex()
-            .items_center()
-            .justify_center()
-            .font_family(".SystemUIFont")
-            .text_sm()
-            .text_color(rgb(THEME.foreground))
-            .child(self.title.clone())
+        drag_ghost(&self.title, self.position, false)
     }
 }
 
 impl Render for TabDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .absolute()
-            .left(self.position.x - px(82.0))
-            .top(self.position.y - px(14.0))
-            .w(px(164.0))
-            .h(px(28.0))
-            .rounded(px(5.0))
-            .bg(rgb(THEME.elevated))
-            .border_1()
-            .border_color(rgb(THEME.accent))
-            .flex()
-            .items_center()
-            .justify_center()
-            .font_family(".SystemUIFont")
-            .text_sm()
-            .text_color(rgb(THEME.foreground))
-            .child(self.title.clone())
+        drag_ghost(&self.title, self.position, false)
     }
+}
+
+/// One shared drag-ghost pill. Terminal ghosts are smaller, monospace, and
+/// square-cornered; workspace and tab ghosts are rounded and system-font.
+fn drag_ghost(title: &str, position: gpui::Point<Pixels>, terminal: bool) -> impl IntoElement {
+    let (width, half_width, border, font) = if terminal {
+        (140.0, 70.0, rgb(THEME.border_strong), "SF Mono")
+    } else {
+        (164.0, 82.0, rgb(THEME.accent), ".SystemUIFont")
+    };
+    let element = div()
+        .absolute()
+        .left(position.x - px(half_width))
+        .top(position.y - px(14.0))
+        .w(px(width))
+        .h(px(28.0))
+        .bg(rgb(THEME.elevated))
+        .border_1()
+        .border_color(border)
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(font);
+    let element = if terminal {
+        element.text_xs()
+    } else {
+        element.text_sm().rounded(px(5.0))
+    };
+    element
+        .text_color(rgb(THEME.foreground))
+        .child(title.to_owned())
 }
 
 #[derive(Clone, Debug)]
@@ -707,7 +698,7 @@ impl WorkspaceCreationDialog {
                 self.step = WorkspaceCreationStep::ConfirmSsh;
                 self.error = None;
             }
-            Err(message) => self.error = Some(message.to_owned()),
+            Err(message) => self.error = Some(message.to_string()),
         }
     }
 
@@ -799,7 +790,7 @@ impl CloseConfirmation {
         Self {
             pane_id: pane.id,
             title: pane.title.clone(),
-            is_browser: matches!(pane.kind, hh_protocol::PaneKind::Browser { .. }),
+            is_browser: pane.kind.is_browser(),
             leaves_workspace_empty,
         }
     }
@@ -885,9 +876,9 @@ impl SidebarResizeLifecycle {
 /// wraps its deterministic compatibility key behind one boundary. A future
 /// protocol `SplitId` can replace the field without changing layout controls.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct SplitControlId {
-    pub(super) first: Uuid,
-    pub(super) second: Uuid,
+pub(crate) struct SplitControlId {
+    pub(crate) first: Uuid,
+    pub(crate) second: Uuid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1109,7 +1100,14 @@ impl DragHoverState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ClientRequest, CloseConfirmation, DialogTextEditor, DragDestination, DragHoverState,
+        DropPlacement, HashSet, MAX_SSH_INPUT_LEN, MouseButton, Pane, SidebarResizeLifecycle,
+        SidebarResizeMove, TmuxScanScope, TmuxSession, TmuxSessionId, TmuxSessionPicker, Uuid,
+        WorkspaceCreationDialog, WorkspaceCreationField, WorkspaceCreationKind,
+        WorkspaceCreationStep, route_workspace_creation_paste,
+    };
+
     #[test]
     fn per_tab_close_requires_an_explicit_confirmation_for_the_exact_terminal() {
         let pane = Pane {

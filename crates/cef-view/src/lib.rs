@@ -63,6 +63,11 @@ pub fn preflight() -> bool {
     false
 }
 
+/// Returns the disabled CEF runtime error on unsupported builds.
+///
+/// # Errors
+///
+/// Always returns an error because CEF is unavailable for this build.
 #[cfg(not(all(feature = "cef", target_os = "macos")))]
 pub fn init_runtime(_: &std::path::Path) -> anyhow::Result<()> {
     anyhow::bail!("CEF support is disabled")
@@ -73,6 +78,11 @@ pub fn shutdown_runtime() {}
 
 #[cfg(not(all(feature = "cef", target_os = "macos")))]
 impl BrowserPane {
+    /// Returns the disabled CEF runtime error on unsupported builds.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an error because CEF is unavailable for this build.
     pub fn create(
         _: *mut std::ffi::c_void,
         _: BrowserRect,

@@ -17,13 +17,13 @@ use uuid::Uuid;
 const SCHEMA_VERSION: u16 = 10;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
-const MAX_WORKSPACES: usize = 16;
-const MAX_TABS_PER_WORKSPACE: usize = 32;
+pub(crate) const MAX_WORKSPACES: usize = 16;
+pub(crate) const MAX_TABS_PER_WORKSPACE: usize = 32;
 const MAX_PANES: usize = 32;
 const MAX_LAYOUT_DEPTH: usize = 16;
-const MAX_TITLE_CHARS: usize = 80;
+pub(crate) const MAX_TITLE_CHARS: usize = 80;
 const MAX_PATH_BYTES: usize = 4096;
-const MAX_RECENT_COLORS: usize = 8;
+pub(crate) const MAX_RECENT_COLORS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RecoveredState {
@@ -86,11 +86,12 @@ impl SnapshotStore {
         Ok(desired.into_runtime())
     }
 
-    pub(crate) fn encode(
+    pub(crate) fn encode_with_offline(
         snapshot: &SessionSnapshot,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
+        offline_panes: &HashSet<Uuid>,
     ) -> Result<Vec<u8>> {
-        let desired = DesiredState::from_runtime(snapshot, cwd_by_pane)?;
+        let desired = DesiredState::from_runtime(snapshot, cwd_by_pane, offline_panes)?;
         desired.validate()?;
         let bytes = serde_json::to_vec(&desired).context("encode recovery snapshot")?;
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
@@ -99,6 +100,15 @@ impl SnapshotStore {
         Ok(bytes)
     }
 
+    /// Atomically writes the recovery snapshot: a fresh `0o600` temporary in
+    /// the same directory is written, synced, renamed over the target, and
+    /// the parent directory is synced.
+    ///
+    /// This must stay behaviorally in sync with
+    /// `hh_protocol::paths::atomic_write_private`. Consolidation is
+    /// intentionally skipped: this copy carries the `#[cfg(test)]`
+    /// injected-failure hook (`fail_before_replace`) that cannot cross the
+    /// crate boundary.
     pub(crate) fn write_snapshot(&self, bytes: &[u8]) -> Result<()> {
         let parent = self
             .path
@@ -149,7 +159,7 @@ impl SnapshotStore {
 
     #[cfg(test)]
     fn save(&self, snapshot: &SessionSnapshot, cwd_by_pane: &HashMap<Uuid, PathBuf>) -> Result<()> {
-        let bytes = Self::encode(snapshot, cwd_by_pane)?;
+        let bytes = Self::encode_with_offline(snapshot, cwd_by_pane, &HashSet::new())?;
         self.write_snapshot(&bytes)
     }
 
@@ -200,16 +210,8 @@ pub(crate) fn default_snapshot_path() -> Result<PathBuf> {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("create recovery directory {}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect recovery directory {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("recovery directory must be a real directory");
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("restrict recovery directory {}", path.display()))?;
-    Ok(())
+    hh_protocol::ensure_private_directory(path)
+        .with_context(|| format!("prepare recovery directory {}", path.display()))
 }
 
 /// Retained only so a snapshot written before the tmux status-bar setting was
@@ -315,6 +317,7 @@ impl DesiredState {
     fn from_runtime(
         snapshot: &SessionSnapshot,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
+        offline_panes: &HashSet<Uuid>,
     ) -> Result<Self> {
         let workspaces = snapshot
             .workspaces
@@ -356,6 +359,7 @@ impl DesiredState {
                                     &tab.layout,
                                     cwd_by_pane,
                                     allow_offline,
+                                    offline_panes,
                                 )?,
                             })
                         })
@@ -455,12 +459,12 @@ impl DesiredState {
             validate_title(&workspace.title, "workspace")?;
             match &workspace.connection {
                 WorkspaceConnection::SystemSsh { destination, .. } => {
-                    validate_ssh_host(destination).map_err(|message| anyhow::anyhow!(message))?;
+                    validate_ssh_host(destination).map_err(anyhow::Error::from)?;
                 }
                 WorkspaceConnection::Local => {}
             }
             if let Some(working_dir) = &workspace.working_dir {
-                validate_workspace_dir(working_dir).map_err(|message| anyhow::anyhow!(message))?;
+                validate_workspace_dir(working_dir).map_err(anyhow::Error::from)?;
             }
             if workspace.tabs.len() > MAX_TABS_PER_WORKSPACE {
                 bail!("workstation must contain at most {MAX_TABS_PER_WORKSPACE} tabs");
@@ -477,8 +481,7 @@ impl DesiredState {
                     validate_title(name, "group")?;
                 }
                 if let Some(project_dir) = &tab.project_dir {
-                    validate_workspace_dir(project_dir)
-                        .map_err(|message| anyhow::anyhow!(message))?;
+                    validate_workspace_dir(project_dir).map_err(anyhow::Error::from)?;
                 }
                 if let Some(icon) = &tab.custom_icon {
                     validate_custom_icon_id(icon)?;
@@ -508,15 +511,26 @@ impl DesiredLayout {
         layout: &PaneLayout,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
         allow_offline: bool,
+        offline_panes: &HashSet<Uuid>,
     ) -> Result<Self> {
         Ok(match layout {
             PaneLayout::Leaf { pane } => Self::Leaf {
-                pane: DesiredPane::from_runtime(pane, cwd_by_pane, allow_offline)?,
+                pane: DesiredPane::from_runtime(
+                    pane,
+                    cwd_by_pane,
+                    allow_offline || offline_panes.contains(&pane.id),
+                )?,
             },
             PaneLayout::Stack { panes, active } => Self::Stack {
                 panes: panes
                     .iter()
-                    .map(|pane| DesiredPane::from_runtime(pane, cwd_by_pane, allow_offline))
+                    .map(|pane| {
+                        DesiredPane::from_runtime(
+                            pane,
+                            cwd_by_pane,
+                            allow_offline || offline_panes.contains(&pane.id),
+                        )
+                    })
                     .collect::<Result<_>>()?,
                 active: *active,
             },
@@ -528,8 +542,18 @@ impl DesiredLayout {
             } => Self::Split {
                 axis: *axis,
                 ratio: *ratio,
-                first: Box::new(Self::from_runtime(first, cwd_by_pane, allow_offline)?),
-                second: Box::new(Self::from_runtime(second, cwd_by_pane, allow_offline)?),
+                first: Box::new(Self::from_runtime(
+                    first,
+                    cwd_by_pane,
+                    allow_offline,
+                    offline_panes,
+                )?),
+                second: Box::new(Self::from_runtime(
+                    second,
+                    cwd_by_pane,
+                    allow_offline,
+                    offline_panes,
+                )?),
             },
         })
     }
@@ -736,7 +760,7 @@ fn validate_id(id: Uuid, ids: &mut HashSet<Uuid>) -> Result<()> {
     Ok(())
 }
 
-fn validate_title(title: &str, kind: &str) -> Result<()> {
+pub(crate) fn validate_title(title: &str, kind: &str) -> Result<()> {
     let length = title.chars().count();
     if length == 0 || length > MAX_TITLE_CHARS || title.chars().any(char::is_control) {
         bail!("{kind} title must be 1 to {MAX_TITLE_CHARS} visible characters");
@@ -763,6 +787,15 @@ mod tests {
 
     fn test_directory(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("hh-{label}-{}", Uuid::new_v4()))
+    }
+
+    fn create_owner_only_directory(path: &Path) {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .unwrap();
     }
 
     fn cwd_map(snapshot: &SessionSnapshot) -> HashMap<Uuid, PathBuf> {
@@ -1017,7 +1050,8 @@ mod tests {
     #[test]
     fn schema_six_harbor_blue_defaults_migrate_to_dark_gray() {
         let snapshot = SessionSnapshot::seeded();
-        let mut desired = DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot)).unwrap();
+        let mut desired =
+            DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot), &HashSet::new()).unwrap();
         desired.schema_version = 6;
         desired.appearance.default_terminal_accent = AppearanceColor::HARBOR_BLUE;
         desired.appearance.default_workspace_color = AppearanceColor::HARBOR_BLUE;
@@ -1099,8 +1133,12 @@ mod tests {
         let recovered = stored.into_runtime();
         assert_eq!(recovered.snapshot.workspaces[0].title, "Workstation");
 
-        let rewritten =
-            DesiredState::from_runtime(&recovered.snapshot, &recovered.cwd_by_pane).unwrap();
+        let rewritten = DesiredState::from_runtime(
+            &recovered.snapshot,
+            &recovered.cwd_by_pane,
+            &HashSet::new(),
+        )
+        .unwrap();
         let encoded = serde_json::to_string(&rewritten).unwrap();
         assert!(!encoded.contains("tmux"), "encoded: {encoded}");
         assert!(!encoded.contains("hide_status_bar"), "encoded: {encoded}");
@@ -1110,7 +1148,7 @@ mod tests {
     #[test]
     fn corrupt_or_unknown_state_is_quarantined() {
         let directory = test_directory("quarantine");
-        fs::create_dir_all(&directory).unwrap();
+        create_owner_only_directory(&directory);
         let path = directory.join("sessions.json");
         fs::write(
             &path,
@@ -1140,7 +1178,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = test_directory("symlink-quarantine");
-        fs::create_dir_all(&directory).unwrap();
+        create_owner_only_directory(&directory);
         let target = directory.join("outside-target");
         fs::write(&target, b"do not touch").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
@@ -1173,7 +1211,8 @@ mod tests {
     #[test]
     fn invalid_ratio_and_duplicate_ids_are_rejected() {
         let snapshot = SessionSnapshot::seeded();
-        let mut desired = DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot)).unwrap();
+        let mut desired =
+            DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot), &HashSet::new()).unwrap();
         let pane = match &desired.workspaces[0].tabs[0].layout {
             DesiredLayout::Leaf { pane } => pane.clone(),
             _ => panic!("expected leaf"),

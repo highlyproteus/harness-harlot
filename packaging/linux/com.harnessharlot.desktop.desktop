@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Harness Harlot
+Comment=Native terminal workspace
+Exec=/bin/sh -lc "exec \"\$HOME/.local/bin/hh\""
+Icon=com.harnessharlot.desktop
+Terminal=false
+Categories=Development;TerminalEmulator;
+StartupNotify=true
+StartupWMClass=hh

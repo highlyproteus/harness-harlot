@@ -206,7 +206,10 @@ fn round_to_half(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        TERMINAL_ZOOM_MAX_LEVEL, TERMINAL_ZOOM_MIN_LEVEL, TerminalCellMetrics,
+        adjusted_terminal_zoom_level, select_font_family,
+    };
 
     fn assert_close(actual: f32, expected: f32) {
         assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");

@@ -13,6 +13,7 @@ resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
+repository = "https://gitlab.com/highlyproteus/harness-harlot"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -22,13 +23,15 @@ alacritty_terminal = "0.26.0"
 anyhow = "1.0.99"
 base64 = "0.22.1"
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
+futures = "0.3"
+flate2 = "1.1.9"
 gpui = "0.2.2"
 image = "0.25.10"
 libc = "0.2.175"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile", "NSImage"] }
 objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSError", "NSString", "NSURL", "NSValue"] }
-time = { version = "0.3.41", features = ["macros", "parsing"] }
+time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
 parking_lot = "0.12"
 raw-window-handle = "0.6.2"
 portable-pty = "0.9.0"
@@ -40,8 +43,10 @@ sha2 = "0.10.9"
 sysinfo = "0.31.4"
 thiserror = "2.0.16"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tar = "0.4.46"
 unicode-width = "0.2.2"
 url = "2.5.8"
+ureq = { version = "2", default-features = false, features = ["tls"] }
 zeroize = "1.8.1"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
@@ -58,4 +63,6 @@ must_use_candidate = "allow"
 [profile.release]
 overflow-checks = true
 lto = "thin"
-strip = "debuginfo"
+# Line tables keep release backtraces symbolized for the local panic log
+# without paying for full debug info.
+debug = "line-tables-only"

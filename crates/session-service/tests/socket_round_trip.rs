@@ -9,9 +9,12 @@ use tokio::net::UnixStream;
 async fn client_can_handshake_and_fetch_snapshot() {
     let (mut client, server) = UnixStream::pair().unwrap();
     let server_task = tokio::spawn(async move {
-        serve_connection(server, &SessionRegistry::default())
-            .await
-            .unwrap();
+        serve_connection(
+            server,
+            &SessionRegistry::new().expect("start seeded configured-shell PTY"),
+        )
+        .await
+        .unwrap();
     });
 
     write_message(
@@ -90,9 +93,12 @@ async fn older_full_state_protocol_is_rejected_before_any_request() {
     let (mut client, server) = UnixStream::pair().unwrap();
     let server_task = tokio::spawn(async move {
         assert!(
-            serve_connection(server, &SessionRegistry::default())
-                .await
-                .is_err()
+            serve_connection(
+                server,
+                &SessionRegistry::new().expect("start seeded configured-shell PTY"),
+            )
+            .await
+            .is_err()
         );
     });
 
@@ -120,7 +126,7 @@ async fn older_full_state_protocol_is_rejected_before_any_request() {
 #[tokio::test]
 async fn terminal_input_is_not_acknowledged_on_the_wire() {
     let (mut client, server) = UnixStream::pair().unwrap();
-    let registry = SessionRegistry::default();
+    let registry = SessionRegistry::new().expect("start seeded configured-shell PTY");
     let snapshot = registry.snapshot().unwrap();
     let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
         hh_protocol::PaneLayout::Leaf { pane } => pane.id,
@@ -175,6 +181,35 @@ async fn terminal_input_is_not_acknowledged_on_the_wire() {
     );
 
     drop(client);
+    server_task.await.unwrap();
+}
+
+/// A client that connects but never sends a hello must be disconnected by
+/// the handshake timeout instead of holding a connection slot forever.
+#[tokio::test]
+async fn silent_client_is_disconnected_after_the_handshake_timeout() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_task = tokio::spawn(async move {
+        assert!(
+            serve_connection(
+                server,
+                &SessionRegistry::new().expect("start seeded configured-shell PTY"),
+            )
+            .await
+            .is_err()
+        );
+    });
+
+    let mut buffer = [0_u8; 8];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(7), client.read(&mut buffer))
+        .await
+        .expect("server must close a silent client within the handshake window");
+    match read {
+        // The server closed the connection (EOF or reset) without sending
+        // anything.
+        Ok(0) | Err(_) => {}
+        Ok(bytes) => panic!("server sent {bytes} bytes before a valid hello"),
+    }
     server_task.await.unwrap();
 }
 

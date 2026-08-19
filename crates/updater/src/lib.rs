@@ -1,15 +1,18 @@
 //! Offline verification primitives for the Harness Harlot stable update feed.
 //!
-//! The compiled production trust configuration intentionally fails closed until
-//! a release host and public key are selected. Release infrastructure may use
-//! [`verify_manifest_with_key`] with an explicit fixture policy.
+//! Production verification pins the stable GitHub host and owner-held Ed25519
+//! public key. Release infrastructure may use [`verify_manifest_with_key`] with
+//! an explicit fixture policy.
+
+#[cfg(feature = "fetch")]
+pub mod fetch;
 
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use semver::Version;
@@ -18,12 +21,41 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
-pub const MANIFEST_SCHEMA: &str = "hh-update-manifest-v1";
+pub const MANIFEST_SCHEMA: &str = "hh-update-manifest-v2";
 pub const PRODUCT_NAME: &str = "Harness Harlot";
 pub const STABLE_CHANNEL: &str = "stable";
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Build sequence embedded by release packaging. Development builds use zero.
+pub fn current_build() -> u64 {
+    option_env!("HH_RELEASE_BUILD")
+        .and_then(|build| build.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Returns the immutable manifest filename for this build's release channel.
+///
+/// Unnotarized community macOS builds use a distinct feed so a future
+/// Developer ID build can never select an ad-hoc-signed artifact.
+#[must_use]
+pub fn update_manifest_name(platform: &str, architecture: &str) -> String {
+    if cfg!(feature = "community-macos") && platform == "macos" {
+        format!("manifest-{platform}-community-{architecture}.update.json")
+    } else {
+        format!("manifest-{platform}-{architecture}.update.json")
+    }
+}
+
+/// Whether this build may replace an installed application automatically.
+///
+/// Community macOS artifacts intentionally stop at authenticated update
+/// notification. Their manual installer is the explicit Gatekeeper trust
+/// boundary.
+#[must_use]
+pub fn automatic_install_supported(platform: &str) -> bool {
+    !(cfg!(feature = "community-macos") && platform == "macos")
+}
 
 /// One key compiled into a production client. Key IDs are part of the signed
 /// manifest and select exactly one corresponding verifying key.
@@ -34,9 +66,22 @@ pub struct TrustedKey {
 }
 
 /// Populate only after the owner selects the real offline release key.
-pub const TRUSTED_UPDATE_KEYS: &[TrustedKey] = &[];
-/// Populate only after the owner selects the immutable production update host.
-pub const UPDATE_HOST: Option<&str> = None;
+/// hh-stable-2026 is the owner-held stable-channel key; its seed never
+/// enters the repository or CI as a file.
+pub const TRUSTED_UPDATE_KEYS: &[TrustedKey] = &[TrustedKey {
+    key_id: "hh-stable-2026",
+    public_key_base64: "W3xGpnOmpqVPsaJDWI8LF25g3/Y24DkuHJWkOldH9DE=",
+}];
+/// The immutable production update host. Only artifact URLs on this host
+/// are accepted by the verifier.
+pub const UPDATE_HOST: Option<&str> = Some("github.com");
+/// Stable manifest location; `releases/latest/download` resolves to the
+/// newest non-prerelease GitHub release without knowing its tag.
+pub const UPDATE_MANIFEST_BASE: Option<&str> =
+    Some("https://github.com/HighlyProtean/harness-harlot/releases/latest/download");
+/// Apple Developer Team ID, required by the in-app installer gate. Stays
+/// fail-closed (None) until Apple Developer Program enrollment completes.
+pub const TRUSTED_APPLE_TEAM_ID: Option<&str> = None;
 
 /// A signed, immutable release description. The detached signature is over
 /// the exact UTF-8 manifest bytes, not over a reserialized representation.
@@ -51,7 +96,11 @@ pub struct UpdateManifest {
     pub build: u64,
     pub published_at: String,
     pub valid_until: String,
-    pub minimum_macos: String,
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_macos: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_glibc: Option<String>,
     pub session_service: SessionServicePolicy,
     pub artifacts: Vec<ReleaseArtifact>,
 }
@@ -81,6 +130,7 @@ pub struct ReleaseArtifact {
 pub struct CurrentRelease<'a> {
     pub version: &'a str,
     pub build: u64,
+    pub platform: &'a str,
     pub architecture: &'a str,
     pub protocol_version: u16,
 }
@@ -247,7 +297,35 @@ pub fn validate_manifest_for_host(
     );
     ensure!(now <= valid_until, "update manifest has expired");
 
-    validate_macos_version(&manifest.minimum_macos)?;
+    match manifest.platform.as_str() {
+        "macos" => {
+            ensure!(
+                manifest.minimum_glibc.is_none(),
+                "macOS manifest must not declare minimum glibc"
+            );
+            validate_dotted_version(
+                manifest
+                    .minimum_macos
+                    .as_deref()
+                    .context("macOS manifest has no minimum macOS version")?,
+                "macOS",
+            )?;
+        }
+        "linux" => {
+            ensure!(
+                manifest.minimum_macos.is_none(),
+                "Linux manifest must not declare minimum macOS"
+            );
+            validate_dotted_version(
+                manifest
+                    .minimum_glibc
+                    .as_deref()
+                    .context("Linux manifest has no minimum glibc version")?,
+                "glibc",
+            )?;
+        }
+        _ => bail!("unsupported update platform"),
+    }
     ensure!(
         manifest.session_service.protocol_version > 0,
         "invalid session service protocol"
@@ -261,47 +339,62 @@ pub fn validate_manifest_for_host(
         "update manifest has no artifacts"
     );
     for artifact in &manifest.artifacts {
+        ensure!(
+            artifact.platform == manifest.platform,
+            "update artifact platform does not match manifest"
+        );
         validate_artifact(artifact, update_host)?;
     }
     Ok(())
 }
 
-fn validate_macos_version(version: &str) -> Result<()> {
-    let mut components = version.split('.');
-    let major = components
-        .next()
-        .context("minimum macOS version is empty")?;
-    ensure!(
-        major.parse::<u16>().is_ok(),
-        "minimum macOS major version is invalid"
-    );
-    for component in components {
+fn validate_dotted_version(version: &str, label: &str) -> Result<()> {
+    ensure!(!version.is_empty(), "minimum {label} version is empty");
+    for component in version.split('.') {
         ensure!(
-            component.parse::<u16>().is_ok(),
-            "minimum macOS version is invalid"
+            !component.is_empty() && component.parse::<u16>().is_ok(),
+            "minimum {label} version is invalid"
         );
     }
     Ok(())
 }
 
 fn validate_artifact(artifact: &ReleaseArtifact, update_host: &str) -> Result<()> {
-    ensure!(artifact.platform == "macos", "unsupported update platform");
     ensure!(
         matches!(artifact.architecture.as_str(), "arm64" | "x86_64"),
-        "unsupported macOS architecture"
+        "unsupported update architecture"
     );
-    ensure!(
-        artifact.format == "dmg",
-        "only macOS DMG update artifacts are accepted"
+    let valid_format = matches!(
+        (artifact.platform.as_str(), artifact.format.as_str()),
+        ("macos", "dmg") | ("linux", "tar.gz")
     );
+    ensure!(valid_format, "unsupported update artifact format");
+    if artifact.platform == "macos" {
+        let community_artifact = artifact.file_name.ends_with("-community.dmg");
+        ensure!(
+            community_artifact == cfg!(feature = "community-macos"),
+            "macOS update artifact does not match this build's release channel"
+        );
+    }
+    let artifact_path = Path::new(&artifact.file_name);
+    let valid_suffix = match artifact.format.as_str() {
+        "dmg" => artifact_path.extension() == Some(std::ffi::OsStr::new("dmg")),
+        "tar.gz" => {
+            artifact_path.extension() == Some(std::ffi::OsStr::new("gz"))
+                && artifact_path
+                    .file_stem()
+                    .and_then(|stem| Path::new(stem).extension())
+                    == Some(std::ffi::OsStr::new("tar"))
+        }
+        _ => false,
+    };
     ensure!(
         !artifact.file_name.is_empty()
+            && !artifact.file_name.starts_with('.')
             && !artifact.file_name.contains('/')
             && !artifact.file_name.contains('\\')
-            && Path::new(&artifact.file_name)
-                .extension()
-                .is_some_and(|extension| extension == "dmg"),
-        "update artifact name must be a plain DMG filename"
+            && valid_suffix,
+        "update artifact name is not a plain platform package filename"
     );
     let url = Url::parse(&artifact.url).context("parse update artifact URL")?;
     ensure!(
@@ -360,6 +453,24 @@ pub fn select_update<'a>(
 ) -> Result<Option<AvailableUpdate<'a>>> {
     let host = UPDATE_HOST.context("production update host is not configured")?;
     validate_manifest_for_host(manifest, host, OffsetDateTime::now_utc(), false)?;
+    select_verified_update(manifest, current)
+}
+
+/// Selects a newer architecture-matched artifact from an already verified
+/// manifest.
+///
+/// # Errors
+///
+/// Returns an error when either version is invalid or no artifact exists for
+/// the requested architecture.
+pub fn select_verified_update<'a>(
+    manifest: &'a UpdateManifest,
+    current: &CurrentRelease<'_>,
+) -> Result<Option<AvailableUpdate<'a>>> {
+    ensure!(
+        manifest.platform == current.platform,
+        "signed update targets a different platform"
+    );
     let incoming = Version::parse(&manifest.version).context("parse incoming update version")?;
     let installed = Version::parse(current.version).context("parse installed update version")?;
     if incoming < installed || (incoming == installed && manifest.build <= current.build) {
@@ -368,8 +479,10 @@ pub fn select_update<'a>(
     let artifact = manifest
         .artifacts
         .iter()
-        .find(|artifact| artifact.architecture == current.architecture)
-        .context("signed update has no artifact for this macOS architecture")?;
+        .find(|artifact| {
+            artifact.platform == current.platform && artifact.architecture == current.architecture
+        })
+        .context("signed update has no artifact for this platform and architecture")?;
     Ok(Some(AvailableUpdate {
         manifest,
         artifact,
@@ -475,6 +588,11 @@ mod tests {
     }
 
     fn manifest_for(bytes: &[u8]) -> UpdateManifest {
+        let file_name = if cfg!(feature = "community-macos") {
+            "Harness-Harlot-0.2.0-macos-arm64-community.dmg"
+        } else {
+            "Harness-Harlot-0.2.0-macos-arm64.dmg"
+        };
         UpdateManifest {
             schema: MANIFEST_SCHEMA.to_owned(),
             product: PRODUCT_NAME.to_owned(),
@@ -484,7 +602,9 @@ mod tests {
             build: 2,
             published_at: "2026-08-14T00:00:00Z".to_owned(),
             valid_until: "2026-08-21T00:00:00Z".to_owned(),
-            minimum_macos: "13.0".to_owned(),
+            platform: "macos".to_owned(),
+            minimum_macos: Some("13.0".to_owned()),
+            minimum_glibc: None,
             session_service: SessionServicePolicy {
                 protocol_version: 11,
                 requires_quiescent_service: true,
@@ -493,12 +613,24 @@ mod tests {
                 platform: "macos".to_owned(),
                 architecture: "arm64".to_owned(),
                 format: "dmg".to_owned(),
-                file_name: "Harness-Harlot-0.2.0-macos-arm64.dmg".to_owned(),
-                url: format!("https://{HOST}/stable/Harness-Harlot-0.2.0-macos-arm64.dmg"),
+                file_name: file_name.to_owned(),
+                url: format!("https://{HOST}/stable/{file_name}"),
                 sha256: sha256_hex(bytes),
                 size: u64::try_from(bytes.len()).unwrap(),
             }],
         }
+    }
+    fn linux_manifest_for(bytes: &[u8]) -> UpdateManifest {
+        let mut manifest = manifest_for(bytes);
+        manifest.platform = "linux".to_owned();
+        manifest.minimum_macos = None;
+        manifest.minimum_glibc = Some("2.35".to_owned());
+        let artifact = &mut manifest.artifacts[0];
+        artifact.platform = "linux".to_owned();
+        artifact.format = "tar.gz".to_owned();
+        artifact.file_name = "Harness-Harlot-0.2.0-linux-arm64.tar.gz".to_owned();
+        artifact.url = format!("https://{HOST}/stable/{}", artifact.file_name);
+        manifest
     }
 
     fn signed(manifest: &UpdateManifest, key: &SigningKey) -> (Vec<u8>, String) {
@@ -527,6 +659,43 @@ mod tests {
         let manifest = verify_fixture(&body, &signature, &key).unwrap();
         verify_artifact_bytes(&manifest.artifacts[0], artifact).unwrap();
     }
+    #[test]
+    fn validates_and_selects_linux_artifact_only_for_linux() {
+        let manifest = linux_manifest_for(b"linux artifact");
+        validate_manifest_for_host(&manifest, HOST, NOW, true).unwrap();
+        let current = CurrentRelease {
+            version: "0.1.0",
+            build: 1,
+            platform: "linux",
+            architecture: "arm64",
+            protocol_version: 11,
+        };
+        let update = select_verified_update(&manifest, &current)
+            .unwrap()
+            .expect("newer Linux release");
+        assert_eq!(update.artifact.format, "tar.gz");
+
+        let current = CurrentRelease {
+            platform: "macos",
+            ..current
+        };
+        assert!(select_verified_update(&manifest, &current).is_err());
+    }
+
+    #[test]
+    fn rejects_cross_platform_manifest_fields_and_artifacts() {
+        let mut manifest = linux_manifest_for(b"artifact");
+        manifest.minimum_macos = Some("13.0".to_owned());
+        assert!(validate_manifest_for_host(&manifest, HOST, NOW, true).is_err());
+
+        let mut manifest = linux_manifest_for(b"artifact");
+        manifest.artifacts[0].platform = "macos".to_owned();
+        assert!(validate_manifest_for_host(&manifest, HOST, NOW, true).is_err());
+
+        let mut manifest = linux_manifest_for(b"artifact");
+        manifest.minimum_glibc = Some("2.bad".to_owned());
+        assert!(validate_manifest_for_host(&manifest, HOST, NOW, true).is_err());
+    }
 
     #[test]
     fn rejects_manifest_signed_by_untrusted_key() {
@@ -543,6 +712,19 @@ mod tests {
         manifest.key_id = "other-v1".to_owned();
         let (body, signature) = signed(&manifest, &key);
         assert!(verify_fixture(&body, &signature, &key).is_err());
+    }
+
+    #[test]
+    fn rejects_macos_artifact_from_the_other_release_channel() {
+        let mut manifest = manifest_for(b"artifact");
+        let wrong_name = if cfg!(feature = "community-macos") {
+            "Harness-Harlot-0.2.0-macos-arm64.dmg"
+        } else {
+            "Harness-Harlot-0.2.0-macos-arm64-community.dmg"
+        };
+        manifest.artifacts[0].file_name = wrong_name.to_owned();
+        manifest.artifacts[0].url = format!("https://{HOST}/stable/{wrong_name}");
+        assert!(validate_manifest_for_host(&manifest, HOST, NOW, true).is_err());
     }
 
     #[test]
@@ -609,20 +791,24 @@ mod tests {
     }
 
     #[test]
-    fn test_key_and_invalid_host_are_not_production_trust() {
+    fn unknown_key_id_and_foreign_host_are_rejected_by_compiled_trust() {
         let mut manifest = manifest_for(b"artifact");
-        manifest.key_id = "test-only-v1".to_owned();
+        manifest.key_id = "not-a-known-key".to_owned();
         assert!(validate_manifest_for_host(&manifest, HOST, NOW, false).is_err());
         manifest.key_id = KEY_ID.to_owned();
         assert!(
             validate_manifest_for_host(&manifest, "updates.example.invalid", NOW, false).is_err()
         );
-        assert!(TRUSTED_UPDATE_KEYS.is_empty());
-        assert!(UPDATE_HOST.is_none());
+        assert_eq!(UPDATE_HOST, Some("github.com"));
+        assert!(
+            !TRUSTED_UPDATE_KEYS
+                .iter()
+                .any(|key| key.key_id == "not-a-known-key")
+        );
     }
 
     #[test]
-    fn compiled_trust_verification_fails_closed_until_configured() {
+    fn garbage_manifests_fail_closed_against_compiled_trust() {
         assert!(verify_manifest_with_trusted_keys(b"{}", "bad").is_err());
     }
 
@@ -633,6 +819,28 @@ mod tests {
         let incoming = Version::parse(&manifest.version).unwrap();
         let installed = Version::parse("0.1.0").unwrap();
         assert!(incoming > installed);
+    }
+
+    #[test]
+    fn community_macos_feed_and_install_policy_are_isolated() {
+        assert_eq!(
+            update_manifest_name("linux", "arm64"),
+            "manifest-linux-arm64.update.json"
+        );
+        assert!(automatic_install_supported("linux"));
+        if cfg!(feature = "community-macos") {
+            assert_eq!(
+                update_manifest_name("macos", "arm64"),
+                "manifest-macos-community-arm64.update.json"
+            );
+            assert!(!automatic_install_supported("macos"));
+        } else {
+            assert_eq!(
+                update_manifest_name("macos", "arm64"),
+                "manifest-macos-arm64.update.json"
+            );
+            assert!(automatic_install_supported("macos"));
+        }
     }
 
     #[test]

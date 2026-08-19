@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Persistent local session service for Harness Harlot"
+publish = false
 
 [[bin]]
 name = "hh-service"
@@ -14,10 +15,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 libc.workspace = true
 portable-pty.workspace = true
-hh-protocol = { version = "0.1.0", path = "../protocol" }
+hh-protocol = { path = "../protocol" }
 parking_lot.workspace = true
-hh-terminal-model = { version = "0.1.0", path = "../terminal-model" }
+hh-terminal-model = { path = "../terminal-model" }
 serde.workspace = true
+time.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true

@@ -60,8 +60,6 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [bytes 1.12.1](https://github.com/tokio-rs/bytes) — MIT
 - [cbindgen 0.28.0](https://github.com/mozilla/cbindgen) — MPL-2.0
 - [cc 1.4.2](https://github.com/rust-lang/cc-rs) — MIT OR Apache-2.0
-- [cef 151.6.0+151.3.18](https://github.com/tauri-apps/cef-rs) — Apache-2.0 OR MIT
-- [cef-dll-sys 151.6.0+151.3.18](https://github.com/tauri-apps/cef-rs) — Apache-2.0 OR MIT
 - [cexpr 0.6.0](https://github.com/jethrogb/rust-cexpr) — Apache-2.0 OR MIT
 - [cfg-if 1.0.4](https://github.com/rust-lang/cfg-if) — MIT OR Apache-2.0
 - [cfg_aliases 0.1.1](https://github.com/katharostech/cfg_aliases) — MIT
@@ -181,13 +179,14 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [gpui_util 0.2.2](https://crates.io/crates/gpui_util) — Apache-2.0
 - [gpui_util_macros 0.2.2](https://crates.io/crates/gpui_util_macros) — Apache-2.0
 - [grid 0.18.0](https://github.com/becheran/grid) — MIT
-- [h2 0.4.15](https://github.com/hyperium/h2) — MIT
+- [h2 0.4.16](https://github.com/hyperium/h2) — MIT
 - [half 2.7.1](https://github.com/VoidStarKat/half-rs) — MIT OR Apache-2.0
 - [hashbrown 0.15.5](https://github.com/rust-lang/hashbrown) — MIT OR Apache-2.0
 - [hashbrown 0.17.1](https://github.com/rust-lang/hashbrown) — MIT OR Apache-2.0
 - [heck 0.4.1](https://github.com/withoutboats/heck) — MIT OR Apache-2.0
 - [heck 0.5.0](https://github.com/withoutboats/heck) — MIT OR Apache-2.0
 - [hexf-parse 0.2.1](https://github.com/lifthrasiir/hexf) — CC0-1.0
+- [hh-cef-view 0.1.0](https://crates.io/crates/hh-cef-view) — MIT
 - [hh-desktop 0.1.0](https://crates.io/crates/hh-desktop) — MIT
 - [hh-macos-icon 0.1.0](https://crates.io/crates/hh-macos-icon) — MIT
 - [hh-protocol 0.1.0](https://crates.io/crates/hh-protocol) — MIT
@@ -416,6 +415,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [system-configuration-sys 0.6.0](https://github.com/mullvad/system-configuration-rs) — MIT OR Apache-2.0
 - [taffy 0.9.0](https://github.com/DioxusLabs/taffy) — MIT
 - [take-until 0.2.0](https://github.com/hdevalke/take-until.git) — MIT
+- [tar 0.4.46](https://github.com/composefs/tar-rs) — MIT OR Apache-2.0
 - [tempfile 3.27.0](https://github.com/Stebalien/tempfile) — MIT OR Apache-2.0
 - [termcolor 1.4.1](https://github.com/BurntSushi/termcolor) — Unlicense OR MIT
 - [thiserror 1.0.69](https://github.com/dtolnay/thiserror) — MIT OR Apache-2.0
@@ -459,6 +459,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [unicode-vo 0.1.0](https://github.com/RazrFalcon/unicode-vo) — MIT OR Apache-2.0
 - [unicode-width 0.2.2](https://github.com/unicode-rs/unicode-width) — MIT OR Apache-2.0
 - [untrusted 0.9.0](https://github.com/briansmith/untrusted) — ISC
+- [ureq 2.12.1](https://github.com/algesten/ureq) — MIT OR Apache-2.0
 - [url 2.5.8](https://github.com/servo/rust-url) — MIT OR Apache-2.0
 - [usvg 0.45.1](https://github.com/linebender/resvg) — Apache-2.0 OR MIT
 - [utf8_iter 1.0.4](https://github.com/hsivonen/utf8_iter) — Apache-2.0 OR MIT
@@ -471,11 +472,14 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [waker-fn 1.2.0](https://github.com/smol-rs/waker-fn) — Apache-2.0 OR MIT
 - [walkdir 2.5.0](https://github.com/BurntSushi/walkdir) — Unlicense OR MIT
 - [want 0.3.1](https://github.com/seanmonstar/want) — MIT
+- [webpki-roots 0.26.11](https://github.com/rustls/webpki-roots) — CDLA-Permissive-2.0
+- [webpki-roots 1.0.9](https://github.com/rustls/webpki-roots) — CDLA-Permissive-2.0
 - [weezl 0.1.12](https://github.com/image-rs/weezl) — MIT OR Apache-2.0
 - [which 6.0.3](https://github.com/harryfei/which-rs.git) — MIT
 - [winnow 0.7.15](https://github.com/winnow-rs/winnow) — MIT
 - [writeable 0.6.3](https://github.com/unicode-org/icu4x) — Unicode-3.0
 - [xattr 0.2.3](https://github.com/Stebalien/xattr) — MIT OR Apache-2.0
+- [xattr 1.6.1](https://github.com/Stebalien/xattr) — MIT OR Apache-2.0
 - [xmlwriter 0.1.0](https://github.com/RazrFalcon/xmlwriter) — MIT
 - [y4m 0.8.0](https://github.com/image-rs/y4m.git) — MIT
 - [yoke 0.8.3](https://github.com/unicode-org/icu4x) — Unicode-3.0
@@ -510,38 +514,38 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 
    1. Definitions.
 
-      &quot;License&quot; shall mean the terms and conditions for use, reproduction,
+      "License" shall mean the terms and conditions for use, reproduction,
       and distribution as defined by Sections 1 through 9 of this document.
 
-      &quot;Licensor&quot; shall mean the copyright owner or entity authorized by
+      "Licensor" shall mean the copyright owner or entity authorized by
       the copyright owner that is granting the License.
 
-      &quot;Legal Entity&quot; shall mean the union of the acting entity and all
+      "Legal Entity" shall mean the union of the acting entity and all
       other entities that control, are controlled by, or are under common
       control with that entity. For the purposes of this definition,
-      &quot;control&quot; means (i) the power, direct or indirect, to cause the
+      "control" means (i) the power, direct or indirect, to cause the
       direction or management of such entity, whether by contract or
       otherwise, or (ii) ownership of fifty percent (50%) or more of the
       outstanding shares, or (iii) beneficial ownership of such entity.
 
-      &quot;You&quot; (or &quot;Your&quot;) shall mean an individual or Legal Entity
+      "You" (or "Your") shall mean an individual or Legal Entity
       exercising permissions granted by this License.
 
-      &quot;Source&quot; form shall mean the preferred form for making modifications,
+      "Source" form shall mean the preferred form for making modifications,
       including but not limited to software source code, documentation
       source, and configuration files.
 
-      &quot;Object&quot; form shall mean any form resulting from mechanical
+      "Object" form shall mean any form resulting from mechanical
       transformation or translation of a Source form, including but
       not limited to compiled object code, generated documentation,
       and conversions to other media types.
 
-      &quot;Work&quot; shall mean the work of authorship, whether in Source or
+      "Work" shall mean the work of authorship, whether in Source or
       Object form, made available under the License, as indicated by a
       copyright notice that is included in or attached to the work
       (an example is provided in the Appendix below).
 
-      &quot;Derivative Works&quot; shall mean any work, whether in Source or Object
+      "Derivative Works" shall mean any work, whether in Source or Object
       form, that is based on (or derived from) the Work and for which the
       editorial revisions, annotations, elaborations, or other modifications
       represent, as a whole, an original work of authorship. For the purposes
@@ -549,21 +553,21 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
       separable from, or merely link (or bind by name) to the interfaces of,
       the Work and Derivative Works thereof.
 
-      &quot;Contribution&quot; shall mean any work of authorship, including
+      "Contribution" shall mean any work of authorship, including
       the original version of the Work and any modifications or additions
       to that Work or Derivative Works thereof, that is intentionally
       submitted to Licensor for inclusion in the Work by the copyright owner
       or by an individual or Legal Entity authorized to submit on behalf of
-      the copyright owner. For the purposes of this definition, &quot;submitted&quot;
+      the copyright owner. For the purposes of this definition, "submitted"
       means any form of electronic, verbal, or written communication sent
       to the Licensor or its representatives, including but not limited to
       communication on electronic mailing lists, source code control systems,
       and issue tracking systems that are managed by, or on behalf of, the
       Licensor for the purpose of discussing and improving the Work, but
       excluding communication that is conspicuously marked or otherwise
-      designated in writing by the copyright owner as &quot;Not a Contribution.&quot;
+      designated in writing by the copyright owner as "Not a Contribution."
 
-      &quot;Contributor&quot; shall mean Licensor and any individual or Legal Entity
+      "Contributor" shall mean Licensor and any individual or Legal Entity
       on behalf of whom a Contribution has been received by Licensor and
       subsequently incorporated within the Work.
 
@@ -607,7 +611,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
           excluding those notices that do not pertain to any part of
           the Derivative Works; and
 
-      (d) If the Work includes a &quot;NOTICE&quot; text file as part of its
+      (d) If the Work includes a "NOTICE" text file as part of its
           distribution, then any Derivative Works that You distribute must
           include a readable copy of the attribution notices contained
           within such NOTICE file, excluding those notices that do not
@@ -646,7 +650,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 
    7. Disclaimer of Warranty. Unless required by applicable law or
       agreed to in writing, Licensor provides the Work (and each
-      Contributor provides its Contributions) on an &quot;AS IS&quot; BASIS,
+      Contributor provides its Contributions) on an "AS IS" BASIS,
       WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
       implied, including, without limitation, any warranties or conditions
       of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
@@ -682,24 +686,24 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
    APPENDIX: How to apply the Apache License to your work.
 
       To apply the Apache License to your work, attach the following
-      boilerplate notice, with the fields enclosed by brackets &quot;[]&quot;
-      replaced with your own identifying information. (Don&#x27;t include
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
       the brackets!)  The text should be enclosed in the appropriate
       comment syntax for the file format. We also recommend that a
       file or class name and description of purpose be included on the
-      same &quot;printed page&quot; as the copyright notice for easier
+      same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
    Copyright 2023 Jacob Pratt et al.
 
-   Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+   Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at
 
        http://www.apache.org/licenses/LICENSE-2.0
 
    Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+   distributed under the License is distributed on an "AS IS" BASIS,
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
@@ -714,7 +718,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
     Copyright (c) Microsoft Corporation.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
-    of this software and associated documentation files (the &quot;Software&quot;), to deal
+    of this software and associated documentation files (the "Software"), to deal
     in the Software without restriction, including without limitation the rights
     to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
     copies of the Software, and to permit persons to whom the Software is
@@ -723,7 +727,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
     The above copyright notice and this permission notice shall be included in all
     copies or substantial portions of the Software.
 
-    THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
     IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
     FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
     AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
@@ -749,8 +753,8 @@ TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
 DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
 
 Permission is hereby granted, free of charge, to any person obtaining a
-copy of data files and any associated documentation (the &quot;Data Files&quot;) or
-software and any associated documentation (the &quot;Software&quot;) to deal in the
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
 Data Files or Software without restriction, including without limitation
 the rights to use, copy, modify, merge, publish, distribute, and/or sell
 copies of the Data Files or Software, and to permit persons to whom the
@@ -759,7 +763,7 @@ this copyright and permission notice appear with all copies of the Data
 Files or Software, or (b) this copyright and permission notice appear in
 associated Documentation.
 
-THE DATA FILES AND SOFTWARE ARE PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
 KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
 THIRD PARTY RIGHTS.
@@ -778,7 +782,7 @@ authorization of the copyright holder.
 
 ```
 
-### BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License
+### BSD 3-Clause "New" or "Revised" License
 
 ```text
 BSD 3-Clause License
@@ -800,7 +804,7 @@ modification, are permitted provided that the following conditions are met:
   contributors may be used to endorse or promote products derived from
   this software without specific prior written permission.
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS &quot;AS IS&quot;
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
 DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
@@ -813,7 +817,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
-### BSD 2-Clause &quot;Simplified&quot; License
+### BSD 2-Clause "Simplified" License
 
 ```text
 BSD 2-Clause License
@@ -831,7 +835,7 @@ modification, are permitted provided that the following conditions are met:
   this list of conditions and the following disclaimer in the documentation
   and/or other materials provided with the distribution.
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS &quot;AS IS&quot;
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
 DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
@@ -853,7 +857,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // purpose with or without fee is hereby granted, provided that the above
 // copyright notice and this permission notice appear in all copies.
 //
-// THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND THE AUTHORS DISCLAIM ALL WARRANTIES
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
 // WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
 // MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
 // ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
@@ -863,33 +867,100 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
+### Community Data License Agreement Permissive 2.0
+
+```text
+# Community Data License Agreement - Permissive - Version 2.0
+
+This is the Community Data License Agreement - Permissive, Version
+2.0 (the "agreement"). Data Provider(s) and Data Recipient(s) agree
+as follows:
+
+## 1. Provision of the Data
+
+1.1. A Data Recipient may use, modify, and share the Data made
+available by Data Provider(s) under this agreement if that Data
+Recipient follows the terms of this agreement.
+
+1.2. This agreement does not impose any restriction on a Data
+Recipient's use, modification, or sharing of any portions of the
+Data that are in the public domain or that may be used, modified,
+or shared under any other legal exception or limitation.
+
+## 2. Conditions for Sharing Data
+
+2.1. A Data Recipient may share Data, with or without modifications, so
+long as the Data Recipient makes available the text of this agreement
+with the shared Data.
+
+## 3. No Restrictions on Results
+
+3.1. This agreement does not impose any restriction or obligations
+with respect to the use, modification, or sharing of Results.
+
+## 4. No Warranty; Limitation of Liability
+
+4.1. All Data Recipients receive the Data subject to the following
+terms:
+
+THE DATA IS PROVIDED ON AN "AS IS" BASIS, WITHOUT REPRESENTATIONS,
+WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED
+INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OR CONDITIONS OF TITLE,
+NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+NO DATA PROVIDER SHALL HAVE ANY LIABILITY FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING
+WITHOUT LIMITATION LOST PROFITS), HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE DATA OR RESULTS,
+EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+## 5. Definitions
+
+5.1. "Data" means the material received by a Data Recipient under
+this agreement.
+
+5.2. "Data Provider" means any person who is the source of Data
+provided under this agreement and in reliance on a Data Recipient's
+agreement to its terms.
+
+5.3. "Data Recipient" means any person who receives Data directly
+or indirectly from a Data Provider and agrees to the terms of this
+agreement.
+
+5.4. "Results" means any outcome obtained by computational analysis
+of Data, including for example machine learning models and models'
+insights.
+
+```
+
 ### Mozilla Public License 2.0
 
 ```text
 Mozilla Public License Version 2.0
-&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;&#x3D;
+==================================
 
 1. Definitions
 --------------
 
-1.1. &quot;Contributor&quot;
+1.1. "Contributor"
     means each individual or legal entity that creates, contributes to
     the creation of, or owns Covered Software.
 
-1.2. &quot;Contributor Version&quot;
+1.2. "Contributor Version"
     means the combination of the Contributions of others (if any) used
-    by a Contributor and that particular Contributor&#x27;s Contribution.
+    by a Contributor and that particular Contributor's Contribution.
 
-1.3. &quot;Contribution&quot;
+1.3. "Contribution"
     means Covered Software of a particular Contributor.
 
-1.4. &quot;Covered Software&quot;
+1.4. "Covered Software"
     means Source Code Form to which the initial Contributor has attached
     the notice in Exhibit A, the Executable Form of such Source Code
     Form, and Modifications of such Source Code Form, in each case
     including portions thereof.
 
-1.5. &quot;Incompatible With Secondary Licenses&quot;
+1.5. "Incompatible With Secondary Licenses"
     means
 
     (a) that the initial Contributor has attached the notice described
@@ -899,22 +970,22 @@ Mozilla Public License Version 2.0
         version 1.1 or earlier of the License, but not also under the
         terms of a Secondary License.
 
-1.6. &quot;Executable Form&quot;
+1.6. "Executable Form"
     means any form of the work other than Source Code Form.
 
-1.7. &quot;Larger Work&quot;
+1.7. "Larger Work"
     means a work that combines Covered Software with other material, in
     a separate file or files, that is not Covered Software.
 
-1.8. &quot;License&quot;
+1.8. "License"
     means this document.
 
-1.9. &quot;Licensable&quot;
+1.9. "Licensable"
     means having the right to grant, to the maximum extent possible,
     whether at the time of the initial grant or subsequently, any and
     all of the rights conveyed by this License.
 
-1.10. &quot;Modifications&quot;
+1.10. "Modifications"
     means any of the following:
 
     (a) any file in Source Code Form that results from an addition to,
@@ -924,7 +995,7 @@ Mozilla Public License Version 2.0
     (b) any new file in Source Code Form that contains any Covered
         Software.
 
-1.11. &quot;Patent Claims&quot; of a Contributor
+1.11. "Patent Claims" of a Contributor
     means any patent claim(s), including without limitation, method,
     process, and apparatus claims, in any patent Licensable by such
     Contributor that would be infringed, but for the grant of the
@@ -932,20 +1003,20 @@ Mozilla Public License Version 2.0
     made, import, or transfer of either its Contributions or its
     Contributor Version.
 
-1.12. &quot;Secondary License&quot;
+1.12. "Secondary License"
     means either the GNU General Public License, Version 2.0, the GNU
     Lesser General Public License, Version 2.1, the GNU Affero General
     Public License, Version 3.0, or any later versions of those
     licenses.
 
-1.13. &quot;Source Code Form&quot;
+1.13. "Source Code Form"
     means the form of the work preferred for making modifications.
 
-1.14. &quot;You&quot; (or &quot;Your&quot;)
+1.14. "You" (or "Your")
     means an individual or a legal entity exercising rights under this
-    License. For legal entities, &quot;You&quot; includes any entity that
+    License. For legal entities, "You" includes any entity that
     controls, is controlled by, or is under common control with You. For
-    purposes of this definition, &quot;control&quot; means (a) the power, direct
+    purposes of this definition, "control" means (a) the power, direct
     or indirect, to cause the direction or management of such entity,
     whether by contract or otherwise, or (b) ownership of more than
     fifty percent (50%) of the outstanding shares or beneficial
@@ -986,7 +1057,7 @@ Contributor:
 (a) for any code that a Contributor has removed from Covered Software;
     or
 
-(b) for infringements caused by: (i) Your and any other third party&#x27;s
+(b) for infringements caused by: (i) Your and any other third party's
     modifications of Covered Software, or (ii) the combination of its
     Contributions with other software (except as part of its Contributor
     Version); or
@@ -1032,7 +1103,7 @@ Modifications that You create or to which You contribute, must be under
 the terms of this License. You must inform recipients that the Source
 Code Form of the Covered Software is governed by the terms of this
 License, and how they can obtain a copy of this License. You may not
-attempt to alter or restrict the recipients&#x27; rights in the Source Code
+attempt to alter or restrict the recipients' rights in the Source Code
 Form.
 
 3.2. Distribution of Executable Form
@@ -1048,7 +1119,7 @@ If You distribute Covered Software in Executable Form then:
 (b) You may distribute such Executable Form under the terms of this
     License, or sublicense it under different terms, provided that the
     license for the Executable Form does not attempt to limit or alter
-    the recipients&#x27; rights in the Source Code Form under this License.
+    the recipients' rights in the Source Code Form under this License.
 
 3.3. Distribution of a Larger Work
 
@@ -1131,7 +1202,7 @@ prior to termination shall survive termination.
 *  6. Disclaimer of Warranty                                           *
 *  -------------------------                                           *
 *                                                                      *
-*  Covered Software is provided under this License on an &quot;as is&quot;       *
+*  Covered Software is provided under this License on an "as is"       *
 *  basis, without warranty of any kind, either expressed, implied, or  *
 *  statutory, including, without limitation, warranties that the       *
 *  Covered Software is free of defects, merchantable, fit for a        *
@@ -1160,7 +1231,7 @@ prior to termination shall survive termination.
 *  and all other commercial damages or losses, even if such party      *
 *  shall have been informed of the possibility of such damages. This   *
 *  limitation of liability shall not apply to liability for death or   *
-*  personal injury resulting from such party&#x27;s negligence to the       *
+*  personal injury resulting from such party's negligence to the       *
 *  extent applicable law prohibits such limitation. Some               *
 *  jurisdictions do not allow the exclusion or limitation of           *
 *  incidental or consequential damages, so this exclusion and          *
@@ -1175,7 +1246,7 @@ Any litigation relating to this License may be brought only in the
 courts of a jurisdiction where the defendant maintains its principal
 place of business and such litigation shall be governed by laws of that
 jurisdiction, without reference to its conflict-of-law provisions.
-Nothing in this Section shall prevent a party&#x27;s ability to bring
+Nothing in this Section shall prevent a party's ability to bring
 cross-claims or counter-claims.
 
 9. Miscellaneous
@@ -1234,10 +1305,10 @@ for such a notice.
 
 You may add additional accurate notices of copyright ownership.
 
-Exhibit B - &quot;Incompatible With Secondary Licenses&quot; Notice
+Exhibit B - "Incompatible With Secondary Licenses" Notice
 ---------------------------------------------------------
 
-  This Source Code Form is &quot;Incompatible With Secondary Licenses&quot;, as
+  This Source Code Form is "Incompatible With Secondary Licenses", as
   defined by the Mozilla Public License, v. 2.0.
 
 ```
@@ -1245,9 +1316,9 @@ Exhibit B - &quot;Incompatible With Secondary Licenses&quot; Notice
 ### zlib License
 
 ```text
-Copyright (c) 2021 Orson Peters &lt;orsonpeters@gmail.com&gt;
+Copyright (c) 2021 Orson Peters <orsonpeters@gmail.com>
 
-This software is provided &#x27;as-is&#x27;, without any express or implied warranty. In
+This software is provided 'as-is', without any express or implied warranty. In
 no event will the authors be held liable for any damages arising from the use of
 this software.
 
@@ -1270,12 +1341,12 @@ the following restrictions:
 ### BSD Zero Clause License
 
 ```text
-Copyright (C) Jonas Schievink &lt;jonasschievink@gmail.com&gt;
+Copyright (C) Jonas Schievink <jonasschievink@gmail.com>
 
 Permission to use, copy, modify, and/or distribute this software for
 any purpose with or without fee is hereby granted.
 
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
 WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
 MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
 ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
@@ -1295,7 +1366,7 @@ CC0 1.0 Universal
     CREATIVE COMMONS CORPORATION IS NOT A LAW FIRM AND DOES NOT PROVIDE
     LEGAL SERVICES. DISTRIBUTION OF THIS DOCUMENT DOES NOT CREATE AN
     ATTORNEY-CLIENT RELATIONSHIP. CREATIVE COMMONS PROVIDES THIS
-    INFORMATION ON AN &quot;AS-IS&quot; BASIS. CREATIVE COMMONS MAKES NO WARRANTIES
+    INFORMATION ON AN "AS-IS" BASIS. CREATIVE COMMONS MAKES NO WARRANTIES
     REGARDING THE USE OF THIS DOCUMENT OR THE INFORMATION OR WORKS
     PROVIDED HEREUNDER, AND DISCLAIMS LIABILITY FOR DAMAGES RESULTING FROM
     THE USE OF THIS DOCUMENT OR THE INFORMATION OR WORKS PROVIDED
@@ -1305,12 +1376,12 @@ Statement of Purpose
 
 The laws of most jurisdictions throughout the world automatically confer
 exclusive Copyright and Related Rights (defined below) upon the creator
-and subsequent owner(s) (each and all, an &quot;owner&quot;) of an original work of
-authorship and/or a database (each, a &quot;Work&quot;).
+and subsequent owner(s) (each and all, an "owner") of an original work of
+authorship and/or a database (each, a "Work").
 
 Certain owners wish to permanently relinquish those rights to a Work for
 the purpose of contributing to a commons of creative, cultural and
-scientific works (&quot;Commons&quot;) that the public can reliably and without fear
+scientific works ("Commons") that the public can reliably and without fear
 of later claims of infringement build upon, modify, incorporate in other
 works, reuse and redistribute as freely as possible in any form whatsoever
 and for any purposes, including without limitation commercial purposes.
@@ -1321,21 +1392,21 @@ part through the use and efforts of others.
 
 For these and/or other purposes and motivations, and without any
 expectation of additional consideration or compensation, the person
-associating CC0 with a Work (the &quot;Affirmer&quot;), to the extent that he or she
+associating CC0 with a Work (the "Affirmer"), to the extent that he or she
 is an owner of Copyright and Related Rights in the Work, voluntarily
 elects to apply CC0 to the Work and publicly distribute the Work under its
 terms, with knowledge of his or her Copyright and Related Rights in the
 Work and the meaning and intended legal effect of CC0 on those rights.
 
 1. Copyright and Related Rights. A Work made available under CC0 may be
-protected by copyright and related or neighboring rights (&quot;Copyright and
-Related Rights&quot;). Copyright and Related Rights include, but are not
+protected by copyright and related or neighboring rights ("Copyright and
+Related Rights"). Copyright and Related Rights include, but are not
 limited to, the following:
 
   i. the right to reproduce, adapt, distribute, perform, display,
      communicate, and translate a Work;
  ii. moral rights retained by the original author(s) and/or performer(s);
-iii. publicity and privacy rights pertaining to a person&#x27;s image or
+iii. publicity and privacy rights pertaining to a person's image or
      likeness depicted in a Work;
  iv. rights protecting against unfair competition in regards to a Work,
      subject to the limitations in paragraph 4(a), below;
@@ -1353,40 +1424,40 @@ vii. other similar, equivalent or corresponding rights throughout the
 2. Waiver. To the greatest extent permitted by, but not in contravention
 of, applicable law, Affirmer hereby overtly, fully, permanently,
 irrevocably and unconditionally waives, abandons, and surrenders all of
-Affirmer&#x27;s Copyright and Related Rights and associated claims and causes
+Affirmer's Copyright and Related Rights and associated claims and causes
 of action, whether now known or unknown (including existing as well as
 future claims and causes of action), in the Work (i) in all territories
 worldwide, (ii) for the maximum duration provided by applicable law or
 treaty (including future time extensions), (iii) in any current or future
 medium and for any number of copies, and (iv) for any purpose whatsoever,
 including without limitation commercial, advertising or promotional
-purposes (the &quot;Waiver&quot;). Affirmer makes the Waiver for the benefit of each
-member of the public at large and to the detriment of Affirmer&#x27;s heirs and
+purposes (the "Waiver"). Affirmer makes the Waiver for the benefit of each
+member of the public at large and to the detriment of Affirmer's heirs and
 successors, fully intending that such Waiver shall not be subject to
 revocation, rescission, cancellation, termination, or any other legal or
 equitable action to disrupt the quiet enjoyment of the Work by the public
-as contemplated by Affirmer&#x27;s express Statement of Purpose.
+as contemplated by Affirmer's express Statement of Purpose.
 
 3. Public License Fallback. Should any part of the Waiver for any reason
 be judged legally invalid or ineffective under applicable law, then the
 Waiver shall be preserved to the maximum extent permitted taking into
-account Affirmer&#x27;s express Statement of Purpose. In addition, to the
+account Affirmer's express Statement of Purpose. In addition, to the
 extent the Waiver is so judged Affirmer hereby grants to each affected
 person a royalty-free, non transferable, non sublicensable, non exclusive,
-irrevocable and unconditional license to exercise Affirmer&#x27;s Copyright and
+irrevocable and unconditional license to exercise Affirmer's Copyright and
 Related Rights in the Work (i) in all territories worldwide, (ii) for the
 maximum duration provided by applicable law or treaty (including future
 time extensions), (iii) in any current or future medium and for any number
 of copies, and (iv) for any purpose whatsoever, including without
 limitation commercial, advertising or promotional purposes (the
-&quot;License&quot;). The License shall be deemed effective as of the date CC0 was
+"License"). The License shall be deemed effective as of the date CC0 was
 applied by Affirmer to the Work. Should any part of the License for any
 reason be judged legally invalid or ineffective under applicable law, such
 partial invalidity or ineffectiveness shall not invalidate the remainder
 of the License, and in such case Affirmer hereby affirms that he or she
 will not (i) exercise any of his or her remaining Copyright and Related
 Rights in the Work or (ii) assert any associated claims and causes of
-action with respect to the Work, in either case contrary to Affirmer&#x27;s
+action with respect to the Work, in either case contrary to Affirmer's
 express Statement of Purpose.
 
 4. Limitations and Disclaimers.
@@ -1402,7 +1473,7 @@ express Statement of Purpose.
     the greatest extent permissible under applicable law.
  c. Affirmer disclaims responsibility for clearing rights of other persons
     that may apply to the Work or any use thereof, including without
-    limitation any person&#x27;s Copyright and Related Rights in the Work.
+    limitation any person's Copyright and Related Rights in the Work.
     Further, Affirmer disclaims responsibility for obtaining any necessary
     consents, permissions or other rights required for any use of the
     Work.

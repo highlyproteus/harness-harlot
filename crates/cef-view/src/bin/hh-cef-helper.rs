@@ -1,5 +1,7 @@
+#[cfg(target_os = "macos")]
 use cef::{App, api_hash, execute_process};
 
+#[cfg(target_os = "macos")]
 fn main() {
     let args = cef::args::Args::new();
 
@@ -33,3 +35,6 @@ fn main() {
     );
     std::process::exit(if code >= 0 { code } else { 1 });
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {}

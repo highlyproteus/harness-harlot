@@ -8,7 +8,7 @@ fi
 
 identity=$1
 app_directory=$2
-repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 jit_entitlements="$repository_root/packaging/macos/cef-helper-jit.entitlements"
 
 if [ ! -d "$app_directory" ]; then
@@ -16,14 +16,15 @@ if [ ! -d "$app_directory" ]; then
   exit 1
 fi
 if [ ! -x "$app_directory/Contents/MacOS/hh" ] || \
-   [ ! -x "$app_directory/Contents/MacOS/hh-service" ]; then
-  echo "bundle must contain executable hh and hh-service binaries" >&2
+   [ ! -x "$app_directory/Contents/MacOS/hh-service" ] || \
+   [ ! -x "$app_directory/Contents/MacOS/hh-update-tool" ]; then
+  echo "bundle must contain executable hh, hh-service, and hh-update-tool binaries" >&2
   exit 1
 fi
 for executable in "$app_directory"/Contents/MacOS/*; do
   [ -e "$executable" ] || continue
   case "${executable##*/}" in
-    hh | hh-service | hh-dev) ;;
+    hh | hh-service | hh-update-tool | hh-dev) ;;
     *) echo "unexpected executable or helper in Contents/MacOS: $executable" >&2; exit 1 ;;
   esac
 done
@@ -32,19 +33,30 @@ bundle_identifier=$(plutil -extract CFBundleIdentifier raw -o - "$app_directory/
 app_name=${app_directory##*/}
 app_name=${app_name%.app}
 
+frameworks_directory="$app_directory/Contents/Frameworks"
+framework="$frameworks_directory/Chromium Embedded Framework.framework"
+
 sign_code() {
   code_path=$1
   identifier=$2
   entitlements=${3:-}
   if [ "$identity" = "-" ]; then
-    # Ad-hoc signatures have no shared Team ID. Enabling the hardened runtime
-    # here makes macOS library validation reject the separately signed CEF
-    # framework. Developer ID builds below retain hardened runtime enforcement.
+    # Ad-hoc signatures have no shared Team ID, so the hardened runtime's
+    # library validation rejects the separately signed CEF framework. Keep
+    # the runtime flag off only when that framework is actually bundled;
+    # CEF-free (test) bundles keep it so the release verifier's runtime
+    # check holds.
+    runtime_flags="--options runtime"
+    if [ -e "$framework" ]; then
+      runtime_flags=""
+    fi
     if [ -n "$entitlements" ]; then
-      codesign --force --entitlements "$entitlements" \
+      # shellcheck disable=SC2086
+      codesign --force $runtime_flags --entitlements "$entitlements" \
         --identifier "$identifier" --sign - "$code_path"
     else
-      codesign --force --identifier "$identifier" --sign - "$code_path"
+      # shellcheck disable=SC2086
+      codesign --force $runtime_flags --identifier "$identifier" --sign - "$code_path"
     fi
   elif [ -n "$entitlements" ]; then
     codesign --force --options runtime --timestamp --entitlements "$entitlements" \
@@ -55,8 +67,6 @@ sign_code() {
   fi
 }
 
-frameworks_directory="$app_directory/Contents/Frameworks"
-framework="$frameworks_directory/Chromium Embedded Framework.framework"
 if [ -e "$framework" ]; then
   if [ ! -d "$framework" ] || [ ! -x "$framework/Chromium Embedded Framework" ]; then
     echo "invalid CEF framework bundle: $framework" >&2
@@ -102,6 +112,7 @@ fi
 # Finish the outer bundle's own nested executables after the CEF framework and
 # helpers. The Dev launcher is a sibling executable only in the Dev bundle.
 sign_code "$app_directory/Contents/MacOS/hh-service" "$bundle_identifier.service"
+sign_code "$app_directory/Contents/MacOS/hh-update-tool" "$bundle_identifier.update-tool"
 sign_code "$app_directory/Contents/MacOS/hh" "$bundle_identifier.executable"
 if [ -x "$app_directory/Contents/MacOS/hh-dev" ]; then
   sign_code "$app_directory/Contents/MacOS/hh-dev" "$bundle_identifier.launcher"

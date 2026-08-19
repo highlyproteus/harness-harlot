@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 root=$(mktemp -d "${TMPDIR:-/tmp}/hh-installer-test.XXXXXX")
 cleanup() { rm -rf "$root"; }
 trap cleanup EXIT HUP INT TERM
@@ -70,7 +70,9 @@ case "${1:-}" in
 PLIST
     printf '#!/bin/sh\n' > "$app/Contents/MacOS/hh"
     printf '#!/bin/sh\n' > "$app/Contents/MacOS/hh-service"
-    chmod 755 "$app/Contents/MacOS/hh" "$app/Contents/MacOS/hh-service"
+    printf '#!/bin/sh\n' > "$app/Contents/MacOS/hh-update-tool"
+    chmod 755 "$app/Contents/MacOS/hh" "$app/Contents/MacOS/hh-service" \
+      "$app/Contents/MacOS/hh-update-tool"
     cat > "$mount/hh-update-tool" <<'TOOL'
 #!/bin/sh
 set -eu
@@ -94,6 +96,15 @@ TOOL
     ;;
 esac
 EOF
+cat > "$mock_bin/ln" <<'EOF'
+#!/bin/sh
+set -eu
+if [ -n "${HH_TEST_FAIL_LINK_ONCE:-}" ] && [ ! -e "$HH_TEST_FAIL_LINK_ONCE" ]; then
+  : > "$HH_TEST_FAIL_LINK_ONCE"
+  exit 1
+fi
+exec /bin/ln "$@"
+EOF
 chmod 755 "$mock_bin"/*
 
 export HOME="$home"
@@ -111,6 +122,19 @@ export HH_INSTALLER_FIXTURE_PUBLIC_KEY=fixture-public-key
 
 if "$repository_root/install.sh" --version 0.1.0+1 >/dev/null 2>&1; then
   echo "unconfigured production installer unexpectedly succeeded" >&2
+  exit 1
+fi
+
+if "$repository_root/install.sh" --version 0.1.0+1 \
+  --prefix "$HOME/../escaped" --print-plan >/dev/null 2>&1; then
+  echo "installer accepted a parent-directory install prefix" >&2
+  exit 1
+fi
+[ ! -e "$root/escaped" ]
+
+if "$repository_root/install.sh" --version 0.1.0+1 \
+  --prefix ../escaped --print-plan >/dev/null 2>&1; then
+  echo "installer accepted a relative install prefix" >&2
   exit 1
 fi
 
@@ -180,6 +204,15 @@ rm -f "$home/.local/bin/hh"
 
 "$repository_root/install.sh" --version 0.1.0+1 >/dev/null
 [ -x "$home/Applications/Harness Harlot.app/Contents/MacOS/hh" ]
+[ -L "$home/.local/bin/hh" ]
+printf 'original\n' > "$home/Applications/Harness Harlot.app/rollback-marker"
+export HH_TEST_FAIL_LINK_ONCE="$root/link-failed"
+if "$repository_root/install.sh" --version 0.1.0+1 >/dev/null 2>&1; then
+  echo "installer did not report a post-swap link failure" >&2
+  exit 1
+fi
+unset HH_TEST_FAIL_LINK_ONCE
+[ -f "$home/Applications/Harness Harlot.app/rollback-marker" ]
 [ -L "$home/.local/bin/hh" ]
 # Reinstall keeps one validated rollback bundle instead of deleting in place.
 "$repository_root/install.sh" --version 0.1.0+1 >/dev/null

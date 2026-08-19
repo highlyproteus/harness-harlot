@@ -3,7 +3,7 @@ set -eu
 
 # Release engineering must set both values before publishing this script.
 EXPECTED_TEAM_ID=''
-UPDATE_BASE_URL=''
+UPDATE_BASE_URL='https://github.com/HighlyProtean/harness-harlot/releases/download'
 BUNDLE_ID='com.harnessharlot.desktop'
 
 usage() {
@@ -31,8 +31,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$prefix" in
+  /*) ;;
+  *) echo "install prefix must be absolute" >&2; exit 1 ;;
+esac
+case "$prefix" in
   "$HOME" | "$HOME"/*) ;;
   *) echo "install prefix must be inside HOME" >&2; exit 1 ;;
+esac
+case "$prefix/" in
+  */../* | */./*) echo "install prefix must be normalized" >&2; exit 1 ;;
 esac
 app="$prefix/Harness Harlot.app"
 backup="$prefix/Harness Harlot.previous.app"
@@ -114,9 +121,11 @@ else
     exit 1
   }
   expected_team_id=$EXPECTED_TEAM_ID
-  artifact="Harness-Harlot-${version}-macos-${architecture}.dmg"
+  build=${version#*+}
+  bare=${version%%+*}
+  artifact="Harness-Harlot-${bare}-b${build}-macos-${architecture}.dmg"
   manifest_name=${artifact%.dmg}.update.json
-  source="${UPDATE_BASE_URL%/}/$artifact"
+  source="${UPDATE_BASE_URL%/}/v${bare}/$artifact"
   manifest_source="${UPDATE_BASE_URL%/}/$manifest_name"
   signature_source="$manifest_source.sig"
   expected_host=${UPDATE_BASE_URL#https://}
@@ -145,15 +154,32 @@ mkdir "$mount"
 mounted=0
 install_in_progress=0
 old_app_moved=0
+new_app_installed=0
+had_link=0
+link_mutated=0
 cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
   if [ "$mounted" = 1 ]; then hdiutil detach "$mount" -quiet >/dev/null 2>&1 || true; fi
-  if [ "$install_in_progress" = 1 ]; then
-    rm -rf "$app"
-    if [ "$old_app_moved" = 1 ] && [ -d "$backup" ]; then mv "$backup" "$app" || true; fi
+  if [ "$status" -ne 0 ] && [ "$install_in_progress" = 1 ]; then
+    if [ "$new_app_installed" = 1 ]; then rm -rf "$app"; fi
+    if [ "$old_app_moved" = 1 ] && [ -d "$backup" ]; then
+      mv "$backup" "$app" 2>/dev/null || true
+    fi
+    if [ "$link_mutated" = 1 ]; then
+      rm -f "$link"
+      if [ "$had_link" = 1 ]; then
+        ln -s "$app/Contents/MacOS/hh" "$link" 2>/dev/null || true
+      fi
+    fi
   fi
   rm -rf "$work"
+  exit "$status"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "$fixture" = 1 ]; then
   cp "$source" "$dmg"
@@ -188,7 +214,7 @@ hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg" >/dev/null
 mounted=1
 mounted_app="$mount/Harness Harlot.app"
 update_tool="$mount/hh-update-tool"
-[ -x "$update_tool" ] || { echo "DMG does not contain verifier-only hh-update-tool" >&2; exit 1; }
+[ -x "$update_tool" ] || { echo "DMG does not contain bootstrap hh-update-tool" >&2; exit 1; }
 tool_details=$(codesign -dv --verbose=4 "$update_tool" 2>&1)
 printf '%s\n' "$tool_details" | grep "TeamIdentifier=$expected_team_id" >/dev/null
 printf '%s\n' "$tool_details" | grep 'flags=.*runtime' >/dev/null
@@ -209,7 +235,10 @@ fi
   exit 1
 }
 codesign --verify --deep --strict -R "$requirement" "$mounted_app"
-for binary in "$mounted_app/Contents/MacOS/hh" "$mounted_app/Contents/MacOS/hh-service"; do
+for binary in \
+  "$mounted_app/Contents/MacOS/hh" \
+  "$mounted_app/Contents/MacOS/hh-service" \
+  "$mounted_app/Contents/MacOS/hh-update-tool"; do
   [ -x "$binary" ] || { echo "mounted app is missing $(basename "$binary")" >&2; exit 1; }
   details=$(codesign -dv --verbose=4 "$binary" 2>&1)
   printf '%s\n' "$details" | grep "TeamIdentifier=$expected_team_id" >/dev/null
@@ -224,6 +253,9 @@ rm -rf "$staging"
 ditto "$mounted_app" "$staging"
 validate_managed_app "$staging" "$expected_team_id"
 validate_managed_link
+if [ -L "$link" ]; then
+  had_link=1
+fi
 if [ -e "$app" ] || [ -L "$app" ]; then
   validate_managed_app "$app" "$expected_team_id"
 fi
@@ -237,7 +269,11 @@ if [ -d "$app" ]; then
   old_app_moved=1
 fi
 mv "$staging" "$app"
+new_app_installed=1
+link_mutated=1
 rm -f "$link"
 ln -s "$app/Contents/MacOS/hh" "$link"
+validate_managed_app "$app" "$expected_team_id"
+validate_managed_link
 install_in_progress=0
 echo "installed $app"

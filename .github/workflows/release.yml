@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   package:
-    name: Package ${{ matrix.architecture }}
+    name: Package macOS ${{ matrix.release_mode }} ${{ matrix.architecture }}
     environment: release
     permissions:
       contents: read
@@ -25,8 +25,24 @@ jobs:
         include:
           - runner: macos-15
             architecture: arm64
+            release_mode: community
+            cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_macosarm64_minimal.tar.bz2
+            cef_sha1: 8245a003c52c01811310b9b7d026e92dff859626
           - runner: macos-15-intel
             architecture: x86_64
+            release_mode: community
+            cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_macosx64_minimal.tar.bz2
+            cef_sha1: e5bfaa9bd08239d2588b902491dede30cab7d2f5
+          - runner: macos-15
+            architecture: arm64
+            release_mode: developer-id
+            cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_macosarm64_minimal.tar.bz2
+            cef_sha1: 8245a003c52c01811310b9b7d026e92dff859626
+          - runner: macos-15-intel
+            architecture: x86_64
+            release_mode: developer-id
+            cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_macosx64_minimal.tar.bz2
+            cef_sha1: e5bfaa9bd08239d2588b902491dede30cab7d2f5
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -35,6 +51,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
       - name: Validate signed tag and runner architecture
+        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
         env:
           RELEASE_TAG_GPG_PUBLIC_KEY: ${{ secrets.RELEASE_TAG_GPG_PUBLIC_KEY }}
         run: |
@@ -46,6 +63,7 @@ jobs:
           test -n "$version"
           test "v$version" = "$GITHUB_REF_NAME"
       - name: Configure ephemeral Apple signing keychain
+        if: matrix.release_mode == 'developer-id' && vars.HH_ENABLE_APPLE_SIGNING == 'true'
         env:
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
@@ -69,13 +87,46 @@ jobs:
             --key "$RUNNER_TEMP/notary-api-key.p8" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID"
-      - name: Build, sign, notarize, and verify
+      # Keep the CEF package pinned to the build paired with cef = 151.6.0.
+      # Both SHA-1 values are published by cef-builds.spotifycdn.com.
+      - name: Cache pinned CEF archive
+        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/cef-downloads/${{ matrix.cef_archive }}
+          key: cef-${{ matrix.cef_sha1 }}-${{ matrix.cef_archive }}
+      - name: Download, verify, and extract pinned CEF
+        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
+        env:
+          CEF_ARCHIVE: ${{ matrix.cef_archive }}
+          CEF_SHA1: ${{ matrix.cef_sha1 }}
+        run: |
+          set -eu
+          download_directory="$RUNNER_TEMP/cef-downloads"
+          extract_directory="$RUNNER_TEMP/cef"
+          archive="$download_directory/$CEF_ARCHIVE"
+          mkdir -p "$download_directory" "$extract_directory"
+          if [ ! -f "$archive" ]; then
+            curl --proto '=https' --tlsv1.2 -fL \
+              "https://cef-builds.spotifycdn.com/$CEF_ARCHIVE" \
+              -o "$archive.tmp"
+            printf '%s  %s\n' "$CEF_SHA1" "$archive.tmp" | shasum -a 1 -c -
+            mv "$archive.tmp" "$archive"
+          fi
+          printf '%s  %s\n' "$CEF_SHA1" "$archive" | shasum -a 1 -c -
+          tar -xjf "$archive" -C "$extract_directory"
+          cef_path="$extract_directory/${CEF_ARCHIVE%.tar.bz2}"
+          test -f "$cef_path/CREDITS.html"
+          test -d "$cef_path/Release/Chromium Embedded Framework.framework"
+          printf 'CEF_PATH=%s\n' "$cef_path" >> "$GITHUB_ENV"
+      - name: Build, package, and verify
+        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
         env:
           HH_CODESIGN_IDENTITY: ${{ vars.HH_CODESIGN_IDENTITY }}
           HH_EXPECTED_TEAM_ID: ${{ vars.HH_EXPECTED_TEAM_ID }}
           HH_NOTARY_PROFILE: hh-ci
           HH_RELEASE_TAG: ${{ github.ref_name }}
-          HH_UPDATE_BASE_URL: ${{ vars.HH_UPDATE_BASE_URL }}
+          HH_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
           HH_UPDATE_KEY_ID: ${{ vars.HH_UPDATE_KEY_ID }}
           HH_UPDATE_PUBLIC_KEY: ${{ secrets.HH_UPDATE_PUBLIC_KEY }}
           HH_UPDATE_SIGNING_SEED: ${{ secrets.HH_UPDATE_SIGNING_SEED }}
@@ -85,15 +136,21 @@ jobs:
           printf '%s\n' "$HH_UPDATE_SIGNING_SEED" > "$key_file"
           chmod 600 "$key_file"
           export HH_UPDATE_SIGNING_KEY_FILE="$key_file"
-          scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$GITHUB_RUN_NUMBER"
+          if [ "${{ matrix.release_mode }}" = community ]; then
+            scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$GITHUB_RUN_NUMBER" --community
+          else
+            scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$GITHUB_RUN_NUMBER"
+          fi
       - name: Attest packaged release files
+        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: target/release-dist/**/*
       - name: Upload packaged release files
+        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-${{ matrix.architecture }}
+          name: release-macos-${{ matrix.release_mode }}-${{ matrix.architecture }}
           path: target/release-dist/**/*
           if-no-files-found: error
           retention-days: 14
@@ -102,6 +159,85 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary-api-key.p8" "$RUNNER_TEMP/update-signing-seed"
           security delete-keychain "$RUNNER_TEMP/hh-release.keychain-db" || true
+
+  package-linux:
+    name: Package Linux ${{ matrix.architecture }}
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            architecture: x86_64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+    steps:
+      - name: Install checkout trust dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git gnupg
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Linux release dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            curl build-essential clang cmake pkg-config python3 \
+            libfontconfig1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-xcb-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+      - name: Validate signed tag and runner architecture
+        env:
+          RELEASE_TAG_GPG_PUBLIC_KEY: ${{ secrets.RELEASE_TAG_GPG_PUBLIC_KEY }}
+        run: |
+          set -eu
+          case "${{ matrix.architecture }}" in
+            arm64) test "$(uname -m)" = aarch64 ;;
+            x86_64) test "$(uname -m)" = x86_64 ;;
+          esac
+          printf '%s' "$RELEASE_TAG_GPG_PUBLIC_KEY" | gpg --batch --import
+          git verify-tag "$GITHUB_REF_NAME"
+      - name: Build, sign, package, and verify
+        env:
+          HH_RELEASE_TAG: ${{ github.ref_name }}
+          HH_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+          HH_UPDATE_KEY_ID: ${{ vars.HH_UPDATE_KEY_ID }}
+          HH_UPDATE_PUBLIC_KEY: ${{ secrets.HH_UPDATE_PUBLIC_KEY }}
+          HH_UPDATE_SIGNING_SEED: ${{ secrets.HH_UPDATE_SIGNING_SEED }}
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          test -n "$version"
+          test "v$version" = "$GITHUB_REF_NAME"
+          key_file="$RUNNER_TEMP/update-signing-seed"
+          printf '%s\n' "$HH_UPDATE_SIGNING_SEED" > "$key_file"
+          chmod 600 "$key_file"
+          export HH_UPDATE_SIGNING_KEY_FILE="$key_file"
+          scripts/package-linux-release.sh "$version" "$GITHUB_RUN_NUMBER"
+      - name: Attest packaged Linux release files
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: target/release-dist/**/*
+      - name: Upload packaged Linux release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux-${{ matrix.architecture }}
+          path: target/release-dist/**/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Destroy update signing seed
+        if: always()
+        run: rm -f "$RUNNER_TEMP/update-signing-seed"
 
   sbom:
     name: Generate SBOM
@@ -131,10 +267,21 @@ jobs:
           path: Harness-Harlot-*-sbom.cdx.tar.gz
           if-no-files-found: error
           retention-days: 14
+      - name: Attest community bootstrap installer
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: install-community-macos.sh
+      - name: Upload community bootstrap installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-community-installer
+          path: install-community-macos.sh
+          if-no-files-found: error
+          retention-days: 14
 
   publish:
     name: Publish immutable release assets
-    needs: [package, sbom]
+    needs: [package, package-linux, sbom]
     environment: release
     runs-on: ubuntu-latest
     permissions:
@@ -146,9 +293,38 @@ jobs:
           path: release-assets
           merge-multiple: true
       - name: Publish signed-tag release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false --generate-notes
-          gh release upload "$GITHUB_REF_NAME" release-assets/*/* release-assets/*.tar.gz --repo "$GITHUB_REPOSITORY"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft --jq .isDraft)
+            if [ "$is_draft" != true ]; then
+              echo "refusing to replace published release $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --generate-notes --draft
+          cleanup_draft() {
+            is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft --jq .isDraft 2>/dev/null || true)
+            if [ "$is_draft" = true ]; then
+              gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes || true
+            fi
+          }
+          trap cleanup_draft EXIT HUP INT TERM
+          mapfile -d '' release_assets < <(
+            find release-assets -type f -print0 | sort -z
+          )
+          if (( ${#release_assets[@]} == 0 )); then
+            echo "no release assets were downloaded" >&2
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" \
+            "${release_assets[@]}" --repo "$GITHUB_REPOSITORY"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          trap - EXIT HUP INT TERM
