@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Local protocol types for Harness Harlot"
+publish = false
 
 [dependencies]
 libc.workspace = true

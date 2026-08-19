@@ -33,14 +33,14 @@ if [ "$#" -ne 0 ]; then
   usage
 fi
 
-repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repository_root"
 
 cef_path=
 cef_framework_source=
 if [ "$browser_enabled" -eq 1 ]; then
   : "${CEF_PATH:?set CEF_PATH to an unpacked CEF distribution before using --browser}"
-  cef_path=$(CDPATH= cd -- "$CEF_PATH" && pwd)
+  cef_path=$(CDPATH='' cd -- "$CEF_PATH" && pwd)
   cef_framework_source="$cef_path/Release/Chromium Embedded Framework.framework"
   if [ ! -d "$cef_framework_source" ]; then
     cef_framework_source="$cef_path/Chromium Embedded Framework.framework"

@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Terminal model adapter for Harness Harlot"
+publish = false
 
 [dependencies]
 alacritty_terminal.workspace = true
-hh-protocol = { version = "0.1.0", path = "../protocol" }
+hh-protocol = { path = "../protocol" }
 
 [lints]
 workspace = true

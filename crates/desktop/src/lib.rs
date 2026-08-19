@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::BufReader;
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -23,7 +23,6 @@ pub struct SessionClient {
 }
 
 fn validate_socket_path(path: &Path, allow_legacy_temp_parent: bool) -> Result<()> {
-    let expected_uid = rustix::process::geteuid().as_raw();
     let parent = path
         .parent()
         .context("session socket has no parent directory")?;
@@ -35,8 +34,7 @@ fn validate_socket_path(path: &Path, allow_legacy_temp_parent: bool) -> Result<(
             parent.display()
         );
     }
-    let private_parent =
-        parent_metadata.uid() == expected_uid && parent_metadata.mode().trailing_zeros() >= 6;
+    let private_parent = hh_protocol::validate_private_ownership(&parent_metadata);
     let accepted_legacy_parent = allow_legacy_temp_parent && parent == std::env::temp_dir();
     if !private_parent && !accepted_legacy_parent {
         bail!(
@@ -49,7 +47,7 @@ fn validate_socket_path(path: &Path, allow_legacy_temp_parent: bool) -> Result<(
     if !metadata.file_type().is_socket() {
         bail!("session path is not a Unix socket: {}", path.display());
     }
-    if metadata.uid() != expected_uid || metadata.mode() & 0o077 != 0 {
+    if !hh_protocol::validate_private_ownership(&metadata) {
         bail!(
             "session socket must be owned by the current user and inaccessible to group/other: {}",
             path.display()
@@ -88,6 +86,16 @@ impl SessionClient {
         validate_socket_path(path, allow_legacy_temp_parent)?;
         let mut stream =
             UnixStream::connect(path).with_context(|| format!("connect to {}", path.display()))?;
+        // Deadlines bound every blocking operation on this connection: a
+        // wedged service fails fast instead of freezing a caller forever.
+        // Timeouts live on the shared file description, so the BufReader
+        // clone below inherits them.
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .context("set session socket read timeout")?;
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .context("set session socket write timeout")?;
         let mut reader = BufReader::new(stream.try_clone().context("clone session socket")?);
 
         write_message(
@@ -130,19 +138,23 @@ impl SessionClient {
 
     /// Sends one request and waits for its response.
     ///
-    /// A transport failure reconnects and retries exactly once. Service errors
-    /// are not retried.
+    /// A failed write reconnects and retries exactly once because an incomplete
+    /// frame cannot be dispatched by the service. A read failure is not
+    /// retried: the request may already have executed, so replaying it could
+    /// duplicate a mutation.
     ///
     /// # Errors
     ///
-    /// Returns an error after a second transport failure, a failed reconnect,
-    /// or a service-side request rejection.
+    /// Returns an error after a failed response read, a failed reconnect or
+    /// retry, or a service-side request rejection.
     pub fn call(&mut self, request: &ClientRequest) -> Result<ServiceResponse> {
-        let response = if let Ok(response) = self.exchange(request) {
-            response
-        } else {
-            *self = Self::connect()?;
-            self.exchange(request)?
+        let response = match write_message(&mut self.stream, request) {
+            Ok(()) => read_message(&mut self.reader)?,
+            Err(WireError::Io(_)) => {
+                *self = Self::connect()?;
+                self.exchange(request)?
+            }
+            Err(error) => return Err(error.into()),
         };
         match response {
             ServiceResponse::Error { message } => bail!("service request failed: {message}"),

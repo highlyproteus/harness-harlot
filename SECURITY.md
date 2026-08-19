@@ -10,7 +10,7 @@
 
 ## Reporting a vulnerability
 
-Use [GitHub private vulnerability reporting](https://github.com/justbytes/rust-mux/security/advisories/new). Do not open a public issue for an unpatched vulnerability. Include the affected version, reproduction steps, impact, and any proposed mitigation.
+Use [GitHub private vulnerability reporting](https://github.com/HighlyProtean/harness-harlot/security/advisories/new) on the release mirror. Do not open a public issue for an unpatched vulnerability. Include the affected version, reproduction steps, impact, and any proposed mitigation.
 
 The project aims to acknowledge a complete report within 7 days, coordinate a fix and release, and publish a disclosure within 90 days. Active exploitation or broad user risk may require a shorter timeline.
 
@@ -24,18 +24,29 @@ Terminal history is stored on-device under the Harness Harlot application-state 
 
 History chunk checksums detect accidental corruption and bit rot. They are not cryptographic tamper evidence against a process running as the user.
 
-First-party Rust denies `unsafe_code` by default. The macOS bridge contains one reviewed AppKit global access and one typed Foundation resource-value call, each locally documented and allowed; third-party dependencies may contain unsafe code.
+First-party Rust denies `unsafe_code` workspace-wide. Item-level allows are confined to two macOS bridge crates: seven sites in `crates/cef-view/src/cef_impl.rs` for Objective-C runtime bridging behind the `cef` feature, and four sites in `crates/macos-icon/src/lib.rs` for AppKit/Foundation calls. Every site has a local `SAFETY` justification; third-party dependencies may contain unsafe code.
 
 ## Release trust status
 
-No production update host, Ed25519 public key, Apple Team ID, or notarized artifact is claimed until release credentials and immutable distribution names are configured. The updater trust root is intentionally empty and fails closed. Test-only keys and `.invalid` hosts are rejected by production policy.
+The production feed host and Ed25519 public key are compiled into the updater.
+Test-only keys and `.invalid` hosts are rejected by production policy. macOS has
+two deliberately isolated trust modes:
 
-A public macOS release requires both independent checks:
+1. **Community:** the user first verifies the bootstrap installer's GitHub
+   build-provenance attestation. That installer verifies attestations for every
+   downloaded input before mounting the ad-hoc-signed DMG, then verifies the
+   unexpired owner-signed Ed25519 manifest and exact artifact bytes. It never
+   disables Gatekeeper or removes quarantine. Automatic replacement is compiled
+   out; future updates are notifications only.
+2. **Developer ID:** the DMG and mounted app must additionally satisfy the
+   pinned Apple Team requirement, hardened runtime checks, and notarization
+   staple validation. This path remains fail-closed until the Team ID is
+   configured after paid Developer Program enrollment.
 
-1. The DMG and mounted app satisfy the expected Apple Developer ID Team requirement, hardened runtime checks, and notarization staple validation.
-2. The app/update path verifies an unexpired signed manifest with a compiled Ed25519 key whose `key_id` selects that exact key and whose artifact URL uses the compiled host.
-
-The application bundle contains `hh` and `hh-service` only. Release signing tools and fixture keys are never bundled.
+The feeds and artifact names differ, preventing a Developer ID client from
+selecting a community DMG or the reverse. App bundles contain `hh`,
+`hh-service`, and `hh-update-tool`; release signing tools and fixture keys are
+never bundled.
 
 ## Release-key rotation
 
@@ -47,13 +58,16 @@ Rotation is a two-release trust transition followed by retirement:
 
 A client must never be asked to trust a key it has not already received through an independently trusted release. `key_id` binding and manifest expiry are required before rotation.
 
-Suspected key compromise is not an in-band rotation. Publish a new installer trust root and installer hash through the private-reporting and release channels, revoke the compromised feed key out of band, and treat artifacts signed only under that key as suspect. Apple Developer ID verification remains the independent second root; compromise of either single key is insufficient for a valid release.
+Suspected key compromise is not an in-band rotation. Publish a new installer trust root through the private-reporting and release channels, revoke the compromised feed key out of band, and treat artifacts signed only under that key as suspect. Apple Developer ID verification is an independent second root when enabled. Community macOS and Linux release provenance is independently attestable through GitHub, while runtime update checks still treat the compiled Ed25519 key as their cryptographic trust root.
 
 ## Residual risks
 
 - Same-user malware can read or alter local application state directly.
 - The app is unsandboxed by product requirement.
 - Known-advisory and license tooling does not audit third-party source code.
-- The v1 feed uses a single Ed25519 signing key, not threshold signatures.
+- The stable feed uses a single Ed25519 signing key, not threshold signatures.
 - Rollback cannot restore live processes, SSH authentication, or terminal output.
 - Reproducible byte-identical DMGs are not claimed; signed provenance must accompany any public release as its build record.
+- Community macOS installation explicitly trusts the repository's GitHub
+  Actions provenance and requires a per-app Gatekeeper override; it is not
+  equivalent to Apple notarization.

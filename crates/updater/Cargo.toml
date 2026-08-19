@@ -5,22 +5,35 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Signed update manifest validation for Harness Harlot"
+publish = false
+
+[features]
+default = []
+fetch = ["dep:ureq"]
+fixture = []
+community-macos = []
 
 [[bin]]
 name = "hh-update-tool"
 path = "src/main.rs"
+required-features = ["fetch"]
 
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
 ed25519-dalek.workspace = true
-hh-protocol = { version = "0.1.0", path = "../protocol" }
+flate2.workspace = true
 semver.workspace = true
+hh-protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
+rustix.workspace = true
 time.workspace = true
+sysinfo.workspace = true
+tar.workspace = true
 url.workspace = true
 sha2.workspace = true
+ureq = { workspace = true, optional = true }
 
 [lints]
 workspace = true

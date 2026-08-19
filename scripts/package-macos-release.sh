@@ -2,14 +2,20 @@
 set -eu
 
 usage() {
-  echo "usage: $0 VERSION BUILD" >&2
+  echo "usage: $0 VERSION BUILD [--community]" >&2
   echo "test fixtures require HH_RELEASE_TEST_MODE=1 plus HH_UPDATE_SIGNING_KEY_FILE and HH_UPDATE_PUBLIC_KEY" >&2
-  echo "production additionally requires HH_CODESIGN_IDENTITY, HH_EXPECTED_TEAM_ID, HH_NOTARY_PROFILE, HH_UPDATE_KEY_ID, HH_UPDATE_BASE_URL, and HH_RELEASE_TAG" >&2
+  echo "community production requires CEF_PATH, HH_UPDATE_KEY_ID, HH_UPDATE_BASE_URL, HH_RELEASE_TAG, and the update signing inputs" >&2
+  echo "Developer ID production additionally requires HH_CODESIGN_IDENTITY, HH_EXPECTED_TEAM_ID, and HH_NOTARY_PROFILE" >&2
   exit 2
 }
 
-if [ "$#" -ne 2 ]; then
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
   usage
+fi
+community=0
+if [ "$#" -eq 3 ]; then
+  [ "$3" = "--community" ] || usage
+  community=1
 fi
 
 version=$1
@@ -21,8 +27,9 @@ case "$build" in
   *[!0-9]* | 0 | '') echo "BUILD must be a positive integer" >&2; exit 2 ;;
 esac
 
-repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repository_root"
+export HH_RELEASE_BUILD="$build"
 
 workspace_version=$(cargo metadata --locked --format-version 1 --no-deps | plutil -extract packages.0.version raw -o - -)
 if [ "$workspace_version" != "$version" ]; then
@@ -48,15 +55,20 @@ if [ "$test_mode" = 1 ]; then
   base_url=${HH_UPDATE_BASE_URL:-https://updates.example.invalid/stable}
   codesign_identity=-
 else
-  : "${HH_CODESIGN_IDENTITY:?set HH_CODESIGN_IDENTITY for a publishable package}"
-  : "${HH_EXPECTED_TEAM_ID:?set HH_EXPECTED_TEAM_ID for verification}"
-  : "${HH_NOTARY_PROFILE:?set HH_NOTARY_PROFILE created by notarytool store-credentials}"
   : "${HH_UPDATE_KEY_ID:?set HH_UPDATE_KEY_ID for a publishable package}"
   : "${HH_UPDATE_BASE_URL:?set HH_UPDATE_BASE_URL for a publishable package}"
   : "${HH_RELEASE_TAG:?set HH_RELEASE_TAG to the signed annotated tag for this release}"
+  : "${CEF_PATH:?set CEF_PATH to the pinned CEF distribution for production browser tabs}"
   key_id=$HH_UPDATE_KEY_ID
   base_url=$HH_UPDATE_BASE_URL
-  codesign_identity=$HH_CODESIGN_IDENTITY
+  if [ "$community" -eq 1 ]; then
+    codesign_identity=-
+  else
+    : "${HH_CODESIGN_IDENTITY:?set HH_CODESIGN_IDENTITY for a publishable Developer ID package}"
+    : "${HH_EXPECTED_TEAM_ID:?set HH_EXPECTED_TEAM_ID for verification}"
+    : "${HH_NOTARY_PROFILE:?set HH_NOTARY_PROFILE created by notarytool store-credentials}"
+    codesign_identity=$HH_CODESIGN_IDENTITY
+  fi
   if [ "$key_id" = "test-only-v1" ]; then
     echo "test-only update key is forbidden in production" >&2
     exit 2
@@ -94,16 +106,53 @@ if [ "$test_mode" != 1 ]; then
   fi
 fi
 
-cargo build --locked --release -p hh-desktop --bin hh
+if [ "$test_mode" = 1 ]; then
+  if [ "$community" -eq 1 ]; then
+    cargo build --locked --release -p hh-desktop --features community-macos --bin hh
+  else
+    cargo build --locked --release -p hh-desktop --bin hh
+  fi
+else
+  if [ "$community" -eq 1 ]; then
+    cargo build --locked --release -p hh-desktop --features browser,community-macos --bin hh
+  else
+    cargo build --locked --release -p hh-desktop --features browser --bin hh
+  fi
+fi
 cargo build --locked --release -p hh-session-service --bin hh-service
-cargo build --locked --release -p hh-updater --bin hh-update-tool
+updater_features=fetch
+if [ "$community" -eq 1 ]; then
+  updater_features="$updater_features,community-macos"
+fi
+cargo build --locked --release -p hh-updater --features "$updater_features" --bin hh-update-tool
+fixture_update_tool=
+if [ "$test_mode" = 1 ]; then
+  fixture_target_directory="$repository_root/target/fixture-updater"
+  fixture_updater_features=fetch,fixture
+  if [ "$community" -eq 1 ]; then
+    fixture_updater_features="$fixture_updater_features,community-macos"
+  fi
+  CARGO_TARGET_DIR="$fixture_target_directory" \
+    cargo build --locked --release -p hh-updater --features "$fixture_updater_features" --bin hh-update-tool
+  fixture_update_tool="$fixture_target_directory/release/hh-update-tool"
+fi
 cargo build --locked --release -p hh-release-signer --bin hh-release-sign
 derived_public_key=$("$repository_root/target/release/hh-release-sign" public-key --private-key "$HH_UPDATE_SIGNING_KEY_FILE")
 if [ "$derived_public_key" != "$HH_UPDATE_PUBLIC_KEY" ]; then
   echo "HH_UPDATE_PUBLIC_KEY does not match HH_UPDATE_SIGNING_KEY_FILE" >&2
   exit 2
 fi
-"$repository_root/scripts/build-macos-app.sh" release
+if [ "$test_mode" = 1 ]; then
+  if [ "$community" -eq 1 ]; then
+    HH_RELEASE_TEST_MODE=0 "$repository_root/scripts/build-macos-app.sh" release --community
+  else
+    HH_RELEASE_TEST_MODE=0 "$repository_root/scripts/build-macos-app.sh" release
+  fi
+elif [ "$community" -eq 1 ]; then
+  "$repository_root/scripts/build-macos-app.sh" release --browser --community
+else
+  "$repository_root/scripts/build-macos-app.sh" release --browser
+fi
 
 app_directory="$repository_root/target/release/Harness Harlot.app"
 plist="$app_directory/Contents/Info.plist"
@@ -112,6 +161,14 @@ plutil -replace CFBundleVersion -string "$build" "$plist"
 "$repository_root/scripts/sign-macos-app.sh" "$codesign_identity" "$app_directory"
 codesign --verify --deep --strict --verbose=2 "$app_directory"
 update_tool="$repository_root/target/release/hh-update-tool"
+verification_tool=$update_tool
+if [ "$test_mode" = 1 ]; then
+  verification_tool=$fixture_update_tool
+  if "$update_tool" verify --fixture >/dev/null 2>&1; then
+    echo "release updater unexpectedly contains fixture verification support" >&2
+    exit 1
+  fi
+fi
 if [ "$codesign_identity" = "-" ]; then
   codesign --force --options runtime --identifier com.harnessharlot.update-tool --sign - "$update_tool"
 else
@@ -124,7 +181,11 @@ artifact_prefix=
 if [ "$test_mode" = 1 ]; then
   artifact_prefix=TESTONLY-
 fi
-artifact_stem="${artifact_prefix}Harness-Harlot-${version}+${build}-macos-${architecture}"
+community_suffix=
+if [ "$community" -eq 1 ]; then
+  community_suffix=-community
+fi
+artifact_stem="${artifact_prefix}Harness-Harlot-${version}-b${build}-macos-${architecture}${community_suffix}"
 distribution_directory="$repository_root/target/release-dist/$artifact_stem"
 rm -rf "$distribution_directory"
 mkdir -p "$distribution_directory"
@@ -136,7 +197,7 @@ ditto "$app_directory" "$dmg_root/Harness Harlot.app"
 cp "$update_tool" "$dmg_root/hh-update-tool"
 hdiutil create -quiet -volname "Harness Harlot" -srcfolder "$dmg_root" -format UDZO -ov "$dmg"
 rm -rf "$dmg_root"
-if [ "$test_mode" = 1 ]; then
+if [ "$test_mode" = 1 ] || [ "$community" -eq 1 ]; then
   codesign --force --sign - "$dmg"
 else
   codesign --force --timestamp --sign "$HH_CODESIGN_IDENTITY" "$dmg"
@@ -154,7 +215,7 @@ published_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 valid_until=$(date -u -v+7d '+%Y-%m-%dT%H:%M:%SZ')
 cat > "$manifest" <<EOF
 {
-  "schema": "hh-update-manifest-v1",
+  "schema": "hh-update-manifest-v2",
   "product": "Harness Harlot",
   "channel": "stable",
   "key_id": "$key_id",
@@ -162,6 +223,7 @@ cat > "$manifest" <<EOF
   "build": $build,
   "published_at": "$published_at",
   "valid_until": "$valid_until",
+  "platform": "macos",
   "minimum_macos": "13.0",
   "session_service": {
     "protocol_version": $protocol_version,
@@ -184,8 +246,15 @@ EOF
 "$repository_root/target/release/hh-release-sign" sign \
   --manifest "$manifest" --signature "$signature" \
   --private-key "$HH_UPDATE_SIGNING_KEY_FILE"
+if [ "$community" -eq 1 ]; then
+  stable_manifest="$distribution_directory/manifest-macos-community-${architecture}.update.json"
+else
+  stable_manifest="$distribution_directory/manifest-macos-${architecture}.update.json"
+fi
+cp "$manifest" "$stable_manifest"
+cp "$signature" "$stable_manifest.sig"
 if [ "$test_mode" = 1 ]; then
-  "$repository_root/target/release/hh-update-tool" verify \
+  "$verification_tool" verify \
     --key-id "$key_id" --public-key "$HH_UPDATE_PUBLIC_KEY" --host "$update_host" \
     --manifest "$manifest" --signature "$signature" --artifact "$dmg" --fixture
 else
@@ -195,8 +264,12 @@ fi
 plutil -lint "$plist"
 
 if [ "$test_mode" = 1 ]; then
-  "$repository_root/scripts/verify-macos-release.sh" --fixture \
-    com.harnessharlot.desktop "$update_host" "$key_id" "$HH_UPDATE_PUBLIC_KEY" "$manifest" "$signature"
+  HH_FIXTURE_UPDATE_TOOL="$fixture_update_tool" \
+    "$repository_root/scripts/verify-macos-release.sh" --fixture \
+      com.harnessharlot.desktop "$update_host" "$key_id" "$HH_UPDATE_PUBLIC_KEY" "$manifest" "$signature"
+elif [ "$community" -eq 1 ]; then
+  "$repository_root/scripts/verify-macos-release.sh" --community \
+    com.harnessharlot.desktop "$manifest" "$signature"
 else
   "$repository_root/scripts/verify-macos-release.sh" \
     "$HH_EXPECTED_TEAM_ID" com.harnessharlot.desktop "$manifest" "$signature"

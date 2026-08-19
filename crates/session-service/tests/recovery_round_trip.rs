@@ -201,7 +201,7 @@ fn projects_and_working_dirs_round_trip() {
     let path = directory.join("sessions.json");
     let workspace_dir = directory.join("workspace");
     let project_dir = directory.join("project");
-    fs::create_dir_all(&directory).unwrap();
+    create_owner_only_directory(&directory);
     fs::create_dir(&workspace_dir).unwrap();
     fs::create_dir(&project_dir).unwrap();
 
@@ -264,7 +264,7 @@ fn project_group_inherits_project_directory() {
     let directory = test_directory("project-group");
     let path = directory.join("sessions.json");
     let project_dir = directory.join("project");
-    fs::create_dir_all(&project_dir).unwrap();
+    create_owner_only_directory(&project_dir);
     let registry = SessionRegistry::persistent(&path).unwrap();
     let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
     let project_pane = registry
@@ -300,7 +300,7 @@ fn close_tab_removes_tab_children_and_sessions() {
     let directory = test_directory("close-project");
     let path = directory.join("sessions.json");
     let project_dir = directory.join("project");
-    fs::create_dir_all(&project_dir).unwrap();
+    create_owner_only_directory(&project_dir);
     let registry = SessionRegistry::persistent(&path).unwrap();
     let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
     let project_pane = registry
@@ -336,7 +336,7 @@ fn close_tab_removes_tab_children_and_sessions() {
 fn tab_color_and_icon_round_trip() {
     let directory = test_directory("tab-appearance");
     let path = directory.join("sessions.json");
-    fs::create_dir_all(&directory).unwrap();
+    create_owner_only_directory(&directory);
     let registry = SessionRegistry::persistent(&path).unwrap();
     let tab_id = registry.snapshot().unwrap().workspaces[0].tabs[0].id;
     let color = AppearanceColor::new(0x12, 0x34, 0x56);
@@ -360,9 +360,9 @@ fn list_remote_directory_lists_local_subdirectories() {
     let directory = test_directory("local-listing");
     let path = directory.join("sessions.json");
     let root = directory.join("root");
-    fs::create_dir_all(root.join("a")).unwrap();
-    fs::create_dir_all(root.join("b")).unwrap();
-    fs::create_dir_all(root.join(".hidden")).unwrap();
+    create_owner_only_directory(&root.join("a"));
+    create_owner_only_directory(&root.join("b"));
+    create_owner_only_directory(&root.join(".hidden"));
     fs::write(root.join("file.txt"), b"file").unwrap();
     let registry = SessionRegistry::persistent(&path).unwrap();
     let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
@@ -419,4 +419,13 @@ fn leaf(layout: &PaneLayout) -> &hh_protocol::Pane {
 
 fn test_directory(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hh-integration-{label}-{}", Uuid::new_v4()))
+}
+
+fn create_owner_only_directory(path: &std::path::Path) {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .unwrap();
 }

@@ -87,6 +87,16 @@ The artwork is reproduced unchanged from the official upstream repository. The A
 
 The official Gemini CLI companion artwork is reproduced unchanged from Google's upstream repository. Google and Gemini are trademarks of Google LLC. No Google endorsement is claimed. The Apache License does not grant trademark permission except for customary descriptive use.
 
+## tmux
+
+- File: `tmux.svg`
+- Official source: [`logo/tmux-logomark.svg`](https://github.com/tmux/tmux/blob/e5a2058c7ca350cda9436720b4e76a2224b8681f/logo/tmux-logomark.svg) at commit `e5a2058c7ca350cda9436720b4e76a2224b8681f` in the official [tmux repository](https://github.com/tmux/tmux)
+- Upstream Git blob: `c543709d7cf68ac9116a5a040854b58fee5df617`
+- SHA-256: `bdc956f2193c3cf4a49d304b76f43d6c6e69670224a45e0422b3e8066de8e358`
+- License: ISC; the complete notice is embedded as `agent-icons/tmux-LICENSE.txt`
+
+Copyright (c) 2015, Jason Long. The official tmux logomark is reproduced unchanged for referential identification. tmux is a trademark of its respective owner. No endorsement is claimed.
+
 ## GitHub Copilot CLI neutral fallback
 
 No GitHub or Copilot artwork is distributed. The official [GitHub Copilot CLI repository](https://github.com/github/copilot-cli/tree/ef627e1baad937d3c8da45f8a5541c6fc3c97b6a) and official npm package `@github/copilot@1.0.79` expose no standalone icon asset. Harness Harlot therefore uses its built-in neutral terminal glyph beside the complete `GitHub Copilot CLI` label.

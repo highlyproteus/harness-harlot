@@ -114,7 +114,7 @@ fn blend(foreground: u32, background: u32, foreground_percent: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{AppTheme, BuiltInTheme, TerminalColor};
 
     #[test]
     fn maps_bold_ansi_and_truecolor_without_mutating_terminal_state() {

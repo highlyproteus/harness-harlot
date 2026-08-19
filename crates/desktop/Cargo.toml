@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Native Harness Harlot terminal workspace desktop"
+publish = false
 
 [[bin]]
 name = "hh"
@@ -13,25 +14,33 @@ path = "src/main.rs"
 [features]
 default = []
 browser = ["dep:hh-cef-view", "hh-cef-view/cef"]
+community-macos = ["hh-updater/community-macos"]
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
 gpui.workspace = true
 image.workspace = true
 libc.workspace = true
-hh-protocol = { version = "0.1.0", path = "../protocol" }
-hh-terminal-model = { version = "0.1.0", path = "../terminal-model" }
+hh-protocol = { path = "../protocol" }
 parking_lot.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
+sysinfo.workspace = true
 unicode-width.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hh-cef-view = { path = "../cef-view", optional = true }
-hh-macos-icon = { version = "0.1.0", path = "../macos-icon" }
+hh-macos-icon = { path = "../macos-icon" }
+hh-updater = { path = "../updater", features = ["fetch"] }
 raw-window-handle.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hh-updater = { path = "../updater", features = ["fetch"] }
+
 [dev-dependencies]
 sha2.workspace = true
 

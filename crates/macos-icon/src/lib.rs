@@ -1,4 +1,5 @@
 //! Minimal macOS `AppKit` and `Foundation` integration for the desktop process.
+#![cfg(target_os = "macos")]
 
 use objc2::AnyThread as _;
 use objc2_app_kit::{NSApplication, NSDockTile, NSImage};

@@ -2,45 +2,51 @@
 set -eu
 
 usage() {
-  echo "usage: $0 [debug|release] [--browser]" >&2
+  echo "usage: $0 [debug|release] [--browser] [--community]" >&2
   exit 2
 }
 
 profile=debug
+profile_set=0
 browser_enabled=0
-if [ "$#" -gt 0 ]; then
+community_build=0
+while [ "$#" -gt 0 ]; do
   case "$1" in
     debug | release)
+      [ "$profile_set" -eq 0 ] || usage
       profile=$1
-      shift
+      profile_set=1
       ;;
     --browser)
+      [ "$browser_enabled" -eq 0 ] || usage
       browser_enabled=1
-      shift
+      ;;
+    --community)
+      [ "$community_build" -eq 0 ] || usage
+      community_build=1
       ;;
     *) usage ;;
   esac
+  shift
+done
+if [ "$community_build" -eq 1 ] && [ "$profile" != release ]; then
+  echo "community bundles must use the release profile" >&2
+  exit 2
 fi
-if [ "$#" -gt 0 ]; then
-  if [ "$1" = "--browser" ] && [ "$browser_enabled" -eq 0 ]; then
-    browser_enabled=1
-    shift
-  else
-    usage
-  fi
-fi
-if [ "$#" -ne 0 ]; then
-  usage
+if [ "$profile" = release ] && [ "${HH_RELEASE_TEST_MODE:-0}" = 1 ]; then
+  echo "fixture-enabled updater is forbidden in release app bundles" >&2
+  exit 2
 fi
 
-repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repository_root"
 
 cef_path=
 cef_framework_source=
 if [ "$browser_enabled" -eq 1 ]; then
   : "${CEF_PATH:?set CEF_PATH to an unpacked CEF distribution before using --browser}"
-  cef_path=$(CDPATH= cd -- "$CEF_PATH" && pwd)
+  cef_path=$(CDPATH='' cd -- "$CEF_PATH" && pwd)
   cef_framework_source="$cef_path/Release/Chromium Embedded Framework.framework"
   if [ ! -d "$cef_framework_source" ]; then
     cef_framework_source="$cef_path/Chromium Embedded Framework.framework"
@@ -60,17 +66,39 @@ cargo_release=
 if [ "$profile" = release ]; then
   cargo_release=--release
 fi
+desktop_features=
 if [ "$browser_enabled" -eq 1 ]; then
+  desktop_features=browser
+fi
+if [ "$community_build" -eq 1 ]; then
+  if [ -n "$desktop_features" ]; then
+    desktop_features="$desktop_features,community-macos"
+  else
+    desktop_features=community-macos
+  fi
+fi
+if [ -n "$desktop_features" ]; then
   # shellcheck disable=SC2086
-  cargo build --locked $cargo_release -p hh-desktop --bin hh --features browser
-  # shellcheck disable=SC2086
-  cargo build --locked $cargo_release -p hh-cef-view --bin hh-cef-helper --features cef
+  cargo build --locked $cargo_release -p hh-desktop --bin hh --features "$desktop_features"
 else
   # shellcheck disable=SC2086
   cargo build --locked $cargo_release -p hh-desktop --bin hh
 fi
+if [ "$browser_enabled" -eq 1 ]; then
+  # shellcheck disable=SC2086
+  cargo build --locked $cargo_release -p hh-cef-view --bin hh-cef-helper --features cef
+fi
 # shellcheck disable=SC2086
 cargo build --locked $cargo_release -p hh-session-service --bin hh-service
+updater_features=fetch
+if [ "$community_build" -eq 1 ]; then
+  updater_features="$updater_features,community-macos"
+fi
+if [ "${HH_RELEASE_TEST_MODE:-0}" = 1 ]; then
+  updater_features="$updater_features,fixture"
+fi
+# shellcheck disable=SC2086
+cargo build --locked $cargo_release -p hh-updater --features "$updater_features" --bin hh-update-tool
 
 app_name="Harness Harlot"
 app_directory="$repository_root/target/$profile/$app_name.app"
@@ -90,7 +118,9 @@ cp "$repository_root/ASSET_NOTICES.md" "$notices_directory/ASSET_NOTICES.md"
 cp "$repository_root"/third_party/licenses/* "$notices_directory/third_party/licenses/"
 cp "$repository_root/target/$profile/hh" "$contents_directory/MacOS/hh"
 cp "$repository_root/target/$profile/hh-service" "$contents_directory/MacOS/hh-service"
-chmod 755 "$contents_directory/MacOS/hh" "$contents_directory/MacOS/hh-service"
+cp "$repository_root/target/$profile/hh-update-tool" "$contents_directory/MacOS/hh-update-tool"
+chmod 755 "$contents_directory/MacOS/hh" "$contents_directory/MacOS/hh-service" \
+  "$contents_directory/MacOS/hh-update-tool"
 
 if [ "$browser_enabled" -eq 1 ]; then
   frameworks_directory="$contents_directory/Frameworks"

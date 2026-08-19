@@ -1,14 +1,15 @@
 use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{AssetSource, SharedString};
 use hh_protocol::{TerminalProfile, state_directory};
-use image::GenericImageView as _;
 use uuid::Uuid;
+
+use crate::ui_state::CanonicalPng;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentIconFormat {
@@ -65,45 +66,12 @@ pub fn load_custom_icons() -> Vec<CustomIcon> {
 pub fn import_custom_icon(source: &Path) -> Result<CustomIcon> {
     let extension = supported_custom_icon_extension(source)
         .context("choose a PNG, JPEG, WebP, or GIF image")?;
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("read custom icon metadata from {}", source.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("custom icon must be a regular file, not a symlink");
-    }
-    if metadata.len() > MAX_CUSTOM_ICON_BYTES {
-        bail!("custom icon must be 5 MiB or smaller");
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(source)
-        .with_context(|| format!("open custom icon {}", source.display()))?
-        .take(MAX_CUSTOM_ICON_BYTES + 1)
-        .read_to_end(&mut bytes)
+    let bytes = hh_protocol::read_private_file(source, MAX_CUSTOM_ICON_BYTES)
         .with_context(|| format!("read custom icon from {}", source.display()))?;
-    if bytes.len() as u64 > MAX_CUSTOM_ICON_BYTES {
-        bail!("custom icon must be 5 MiB or smaller");
-    }
     if !matches_custom_icon_format(extension, &bytes) {
         bail!("custom icon contents do not match its file extension");
     }
-    let decoded = decode_custom_icon(&bytes)?;
-    let (width, height) = decoded.dimensions();
-    if width == 0
-        || height == 0
-        || width > MAX_CUSTOM_ICON_DIMENSION
-        || height > MAX_CUSTOM_ICON_DIMENSION
-        || u64::from(width) * u64::from(height) > MAX_CUSTOM_ICON_PIXELS
-    {
-        bail!(
-            "custom icon dimensions must be at most {MAX_CUSTOM_ICON_DIMENSION}x{MAX_CUSTOM_ICON_DIMENSION}"
-        );
-    }
-    let mut canonical = Cursor::new(Vec::new());
-    decoded
-        .write_to(&mut canonical, image::ImageFormat::Png)
-        .context("encode canonical custom icon PNG")?;
+    let canonical = canonical_custom_icon(&bytes)?;
 
     let directory =
         custom_icon_directory().context("application state directory is unavailable")?;
@@ -116,39 +84,28 @@ pub fn import_custom_icon(source: &Path) -> Result<CustomIcon> {
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("create custom icon {}", path.display()))?;
-    file.write_all(canonical.get_ref())
+    file.write_all(&canonical.png)
         .with_context(|| format!("save custom icon to {}", path.display()))?;
     file.sync_all().context("sync custom icon")?;
 
     Ok(CustomIcon { id, path })
 }
-fn decode_custom_icon(bytes: &[u8]) -> Result<image::DynamicImage> {
-    let mut reader = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .context("detect custom icon image format")?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_CUSTOM_ICON_DIMENSION);
-    limits.max_image_height = Some(MAX_CUSTOM_ICON_DIMENSION);
-    limits.max_alloc = Some(MAX_CUSTOM_ICON_PIXELS * 4);
-    reader.limits(limits);
-    reader.decode().context("decode bounded custom icon image")
+
+fn canonical_custom_icon(bytes: &[u8]) -> Result<CanonicalPng> {
+    crate::ui_state::decode_canonical_png(
+        bytes,
+        &crate::ui_state::CanonicalPngLimits {
+            what: "custom icon",
+            max_dimension: MAX_CUSTOM_ICON_DIMENSION,
+            max_pixels: MAX_CUSTOM_ICON_PIXELS,
+            max_alloc: MAX_CUSTOM_ICON_PIXELS * 4,
+        },
+    )
 }
 
 fn ensure_private_icon_directory(directory: &Path) -> Result<()> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => bail!("custom icon directory must be a real directory"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder
-                .create(directory)
-                .with_context(|| format!("create custom icon directory {}", directory.display()))?;
-        }
-        Err(error) => return Err(error).context("inspect custom icon directory"),
-    }
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("restrict custom icon directory {}", directory.display()))
+    hh_protocol::ensure_private_directory(directory)
+        .with_context(|| format!("prepare custom icon directory {}", directory.display()))
 }
 
 fn custom_icon_directory() -> Option<PathBuf> {
@@ -301,7 +258,7 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 12] = [
         accessible_name: "tmux",
         asset: Some(svg(
             "agent-icons/tmux.svg",
-            "39f20507b6b23cbbeeb6a1e57520f76cc0af0712dfcabaa89d88774123480acb",
+            "bdc956f2193c3cf4a49d304b76f43d6c6e69670224a45e0422b3e8066de8e358",
         )),
         notice_key: "tmux",
     },
@@ -392,7 +349,11 @@ impl AssetSource for AgentIconAssets {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AGENT_ICON_REGISTRY, AgentIconAssets, AgentIconFormat, MAX_CUSTOM_ICON_DIMENSION,
+        TerminalProfile, agent_icon_definition, canonical_custom_icon, matches_custom_icon_format,
+    };
+    use gpui::AssetSource;
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
     fn png_crc32(bytes: &[u8]) -> u32 {
@@ -513,7 +474,7 @@ mod tests {
     }
     #[test]
     fn custom_icon_decoder_rejects_oversized_dimensions_before_allocation() {
-        let error = decode_custom_icon(&oversized_png_header()).unwrap_err();
+        let error = canonical_custom_icon(&oversized_png_header()).unwrap_err();
         let message = format!("{error:#}").to_ascii_lowercase();
         assert!(message.contains("limit") || message.contains("dimension"));
     }
