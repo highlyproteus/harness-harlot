@@ -57,6 +57,8 @@ jobs:
         run: |
           set -eu
           test "$(uname -m)" = "${{ matrix.architecture }}"
+          git fetch --force --no-tags origin \
+            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
           git config gpg.format ssh
           git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-tag-allowed-signers"
           git verify-tag "$GITHUB_REF_NAME"
@@ -251,6 +253,8 @@ jobs:
             arm64) test "$(uname -m)" = aarch64 ;;
             x86_64) test "$(uname -m)" = x86_64 ;;
           esac
+          git fetch --force --no-tags origin \
+            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
           git config gpg.format ssh
           git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-tag-allowed-signers"
           git verify-tag "$GITHUB_REF_NAME"
