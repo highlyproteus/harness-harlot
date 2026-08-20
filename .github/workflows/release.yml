@@ -54,12 +54,11 @@ jobs:
           toolchain: "1.96"
       - name: Validate signed tag and runner architecture
         if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
-        env:
-          RELEASE_TAG_GPG_PUBLIC_KEY: ${{ secrets.RELEASE_TAG_GPG_PUBLIC_KEY }}
         run: |
           set -eu
           test "$(uname -m)" = "${{ matrix.architecture }}"
-          printf '%s' "$RELEASE_TAG_GPG_PUBLIC_KEY" | gpg --batch --import
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-tag-allowed-signers"
           git verify-tag "$GITHUB_REF_NAME"
           version=${GITHUB_REF_NAME#v}
           test -n "$version"
@@ -246,15 +245,14 @@ jobs:
           test -d "$cef_runtime/locales"
           printf 'CEF_PATH=%s\n' "$cef_runtime" >> "$GITHUB_ENV"
       - name: Validate signed tag and runner architecture
-        env:
-          RELEASE_TAG_GPG_PUBLIC_KEY: ${{ secrets.RELEASE_TAG_GPG_PUBLIC_KEY }}
         run: |
           set -eu
           case "${{ matrix.architecture }}" in
             arm64) test "$(uname -m)" = aarch64 ;;
             x86_64) test "$(uname -m)" = x86_64 ;;
           esac
-          printf '%s' "$RELEASE_TAG_GPG_PUBLIC_KEY" | gpg --batch --import
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-tag-allowed-signers"
           git verify-tag "$GITHUB_REF_NAME"
       - name: Build, sign, package, and verify
         env:
@@ -322,11 +320,17 @@ jobs:
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: install-community-macos.sh
-      - name: Upload community bootstrap installer
+      - name: Attest Linux bootstrap installer
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: install-linux.sh
+      - name: Upload bootstrap installers
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-community-installer
-          path: install-community-macos.sh
+          name: release-bootstrap-installers
+          path: |
+            install-community-macos.sh
+            install-linux.sh
           if-no-files-found: error
           retention-days: 14
 

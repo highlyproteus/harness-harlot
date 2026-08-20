@@ -4,6 +4,23 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.4] - 2026-08-19
+
+### Added
+
+- A one-command Linux bootstrap installer selects the native package, verifies
+  its GitHub build provenance, and rejects unsafe archives before installation.
+
+### Changed
+
+- The README now provides copy-and-paste macOS and Linux install commands and
+  makes the temporary manual macOS update procedure explicit.
+
+### Fixed
+
+- Release automation now verifies the owner's SSH-signed tags, and the Linux
+  release fixture derives its package version from workspace metadata.
+
 ## [0.1.3] - 2026-08-19
 
 ### Changed

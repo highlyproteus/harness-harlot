@@ -63,25 +63,28 @@ Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profil
 
 ### macOS
 
-Download the DMG from the [latest release](https://github.com/highlyproteus/harness-harlot/releases/latest), or install from the terminal:
+Install or update with one copy-and-paste command:
 
 ```bash
-gh release download --repo highlyproteus/harness-harlot --pattern install-community-macos.sh
-chmod +x install-community-macos.sh && ./install-community-macos.sh --acknowledge-unnotarized
+curl --proto '=https' --tlsv1.2 -fsSLo /tmp/hh-install-macos.sh https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh && sh /tmp/hh-install-macos.sh --acknowledge-unnotarized
 ```
 
-Community macOS builds notify when an update is available; rerun the same
-installer command to update. In-app one-click replacement stays disabled until
-Developer ID signing and Apple notarization are enabled.
+> **macOS updates are manual for now.** Until Developer ID signing and Apple
+> notarization are enabled, quit Harness Harlot, end its terminal sessions, and
+> run the command above again whenever the app reports an available update.
+> Your workstations, settings, and history remain in the application state
+> directory and are not replaced with the app.
 
 ### Linux
 
-Download the `.tar.gz` for your architecture from the [latest release](https://github.com/highlyproteus/harness-harlot/releases/latest), or install from the terminal:
+Install with one copy-and-paste command:
 
 ```bash
-gh release download --repo highlyproteus/harness-harlot --pattern "*linux-$(uname -m).tar.gz"
-tar -xzf Harness-Harlot-*-linux-*.tar.gz && ./Harness-Harlot/install.sh
+curl --proto '=https' --tlsv1.2 -fsSLo /tmp/hh-install-linux.sh https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-linux.sh && sh /tmp/hh-install-linux.sh
 ```
+
+The bootstrap installer requires GitHub CLI (`gh`) and uses GitHub release
+attestations before extracting the architecture-matched package.
 
 No `sudo` required — everything installs under `~/.local`, and the in-app update button verifies, stages, and swaps updates with rollback. Built on Ubuntu 22.04 (glibc 2.35 baseline) for x86_64 and arm64. Browser tabs need these distribution packages:
 

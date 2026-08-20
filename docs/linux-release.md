@@ -4,25 +4,17 @@ Harness Harlot publishes native `x86_64` and `arm64` Linux packages from Ubuntu 
 
 ## Install a release
 
-Download these assets for the machine's architecture from the same GitHub Release:
-
-- `Harness-Harlot-VERSION-bBUILD-linux-ARCH.tar.gz`
-- `Harness-Harlot-VERSION-bBUILD-linux-ARCH.update.json`
-- `Harness-Harlot-VERSION-bBUILD-linux-ARCH.update.json.sig`
-
-GitHub Actions publishes a build-provenance attestation for every asset. Verify the archive before extracting it when GitHub CLI is available:
+The supported bootstrap command selects the latest package for the machine's
+architecture, verifies its GitHub build-provenance attestation, rejects unsafe
+archive entries, and runs the unprivileged package installer:
 
 ```bash
-gh attestation verify Harness-Harlot-*-linux-*.tar.gz \
-  --repo highlyproteus/harness-harlot
+curl --proto '=https' --tlsv1.2 -fsSLo /tmp/hh-install-linux.sh https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-linux.sh && sh /tmp/hh-install-linux.sh
 ```
 
-Then extract and run the unprivileged installer:
-
-```bash
-tar -xzf Harness-Harlot-*-linux-*.tar.gz
-./Harness-Harlot/install.sh
-```
+GitHub CLI (`gh`) is required for provenance verification. To pin a release,
+download the bootstrap script and pass `--tag vVERSION`. To verify without
+installing, pass `--verify-only`.
 
 The installer refuses root and writes only below the current user's home directory:
 

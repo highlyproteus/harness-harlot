@@ -6,6 +6,11 @@ if [ "$(uname -s)" != Linux ]; then
   exit 2
 fi
 repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+version=$(
+  cd "$repository_root"
+  cargo metadata --locked --format-version 1 --no-deps |
+    python3 -c 'import json,sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "hh-desktop"))'
+)
 target_directory=${CARGO_TARGET_DIR:-"$repository_root/target"}
 case "$target_directory" in
   /*) ;;
@@ -24,7 +29,7 @@ HH_RELEASE_TEST_MODE=1 \
 HH_ALLOW_DIRTY_TEST_PACKAGE=1 \
 HH_UPDATE_SIGNING_KEY_FILE="$key" \
 HH_UPDATE_PUBLIC_KEY="$public_key" \
-  "$repository_root/scripts/package-linux-release.sh" 0.1.0 97 >/dev/null
+  "$repository_root/scripts/package-linux-release.sh" "$version" 97 >/dev/null
 
 case "$(uname -m)" in
   aarch64 | arm64) architecture=arm64 ;;
@@ -32,8 +37,8 @@ case "$(uname -m)" in
   *) echo "unsupported Linux test architecture" >&2; exit 1 ;;
 esac
 distribution="$target_directory/release-dist/linux-$architecture"
-artifact="$distribution/Harness-Harlot-0.1.0-b97-linux-$architecture.tar.gz"
-manifest="$distribution/Harness-Harlot-0.1.0-b97-linux-$architecture.update.json"
+artifact="$distribution/Harness-Harlot-${version}-b97-linux-$architecture.tar.gz"
+manifest="$distribution/Harness-Harlot-${version}-b97-linux-$architecture.update.json"
 signature="$manifest.sig"
 [ -f "$artifact" ]
 [ -f "$manifest" ]
@@ -109,4 +114,44 @@ done
 [ "$(cat "$work/local-launched")" = launched ]
 [ "$up_to_date" = "up to date" ]
 
-echo "Linux release fixture bundles all runtime files, signs stable manifests, and embeds its build number"
+mkdir -p "$work/mock-bin"
+cat > "$work/mock-bin/gh" <<'EOF'
+#!/bin/sh
+set -eu
+case "$1:$2" in
+  release:view)
+    printf '%s\n' "$HH_TEST_RELEASE_TAG"
+    ;;
+  release:download)
+    shift 3
+    destination=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --dir) destination=$2; shift 2 ;;
+        --repo | --pattern) shift 2 ;;
+        *) exit 2 ;;
+      esac
+    done
+    [ -n "$destination" ]
+    mkdir -p "$destination"
+    cp "$HH_TEST_RELEASE_ARTIFACT" "$destination/$(basename "$HH_TEST_RELEASE_ARTIFACT")"
+    ;;
+  attestation:verify)
+    : > "$HH_TEST_ATTESTATION_LOG"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+chmod 0755 "$work/mock-bin/gh"
+HH_TEST_RELEASE_TAG="v$version" \
+HH_TEST_RELEASE_ARTIFACT="$artifact" \
+HH_TEST_ATTESTATION_LOG="$work/attestation-verified" \
+PATH="$work/mock-bin:$PATH" \
+  "$repository_root/install-linux.sh" --verify-only > "$work/bootstrap.out"
+grep -F "verified Harness Harlot Linux release v$version for $architecture" \
+  "$work/bootstrap.out" >/dev/null
+[ -f "$work/attestation-verified" ]
+
+echo "Linux release fixture bundles all runtime files, verifies the bootstrap path, signs stable manifests, and embeds its build number"
