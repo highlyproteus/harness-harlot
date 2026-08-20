@@ -69,7 +69,7 @@ This is the first incremental implementation to authorize. It should visibly imp
 ### Phase R4: history and navigation (bounded slice integrated)
 
 - Bounded Alacritty scrollback, wheel/trackpad scrolling, and literal search are integrated without copying an unbounded client buffer.
-- The daemon now records future PTY output into optional owner-only atomic/checksummed chunks through a bounded non-blocking queue. Reaching the top of live scrollback or missing a live search lazily loads one clearly labeled local-history page; the UI never retains a full archived session.
+- The daemon can record future PTY output into optional owner-only atomic/checksummed chunks through a bounded non-blocking queue. Normal scrolling remains in live scrollback; an explicit live-search miss can lazily load one clearly labeled local-history page. The UI never retains a full archived session.
 - Rich styled historical replay, a scrollbar affordance spanning live plus archived ranges, and selection across archive-page boundaries remain open. The current archive is an honest bounded plain-text projection of raw output, not a restored live terminal snapshot.
 - Preserve deterministic reconnect/snapshot behavior and measure high-output backpressure before calling the renderer complete.
 
@@ -96,7 +96,7 @@ Harness Harlot is a lightweight terminal workspace, not an agent harness or runt
 - For a pane on a tab that is not displayed, the daemon keeps draining and parsing the PTY into bounded history but serializes no screen. The desktop holds only coalesced state metadata needed for correctness.
 - Displaying such a pane requests one immediate current snapshot before it is rendered, then resumes live deltas. Normal frequent tab switching must not introduce visible waiting.
 
-Global idleness relaxes cadence rather than dropping panes: after an hour with no output and no input, polling drops to once every two seconds, and pane-state metadata at that cadence restores the active rate within one poll of the next output byte.
+Elapsed idle time never drops a displayed pane into a multi-second or stopped-rendering state. Polling backs off only to 250 ms while displayed terminals are unchanged, returns to the roughly 30-frames-per-second active cadence as soon as output changes, and input explicitly wakes an idle poll. This behavior has no elapsed-time cutoff.
 
 Hidden never means disconnected: local shells and system-SSH processes continue running, their PTYs continue draining, and output stays available within the documented history bound. Revision gaps also force a deterministic fresh snapshot. Protocol decoding, update preparation, and terminal parsing must not run on the UI thread; only bounded paint-ready data crosses into it. Terminal input is a one-way message on its own connection, so keystrokes never queue behind screen payloads.
 

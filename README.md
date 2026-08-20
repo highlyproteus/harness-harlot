@@ -43,7 +43,7 @@ A workstation is a machine — your local computer or an SSH host.
 - Rename any terminal tab, pick its color, or give it its own icon.
 - Known agent CLIs — Codex, Claude Code, Cursor, Aider, Gemini, and more — are recognized and labeled with their official icons automatically.
 - Your terminals keep running if the app closes, crashes, or updates. They live in a small local session service, so reopening the app puts you right back where you were. Ending a session is always explicit: close its tab or exit the shell.
-- Optional terminal history archive: beyond live scrollback, an opt-in owner-only disk archive lets you scroll and search older output, with quotas and retention you control.
+- Optional terminal history archive: beyond live scrollback, an opt-in owner-only disk archive lets explicit searches reach older output, with quotas and retention you control.
 
 ## Groups
 

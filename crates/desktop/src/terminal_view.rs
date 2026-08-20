@@ -32,7 +32,7 @@ use crate::view_models::{
     CreateMenu, CreateMenuTarget, DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag,
     SearchEditor, SplitControlId, TabDrag, TerminalLineRender, TooltipView, WorkspaceDrag,
 };
-use crate::{HhApp, PANE_HEADER_HEIGHT, TAB_COLOR_ALPHA, THEME};
+use crate::{HhApp, PANE_HEADER_HEIGHT, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
 use uuid::Uuid;
 
 impl HhApp {
@@ -1284,7 +1284,7 @@ impl HhApp {
             });
         div()
             .id(("workspace-tab-strip", element_key(workspace_id)))
-            .h(px(32.0))
+            .h(px(WORKSPACE_TAB_STRIP_HEIGHT))
             .flex_none()
             .border_b_1()
             .border_color(rgb(THEME.border_strong))

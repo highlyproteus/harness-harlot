@@ -4,7 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hh_protocol::{
-    HistoryClearScope, HistoryPageDirection, PaneLayout, PaneRevisionCursor, TerminalProfile,
+    HistoryClearScope, HistoryPageDirection, HistorySettings, PaneLayout, PaneRevisionCursor,
+    TerminalProfile,
 };
 use hh_session_service::SessionRegistry;
 use uuid::Uuid;
@@ -13,6 +14,11 @@ use uuid::Uuid;
 fn real_pty_output_is_archived_and_lazily_loaded_without_expanding_live_history() {
     let directory = test_directory("pty-archive");
     let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
+    let history_settings = HistorySettings {
+        enabled: true,
+        ..HistorySettings::default()
+    };
+    registry.set_history_settings(history_settings).unwrap();
     let snapshot = registry.snapshot().unwrap();
     let pane_id = leaf(&snapshot.workspaces[0].tabs[0].layout);
     let initial = registry

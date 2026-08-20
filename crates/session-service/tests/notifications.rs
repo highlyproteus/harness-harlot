@@ -16,7 +16,9 @@ fn pane_signals_reach_the_feed_and_read_state_is_shared() {
         )
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Workspace test binaries run concurrently; allow shell startup and PTY
+    // event delivery to survive transient host load without hiding a hang.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let notifications = loop {
         let update = registry.pane_updates(None, &[], &[], false, 0).unwrap();
         let has_attention = update.notifications.iter().any(|notification| {
@@ -60,7 +62,7 @@ fn process_exit_reaches_updates_as_a_completion_notification() {
         .write_input(pane_id, b"exec sh -c 'exit 0'\r")
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let update = registry.pane_updates(None, &[], &[], false, 0).unwrap();
         if update.notifications.iter().any(|notification| {

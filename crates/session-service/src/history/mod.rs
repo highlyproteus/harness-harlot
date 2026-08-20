@@ -547,7 +547,12 @@ mod tests {
     fn open_store(label: &str) -> (PathBuf, Store) {
         let root = test_root(label);
         ensure_private_directory(&root).unwrap();
-        let settings = HistorySettings::default();
+        // Store-level tests exercise an active archive unless a test opts out
+        // explicitly. Product defaults are covered in hh-protocol.
+        let settings = HistorySettings {
+            enabled: true,
+            ..HistorySettings::default()
+        };
         let status = Arc::new(RwLock::new(empty_status(settings.clone())));
         let store = Store {
             root: root.clone(),
@@ -797,8 +802,9 @@ mod tests {
     }
 
     #[test]
-    fn oldest_first_capacity_cleanup_requires_the_opt_in_policy() {
+    fn capacity_cleanup_obeys_the_selected_pause_policy() {
         let (root, mut store) = open_store("oldest-first");
+        store.settings.cleanup_policy = HistoryCleanupPolicy::PauseWhenFull;
         let meta = SessionMeta {
             session_id: Uuid::new_v4(),
             pane_id: Uuid::new_v4(),
@@ -891,6 +897,49 @@ mod tests {
         let mut disabled = store.settings.clone();
         disabled.enabled = false;
         store.update_settings(disabled).unwrap();
+
+        assert!(store.session_path(meta.session_id).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_started_and_closed_while_disabled_leaves_no_archive_session() {
+        let (root, mut store) = open_store("disabled-no-empty-session");
+        store.settings.enabled = false;
+        let meta = SessionMeta {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            started_ms: now_ms(),
+        };
+
+        store.start(meta).unwrap();
+        store.end(meta.session_id).unwrap();
+
+        assert!(!store.session_path(meta.session_id).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disabled_finite_retention_does_not_delete_existing_archive() {
+        let (root, mut store) = open_store("disabled-retention-preserve");
+        let meta = SessionMeta {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            started_ms: 1,
+        };
+        store.start(meta).unwrap();
+        store.append(meta.session_id, b"old output\n", 0).unwrap();
+        store.end(meta.session_id).unwrap();
+        let mut manifest: Manifest =
+            read_json_private(&store.manifest_path(meta.session_id)).unwrap();
+        manifest.ended_ms = Some(1);
+        write_json_atomic(&store.manifest_path(meta.session_id), &manifest).unwrap();
+        store.settings.enabled = false;
+        store.settings.retention = HistoryRetention::Days { days: 1 };
+
+        store.apply_retention().unwrap();
 
         assert!(store.session_path(meta.session_id).exists());
         fs::remove_dir_all(root).unwrap();

@@ -653,7 +653,6 @@ impl HhApp {
         if let (Some(pane_id), Some(bytes)) = (self.layout.focused_pane, bytes) {
             self.dispatch_control(ClientRequest::WriteInput { pane_id, bytes });
             cx.stop_propagation();
-            cx.notify();
         }
     }
 }

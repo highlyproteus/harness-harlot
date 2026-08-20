@@ -3,6 +3,24 @@ use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px, rgb};
 use crate::THEME;
 use hh_protocol::{HistoryClearScope, HistoryWarning};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveScrollTarget {
+    TerminalMouseReporting,
+    LiveBuffer,
+}
+
+pub(crate) const fn live_scroll_target(
+    mouse_reporting: bool,
+    shift_held: bool,
+    _at_live_top: bool,
+) -> LiveScrollTarget {
+    if mouse_reporting && !shift_held {
+        LiveScrollTarget::TerminalMouseReporting
+    } else {
+        LiveScrollTarget::LiveBuffer
+    }
+}
+
 pub(crate) fn history_label(label: &'static str) -> AnyElement {
     div()
         .w(px(76.0))
@@ -88,7 +106,7 @@ pub(crate) fn history_warning_text(
 
 #[cfg(test)]
 mod tests {
-    use super::format_bytes;
+    use super::{LiveScrollTarget, format_bytes, live_scroll_target};
 
     #[test]
     fn byte_sizes_use_the_largest_meaningful_binary_unit() {
@@ -96,5 +114,17 @@ mod tests {
         assert_eq!(format_bytes(1_536), "1.5 KiB");
         assert_eq!(format_bytes(1_572_864), "1.5 MiB");
         assert_eq!(format_bytes(1_610_612_736), "1.5 GiB");
+    }
+
+    #[test]
+    fn scrolling_past_live_history_never_enters_the_archive_implicitly() {
+        assert_eq!(
+            live_scroll_target(false, false, true),
+            LiveScrollTarget::LiveBuffer
+        );
+        assert_eq!(
+            live_scroll_target(true, false, true),
+            LiveScrollTarget::TerminalMouseReporting
+        );
     }
 }

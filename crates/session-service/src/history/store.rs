@@ -263,18 +263,20 @@ impl Store {
     }
 
     pub(super) fn flush_session(&mut self, session_id: Uuid) -> Result<()> {
+        let manifest_path = self.manifest_path(session_id);
         let Some(active) = self.active.get_mut(&session_id) else {
             return Ok(());
         };
+        if !self.settings.enabled && !manifest_path.exists() {
+            return Ok(());
+        }
         if active.buffer.is_empty() {
             let manifest = active.manifest.clone();
-            let manifest_path = self.manifest_path(session_id);
             return self.write_json_tracked(&manifest_path, &manifest);
         }
         let index = active.manifest.chunk_count;
         let payload = std::mem::take(&mut active.buffer);
         let gap_before = std::mem::take(&mut active.gap_before_buffer);
-        let manifest_path = self.manifest_path(session_id);
         let chunk_path = manifest_path
             .parent()
             .context("history manifest has no parent")?
@@ -321,8 +323,12 @@ impl Store {
         let Some(mut active) = self.active.remove(&session_id) else {
             return Ok(());
         };
+        let manifest_path = self.manifest_path(session_id);
+        if !manifest_path.exists() {
+            return Ok(());
+        }
         active.manifest.ended_ms = Some(now_ms());
-        self.write_json_tracked(&self.manifest_path(session_id), &active.manifest)
+        self.write_json_tracked(&manifest_path, &active.manifest)
     }
 
     pub(super) fn update_settings(&mut self, settings: HistorySettings) -> Result<()> {
@@ -504,6 +510,9 @@ impl Store {
 
     pub(super) fn apply_retention(&mut self) -> Result<()> {
         self.last_retention_sweep = Some(Instant::now());
+        if !self.settings.enabled {
+            return Ok(());
+        }
         let HistoryRetention::Days { days } = self.settings.retention else {
             return Ok(());
         };

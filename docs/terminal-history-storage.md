@@ -13,21 +13,21 @@ The session service is the only writer. Stable archive data lives under `history
 
 Each terminal run receives a distinct archive session ID even when a recovered pane keeps the same pane ID. Output is accumulated on a dedicated writer thread and published as independently checksummed 128 KiB chunks. A chunk is written to an owner-only temporary file, synced, renamed atomically, and followed by a directory sync. Manifests and settings use the same atomic-replace pattern. On restart, unpublished temporary files are removed and an unfinished session is closed with a visible gap marker; already published chunks remain readable. A corrupt, truncated, reordered, or checksum-mismatched chunk becomes a visible archive gap instead of being rendered as trusted output. These checks detect accidental corruption and bit rot; they are not evidence against a malicious process running as the same user.
 
-The archive view is a bounded plain-text projection of one chunk at a time. It is intentionally labeled **LOCAL HISTORY** so it cannot be mistaken for the styled live Alacritty grid. Scrolling upward from the top of live scrollback loads one older page on demand; scrolling down returns through newer pages and then to the live terminal. A live literal-search miss falls back to archived chunks without loading the entire retained session.
+The archive view is a bounded plain-text projection of one chunk at a time. It is intentionally labeled **LOCAL HISTORY** so it cannot be mistaken for the styled live Alacritty grid. Normal scrolling remains inside the bounded live terminal buffer, including at its oldest line. An explicit literal search may fall back to archived chunks without loading the entire retained session; scrolling inside that clearly labeled archive view moves between archived pages and back to the live terminal.
 
 ## Backpressure and capacity
 
 PTY reads never wait for disk. The reader first advances the bounded live terminal model, then uses a non-blocking send into a fixed 256-item archive queue. A full or disconnected queue records the exact rejected byte count. The next accepted chunk carries a gap flag, and Settings reports the uncommitted gap immediately. Terminal input, output, and rendering continue normally.
 
-The default archive policy is:
+Persistent history is off by default. If the user enables it without changing the other settings, the policy is:
 
-- enabled, local only;
-- keep indefinitely;
-- 5 GiB quota;
+- enabled only by that explicit local choice;
+- retain closed sessions for 30 days;
+- 1 GiB quota;
 - warn at 80%;
-- pause new archive writes at capacity.
+- delete the oldest closed sessions at capacity.
 
-Capacity never silently deletes retained sessions under the default policy. Settings asks the user to increase the quota or explicitly clear terminal, workspace, or all history. Clear actions require a second click. Disabling local history pauses future archive writes but preserves existing bytes until the user invokes an explicit clear action; output produced while disabled is not retained. Users may opt into a finite 7/30/90/custom-day retention period, which permits removal of closed sessions after that age, or separately opt into oldest-first cleanup at capacity. Finite retention is enforced during long-running sessions as well as at startup and session close. Active terminal sessions are never removed to satisfy a quota. Switching either deletion policy on is an explicit local choice.
+Settings lets the user increase the quota, keep history indefinitely, pause instead of deleting at capacity, or explicitly clear terminal, workspace, or all history. Clear actions require a second click. Disabling local history pauses future archive writes and all retention deletion, preserving existing bytes until history is enabled again or the user invokes an explicit clear action; output produced while disabled is not retained. Finite retention is enforced during long-running sessions as well as at startup and session close while archiving is enabled. Active terminal sessions are never removed to satisfy a quota.
 
 Settings shows live memory separately from archive bytes, retained-session count, oldest date, retention and quota presets/custom values, the capacity policy, and any corruption/overflow/capacity warning. Archive status contains sizes, counts, dates, and gap state; it does not include terminal text.
 

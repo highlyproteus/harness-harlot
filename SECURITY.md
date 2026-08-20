@@ -28,7 +28,7 @@ data is local under the owner-only application-state directory's
 
 Processes running as the same local user are not a security boundary. Socket ownership, permissions, peer credentials, frame bounds, and timeouts provide defense in depth against cross-account access and confused-deputy failures. A malicious process already running as the user can access that user's files and interfere with their terminal sessions.
 
-Terminal history is stored on-device under the Harness Harlot application-state directory. It is enabled by default with the product's existing indefinite, 5-GiB policy. PTY output can include echoed commands and secrets printed by programs. File permissions and storage validation reduce accidental exposure; terminal output cannot be reliably scrubbed of secrets.
+Terminal history can be stored on-device under the Harness Harlot application-state directory. Persistent history is off by default; enabling it uses a 30-day, 1-GiB, oldest-first cleanup policy unless the user changes those settings. PTY output can include echoed commands and secrets printed by programs. File permissions and storage validation reduce accidental exposure; terminal output cannot be reliably scrubbed of secrets.
 
 History chunk checksums detect accidental corruption and bit rot. They are not cryptographic tamper evidence against a process running as the user.
 
