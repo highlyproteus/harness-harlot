@@ -11,7 +11,7 @@ key="$work/update-key"
 printf '********************************' | base64 > "$key"
 chmod 600 "$key"
 cargo build --locked --release -p hh-release-signer --bin hh-release-sign
-cargo build --locked --release -p hh-updater --features fetch,fixture --bin hh-update-tool
+cargo build --locked --release -p hh-updater --features fetch,fixture,community-macos --bin hh-update-tool
 public_key=$("$repository_root/target/release/hh-release-sign" public-key --private-key "$key")
 
 case "$(uname -m)" in
@@ -19,18 +19,7 @@ case "$(uname -m)" in
   x86_64) architecture=x86_64 ;;
   *) echo "unsupported test architecture" >&2; exit 1 ;;
 esac
-case "$architecture" in
-  arm64) other_architecture=x86_64 ;;
-  x86_64) other_architecture=arm64 ;;
-esac
-if "$repository_root/target/release/hh-update-tool" install \
-  --architecture "$other_architecture" --current-version 0.1.0 \
-  >"$work/wrong-architecture.out" 2>&1; then
-  echo "production updater accepted a non-native architecture" >&2
-  exit 1
-fi
-grep -q "production update architecture must match" "$work/wrong-architecture.out"
-artifact="$work/Harness-Harlot-0.2.0-b1-macos-${architecture}.dmg"
+artifact="$work/Harness-Harlot-0.2.0-b1-macos-${architecture}-community.dmg"
 printf 'fixture dmg bytes\n' > "$artifact"
 size=$(stat -f %z "$artifact")
 sha256=$(shasum -a 256 "$artifact" | sed 's/[[:space:]].*$//')
@@ -70,6 +59,22 @@ EOF
 "$repository_root/target/release/hh-release-sign" sign \
   --manifest "$manifest" --signature "$signature" --private-key "$key"
 
+if "$repository_root/target/release/hh-update-tool" check --current-version 0.1.0 \
+  >"$work/unpackaged-build.out" 2>&1; then
+  echo "unpackaged updater accessed the production feed" >&2
+  exit 1
+fi
+grep -q "updates are available only from a packaged build" "$work/unpackaged-build.out"
+
+check_output=$(
+  "$repository_root/target/release/hh-update-tool" check \
+    --fixture --key-id test-only-v1 --public-key "$public_key" \
+    --host updates.example.invalid --manifest "$manifest" \
+    --signature "$signature" --artifact "$artifact" \
+    --current-version 0.1.0
+)
+[ "$check_output" = "update available: 0.2.0 build 1" ]
+
 write_app() {
   app=$1
   marker=$2
@@ -89,6 +94,9 @@ ln -s "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh" "$work/home
 
 cat > "$work/mock-bin/codesign" <<'EOF'
 #!/bin/sh
+if [ "${1:-}" = -dv ]; then
+  echo 'Signature=adhoc' >&2
+fi
 exit 0
 EOF
 cat > "$work/mock-bin/hdiutil" <<'EOF'
@@ -122,8 +130,8 @@ install_fixture() {
   HH_UPDATE_FIXTURE_APP="$work/mounted-app" \
   HH_UPDATE_FIXTURE_OPEN_LOG="$work/open.log" \
   "$repository_root/target/release/hh-update-tool" install \
-    --fixture --key-id test-only-v1 --public-key "$public_key" \
-    --host updates.example.invalid --team-id TESTTEAM01 \
+    --fixture --community --key-id test-only-v1 --public-key "$public_key" \
+    --host updates.example.invalid \
     --manifest "$manifest" --signature "$signature" --artifact "$artifact" \
     --current-version 0.1.0 --prefix "$work/home/Applications"
 }
@@ -136,12 +144,11 @@ install_fixture
 
 printf '#!/bin/sh\necho current-before-failure\n' > "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh"
 chmod +x "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh"
-if HH_UPDATE_FIXTURE_OPEN_FAIL=1 install_fixture >/dev/null 2>&1; then
-  echo "installer accepted a failed post-swap launch" >&2
-  exit 1
-fi
-[ "$("$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh")" = current-before-failure ]
-[ ! -e "$work/home/Applications/Harness Harlot.previous.app" ]
+HH_UPDATE_FIXTURE_OPEN_FAIL=1 install_fixture >"$work/relaunch-failure.out" 2>&1
+grep -F "update installed, but Harness Harlot could not be relaunched" \
+  "$work/relaunch-failure.out" >/dev/null
+[ "$("$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh")" = new ]
+[ "$("$work/home/Applications/Harness Harlot.previous.app/Contents/MacOS/hh")" = current-before-failure ]
 [ "$(readlink "$work/home/.local/bin/hh")" = "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh" ]
 
-echo "hh-update-tool fixture installs atomically and rolls back post-swap failures"
+echo "hh-update-tool fixture installs atomically, preserves rollback, and reports relaunch failures"

@@ -107,16 +107,18 @@ gh release download "$tag" --repo "$REPOSITORY" --dir "$work" \
   --pattern "$(basename "$manifest")" \
   --pattern "$(basename "$signature")" \
   --pattern "$artifact_pattern"
+# The unquoted pattern is intentional: exactly one downloaded artifact must match.
+# shellcheck disable=SC2086
 set -- "$work"/$artifact_pattern
-[ "$#" -eq 1 ] && [ -f "$1" ] || {
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
   echo "release must contain exactly one architecture-matched community DMG" >&2
   exit 1
-}
+fi
 dmg=$1
-[ -f "$manifest" ] && [ -f "$signature" ] || {
+if [ ! -f "$manifest" ] || [ ! -f "$signature" ]; then
   echo "release is missing the community update manifest or signature" >&2
   exit 1
-}
+fi
 
 # GitHub's signed workflow provenance is the bootstrap trust root. Only after
 # all downloaded inputs pass this check do we inspect or mount the DMG.
@@ -241,5 +243,6 @@ open "$app"
 install_in_progress=0
 
 echo "installed unnotarized community build at $app"
-echo "Automatic replacement is disabled. Future releases appear as manual update notifications."
+echo "Future releases can be installed with: hh update"
+echo "Check without installing with: hh update --check"
 echo "If macOS blocks first launch, use System Settings > Privacy & Security > Open Anyway."

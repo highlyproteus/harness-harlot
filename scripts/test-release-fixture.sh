@@ -35,6 +35,7 @@ distribution=$(
   HH_ALLOW_DIRTY_TEST_PACKAGE=1 \
   HH_UPDATE_SIGNING_KEY_FILE="$key" \
   HH_UPDATE_PUBLIC_KEY="$public_key" \
+  HH_UPDATE_CHANNEL=edge \
   "$repository_root/scripts/package-macos-release.sh" "$version" 1 | sed -n '$p'
 )
 
@@ -69,5 +70,6 @@ grep -F "fixture support is not compiled into this updater" \
 
 [ -f "$distribution/manifest-macos-${architecture}.update.json" ]
 [ -f "$distribution/manifest-macos-${architecture}.update.json.sig" ]
+grep -F '"channel": "edge"' "$distribution/manifest-macos-${architecture}.update.json" >/dev/null
 
-echo "release fixture signs inside-out, publishes stable manifests, and bundles hh, hh-service, and hh-update-tool"
+echo "release fixture signs inside-out, publishes channel manifests, and bundles hh, hh-service, and hh-update-tool"

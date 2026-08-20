@@ -52,6 +52,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.96"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-macos-${{ matrix.architecture }}-${{ matrix.release_mode }}
+          cache-targets: true
       - name: Validate signed tag and runner architecture
         if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
         run: |
@@ -139,10 +143,11 @@ jobs:
           printf '%s\n' "$HH_UPDATE_SIGNING_SEED" > "$key_file"
           chmod 600 "$key_file"
           export HH_UPDATE_SIGNING_KEY_FILE="$key_file"
+          build=$(git rev-list --count HEAD)
           if [ "${{ matrix.release_mode }}" = community ]; then
-            scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$GITHUB_RUN_NUMBER" --community
+            scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$build" --community
           else
-            scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$GITHUB_RUN_NUMBER"
+            scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$build"
           fi
       - name: Attest packaged release files
         if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
@@ -205,6 +210,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.96"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-linux-${{ matrix.architecture }}
+          cache-targets: true
       # Keep Linux CEF pinned to the build paired with cef = 151.6.0.
       # Both SHA-1 values are published by cef-builds.spotifycdn.com.
       - name: Cache pinned Linux CEF archive
@@ -275,7 +284,8 @@ jobs:
           printf '%s\n' "$HH_UPDATE_SIGNING_SEED" > "$key_file"
           chmod 600 "$key_file"
           export HH_UPDATE_SIGNING_KEY_FILE="$key_file"
-          scripts/package-linux-release.sh "$version" "$GITHUB_RUN_NUMBER"
+          build=$(git rev-list --count HEAD)
+          scripts/package-linux-release.sh "$version" "$build"
       - name: Attest packaged Linux release files
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:

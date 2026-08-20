@@ -45,11 +45,13 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
 artifact_pattern="Harness-Harlot-${version}-b*-linux-${architecture}.tar.gz"
 gh release download "$tag" --repo "$REPOSITORY" --dir "$work" --pattern "$artifact_pattern"
+# The unquoted pattern is intentional: exactly one downloaded artifact must match.
+# shellcheck disable=SC2086
 set -- "$work"/$artifact_pattern
-[ "$#" -eq 1 ] && [ -f "$1" ] || {
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
   echo "release must contain exactly one Linux package for $architecture" >&2
   exit 1
-}
+fi
 artifact=$1
 gh attestation verify "$artifact" --repo "$REPOSITORY"
 

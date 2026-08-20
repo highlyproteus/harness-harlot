@@ -1,0 +1,14 @@
+title = "Harness Harlot gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Pinned public CEF archive checksum used in the macOS ARM64 cache key"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''key:\s+cef-8245a003c52c01811310b9b7d026e92dff859626-macosarm64''']
+paths = ['''^\.github/workflows/edge\.yml$''']

@@ -231,9 +231,10 @@ fi
 if [ "$fixture" = 1 ]; then
   "$verification_tool" verify --key-id "$expected_key_id" --public-key "$public_key" \
     --host "$expected_update_host" --manifest "$manifest" \
-    --signature "$signature" --fixture
+    --signature "$signature" --channel "${HH_UPDATE_CHANNEL:-stable}" --fixture
 else
-  "$tool" verify-trusted --manifest "$manifest" --signature "$signature"
+  "$tool" verify-trusted --manifest "$manifest" --signature "$signature" \
+    --channel "${HH_UPDATE_CHANNEL:-stable}"
 fi
 
 artifact=$(plutil -extract artifacts.0.file_name raw -o - "$manifest")
@@ -244,9 +245,11 @@ fi
 if [ "$fixture" = 1 ]; then
   "$verification_tool" verify --key-id "$expected_key_id" --public-key "$public_key" \
     --host "$expected_update_host" --manifest "$manifest" \
-    --signature "$signature" --artifact "$dmg" --fixture
+    --signature "$signature" --artifact "$dmg" \
+    --channel "${HH_UPDATE_CHANNEL:-stable}" --fixture
 else
-  "$tool" verify-trusted --manifest "$manifest" --signature "$signature" --artifact "$dmg"
+  "$tool" verify-trusted --manifest "$manifest" --signature "$signature" --artifact "$dmg" \
+    --channel "${HH_UPDATE_CHANNEL:-stable}"
 fi
 verify_app "$app"
 

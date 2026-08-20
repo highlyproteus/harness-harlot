@@ -63,17 +63,27 @@ Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profil
 
 ### macOS
 
-Install or update with one copy-and-paste command:
+Install with one copy-and-paste command:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLo /tmp/hh-install-macos.sh https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh && sh /tmp/hh-install-macos.sh --acknowledge-unnotarized
 ```
 
-> **macOS updates are manual for now.** Until Developer ID signing and Apple
-> notarization are enabled, quit Harness Harlot, end its terminal sessions, and
-> run the command above again whenever the app reports an available update.
-> Your workstations, settings, and history remain in the application state
-> directory and are not replaced with the app.
+The installer creates `~/.local/bin/hh`; the DMG app repairs the same command
+link on first launch. Add `~/.local/bin` to `PATH` once if your shell does not
+already include it. After either terminal or DMG installation, use:
+
+```bash
+hh version
+hh update --check
+hh update
+```
+
+`hh update` uses the bundled signed updater, retains the previous application
+for rollback, and relaunches Harness Harlot after a successful replacement.
+End active terminal sessions before installing an update. Contributors can opt
+into the independently published main-branch feed with
+`hh update --channel edge`.
 
 ### Linux
 
