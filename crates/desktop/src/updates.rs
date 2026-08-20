@@ -9,7 +9,7 @@ use gpui::{
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use hh_updater::fetch::{fetch_available_update, runtime_architecture, runtime_platform};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use hh_updater::{CurrentRelease, TRUSTED_UPDATE_KEYS, automatic_install_supported, current_build};
+use hh_updater::{CurrentRelease, TRUSTED_UPDATE_KEYS, current_build, explicit_install_supported};
 
 pub(crate) const fn automatic_update_check_interval() -> Duration {
     Duration::from_hours(1)
@@ -128,7 +128,7 @@ impl HhApp {
                         this.editor.update_available = Some(AvailableUpdateBanner {
                             version: update.version,
                             requires_service_restart: update.requires_service_restart,
-                            install_supported: automatic_install_supported(
+                            install_supported: explicit_install_supported(
                                 update.artifact.platform.as_str(),
                             ),
                             installing,

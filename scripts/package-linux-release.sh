@@ -48,6 +48,11 @@ case "$(uname -m)" in
 esac
 
 test_mode=${HH_RELEASE_TEST_MODE:-0}
+channel=${HH_UPDATE_CHANNEL:-stable}
+case "$channel" in
+  stable | edge) ;;
+  *) echo "HH_UPDATE_CHANNEL must be stable or edge" >&2; exit 2 ;;
+esac
 : "${HH_UPDATE_SIGNING_KEY_FILE:?set HH_UPDATE_SIGNING_KEY_FILE to an owner-only base64 Ed25519 seed file}"
 : "${HH_UPDATE_PUBLIC_KEY:?set HH_UPDATE_PUBLIC_KEY to the matching base64 Ed25519 public key}"
 if [ "$test_mode" = 1 ]; then
@@ -56,8 +61,12 @@ if [ "$test_mode" = 1 ]; then
 else
   : "${HH_UPDATE_KEY_ID:?set HH_UPDATE_KEY_ID for a publishable package}"
   : "${HH_UPDATE_BASE_URL:?set HH_UPDATE_BASE_URL for a publishable package}"
-  : "${HH_RELEASE_TAG:?set HH_RELEASE_TAG to the signed annotated tag for this release}"
   : "${CEF_PATH:?set CEF_PATH to the unpacked Linux CEF distribution}"
+  if [ "$channel" = stable ]; then
+    : "${HH_RELEASE_TAG:?set HH_RELEASE_TAG to the signed annotated tag for this release}"
+  else
+    : "${HH_RELEASE_COMMIT:?set HH_RELEASE_COMMIT to the edge source commit}"
+  fi
   key_id=$HH_UPDATE_KEY_ID
   base_url=$HH_UPDATE_BASE_URL
   if [ "$key_id" = "test-only-v1" ]; then
@@ -88,11 +97,16 @@ if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   fi
 fi
 if [ "$test_mode" != 1 ]; then
-  git verify-tag "$HH_RELEASE_TAG"
-  tag_commit=$(git rev-parse "$HH_RELEASE_TAG^{commit}")
   head_commit=$(git rev-parse HEAD)
-  if [ "$tag_commit" != "$head_commit" ]; then
-    echo "signed release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
+  if [ "$channel" = stable ]; then
+    git verify-tag "$HH_RELEASE_TAG"
+    tag_commit=$(git rev-parse "$HH_RELEASE_TAG^{commit}")
+    if [ "$tag_commit" != "$head_commit" ]; then
+      echo "signed release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
+      exit 2
+    fi
+  elif [ "$HH_RELEASE_COMMIT" != "$head_commit" ]; then
+    echo "edge release commit $HH_RELEASE_COMMIT does not resolve to HEAD" >&2
     exit 2
   fi
 fi
@@ -187,7 +201,7 @@ cat > "$manifest" <<EOF
 {
   "schema": "hh-update-manifest-v2",
   "product": "Harness Harlot",
-  "channel": "stable",
+  "channel": "$channel",
   "key_id": "$key_id",
   "version": "$version",
   "build": $build,
@@ -227,12 +241,14 @@ if [ "$test_mode" = 1 ]; then
     --host "$update_host" \
     --manifest "$manifest" \
     --signature "$signature" \
-    --artifact "$artifact"
+    --artifact "$artifact" \
+    --channel "$channel"
 else
   "$release_binary_directory/hh-update-tool" verify-trusted \
     --manifest "$manifest" \
     --signature "$signature" \
-    --artifact "$artifact"
+    --artifact "$artifact" \
+    --channel "$channel"
 fi
 
 echo "$distribution_directory"

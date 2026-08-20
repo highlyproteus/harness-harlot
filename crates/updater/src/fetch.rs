@@ -13,9 +13,9 @@ use std::process::Command;
 use url::Url;
 
 use crate::{
-    CurrentRelease, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, ReleaseArtifact, UPDATE_MANIFEST_BASE,
-    select_verified_update, update_manifest_name, verify_artifact_file,
-    verify_manifest_with_trusted_keys,
+    CurrentRelease, EDGE_UPDATE_RELEASE_PREFIX, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES,
+    ReleaseArtifact, UPDATE_MANIFEST_BASE, UpdateChannel, select_verified_update,
+    update_manifest_name, verify_artifact_file, verify_manifest_with_trusted_keys_for_channel,
 };
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -26,6 +26,7 @@ static DOWNLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedUpdate {
     pub version: String,
+    pub build: u64,
     pub artifact: ReleaseArtifact,
     pub requires_service_restart: bool,
 }
@@ -64,7 +65,31 @@ pub fn runtime_architecture() -> Result<&'static str> {
 /// Network, size-limit, signature, manifest-policy, and version errors are
 /// returned to the caller. A missing release is not treated as "up to date".
 pub fn fetch_available_update(current: &CurrentRelease<'_>) -> Result<Option<OwnedUpdate>> {
-    let base = UPDATE_MANIFEST_BASE.context("production update manifest URL is not configured")?;
+    fetch_available_update_for_channel(current, UpdateChannel::Stable)
+}
+
+/// Fetch and authenticate the newest release from the requested channel.
+///
+/// # Errors
+///
+/// Returns an error when network, redirect, size, signature, channel, platform,
+/// architecture, host, or release-selection policy rejects the response.
+pub fn fetch_available_update_for_channel(
+    current: &CurrentRelease<'_>,
+    channel: UpdateChannel,
+) -> Result<Option<OwnedUpdate>> {
+    let edge_base;
+    let base = match channel {
+        UpdateChannel::Stable => {
+            UPDATE_MANIFEST_BASE.context("production update manifest URL is not configured")?
+        }
+        UpdateChannel::Edge => {
+            let prefix =
+                EDGE_UPDATE_RELEASE_PREFIX.context("edge update manifest URL is not configured")?;
+            edge_base = format!("{prefix}-{}-{}", current.platform, current.architecture);
+            &edge_base
+        }
+    };
     let manifest_url = format!(
         "{}/{}",
         base.trim_end_matches('/'),
@@ -81,7 +106,8 @@ pub fn fetch_available_update(current: &CurrentRelease<'_>) -> Result<Option<Own
         .context("fetch stable update signature")?;
     let signature =
         std::str::from_utf8(&signature_bytes).context("update manifest signature is not UTF-8")?;
-    let manifest = verify_manifest_with_trusted_keys(&manifest_bytes, signature)?;
+    let manifest =
+        verify_manifest_with_trusted_keys_for_channel(&manifest_bytes, signature, channel)?;
     let selected = select_verified_update(&manifest, current)?;
     #[cfg(target_os = "linux")]
     if current.platform == "linux" && selected.is_some() {
@@ -94,6 +120,7 @@ pub fn fetch_available_update(current: &CurrentRelease<'_>) -> Result<Option<Own
     }
     Ok(selected.map(|update| OwnedUpdate {
         version: update.manifest.version.clone(),
+        build: update.manifest.build,
         artifact: update.artifact.clone(),
         requires_service_restart: update.requires_service_restart,
     }))

@@ -52,13 +52,7 @@ case "$artifact" in
 esac
 
 app="$repository_root/target/release/Harness Harlot.app"
-if "$app/Contents/MacOS/hh-update-tool" install >"$work/automatic-install.out" 2>&1; then
-  echo "community updater allowed automatic macOS replacement" >&2
-  exit 1
-fi
-grep -F "automatic update installation is unavailable for unnotarized community macOS builds" \
-  "$work/automatic-install.out" >/dev/null
 HH_SOCKET="$work/no-service.sock" \
   "$app/Contents/MacOS/hh-update-tool" prepare-community-install
 
-echo "community fixture isolates its feed, requires explicit trust, and disables automatic replacement"
+echo "community fixture isolates its feed and validates explicit installation trust"

@@ -16,16 +16,17 @@ use anyhow::{Context, Result, bail, ensure};
 #[cfg(feature = "fixture")]
 use hh_updater::fetch::OwnedUpdate;
 use hh_updater::fetch::{
-    download_verified, fetch_available_update, runtime_architecture, runtime_platform,
+    download_verified, fetch_available_update_for_channel, runtime_architecture, runtime_platform,
 };
 use hh_updater::{
-    CurrentRelease, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, TRUSTED_APPLE_TEAM_ID, UpdateManifest,
-    automatic_install_supported, current_build, verify_artifact_file,
-    verify_manifest_with_trusted_keys,
+    CurrentRelease, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, TRUSTED_APPLE_TEAM_ID,
+    TRUSTED_UPDATE_KEYS, UpdateChannel, UpdateManifest, current_build, explicit_install_supported,
+    verify_artifact_file, verify_manifest_with_trusted_keys_for_channel,
 };
 #[cfg(feature = "fixture")]
 use hh_updater::{
-    ReleaseArtifact, public_key_from_base64, select_verified_update, verify_manifest_with_key,
+    ReleaseArtifact, public_key_from_base64, select_verified_update,
+    verify_manifest_with_key_for_channel,
 };
 use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(feature = "fixture")]
@@ -33,10 +34,14 @@ use time::OffsetDateTime;
 
 #[cfg(target_os = "macos")]
 const BUNDLE_ID: &str = "com.harnessharlot.desktop";
-#[cfg(target_os = "macos")]
 const MACOS_APP_NAME: &str = "Harness Harlot.app";
 #[cfg(target_os = "macos")]
 const MACOS_BACKUP_NAME: &str = "Harness Harlot.previous.app";
+#[cfg(target_os = "macos")]
+enum MacAppTrust {
+    CommunityAdHoc,
+    DeveloperId(String),
+}
 const LINUX_APP_NAME: &str = "harness-harlot";
 const LINUX_BACKUP_NAME: &str = "harness-harlot.previous";
 const LINUX_ARCHIVE_ROOT: &str = "Harness-Harlot";
@@ -47,7 +52,7 @@ type FixtureUpdate = (Option<OwnedUpdate>, Option<(PathBuf, ReleaseArtifact)>);
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  hh-update-tool verify-trusted --manifest FILE --signature FILE [--artifact FILE]\n  hh-update-tool install [--current-version VERSION] [--current-build BUILD] [--wait-pid PID --wait-start-time UNIX_SECONDS] [--prefix DIR]\n  hh-update-tool install-local --source DIR [--prefix DIR]"
+        "usage:\n  hh-update-tool verify-trusted --manifest FILE --signature FILE [--artifact FILE] [--channel stable|edge]\n  hh-update-tool check [--current-version VERSION] [--current-build BUILD] [--channel stable|edge]\n  hh-update-tool install [--current-version VERSION] [--current-build BUILD] [--channel stable|edge] [--wait-pid PID --wait-start-time UNIX_SECONDS] [--prefix DIR]\n  hh-update-tool install-local --source DIR [--prefix DIR]"
     );
     #[cfg(feature = "community-macos")]
     eprintln!("community macOS:\n  hh-update-tool prepare-community-install");
@@ -75,6 +80,14 @@ fn optional_string_option(arguments: &[String], name: &str) -> Result<Option<Str
 
 fn string_option(arguments: &[String], name: &str) -> Result<String> {
     optional_string_option(arguments, name)?.with_context(|| format!("missing {name}"))
+}
+
+fn update_channel(arguments: &[String]) -> Result<UpdateChannel> {
+    match optional_string_option(arguments, "--channel")?.as_deref() {
+        None | Some("stable") => Ok(UpdateChannel::Stable),
+        Some("edge") => Ok(UpdateChannel::Edge),
+        Some(_) => bail!("update channel must be stable or edge"),
+    }
 }
 
 fn verify_optional_artifact(arguments: &[String], manifest: &UpdateManifest) -> Result<()> {
@@ -124,11 +137,15 @@ fn run_verify_trusted(arguments: &[String]) -> Result<()> {
     let manifest_bytes = read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
     let signature = String::from_utf8(read_bounded(&signature_path, MAX_SIGNATURE_BYTES)?)
         .context("update signature is not UTF-8")?;
-    let manifest = verify_manifest_with_trusted_keys(&manifest_bytes, &signature)?;
+    let channel = update_channel(arguments)?;
+    let manifest =
+        verify_manifest_with_trusted_keys_for_channel(&manifest_bytes, &signature, channel)?;
     verify_optional_artifact(arguments, &manifest)?;
     println!(
-        "trusted stable update {} build {}",
-        manifest.version, manifest.build
+        "trusted {} update {} build {}",
+        channel.as_str(),
+        manifest.version,
+        manifest.build
     );
     Ok(())
 }
@@ -147,7 +164,8 @@ fn run_verify_fixture(arguments: &[String]) -> Result<()> {
     let manifest_bytes = read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
     let signature = String::from_utf8(read_bounded(&signature_path, MAX_SIGNATURE_BYTES)?)
         .context("update signature is not UTF-8")?;
-    let manifest = verify_manifest_with_key(
+    let channel = update_channel(arguments)?;
+    let manifest = verify_manifest_with_key_for_channel(
         &manifest_bytes,
         &signature,
         &key_id,
@@ -155,12 +173,98 @@ fn run_verify_fixture(arguments: &[String]) -> Result<()> {
         &host,
         OffsetDateTime::now_utc(),
         true,
+        channel,
     )?;
     verify_optional_artifact(arguments, &manifest)?;
     println!(
-        "trusted stable update {} build {}",
-        manifest.version, manifest.build
+        "trusted {} update {} build {}",
+        channel.as_str(),
+        manifest.version,
+        manifest.build
     );
+    Ok(())
+}
+
+fn production_update_eligible(packaged_build: u64) -> bool {
+    packaged_build > 0 && !TRUSTED_UPDATE_KEYS.is_empty()
+}
+
+fn ensure_production_target_matches(
+    fixture: bool,
+    requested: &str,
+    native: &str,
+    target_kind: &str,
+) -> Result<()> {
+    ensure!(
+        fixture || requested == native,
+        "production update {target_kind} must match the running system"
+    );
+    Ok(())
+}
+
+fn macos_install_prefix_for_executable(executable: &Path) -> Option<PathBuf> {
+    let macos = executable.parent()?;
+    if macos.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents = macos.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    let app = contents.parent()?;
+    if app.file_name()? != MACOS_APP_NAME {
+        return None;
+    }
+    app.parent().map(Path::to_path_buf)
+}
+
+fn run_check(arguments: &[String]) -> Result<()> {
+    #[cfg(feature = "fixture")]
+    let fixture = arguments.iter().any(|argument| argument == "--fixture");
+    #[cfg(not(feature = "fixture"))]
+    let fixture = false;
+    ensure!(
+        fixture || production_update_eligible(current_build()),
+        "updates are available only from a packaged build with trusted update keys"
+    );
+    let native_platform = runtime_platform()?;
+    let platform = optional_string_option(arguments, "--platform")?
+        .unwrap_or_else(|| native_platform.to_owned());
+    ensure_production_target_matches(fixture, &platform, native_platform, "platform")?;
+    let native_architecture = runtime_architecture()?;
+    let architecture = optional_string_option(arguments, "--architecture")?
+        .unwrap_or_else(|| native_architecture.to_owned());
+    ensure_production_target_matches(fixture, &architecture, native_architecture, "architecture")?;
+    let current_version = optional_string_option(arguments, "--current-version")?
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    let installed_build = optional_string_option(arguments, "--current-build")?.map_or_else(
+        || Ok(current_build()),
+        |value| value.parse().context("parse --current-build"),
+    )?;
+    let current = CurrentRelease {
+        version: &current_version,
+        build: installed_build,
+        platform: &platform,
+        architecture: &architecture,
+        protocol_version: hh_protocol::PROTOCOL_VERSION,
+    };
+    let channel = update_channel(arguments)?;
+    #[cfg(feature = "fixture")]
+    let update = if fixture {
+        load_fixture_update(arguments, &current)?.0
+    } else {
+        fetch_available_update_for_channel(&current, channel)?
+    };
+    #[cfg(not(feature = "fixture"))]
+    let update = fetch_available_update_for_channel(&current, channel)?;
+    if let Some(update) = update {
+        println!(
+            "update available: {} build {}",
+            update.version, update.build
+        );
+    } else {
+        println!("up to date");
+    }
     Ok(())
 }
 
@@ -179,24 +283,22 @@ fn run_install(arguments: &[String]) -> Result<()> {
         );
         false
     };
+    ensure!(
+        fixture || production_update_eligible(current_build()),
+        "updates are available only from a packaged build with trusted update keys"
+    );
     let native_platform = runtime_platform()?;
     let platform = optional_string_option(arguments, "--platform")?
         .unwrap_or_else(|| native_platform.to_owned());
+    ensure_production_target_matches(fixture, &platform, native_platform, "platform")?;
     ensure!(
-        fixture || platform == native_platform,
-        "production update platform must match the running system"
-    );
-    ensure!(
-        fixture || automatic_install_supported(&platform),
-        "automatic update installation is unavailable for unnotarized community macOS builds; use install-community-macos.sh"
+        fixture || explicit_install_supported(&platform),
+        "explicit update installation is unavailable for this packaged platform"
     );
     let native_architecture = runtime_architecture()?;
     let architecture = optional_string_option(arguments, "--architecture")?
         .unwrap_or_else(|| native_architecture.to_owned());
-    ensure!(
-        fixture || architecture == native_architecture,
-        "production update architecture must match the running system"
-    );
+    ensure_production_target_matches(fixture, &architecture, native_architecture, "architecture")?;
     let current_version = optional_string_option(arguments, "--current-version")?
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
     let installed_build = optional_string_option(arguments, "--current-build")?.map_or_else(
@@ -210,17 +312,18 @@ fn run_install(arguments: &[String]) -> Result<()> {
         architecture: &architecture,
         protocol_version: hh_protocol::PROTOCOL_VERSION,
     };
+    let channel = update_channel(arguments)?;
     #[cfg(feature = "fixture")]
     let (update, fixture_artifact) = if fixture {
         load_fixture_update(arguments, &current)?
     } else {
-        (fetch_available_update(&current)?, None)
+        (fetch_available_update_for_channel(&current, channel)?, None)
     };
     #[cfg(not(feature = "fixture"))]
     let (update, fixture_artifact): (
         Option<hh_updater::fetch::OwnedUpdate>,
         Option<(PathBuf, hh_updater::ReleaseArtifact)>,
-    ) = (fetch_available_update(&current)?, None);
+    ) = (fetch_available_update_for_channel(&current, channel)?, None);
     let Some(update) = update else {
         println!("up to date");
         return Ok(());
@@ -230,16 +333,26 @@ fn run_install(arguments: &[String]) -> Result<()> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")?;
+    let managed_prefix = if platform == "macos" {
+        env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(macos_install_prefix_for_executable)
+    } else {
+        None
+    };
     let default_prefix = match platform.as_str() {
-        "macos" => home.join("Applications"),
+        "macos" => managed_prefix
+            .clone()
+            .unwrap_or_else(|| home.join("Applications")),
         "linux" => home.join(".local/lib"),
         _ => bail!("unsupported install platform {platform}"),
     };
     let prefix =
         optional_string_option(arguments, "--prefix")?.map_or(default_prefix, PathBuf::from);
     ensure!(
-        path_is_confined(&prefix, &home)?,
-        "install prefix must be an absolute normalized path inside HOME"
+        path_is_confined(&prefix, &home)? || managed_prefix.as_ref() == Some(&prefix),
+        "install prefix must be inside HOME or contain the running managed app"
     );
 
     let work = TemporaryDirectory::new()?;
@@ -273,26 +386,34 @@ fn run_install(arguments: &[String]) -> Result<()> {
         (Some(_), None) => bail!("--wait-start-time is required with --wait-pid"),
         (None, Some(_)) => bail!("--wait-pid is required with --wait-start-time"),
     }
+    ensure_no_running_desktop_process()?;
 
     match platform.as_str() {
         "macos" => {
-            let team_id = if fixture {
-                string_option(arguments, "--team-id")?
+            let community = cfg!(feature = "community-macos")
+                && (!fixture || arguments.iter().any(|argument| argument == "--community"));
+            let trust = if community {
+                MacAppTrust::CommunityAdHoc
             } else {
-                TRUSTED_APPLE_TEAM_ID
-                    .context("update install is not release-configured")?
-                    .to_owned()
+                let team_id = if fixture {
+                    string_option(arguments, "--team-id")?
+                } else {
+                    TRUSTED_APPLE_TEAM_ID
+                        .context("update install is not release-configured")?
+                        .to_owned()
+                };
+                ensure!(
+                    !team_id.is_empty()
+                        && team_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+                    "invalid expected Apple Team ID"
+                );
+                MacAppTrust::DeveloperId(team_id)
             };
-            ensure!(
-                !team_id.is_empty()
-                    && team_id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
-                "invalid expected Apple Team ID"
-            );
             #[cfg(target_os = "macos")]
             {
-                install_dmg(&package, &prefix, &home, &team_id, requires_service_restart)
+                install_dmg(&package, &prefix, &home, &trust, requires_service_restart)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -345,6 +466,37 @@ fn wait_for_process_exit(process_id: u32, start_time: u64) -> Result<()> {
         );
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn command_line_is_desktop(command: &[&str]) -> bool {
+    command.len() == 1
+        || command.get(1..).is_some_and(|arguments| {
+            arguments
+                .iter()
+                .all(|argument| argument.starts_with("-psn_"))
+        })
+}
+
+fn ensure_no_running_desktop_process() -> Result<()> {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All);
+    let running = system.processes().values().any(|process| {
+        if process.name().to_string_lossy() != "hh" {
+            return false;
+        }
+        let command = process
+            .cmd()
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+        let command = command.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+        command_line_is_desktop(&command)
+    });
+    ensure!(
+        !running,
+        "quit Harness Harlot before updating; the app will restart after installation"
+    );
+    Ok(())
 }
 
 fn process_matches_start_time(system: &System, pid: Pid, start_time: u64) -> bool {
@@ -403,7 +555,7 @@ fn load_fixture_update(
     let manifest_bytes = read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
     let signature = String::from_utf8(read_bounded(&signature_path, MAX_SIGNATURE_BYTES)?)
         .context("update signature is not UTF-8")?;
-    let manifest = verify_manifest_with_key(
+    let manifest = verify_manifest_with_key_for_channel(
         &manifest_bytes,
         &signature,
         &key_id,
@@ -411,6 +563,7 @@ fn load_fixture_update(
         &host,
         OffsetDateTime::now_utc(),
         true,
+        update_channel(arguments)?,
     )?;
     let Some(selected) = select_verified_update(&manifest, current)? else {
         return Ok((None, None));
@@ -419,6 +572,7 @@ fn load_fixture_update(
     Ok((
         Some(OwnedUpdate {
             version: selected.manifest.version.clone(),
+            build: selected.manifest.build,
             artifact: selected.artifact.clone(),
             requires_service_restart: selected.requires_service_restart,
         }),
@@ -907,7 +1061,7 @@ fn install_dmg(
     dmg: &Path,
     prefix: &Path,
     home: &Path,
-    team_id: &str,
+    trust: &MacAppTrust,
     restart_service: bool,
 ) -> Result<()> {
     fs::create_dir_all(prefix)
@@ -918,7 +1072,7 @@ fn install_dmg(
 
     let mut mount = MountedDmg::attach(dmg, TemporaryDirectory::new()?)?;
     let mounted_app = mount.path().join(MACOS_APP_NAME);
-    validate_managed_app(&mounted_app, team_id)?;
+    validate_managed_app(&mounted_app, trust)?;
 
     let app = prefix.join(MACOS_APP_NAME);
     let backup = prefix.join(MACOS_BACKUP_NAME);
@@ -930,16 +1084,16 @@ fn install_dmg(
         [mounted_app.as_os_str(), staging.as_os_str()],
         "stage mounted update app",
     )?;
-    validate_managed_app(&staging, team_id)?;
+    validate_managed_app(&staging, trust)?;
     validate_managed_link(&link, &app)?;
     if path_exists(&app)? {
-        validate_managed_app(&app, team_id)?;
+        validate_managed_app(&app, trust)?;
         if restart_service {
             stop_managed_service(&app.join("Contents/MacOS/hh-service"))?;
         }
     }
     if path_exists(&backup)? {
-        validate_managed_app(&backup, team_id)?;
+        validate_managed_app(&backup, trust)?;
         fs::remove_dir_all(&backup)
             .with_context(|| format!("remove previous backup {}", backup.display()))?;
     }
@@ -969,7 +1123,7 @@ fn install_dmg(
         }
         symlink(app.join("Contents/MacOS/hh"), &link)
             .with_context(|| format!("create command link {}", link.display()))?;
-        validate_managed_app(&app, team_id)?;
+        validate_managed_app(&app, trust)?;
         ensure!(
             path_exists(&link)?,
             "updated command link is missing: {}",
@@ -977,7 +1131,6 @@ fn install_dmg(
         );
         validate_managed_link(&link, &app)?;
         mount.detach()?;
-        run_status("open", [app.as_os_str()], "launch updated app")?;
         Ok(())
     })();
 
@@ -1009,7 +1162,7 @@ fn install_dmg(
                     .with_context(|| format!("remove staging app {}", staging.display()))?;
             }
             if had_app {
-                validate_managed_app(&app, team_id)?;
+                validate_managed_app(&app, trust)?;
                 ensure!(
                     path_exists(&link)?,
                     "restored command link is missing: {}",
@@ -1034,11 +1187,14 @@ fn install_dmg(
         };
     }
     println!("installed {}", app.display());
+    if let Err(error) = run_status("open", [app.as_os_str()], "launch updated app") {
+        eprintln!("update installed, but Harness Harlot could not be relaunched: {error:#}");
+    }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn validate_managed_app(candidate: &Path, team_id: &str) -> Result<()> {
+fn validate_managed_app(candidate: &Path, trust: &MacAppTrust) -> Result<()> {
     let metadata = fs::symlink_metadata(candidate)
         .with_context(|| format!("inspect app {}", candidate.display()))?;
     ensure!(
@@ -1074,20 +1230,52 @@ fn validate_managed_app(candidate: &Path, team_id: &str) -> Result<()> {
         "app has no hh executable: {}",
         candidate.display()
     );
-    let requirement =
-        format!("=anchor apple generic and certificate leaf[subject.OU] = \"{team_id}\"");
-    run_status(
-        "codesign",
-        [
-            "--verify".as_ref(),
-            "--deep".as_ref(),
-            "--strict".as_ref(),
-            "-R".as_ref(),
-            requirement.as_ref(),
-            candidate.as_os_str(),
-        ],
-        "verify app signature and Apple Team ID",
-    )
+    match trust {
+        MacAppTrust::CommunityAdHoc => {
+            run_status(
+                "codesign",
+                [
+                    "--verify".as_ref(),
+                    "--deep".as_ref(),
+                    "--strict".as_ref(),
+                    candidate.as_os_str(),
+                ],
+                "verify community app signature",
+            )?;
+            let details = run_output(
+                "codesign",
+                [
+                    "-dv".as_ref(),
+                    "--verbose=4".as_ref(),
+                    candidate.as_os_str(),
+                ],
+                "inspect community app signature",
+            )?;
+            let details = String::from_utf8_lossy(&details.stderr);
+            ensure!(
+                details.lines().any(|line| line.trim() == "Signature=adhoc"),
+                "refusing a non-community app at {}",
+                candidate.display()
+            );
+            Ok(())
+        }
+        MacAppTrust::DeveloperId(team_id) => {
+            let requirement =
+                format!("=anchor apple generic and certificate leaf[subject.OU] = \"{team_id}\"");
+            run_status(
+                "codesign",
+                [
+                    "--verify".as_ref(),
+                    "--deep".as_ref(),
+                    "--strict".as_ref(),
+                    "-R".as_ref(),
+                    requirement.as_ref(),
+                    candidate.as_os_str(),
+                ],
+                "verify app signature and Apple Team ID",
+            )
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1309,6 +1497,7 @@ fn run() -> Result<()> {
         Some("verify-trusted") => run_verify_trusted(&arguments),
         #[cfg(feature = "fixture")]
         Some("verify") => run_verify_fixture(&arguments),
+        Some("check") => run_check(&arguments),
         Some("install") => run_install(&arguments),
         Some("install-local") => run_install_local(&arguments),
         #[cfg(feature = "community-macos")]
@@ -1331,6 +1520,47 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_network_updates_require_packaged_build_metadata() {
+        assert!(!production_update_eligible(0));
+        assert!(production_update_eligible(1));
+    }
+
+    #[test]
+    fn production_updates_require_the_native_platform_and_architecture() {
+        assert!(ensure_production_target_matches(false, "arm64", "arm64", "architecture").is_ok());
+        assert!(
+            ensure_production_target_matches(false, "x86_64", "arm64", "architecture").is_err()
+        );
+        assert!(ensure_production_target_matches(false, "linux", "macos", "platform").is_err());
+        assert!(ensure_production_target_matches(true, "x86_64", "arm64", "architecture").is_ok());
+    }
+
+    #[test]
+    fn macos_install_prefix_follows_the_bundle_that_contains_the_updater() {
+        let updater = Path::new("/Applications/Harness Harlot.app/Contents/MacOS/hh-update-tool");
+        assert_eq!(
+            macos_install_prefix_for_executable(updater),
+            Some(PathBuf::from("/Applications"))
+        );
+        assert_eq!(
+            macos_install_prefix_for_executable(Path::new("/tmp/hh-update-tool")),
+            None
+        );
+    }
+
+    #[test]
+    fn desktop_process_detection_does_not_block_the_calling_cli() {
+        assert!(command_line_is_desktop(&[
+            "/Applications/Harness Harlot.app/Contents/MacOS/hh"
+        ]));
+        assert!(!command_line_is_desktop(&[
+            "/Applications/Harness Harlot.app/Contents/MacOS/hh",
+            "update",
+        ]));
+        assert!(!command_line_is_desktop(&["hh", "version"]));
+    }
 
     #[test]
     fn confined_paths_resolve_existing_symlink_ancestors() {

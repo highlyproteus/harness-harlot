@@ -24,9 +24,26 @@ use url::Url;
 pub const MANIFEST_SCHEMA: &str = "hh-update-manifest-v2";
 pub const PRODUCT_NAME: &str = "Harness Harlot";
 pub const STABLE_CHANNEL: &str = "stable";
+pub const EDGE_CHANNEL: &str = "edge";
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateChannel {
+    Stable,
+    Edge,
+}
+
+impl UpdateChannel {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => STABLE_CHANNEL,
+            Self::Edge => EDGE_CHANNEL,
+        }
+    }
+}
 /// Build sequence embedded by release packaging. Development builds use zero.
 pub fn current_build() -> u64 {
     option_env!("HH_RELEASE_BUILD")
@@ -47,14 +64,16 @@ pub fn update_manifest_name(platform: &str, architecture: &str) -> String {
     }
 }
 
-/// Whether this build may replace an installed application automatically.
-///
-/// Community macOS artifacts intentionally stop at authenticated update
-/// notification. Their manual installer is the explicit Gatekeeper trust
-/// boundary.
+/// Whether this build may replace an installed application in the background.
 #[must_use]
-pub fn automatic_install_supported(platform: &str) -> bool {
-    !(cfg!(feature = "community-macos") && platform == "macos")
+pub const fn automatic_install_supported(platform: &str) -> bool {
+    !(cfg!(feature = "community-macos") && matches!(platform.as_bytes(), b"macos"))
+}
+
+/// Whether an explicit user request may replace this packaged platform.
+#[must_use]
+pub const fn explicit_install_supported(_platform: &str) -> bool {
+    true
 }
 
 /// One key compiled into a production client. Key IDs are part of the signed
@@ -79,6 +98,8 @@ pub const UPDATE_HOST: Option<&str> = Some("github.com");
 /// newest non-prerelease GitHub release without knowing its tag.
 pub const UPDATE_MANIFEST_BASE: Option<&str> =
     Some("https://github.com/highlyproteus/harness-harlot/releases/latest/download");
+pub const EDGE_UPDATE_RELEASE_PREFIX: Option<&str> =
+    Some("https://github.com/highlyproteus/harness-harlot/releases/download/edge");
 /// Apple Developer Team ID, required by the in-app installer gate. Stays
 /// fail-closed (None) until Apple Developer Program enrollment completes.
 pub const TRUSTED_APPLE_TEAM_ID: Option<&str> = None;
@@ -175,6 +196,24 @@ pub fn verify_manifest_with_trusted_keys(
     manifest_bytes: &[u8],
     signature_base64: &str,
 ) -> Result<UpdateManifest> {
+    verify_manifest_with_trusted_keys_for_channel(
+        manifest_bytes,
+        signature_base64,
+        UpdateChannel::Stable,
+    )
+}
+
+/// Verify a channel-specific manifest against the compiled production keys.
+///
+/// # Errors
+///
+/// Returns an error for an unknown key, invalid signature, malformed manifest,
+/// wrong channel, expired release, or any production policy violation.
+pub fn verify_manifest_with_trusted_keys_for_channel(
+    manifest_bytes: &[u8],
+    signature_base64: &str,
+    channel: UpdateChannel,
+) -> Result<UpdateManifest> {
     let host = UPDATE_HOST.context("production update host is not configured")?;
     ensure!(
         !TRUSTED_UPDATE_KEYS.is_empty(),
@@ -187,7 +226,7 @@ pub fn verify_manifest_with_trusted_keys(
         .find(|key| key.key_id == selector.key_id)
         .context("update manifest key ID is not trusted")?;
     let public_key = public_key_from_base64(trusted.public_key_base64)?;
-    verify_manifest_with_key(
+    verify_manifest_with_key_for_channel(
         manifest_bytes,
         signature_base64,
         trusted.key_id,
@@ -195,6 +234,7 @@ pub fn verify_manifest_with_trusted_keys(
         host,
         OffsetDateTime::now_utc(),
         false,
+        channel,
     )
 }
 
@@ -216,6 +256,35 @@ pub fn verify_manifest_with_key(
     now: OffsetDateTime,
     allow_test_key: bool,
 ) -> Result<UpdateManifest> {
+    verify_manifest_with_key_for_channel(
+        manifest_bytes,
+        signature_base64,
+        expected_key_id,
+        public_key,
+        update_host,
+        now,
+        allow_test_key,
+        UpdateChannel::Stable,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Verify a channel-specific manifest with an explicitly supplied key.
+///
+/// # Errors
+///
+/// Returns an error when signature verification, parsing, channel matching, or
+/// manifest policy validation fails.
+pub fn verify_manifest_with_key_for_channel(
+    manifest_bytes: &[u8],
+    signature_base64: &str,
+    expected_key_id: &str,
+    public_key: &VerifyingKey,
+    update_host: &str,
+    now: OffsetDateTime,
+    allow_test_key: bool,
+    channel: UpdateChannel,
+) -> Result<UpdateManifest> {
     let signature_bytes = STANDARD
         .decode(signature_base64.trim())
         .context("decode base64 update manifest signature")?;
@@ -231,7 +300,7 @@ pub fn verify_manifest_with_key(
         manifest.key_id == expected_key_id,
         "update manifest key ID does not match its verifying key"
     );
-    validate_manifest_for_host(&manifest, update_host, now, allow_test_key)?;
+    validate_manifest_for_host_and_channel(&manifest, update_host, now, allow_test_key, channel)?;
     Ok(manifest)
 }
 
@@ -247,6 +316,28 @@ pub fn validate_manifest_for_host(
     now: OffsetDateTime,
     allow_test_key: bool,
 ) -> Result<()> {
+    validate_manifest_for_host_and_channel(
+        manifest,
+        update_host,
+        now,
+        allow_test_key,
+        UpdateChannel::Stable,
+    )
+}
+
+/// Validate manifest policy for the expected host and requested channel.
+///
+/// # Errors
+///
+/// Returns an error when any schema, product, channel, time, platform,
+/// architecture, artifact, host, or test-key policy is violated.
+pub fn validate_manifest_for_host_and_channel(
+    manifest: &UpdateManifest,
+    update_host: &str,
+    now: OffsetDateTime,
+    allow_test_key: bool,
+    channel: UpdateChannel,
+) -> Result<()> {
     ensure!(
         manifest.schema == MANIFEST_SCHEMA,
         "unsupported update manifest schema"
@@ -256,8 +347,8 @@ pub fn validate_manifest_for_host(
         "unexpected update product"
     );
     ensure!(
-        manifest.channel == STABLE_CHANNEL,
-        "only the stable channel is supported"
+        manifest.channel == channel.as_str(),
+        "update manifest channel does not match the requested channel"
     );
     ensure!(
         !manifest.key_id.trim().is_empty(),
@@ -473,7 +564,7 @@ pub fn select_verified_update<'a>(
     );
     let incoming = Version::parse(&manifest.version).context("parse incoming update version")?;
     let installed = Version::parse(current.version).context("parse installed update version")?;
-    if incoming < installed || (incoming == installed && manifest.build <= current.build) {
+    if incoming < installed || manifest.build <= current.build {
         return Ok(None);
     }
     let artifact = manifest
@@ -659,6 +750,28 @@ mod tests {
         let manifest = verify_fixture(&body, &signature, &key).unwrap();
         verify_artifact_bytes(&manifest.artifacts[0], artifact).unwrap();
     }
+
+    #[test]
+    fn edge_manifests_are_accepted_only_by_the_edge_channel() {
+        let key = signing_key(42);
+        let mut manifest = manifest_for(b"edge artifact");
+        manifest.channel = "edge".to_owned();
+        let (body, signature) = signed(&manifest, &key);
+        assert!(
+            verify_manifest_with_key_for_channel(
+                &body,
+                &signature,
+                KEY_ID,
+                &key.verifying_key(),
+                HOST,
+                NOW,
+                true,
+                UpdateChannel::Edge,
+            )
+            .is_ok()
+        );
+        assert!(verify_fixture(&body, &signature, &key).is_err());
+    }
     #[test]
     fn validates_and_selects_linux_artifact_only_for_linux() {
         let manifest = linux_manifest_for(b"linux artifact");
@@ -824,30 +937,55 @@ mod tests {
     fn only_selects_newer_fixture_updates() {
         let manifest = manifest_for(b"artifact");
         validate_manifest_for_host(&manifest, HOST, NOW, true).unwrap();
-        let incoming = Version::parse(&manifest.version).unwrap();
-        let installed = Version::parse("0.1.0").unwrap();
-        assert!(incoming > installed);
+        let older_build = CurrentRelease {
+            version: &manifest.version,
+            build: manifest.build - 1,
+            platform: "macos",
+            architecture: "arm64",
+            protocol_version: 1,
+        };
+        assert!(
+            select_verified_update(&manifest, &older_build)
+                .unwrap()
+                .is_some()
+        );
+
+        let newer_build_with_older_version = CurrentRelease {
+            version: "0.1.0",
+            build: manifest.build + 1,
+            platform: "macos",
+            architecture: "arm64",
+            protocol_version: 1,
+        };
+        assert!(
+            select_verified_update(&manifest, &newer_build_with_older_version)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
-    fn community_macos_feed_and_install_policy_are_isolated() {
+    fn community_macos_feed_is_isolated_and_explicit_install_is_supported() {
         assert_eq!(
             update_manifest_name("linux", "arm64"),
             "manifest-linux-arm64.update.json"
         );
         assert!(automatic_install_supported("linux"));
+        assert!(explicit_install_supported("linux"));
         if cfg!(feature = "community-macos") {
             assert_eq!(
                 update_manifest_name("macos", "arm64"),
                 "manifest-macos-community-arm64.update.json"
             );
             assert!(!automatic_install_supported("macos"));
+            assert!(explicit_install_supported("macos"));
         } else {
             assert_eq!(
                 update_manifest_name("macos", "arm64"),
                 "manifest-macos-arm64.update.json"
             );
             assert!(automatic_install_supported("macos"));
+            assert!(explicit_install_supported("macos"));
         }
     }
 

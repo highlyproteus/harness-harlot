@@ -35,6 +35,7 @@ use uuid::Uuid;
 mod agent_icons;
 mod appearance;
 mod browser;
+mod cli;
 mod commands;
 mod dialogs;
 mod elements;
@@ -815,9 +816,20 @@ fn install_panic_log() {
 
 fn main() {
     install_panic_log();
+    prepare_cef_process();
+    match cli::run_cli_or_request_desktop() {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            eprintln!("hh: {error:#}");
+            std::process::exit(1);
+        }
+    }
+    if let Err(error) = cli::ensure_packaged_cli_link() {
+        eprintln!("hh: could not install ~/.local/bin/hh: {error:#}");
+    }
     #[cfg(all(target_os = "linux", feature = "browser"))]
     configure_linux_browser_backend();
-    prepare_cef_process();
     let development_build = development_build();
     let product_name = product_name(development_build);
     ensure_bundled_session_service();
@@ -878,22 +890,22 @@ mod tests {
     };
 
     #[test]
-    fn community_update_banner_is_notify_only() {
-        let community = AvailableUpdateBanner {
+    fn update_banner_reflects_install_capability() {
+        let installable = AvailableUpdateBanner {
             version: "0.2.0".to_owned(),
             requires_service_restart: true,
-            install_supported: false,
+            install_supported: true,
             installing: false,
         };
-        assert_eq!(community.label(), "0.2.0 available — install manually");
-        assert!(!community.can_install());
+        assert_eq!(installable.label(), "Update to 0.2.0");
+        assert!(installable.can_install());
 
-        let developer_id = AvailableUpdateBanner {
-            install_supported: true,
-            ..community
+        let manual = AvailableUpdateBanner {
+            install_supported: false,
+            ..installable
         };
-        assert_eq!(developer_id.label(), "Update to 0.2.0");
-        assert!(developer_id.can_install());
+        assert_eq!(manual.label(), "0.2.0 available — install manually");
+        assert!(!manual.can_install());
     }
 
     #[test]
