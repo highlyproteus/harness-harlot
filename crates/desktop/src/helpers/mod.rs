@@ -23,7 +23,8 @@ pub(crate) use geometry::{
     split_child_dimensions, workspace_pixel_size, workstation_banner_header_height,
 };
 pub(crate) use history_ui::{
-    format_bytes, format_history_date, history_label, history_scope_key, history_warning_text,
+    LiveScrollTarget, format_bytes, format_history_date, history_label, history_scope_key,
+    history_warning_text, live_scroll_target,
 };
 pub(crate) use icons::{
     IDENTITY_MARK_SIZE, render_bell_icon, render_sidebar_toggle_icon, render_terminal_profile_icon,
@@ -37,6 +38,7 @@ pub(crate) use layout::{
 };
 pub(crate) use polling::{
     next_terminal_poll_delay_ms, paced_subscriptions, pane_update_requires_repaint,
+    terminal_poll_wake_requested,
 };
 pub(crate) use tabs::{
     FocusResync, SidebarSection, WorkspaceTabScope, WorkstationTabEntry, focus_resync_for,

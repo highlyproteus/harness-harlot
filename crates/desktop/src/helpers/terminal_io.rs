@@ -161,10 +161,16 @@ pub(crate) fn terminal_grid_for_pane(
     pane_width: f32,
     pane_height: f32,
     metrics: typography::TerminalCellMetrics,
+    show_pane_header: bool,
 ) -> (u16, u16) {
     let content_width =
         (pane_width - TERMINAL_HORIZONTAL_PADDING - TERMINAL_FOCUS_BORDER_WIDTH).max(1.0);
-    let content_height = (pane_height - PANE_HEADER_HEIGHT - TERMINAL_VERTICAL_PADDING).max(1.0);
+    let pane_chrome_height = if show_pane_header {
+        PANE_HEADER_HEIGHT
+    } else {
+        0.0
+    };
+    let content_height = (pane_height - pane_chrome_height - TERMINAL_VERTICAL_PADDING).max(1.0);
     let columns = metrics.columns_for_width(content_width);
     let rows = metrics.rows_for_height(content_height);
     let max_rows_for_columns = (hh_protocol::MAX_TERMINAL_CELLS / u32::from(columns)) as u16;

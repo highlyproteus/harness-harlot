@@ -347,7 +347,10 @@ fn settle_pane_cursors(
             .pane_updates(None, &current, pane_ids, true, 0)
             .unwrap();
         if update.screens.is_empty() {
-            if quiet_since.elapsed() >= Duration::from_millis(50) {
+            // Interactive shells can emit a delayed prompt or startup-hook
+            // update after the first quiet tick. Require a sustained quiet
+            // window before asserting that later output came from one pane.
+            if quiet_since.elapsed() >= Duration::from_millis(250) {
                 return current;
             }
         } else {

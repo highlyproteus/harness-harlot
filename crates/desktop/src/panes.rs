@@ -11,9 +11,10 @@ use hh_protocol::{
 };
 
 use crate::helpers::{
-    WorkspaceTabScope, append_rename_text, apply_layout_control_mutation, collect_terminal_tabs,
-    constrained_sidebar_width, effective_split_ratio, find_pane, find_split_rect, prepare_paste,
-    terminal_modifiers, terminal_mouse_button, visible_panes, workspace_tab_set,
+    LiveScrollTarget, WorkspaceTabScope, append_rename_text, apply_layout_control_mutation,
+    collect_terminal_tabs, constrained_sidebar_width, effective_split_ratio, find_pane,
+    find_split_rect, live_scroll_target, prepare_paste, terminal_modifiers, terminal_mouse_button,
+    visible_panes, workspace_tab_set,
 };
 use crate::typography::{TerminalCellMetrics, adjusted_terminal_zoom_level};
 use crate::view_models::{
@@ -976,32 +977,31 @@ impl HhApp {
             cx.stop_propagation();
             return;
         }
-        if self
+        let mouse_reporting = self
             .session
             .screens
             .get(&pane_id)
-            .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING))
-            && !event.modifiers.shift
-        {
-            self.dispatch_control(ClientRequest::MouseInput {
-                pane_id,
-                point,
-                button: if lines > 0 {
-                    TerminalMouseButton::WheelUp
-                } else {
-                    TerminalMouseButton::WheelDown
-                },
-                action: TerminalMouseAction::Press,
-                modifiers: terminal_modifiers(event.modifiers),
-            });
-        } else if lines > 0
-            && self.session.screens.get(&pane_id).is_some_and(|screen| {
-                screen.display_offset >= screen.history_size && screen.history_size > 0
-            })
-        {
-            self.load_archived_page(pane_id, None, HistoryPageDirection::Older, cx);
-        } else {
-            self.dispatch_control(ClientRequest::ScrollPane { pane_id, lines });
+            .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING));
+        let at_live_top = self.session.screens.get(&pane_id).is_some_and(|screen| {
+            screen.display_offset >= screen.history_size && screen.history_size > 0
+        });
+        match live_scroll_target(mouse_reporting, event.modifiers.shift, at_live_top) {
+            LiveScrollTarget::TerminalMouseReporting => {
+                self.dispatch_control(ClientRequest::MouseInput {
+                    pane_id,
+                    point,
+                    button: if lines > 0 {
+                        TerminalMouseButton::WheelUp
+                    } else {
+                        TerminalMouseButton::WheelDown
+                    },
+                    action: TerminalMouseAction::Press,
+                    modifiers: terminal_modifiers(event.modifiers),
+                });
+            }
+            LiveScrollTarget::LiveBuffer => {
+                self.dispatch_control(ClientRequest::ScrollPane { pane_id, lines });
+            }
         }
         cx.stop_propagation();
         cx.notify();

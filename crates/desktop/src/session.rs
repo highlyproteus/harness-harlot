@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::helpers::{
-    collect_pane_sizes, inactive_stack_contains, paced_subscriptions, sidebar_width_for_visibility,
-    visible_panes, workspace_layout_for_focused_pane, workspace_pixel_size, zoom_projection,
+    collect_pane_sizes, find_pane, inactive_stack_contains, paced_subscriptions,
+    sidebar_width_for_visibility, terminal_poll_wake_requested, visible_panes,
+    workspace_layout_for_focused_pane, workspace_pixel_size, workspace_tab_standalone_pane,
+    zoom_projection,
 };
 use crate::pipeline::{ApplyFn, PipelineJob};
 use crate::reconcile::{UpdatePayload, reconcile_updates};
@@ -72,14 +74,22 @@ impl HhApp {
     /// Enqueues a control-lane request with no follow-up refresh. Terminal
     /// input and selection updates are written one-way.
     pub(crate) fn dispatch_control(&mut self, request: ClientRequest) {
-        self.session.last_activity = Instant::now();
+        let wake_poll = terminal_poll_wake_requested(&request);
         let one_way = PipelineJob::is_one_way(&request);
-        let _ = self.session.control_tx.unbounded_send(PipelineJob {
-            request,
-            one_way,
-            followup_refresh: false,
-            apply: None,
-        });
+        if self
+            .session
+            .control_tx
+            .unbounded_send(PipelineJob {
+                request,
+                one_way,
+                followup_refresh: false,
+                apply: None,
+            })
+            .is_ok()
+            && wake_poll
+        {
+            let _ = self.session.poll_wake_tx.try_send(());
+        }
     }
 
     /// Enqueues a control-lane request with a typed continuation applied
@@ -375,6 +385,20 @@ impl HhApp {
         let Some(layout) = self.active_layout(snapshot) else {
             return;
         };
+        let show_root_header = self
+            .active_workspace_in(snapshot)
+            .and_then(|workspace| {
+                self.layout
+                    .focused_pane
+                    .and_then(|pane_id| {
+                        workspace
+                            .tabs
+                            .iter()
+                            .find(|tab| find_pane(&tab.layout, pane_id).is_some())
+                    })
+                    .or_else(|| workspace.tabs.first())
+            })
+            .is_none_or(|tab| workspace_tab_standalone_pane(tab).is_none());
         let mut sizes = Vec::new();
         let projected = self
             .layout
@@ -386,6 +410,7 @@ impl HhApp {
             self.layout.workspace_pixels.1,
             &|pane_id| self.terminal_metrics(pane_id),
             &self.layout.split_ratios,
+            show_root_header,
             &mut sizes,
         );
         let changed = sizes.len() != self.layout.last_sizes.len()

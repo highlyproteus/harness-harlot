@@ -33,10 +33,10 @@ pub struct HistorySettings {
 impl Default for HistorySettings {
     fn default() -> Self {
         Self {
-            enabled: true,
-            retention: HistoryRetention::Indefinite,
-            quota_bytes: 5 * 1024 * 1024 * 1024,
-            cleanup_policy: HistoryCleanupPolicy::PauseWhenFull,
+            enabled: false,
+            retention: HistoryRetention::Days { days: 30 },
+            quota_bytes: 1024 * 1024 * 1024,
+            cleanup_policy: HistoryCleanupPolicy::DeleteOldest,
         }
     }
 }
@@ -111,4 +111,19 @@ pub struct TerminalHistoryPage {
     pub started_ms: u64,
     pub lines: Vec<String>,
     pub flags: HistoryPageFlags,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HistoryCleanupPolicy, HistoryRetention, HistorySettings};
+
+    #[test]
+    fn persistent_history_is_opt_in_with_bounded_defaults() {
+        let settings = HistorySettings::default();
+
+        assert!(!settings.enabled);
+        assert_eq!(settings.retention, HistoryRetention::Days { days: 30 });
+        assert_eq!(settings.quota_bytes, 1024 * 1024 * 1024);
+        assert_eq!(settings.cleanup_policy, HistoryCleanupPolicy::DeleteOldest);
+    }
 }

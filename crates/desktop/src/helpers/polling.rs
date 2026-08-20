@@ -1,18 +1,13 @@
+use hh_protocol::ClientRequest;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::{ACTIVE_TERMINAL_POLL_MS, DEEP_IDLE_POLL_MS, IDLE_TERMINAL_POLL_MS};
+use crate::{ACTIVE_TERMINAL_POLL_MS, IDLE_TERMINAL_POLL_MS};
 
-pub(crate) fn next_terminal_poll_delay_ms(
-    current: u64,
-    state_changed: bool,
-    deep_idle: bool,
-) -> u64 {
+pub(crate) fn next_terminal_poll_delay_ms(current: u64, state_changed: bool) -> u64 {
     if state_changed {
         ACTIVE_TERMINAL_POLL_MS
-    } else if deep_idle {
-        DEEP_IDLE_POLL_MS
     } else {
         current.saturating_mul(2).min(IDLE_TERMINAL_POLL_MS)
     }
@@ -23,6 +18,13 @@ pub(crate) fn pane_update_requires_repaint(
     screens_delivered: usize,
 ) -> bool {
     snapshot_delivered || screens_delivered > 0
+}
+
+pub(crate) const fn terminal_poll_wake_requested(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::WriteInput { .. } | ClientRequest::MouseInput { .. }
+    )
 }
 
 /// The focused pane streams every poll. Other on-screen panes are paced so a
@@ -49,8 +51,11 @@ pub(crate) fn paced_subscriptions(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_TERMINAL_POLL_MS, DEEP_IDLE_POLL_MS, IDLE_TERMINAL_POLL_MS,
-        next_terminal_poll_delay_ms, paced_subscriptions, pane_update_requires_repaint,
+        ACTIVE_TERMINAL_POLL_MS, IDLE_TERMINAL_POLL_MS, next_terminal_poll_delay_ms,
+        paced_subscriptions, pane_update_requires_repaint, terminal_poll_wake_requested,
+    };
+    use hh_protocol::{
+        ClientRequest, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
     };
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -61,25 +66,49 @@ mod tests {
     #[test]
     fn terminal_polling_is_fast_while_output_changes_and_backs_off_when_idle() {
         assert_eq!(
-            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, true, false),
+            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, true),
             ACTIVE_TERMINAL_POLL_MS
         );
         assert_eq!(
-            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, true, true),
+            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, true),
             ACTIVE_TERMINAL_POLL_MS
         );
         assert_eq!(
-            next_terminal_poll_delay_ms(ACTIVE_TERMINAL_POLL_MS, false, false),
+            next_terminal_poll_delay_ms(ACTIVE_TERMINAL_POLL_MS, false),
             ACTIVE_TERMINAL_POLL_MS * 2
         );
         assert_eq!(
-            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, false, false),
+            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, false),
             IDLE_TERMINAL_POLL_MS
         );
+    }
+
+    #[test]
+    fn visible_terminal_never_waits_multiple_seconds_after_long_idle() {
         assert_eq!(
-            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, false, true),
-            DEEP_IDLE_POLL_MS
+            next_terminal_poll_delay_ms(IDLE_TERMINAL_POLL_MS, false),
+            IDLE_TERMINAL_POLL_MS,
+            "a visible terminal must remain responsive no matter how long it has been idle"
         );
+    }
+
+    #[test]
+    fn terminal_input_wakes_an_idle_poll_immediately() {
+        let pane_id = Uuid::from_u128(1);
+        assert!(terminal_poll_wake_requested(&ClientRequest::WriteInput {
+            pane_id,
+            bytes: b"a".to_vec(),
+        }));
+        assert!(terminal_poll_wake_requested(&ClientRequest::MouseInput {
+            pane_id,
+            point: TerminalPoint { row: 0, column: 0 },
+            button: TerminalMouseButton::Left,
+            action: TerminalMouseAction::Press,
+            modifiers: TerminalModifiers::default(),
+        }));
+        assert!(!terminal_poll_wake_requested(
+            &ClientRequest::ClearSelection { pane_id }
+        ));
     }
 
     #[test]

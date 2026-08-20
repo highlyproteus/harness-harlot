@@ -7,6 +7,7 @@
     clippy::unused_self
 )]
 
+use futures::StreamExt;
 use gpui::{
     App, AppContext, Application, Bounds, Context, FocusHandle, Image, ImageFormat, KeyBinding,
     Pixels, ScrollHandle, ShapedLine, TitlebarOptions, Window, WindowBounds, WindowOptions,
@@ -121,7 +122,8 @@ const MIN_TERMINAL_AREA_WIDTH: f32 = 320.0;
 const SIDEBAR_RESIZE_HIT_WIDTH: f32 = 8.0;
 const SIDEBAR_RESIZE_VISUAL_WIDTH: f32 = 2.0;
 const TITLEBAR_HEIGHT: f32 = 38.0;
-const APP_CHROME_HEIGHT: f32 = TITLEBAR_HEIGHT;
+const WORKSPACE_TAB_STRIP_HEIGHT: f32 = 32.0;
+const APP_CHROME_HEIGHT: f32 = TITLEBAR_HEIGHT + WORKSPACE_TAB_STRIP_HEIGHT;
 const MACOS_TRAFFIC_LIGHT_SAFE_INSET: f32 = 78.0;
 const WORKSTATION_BANNER_ASPECT_RATIO: f32 = 3.0;
 /// Pixel size of the bundled banner asset, asserted against the packaged file
@@ -144,11 +146,6 @@ const MAX_PASTE_BYTES: usize = 64 * 1024;
 const ACTIVE_TERMINAL_POLL_MS: u64 = 33;
 const DRAG_CLICK_SUPPRESSION_MS: u64 = 150;
 const IDLE_TERMINAL_POLL_MS: u64 = 250;
-/// Polling cadence once nothing has produced output and nobody has typed for
-/// `DEEP_IDLE_AFTER`. Pane states still arrive at this rate, so the first byte
-/// of new output restores the active cadence within one poll.
-const DEEP_IDLE_POLL_MS: u64 = 2_000;
-const DEEP_IDLE_AFTER: Duration = Duration::from_hours(1);
 const PTY_RESIZE_DEBOUNCE_MS: u64 = 16;
 /// On-screen panes other than the focused one stream at this cadence so a
 /// four-way split cannot multiply the focused pane's payload every 33 ms.
@@ -203,6 +200,9 @@ struct SessionState {
     stream_tx: futures::channel::mpsc::UnboundedSender<pipeline::PipelineJob>,
     /// Enqueue side of the control lane's serialized request pipeline.
     control_tx: futures::channel::mpsc::UnboundedSender<pipeline::PipelineJob>,
+    /// Interrupts an idle screen poll when input is queued. Capacity one
+    /// coalesces a burst of keystrokes instead of scheduling a poll per byte.
+    poll_wake_tx: futures::channel::mpsc::Sender<()>,
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
     pane_states: HashMap<Uuid, PaneStreamState>,
@@ -211,10 +211,7 @@ struct SessionState {
     /// When each pane's screen was last applied, used to pace on-screen panes
     /// other than the focused one.
     last_delivery: HashMap<Uuid, Instant>,
-    /// Last time output was delivered or the user acted, driving the deep-idle
-    /// polling tier.
     window_active: bool,
-    last_activity: Instant,
     stream_diagnostics: StreamDiagnostics,
     connection_error: Option<String>,
     history_status: Option<HistoryArchiveStatus>,
@@ -226,6 +223,7 @@ impl SessionState {
         control_client: SharedSessionClient,
         stream_tx: futures::channel::mpsc::UnboundedSender<pipeline::PipelineJob>,
         control_tx: futures::channel::mpsc::UnboundedSender<pipeline::PipelineJob>,
+        poll_wake_tx: futures::channel::mpsc::Sender<()>,
         window_active: bool,
         connection_error: Option<String>,
     ) -> Self {
@@ -234,6 +232,7 @@ impl SessionState {
             control_client,
             stream_tx,
             control_tx,
+            poll_wake_tx,
             snapshot: None,
             screens: HashMap::new(),
             pane_states: HashMap::new(),
@@ -241,7 +240,6 @@ impl SessionState {
             notifications_latest_id: 0,
             last_delivery: HashMap::new(),
             window_active,
-            last_activity: Instant::now(),
             stream_diagnostics: StreamDiagnostics::default(),
             connection_error,
             history_status: None,
@@ -478,6 +476,7 @@ impl HhApp {
         let startup_connection_error = startup_connection_error.or(second_error);
         let (stream_tx, stream_rx) = futures::channel::mpsc::unbounded();
         let (control_tx, control_rx) = futures::channel::mpsc::unbounded();
+        let (poll_wake_tx, mut poll_wake_rx) = futures::channel::mpsc::channel(1);
         #[cfg(all(target_os = "macos", feature = "browser"))]
         let browser_parent_view = native_nsview(window);
         let mut app = Self {
@@ -492,6 +491,7 @@ impl HhApp {
                 control_client,
                 stream_tx,
                 control_tx,
+                poll_wake_tx,
                 window.is_window_active(),
                 startup_connection_error,
             ),
@@ -560,18 +560,19 @@ impl HhApp {
         cx.spawn(async move |this, cx| {
             let mut poll_delay_ms = ACTIVE_TERMINAL_POLL_MS;
             loop {
-                gpui::Timer::after(Duration::from_millis(poll_delay_ms)).await;
+                let delay = futures::FutureExt::fuse(gpui::Timer::after(Duration::from_millis(
+                    poll_delay_ms,
+                )));
+                let input_wake = futures::FutureExt::fuse(poll_wake_rx.next());
+                futures::pin_mut!(delay, input_wake);
+                futures::select_biased! {
+                    _ = input_wake => poll_delay_ms = ACTIVE_TERMINAL_POLL_MS,
+                    _ = delay => {}
+                }
                 let Some(state_changed) = pipeline::poll_once(&this, cx).await else {
                     break;
                 };
-                let deep_idle = this
-                    .update(cx, |this, _| {
-                        Instant::now().saturating_duration_since(this.session.last_activity)
-                            >= DEEP_IDLE_AFTER
-                    })
-                    .unwrap_or(false);
-                poll_delay_ms =
-                    next_terminal_poll_delay_ms(poll_delay_ms, state_changed, deep_idle);
+                poll_delay_ms = next_terminal_poll_delay_ms(poll_delay_ms, state_changed);
             }
         })
         .detach();

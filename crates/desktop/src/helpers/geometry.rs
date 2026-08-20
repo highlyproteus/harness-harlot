@@ -212,15 +212,18 @@ pub(crate) fn collect_pane_sizes(
     height: f32,
     metrics_for_pane: &impl Fn(Uuid) -> typography::TerminalCellMetrics,
     ratios: &HashMap<SplitControlId, f32>,
+    show_root_header: bool,
     output: &mut Vec<(Uuid, u16, u16)>,
 ) {
     match layout {
         PaneLayout::Leaf { pane } => {
-            let (columns, rows) = terminal_grid_for_pane(width, height, metrics_for_pane(pane.id));
+            let (columns, rows) =
+                terminal_grid_for_pane(width, height, metrics_for_pane(pane.id), show_root_header);
             output.push((pane.id, columns, rows));
         }
         PaneLayout::Stack { active, .. } => {
-            let (columns, rows) = terminal_grid_for_pane(width, height, metrics_for_pane(*active));
+            let (columns, rows) =
+                terminal_grid_for_pane(width, height, metrics_for_pane(*active), show_root_header);
             output.push((*active, columns, rows));
         }
         PaneLayout::Split {
@@ -246,6 +249,7 @@ pub(crate) fn collect_pane_sizes(
                 first_height,
                 metrics_for_pane,
                 ratios,
+                true,
                 output,
             );
             collect_pane_sizes(
@@ -254,6 +258,7 @@ pub(crate) fn collect_pane_sizes(
                 second_height,
                 metrics_for_pane,
                 ratios,
+                true,
                 output,
             );
         }
@@ -371,19 +376,29 @@ mod tests {
                     workspace.1,
                     &|_| metrics,
                     &ratios,
+                    false,
                     &mut sizes,
                 );
                 sizes[0]
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(dimensions[0], (Uuid::from_u128(10), 69, 20));
-        assert_eq!(dimensions[1], (Uuid::from_u128(10), 139, 39));
+        assert_eq!(dimensions[0], (Uuid::from_u128(10), 69, 19));
+        assert_eq!(dimensions[1], (Uuid::from_u128(10), 139, 38));
         assert_eq!(dimensions[2], (Uuid::from_u128(10), 204, 48));
         assert!(
             dimensions
                 .windows(2)
                 .all(|pair| { pair[0].1 < pair[1].1 && pair[0].2 < pair[1].2 })
+        );
+    }
+
+    #[test]
+    fn workspace_geometry_excludes_both_navigation_rows() {
+        assert_eq!(
+            workspace_pixel_size(1280.0, 820.0, DEFAULT_SIDEBAR_WIDTH),
+            (1136.0, 750.0),
+            "PTY sizing must exclude the 38 px global navigation and 32 px workspace tab strip"
         );
     }
 
@@ -537,12 +552,13 @@ mod tests {
             workspace.1,
             &|_| metrics,
             &HashMap::new(),
+            true,
             &mut sizes,
         );
 
         assert_eq!(
             sizes,
-            vec![(first.id, 68, 39), (Uuid::from_u128(22), 68, 39)]
+            vec![(first.id, 68, 37), (Uuid::from_u128(22), 68, 37)]
         );
         let used_pixel_width = 568.0 + SPLIT_DIVIDER_SIZE + 564.0;
         assert!((used_pixel_width - workspace.0).abs() < 0.0001);
@@ -612,10 +628,11 @@ mod tests {
                 }
             },
             &HashMap::new(),
+            true,
             &mut sizes,
         );
 
-        assert_eq!(sizes[1], (second.id, 68, 39));
+        assert_eq!(sizes[1], (second.id, 68, 37));
         assert!(sizes[0].1 < sizes[1].1);
         assert!(sizes[0].2 < sizes[1].2);
     }
