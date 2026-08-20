@@ -793,6 +793,7 @@ impl HhApp {
                             .text_color(rgb(THEME.dim))
                             .child("Saved locally with session layout · no network or telemetry"),
                     )
+                    .child(self.render_update_settings(cx))
                     .child(self.render_history_settings(cx)),
                     ),
             )
