@@ -19,10 +19,6 @@ use hh_protocol::{
     PaneStreamState, ServiceResponse, SessionNotification, SessionSnapshot, StreamDiagnostics,
     TerminalScreen,
 };
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use hh_updater::fetch::{fetch_available_update, runtime_architecture, runtime_platform};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use hh_updater::{CurrentRelease, TRUSTED_UPDATE_KEYS, automatic_install_supported, current_build};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 #[cfg(all(target_os = "macos", feature = "browser"))]
@@ -61,6 +57,7 @@ mod workspaces;
 mod typography;
 
 mod ui_state;
+mod updates;
 mod view_models;
 
 use agent_icons::{AgentIconAssets, CustomIcon, load_custom_icons};
@@ -81,6 +78,7 @@ use session::session_call;
 use theme::{AppTheme, BuiltInTheme};
 use typography::TerminalFontProfile;
 use ui_state::UiStateStore;
+use updates::{UpdateCheckState, automatic_update_check_interval, automatic_update_checks_enabled};
 use view_models::{
     ArchivedView, ColorPickerState, DragHoverState, HistoryEditor, Modal, PaneDrag, ResizeDrag,
     SelectionDrag, SidebarResizeLifecycle, SplitControlId, TabDropPreview, WorkspaceDropPreview,
@@ -344,6 +342,7 @@ struct EditorUi {
     /// Archived-history views per pane; belongs with editing UI state.
     archived_views: HashMap<Uuid, ArchivedView>,
     update_available: Option<AvailableUpdateBanner>,
+    update_check: UpdateCheckState,
 }
 
 impl EditorUi {
@@ -360,6 +359,7 @@ impl EditorUi {
             workspace_input_bounds: [None, None],
             archived_views: HashMap::new(),
             update_available: None,
+            update_check: UpdateCheckState::default(),
         }
     }
 }
@@ -598,61 +598,18 @@ impl HhApp {
             }
         })
         .detach();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if !development_build() && !TRUSTED_UPDATE_KEYS.is_empty() {
+        if automatic_update_checks_enabled() {
             cx.spawn(async move |this, cx| {
                 let mut first_check = true;
-                let mut error_reported = false;
                 loop {
                     gpui::Timer::after(if first_check {
                         Duration::from_secs(10)
                     } else {
-                        Duration::from_hours(24)
+                        automatic_update_check_interval()
                     })
                     .await;
                     first_check = false;
-                    let result = cx
-                        .background_spawn(async move {
-                            let platform = runtime_platform()?;
-                            let architecture = runtime_architecture()?;
-                            fetch_available_update(&CurrentRelease {
-                                version: env!("CARGO_PKG_VERSION"),
-                                build: current_build(),
-                                platform,
-                                architecture,
-                                protocol_version: hh_protocol::PROTOCOL_VERSION,
-                            })
-                        })
-                        .await;
-                    if let Err(error) = &result
-                        && !error_reported
-                    {
-                        eprintln!("Harness Harlot update check failed: {error:#}");
-                        error_reported = true;
-                    }
-                    let Ok(()) = this.update(cx, |this, cx| {
-                        if let Ok(Some(update)) = result {
-                            let installing =
-                                this.editor
-                                    .update_available
-                                    .as_ref()
-                                    .is_some_and(|current| {
-                                        current.version == update.version && current.installing
-                                    });
-                            let banner = AvailableUpdateBanner {
-                                version: update.version,
-                                requires_service_restart: update.requires_service_restart,
-                                install_supported: automatic_install_supported(
-                                    update.artifact.platform.as_str(),
-                                ),
-                                installing,
-                            };
-                            if this.editor.update_available.as_ref() != Some(&banner) {
-                                this.editor.update_available = Some(banner);
-                                cx.notify();
-                            }
-                        }
-                    }) else {
+                    let Ok(()) = this.update(cx, |this, cx| this.check_for_updates(cx)) else {
                         break;
                     };
                 }
