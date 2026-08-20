@@ -1,8 +1,9 @@
 name: Edge Update
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   workflow_dispatch:
 
 permissions: {}
@@ -14,6 +15,10 @@ concurrency:
 jobs:
   macos-arm64:
     name: Publish macOS ARM64 edge update
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main')
     environment: release
     runs-on: macos-15
     permissions:
@@ -25,6 +30,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.96"
@@ -60,7 +66,7 @@ jobs:
           printf 'CEF_PATH=%s\n' "$cef_path" >> "$GITHUB_ENV"
       - name: Build, sign, package, and verify edge update
         env:
-          HH_RELEASE_COMMIT: ${{ github.sha }}
+          HH_RELEASE_COMMIT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
           HH_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/edge-macos-arm64
           HH_UPDATE_CHANNEL: edge
           HH_UPDATE_KEY_ID: ${{ vars.HH_UPDATE_KEY_ID }}
@@ -85,14 +91,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          source_sha=$(git rev-parse HEAD)
           feed=edge-macos-arm64
           build=$(git rev-list --count HEAD)
           candidate="$feed-b$build"
           if gh release view "$candidate" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release delete "$candidate" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           fi
-          gh release create "$candidate" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Harness Harlot edge" --notes "Verified macOS ARM64 edge build from $GITHUB_SHA" \
+          gh release create "$candidate" --repo "$GITHUB_REPOSITORY" --target "$source_sha" \
+            --title "Harness Harlot edge" --notes "Verified macOS ARM64 edge build from $source_sha" \
             --prerelease --draft
           cleanup_draft() {
             is_draft=$(gh release view "$candidate" --repo "$GITHUB_REPOSITORY" \
