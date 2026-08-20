@@ -225,6 +225,7 @@ fn run_install(arguments: &[String]) -> Result<()> {
         println!("up to date");
         return Ok(());
     };
+    let requires_service_restart = update.requires_service_restart;
 
     let home = env::var_os("HOME")
         .map(PathBuf::from)
@@ -291,7 +292,7 @@ fn run_install(arguments: &[String]) -> Result<()> {
             );
             #[cfg(target_os = "macos")]
             {
-                install_dmg(&package, &prefix, &home, &team_id)
+                install_dmg(&package, &prefix, &home, &team_id, requires_service_restart)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -299,7 +300,7 @@ fn run_install(arguments: &[String]) -> Result<()> {
             }
         }
 
-        "linux" => install_linux_archive(&package, &prefix, &home),
+        "linux" => install_linux_archive(&package, &prefix, &home, requires_service_restart),
         _ => bail!("unsupported install platform {platform}"),
     }
 }
@@ -385,7 +386,7 @@ fn run_install_local(arguments: &[String]) -> Result<()> {
         .context("stage local Linux installation")?;
     let encoder = archive.into_inner().context("finish local Linux archive")?;
     encoder.finish().context("finish local Linux compression")?;
-    install_linux_archive(&archive_path, &prefix, &home)
+    install_linux_archive(&archive_path, &prefix, &home, true)
 }
 
 #[cfg(feature = "fixture")]
@@ -419,16 +420,18 @@ fn load_fixture_update(
         Some(OwnedUpdate {
             version: selected.manifest.version.clone(),
             artifact: selected.artifact.clone(),
-            requires_quiescent_service: selected
-                .manifest
-                .session_service
-                .requires_quiescent_service,
+            requires_service_restart: selected.requires_service_restart,
         }),
         Some((artifact_path, selected.artifact.clone())),
     ))
 }
 
-fn install_linux_archive(package: &Path, prefix: &Path, home: &Path) -> Result<()> {
+fn install_linux_archive(
+    package: &Path,
+    prefix: &Path,
+    home: &Path,
+    restart_service: bool,
+) -> Result<()> {
     fs::create_dir_all(prefix)
         .with_context(|| format!("create install prefix {}", prefix.display()))?;
     let bin_directory = home.join(".local/bin");
@@ -481,7 +484,7 @@ fn install_linux_archive(package: &Path, prefix: &Path, home: &Path) -> Result<(
     extract_linux_archive(package, &extraction.path)?;
     let extracted = extraction.path.join(LINUX_ARCHIVE_ROOT);
     validate_linux_install(&extracted)?;
-    if current_installed {
+    if current_installed && restart_service {
         stop_managed_service(&app.join("bin/hh-service"))?;
     }
     let mut old_moved = false;
@@ -900,7 +903,13 @@ fn validate_linux_managed_link(link: &Path, expected_target: &Path) -> Result<bo
 }
 
 #[cfg(target_os = "macos")]
-fn install_dmg(dmg: &Path, prefix: &Path, home: &Path, team_id: &str) -> Result<()> {
+fn install_dmg(
+    dmg: &Path,
+    prefix: &Path,
+    home: &Path,
+    team_id: &str,
+    restart_service: bool,
+) -> Result<()> {
     fs::create_dir_all(prefix)
         .with_context(|| format!("create install prefix {}", prefix.display()))?;
     let bin_directory = home.join(".local/bin");
@@ -925,7 +934,9 @@ fn install_dmg(dmg: &Path, prefix: &Path, home: &Path, team_id: &str) -> Result<
     validate_managed_link(&link, &app)?;
     if path_exists(&app)? {
         validate_managed_app(&app, team_id)?;
-        stop_managed_service(&app.join("Contents/MacOS/hh-service"))?;
+        if restart_service {
+            stop_managed_service(&app.join("Contents/MacOS/hh-service"))?;
+        }
     }
     if path_exists(&backup)? {
         validate_managed_app(&backup, team_id)?;

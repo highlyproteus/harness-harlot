@@ -171,7 +171,7 @@ const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AvailableUpdateBanner {
     version: String,
-    requires_quiescent: bool,
+    requires_service_restart: bool,
     install_supported: bool,
     installing: bool,
 }
@@ -640,7 +640,7 @@ impl HhApp {
                                     });
                             let banner = AvailableUpdateBanner {
                                 version: update.version,
-                                requires_quiescent: update.requires_quiescent_service,
+                                requires_service_restart: update.requires_service_restart,
                                 install_supported: automatic_install_supported(
                                     update.artifact.platform.as_str(),
                                 ),
@@ -923,7 +923,7 @@ mod tests {
     fn community_update_banner_is_notify_only() {
         let community = AvailableUpdateBanner {
             version: "0.2.0".to_owned(),
-            requires_quiescent: true,
+            requires_service_restart: true,
             install_supported: false,
             installing: false,
         };

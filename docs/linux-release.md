@@ -83,12 +83,15 @@ A packaged production build checks the architecture-specific signed manifest sho
 
 Clicking the button performs this sequence:
 
-1. Refuse the update while any local, SSH, or tmux terminal remains live.
+1. If the signed manifest changes the session-service protocol, refuse the
+   update while any local, SSH, or tmux terminal remains live.
 2. Launch the bundled updater and close the desktop process.
 3. Fetch `manifest-linux-ARCH.update.json` and its detached Ed25519 signature from GitHub Releases.
 4. Verify the compiled release key, stable channel, expiry, platform, architecture, glibc floor, immutable HTTPS host, artifact name, exact byte count, and SHA-256.
 5. Reject archive traversal, links, special files, duplicate files, unexpected files, unsafe ownership, and unsafe permissions.
-6. Ask the quiescent session service to persist and exit.
+6. For a protocol change only, ask the quiescent session service to persist and
+   exit. Routine app-only updates leave the compatible service and its PTYs
+   running.
 7. Stage the new application on the destination filesystem, retain the current application as `harness-harlot.previous`, atomically replace the application and integration links, and relaunch the desktop.
 8. Restore the prior application if replacement or relaunch fails.
 

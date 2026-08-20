@@ -314,7 +314,7 @@ impl HhApp {
                 .iter()
                 .any(|workspace| workspace.active_terminal_count > 0)
         });
-        if update.requires_quiescent && has_live_terminals {
+        if update.requires_service_restart && has_live_terminals {
             self.session.connection_error = Some(
                 "Close all terminals, then update — live sessions must end before the service restarts"
                     .to_owned(),

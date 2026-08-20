@@ -4,6 +4,15 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.3] - 2026-08-19
+
+### Changed
+
+- Routine Linux updates preserve the compatible session service and live
+  terminals; protocol-changing updates still wait for sessions to end.
+- Community macOS updates remain notify-only until Developer ID signing and
+  Apple notarization are enabled.
+
 ## [0.1.1] - 2026-08-19
 
 ### Fixed

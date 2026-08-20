@@ -674,6 +674,14 @@ mod tests {
             .unwrap()
             .expect("newer Linux release");
         assert_eq!(update.artifact.format, "tar.gz");
+        assert!(!update.requires_service_restart);
+
+        let mut protocol_manifest = manifest.clone();
+        protocol_manifest.session_service.protocol_version += 1;
+        let protocol_update = select_verified_update(&protocol_manifest, &current)
+            .unwrap()
+            .expect("newer Linux protocol release");
+        assert!(protocol_update.requires_service_restart);
 
         let current = CurrentRelease {
             platform: "macos",

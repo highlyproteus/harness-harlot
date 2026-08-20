@@ -70,6 +70,10 @@ gh release download --repo highlyproteus/harness-harlot --pattern install-commun
 chmod +x install-community-macos.sh && ./install-community-macos.sh --acknowledge-unnotarized
 ```
 
+Community macOS builds notify when an update is available; rerun the same
+installer command to update. In-app one-click replacement stays disabled until
+Developer ID signing and Apple notarization are enabled.
+
 ### Linux
 
 Download the `.tar.gz` for your architecture from the [latest release](https://github.com/highlyproteus/harness-harlot/releases/latest), or install from the terminal:

@@ -8,7 +8,14 @@ case "$target_directory" in
   *) target_directory="$repository_root/$target_directory" ;;
 esac
 work=$(mktemp -d "${TMPDIR:-/tmp}/hh-linux-update-test.XXXXXX")
-cleanup() { rm -rf "$work"; }
+service_pid=
+cleanup() {
+  if [ -n "$service_pid" ]; then
+    kill "$service_pid" 2>/dev/null || :
+    wait "$service_pid" 2>/dev/null || :
+  fi
+  rm -rf "$work"
+}
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$work/home/.local/lib" "$work/home/.local/bin"
 
@@ -20,6 +27,8 @@ cargo build --locked --release -p hh-updater --features fetch,fixture --bin hh-u
 signer="$target_directory/release/hh-release-sign"
 tool="$target_directory/release/hh-update-tool"
 public_key=$("$signer" public-key --private-key "$key")
+current_protocol_version=$(sed -nE 's/^pub const PROTOCOL_VERSION: u16 = ([0-9]+);$/\1/p' "$repository_root/crates/protocol/src/lib.rs")
+[ -n "$current_protocol_version" ]
 case "$(uname -m)" in
   arm64 | aarch64) architecture=arm64 ;;
   x86_64) architecture=x86_64 ;;
@@ -94,6 +103,7 @@ make_manifest() {
   manifest=$4
   sha256=$(shasum -a 256 "$artifact" | sed 's/[[:space:]].*$//')
   size=$(file_size "$artifact")
+  protocol_version=${5:-"$current_protocol_version"}
   cat > "$manifest" <<EOF
 {
   "schema": "hh-update-manifest-v2",
@@ -107,7 +117,7 @@ make_manifest() {
   "platform": "linux",
   "minimum_glibc": "2.35",
   "session_service": {
-    "protocol_version": 1,
+    "protocol_version": $protocol_version,
     "requires_quiescent_service": true
   },
   "artifacts": [
@@ -129,8 +139,10 @@ EOF
 run_install() {
   artifact=$1
   manifest=$2
-  install_home=${INSTALL_HOME:-"$work/home"}
-  HOME="$install_home" HH_SOCKET="$work/session.sock" HH_LINUX_UPDATE_LAUNCH_LOG="$work/launched" "$tool" install \
+  install_home=${3:-"$work/home"}
+  HOME="$install_home" HH_SOCKET="$work/session.sock" \
+    HH_TEST_SERVICE_STOP_LOG="$work/service-stop.log" \
+    HH_LINUX_UPDATE_LAUNCH_LOG="$work/launched" "$tool" install \
     --fixture \
     --platform linux \
     --architecture "$architecture" \
@@ -144,11 +156,34 @@ run_install() {
     --signature "$manifest.sig" \
     --artifact "$artifact"
 }
+start_test_service() {
+  rm -f "$work/session.sock"
+  python3 - "$work/session.sock" <<'PY' >"$work/service.log" 2>&1 &
+import socket
+import sys
+
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(sys.argv[1])
+listener.listen()
+while True:
+    connection, _ = listener.accept()
+    connection.close()
+PY
+  service_pid=$!
+  printf '%s\n' "$service_pid" >"$work/service.pid"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -S "$work/session.sock" ] && break
+    sleep 0.1
+  done
+  [ -S "$work/session.sock" ]
+}
+
 
 app="$work/home/.local/lib/harness-harlot"
 backup="$work/home/.local/lib/harness-harlot.previous"
 write_install "$app" normal old
 ln -s "$app/bin/hh" "$work/home/.local/bin/hh"
+start_test_service
 
 artifact=$(make_package good normal new)
 manifest="$work/good.json"
@@ -163,6 +198,8 @@ grep -q old "$backup/bin/hh"
 [ "$(readlink "$work/home/.local/bin/hh")" = "$app/bin/hh" ]
 [ "$(readlink "$work/home/.local/share/applications/com.harnessharlot.desktop.desktop")" = "$app/share/applications/com.harnessharlot.desktop.desktop" ]
 [ "$(readlink "$work/home/.local/share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png")" = "$app/share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png" ]
+kill -0 "$service_pid"
+
 
 broken_artifact=$(make_package broken broken broken)
 broken_manifest="$work/broken.json"
@@ -183,7 +220,7 @@ done
 
 clean_home="$work/clean-home"
 mkdir -p "$clean_home/.local/lib" "$clean_home/.local/bin"
-if INSTALL_HOME="$clean_home" run_install "$broken_artifact" "$broken_manifest" >"$work/clean-broken.out" 2>&1; then
+if run_install "$broken_artifact" "$broken_manifest" "$clean_home" >"$work/clean-broken.out" 2>&1; then
   echo "Linux updater accepted a broken clean installation" >&2
   exit 1
 fi
@@ -240,4 +277,32 @@ if HOME="$work/foreign-home" HH_SOCKET="$work/foreign-session.sock" "$tool" inst
 fi
 [ "$(readlink "$work/foreign-home/.local/bin/hh")" = /tmp/not-harness-harlot ]
 
-echo "Linux updater fixture installs atomically and rejects rollback, archive, integrity, and ownership hazards"
+kill "$service_pid" 2>/dev/null || :
+wait "$service_pid" 2>/dev/null || :
+service_pid=
+start_test_service
+
+cat >"$app/bin/hh-service" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = "--shutdown" ] || exit 1
+touch "$HH_TEST_SERVICE_STOP_LOG"
+rm -f "$HH_SOCKET"
+EOF
+chmod 0755 "$app/bin/hh-service"
+
+restart_artifact=$(make_package restart normal restart)
+restart_manifest="$work/restart.json"
+make_manifest "$restart_artifact" 0.4.0 5 "$restart_manifest" "$((current_protocol_version + 1))"
+run_install "$restart_artifact" "$restart_manifest"
+[ -f "$work/service-stop.log" ]
+kill "$service_pid" 2>/dev/null || :
+wait "$service_pid" 2>/dev/null || :
+service_pid=
+[ ! -S "$work/session.sock" ]
+for _ in 1 2 3 4 5; do
+  [ "$(cat "$work/launched" 2>/dev/null || :)" = restart ] && break
+  sleep 0.1
+done
+[ "$(cat "$work/launched")" = restart ]
+
+echo "Linux updater fixture preserves compatible services, restarts incompatible services, installs atomically, and rejects rollback, archive, integrity, and ownership hazards"

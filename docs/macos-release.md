@@ -25,8 +25,9 @@ can select the other mode's artifact.
 - Community apps notify about newer community releases but both the UI and
   `hh-update-tool install` refuse automatic replacement. Developer ID builds
   retain the verified staged-swap updater once `TRUSTED_APPLE_TEAM_ID` is set.
-- Every manifest requires a quiescent session service. Manual community
-  replacement and automatic Developer ID replacement must not strand live PTYs.
+- Manual community replacement requires all terminal sessions to end. Future
+  Developer ID updates preserve the compatible service for routine app-only
+  releases and require quiescence only when the signed service protocol changes.
 
 The package script refuses any dirty checkout, including untracked files.
 Every production mode requires a signed tag, pinned CEF, and the distinct
@@ -140,23 +141,26 @@ app. A failed staged replacement restores the prior community bundle. Updates
 stay notify-only and repeat this manual process.
 
 Developer ID installation uses `install.sh` after the Team ID is configured.
-Before an automatic update, the UI queries the service for active panes and
-shows **Update after sessions end** whenever a PTY or SSH workstation is live.
-Once the user has ended all terminal sessions, that installer:
+Before an automatic Developer ID update, the UI compares the signed
+session-service protocol with the running build. Routine app-only updates retain
+the compatible service and its live PTYs. A protocol-changing update shows
+**Update after sessions end** until every PTY and SSH workstation has ended.
+The installer then:
 
 1. Downloads and verifies signed metadata, exact DMG size/hash, Developer ID
    Team ID, hardened runtime, notarization, and bundle identifier.
-2. Waits for the desktop process to exit, asks the quiescent session service to
-   persist and stop, and stages the app on the destination filesystem.
+2. Waits for the desktop process to exit and, for a protocol change only, asks
+   the quiescent session service to persist and stop.
 3. Replaces the app bundle and command link as an ordered transaction, retains
    the prior app as `Harness Harlot.previous.app`, and launches the new desktop.
 4. On replacement or relaunch failure, restores and validates the prior app and
    command link.
 
-Rollback requires no live service-owned PTYs. Desired-state recovery can
-recreate local shells after a service stop, but it does not preserve arbitrary
-live processes, SSH authentication, or terminal output; release notes must say
-this plainly.
+Routine app-only rollback leaves the compatible service and its PTYs running.
+A protocol-changing update waits until the service owns no live PTYs because
+desired-state recovery can recreate local shells after a service stop, but it
+does not preserve arbitrary live processes, SSH authentication, or terminal
+output; release notes must identify such migrations plainly.
 
 Linux releases use the verified `.tar.gz` and `hh-update-tool install-local`
 flow instead of a DMG. The unprivileged installer stages the application at
@@ -214,8 +218,9 @@ Ordered owner steps from a staged repository to a real no-cost release:
    commit and signed tags appear on GitHub.
 5. **Store the required GitHub secrets**:
    - `RELEASE_TAG_GPG_PUBLIC_KEY` — public key for tag signing
-   - `HH_UPDATE_SIGNING_SEED` — contents of `~/.ssh/hh-update-signing-seed`
-   - `HH_UPDATE_PUBLIC_KEY` — `W3xGpnOmpqVPsaJDWI8LF25g3/Y24DkuHJWkOldH9DE=`
+   - `HH_UPDATE_SIGNING_SEED` — contents of
+     `~/.config/harness-harlot/hh-stable-2026.seed`
+   - `HH_UPDATE_PUBLIC_KEY` — `Cy/alHdZ5R7fSJEeuvqu1UXH9j5O0f34hWv4Rv8TFwo=`
 6. **Store the required GitHub variable**:
    `HH_UPDATE_KEY_ID=hh-stable-2026`. Leave
    `HH_ENABLE_APPLE_SIGNING` unset or `false`.
@@ -243,7 +248,7 @@ Optional Developer ID upgrade, when funding/credentials become available:
 
 ### Update-key custody
 
-`~/.ssh/hh-update-signing-seed` is the stable-channel signing seed. Keep an
+`~/.config/harness-harlot/hh-stable-2026.seed` is the stable-channel signing seed. Keep an
 offline copy (password manager or printed). Rotation: generate a new seed,
 add a second `TrustedKey` entry with a new `key_id` (e.g.
 `hh-stable-2027`), publish one release signed with both keys' manifests if
