@@ -2,6 +2,11 @@
 set -eu
 
 repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+version=$(
+  cd "$repository_root"
+  cargo metadata --locked --format-version 1 --no-deps |
+    python3 -c 'import json,sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "hh-desktop"))'
+)
 case "$(uname -m)" in
   arm64) architecture=arm64 ;;
   x86_64) architecture=x86_64 ;;
@@ -30,7 +35,7 @@ distribution=$(
   HH_ALLOW_DIRTY_TEST_PACKAGE=1 \
   HH_UPDATE_SIGNING_KEY_FILE="$key" \
   HH_UPDATE_PUBLIC_KEY="$public_key" \
-  "$repository_root/scripts/package-macos-release.sh" 0.1.0 1 | sed -n '$p'
+  "$repository_root/scripts/package-macos-release.sh" "$version" 1 | sed -n '$p'
 )
 
 case "$(basename "$distribution")" in TESTONLY-*) ;; *) echo "fixture artifact is not TESTONLY-prefixed" >&2; exit 1 ;; esac

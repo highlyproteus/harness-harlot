@@ -18,8 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Release automation now verifies the owner's SSH-signed tags, and the Linux
-  release fixture derives its package version from workspace metadata.
+- Release automation now verifies the owner's SSH-signed tags, and release
+  fixtures derive package versions from workspace metadata.
 
 ## [0.1.3] - 2026-08-19
 
