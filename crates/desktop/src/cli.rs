@@ -89,6 +89,12 @@ fn updater_arguments(options: &UpdateOptions, version: &str, build: u64) -> Vec<
 
 fn bundled_executable(name: &str) -> Result<PathBuf> {
     let current = std::env::current_exe().context("resolve the Harness Harlot executable")?;
+    bundled_executable_from(&current, name)
+}
+
+fn bundled_executable_from(current: &Path, name: &str) -> Result<PathBuf> {
+    let current = fs::canonicalize(current)
+        .with_context(|| format!("resolve Harness Harlot executable {}", current.display()))?;
     let candidate = current
         .parent()
         .context("the Harness Harlot executable has no parent directory")?
@@ -189,7 +195,10 @@ pub(crate) fn run_cli_or_request_desktop() -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliAction, UpdateOptions, install_cli_link, parse_cli_action, updater_arguments};
+    use super::{
+        CliAction, UpdateOptions, bundled_executable_from, install_cli_link, parse_cli_action,
+        updater_arguments,
+    };
 
     #[test]
     fn no_arguments_launches_the_desktop() {
@@ -301,6 +310,29 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(root.join("foreign-hh"), &link).unwrap();
         assert!(install_cli_link(&executable, &home).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_executable_follows_the_installed_cli_symlink() {
+        let root =
+            std::env::temp_dir().join(format!("hh-cli-bundle-test-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("home/.local/bin");
+        let bundle = root.join("Applications/Harness Harlot.app/Contents/MacOS");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&bundle).unwrap();
+        let executable = bundle.join("hh");
+        let updater = bundle.join("hh-update-tool");
+        std::fs::write(&executable, b"fixture").unwrap();
+        std::fs::write(&updater, b"fixture").unwrap();
+        let link = bin.join("hh");
+        std::os::unix::fs::symlink(&executable, &link).unwrap();
+
+        assert_eq!(
+            bundled_executable_from(&link, "hh-update-tool").unwrap(),
+            std::fs::canonicalize(updater).unwrap()
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

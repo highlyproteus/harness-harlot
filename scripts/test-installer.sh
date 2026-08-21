@@ -215,13 +215,16 @@ unset HH_TEST_FAIL_LINK_ONCE
 [ -f "$home/Applications/Harness Harlot.app/rollback-marker" ]
 [ -L "$home/.local/bin/hh" ]
 # Reinstall keeps one validated rollback bundle instead of deleting in place.
+ditto "$home/Applications/Harness Harlot.app" \
+  "$home/Applications/Harness Harlot.previous.app"
 "$repository_root/install.sh" --version 0.1.0+1 >/dev/null
-[ -x "$home/Applications/Harness Harlot.previous.app/Contents/MacOS/hh" ]
+[ -x "$home/Applications/.Harness Harlot.previous.app/Contents/MacOS/hh" ]
+[ ! -e "$home/Applications/Harness Harlot.previous.app" ]
 mkdir -p "$home/Library/Application Support/Harness Harlot/history"
 printf 'retain\n' > "$home/Library/Application Support/Harness Harlot/history/local"
 "$repository_root/install.sh" --uninstall >/dev/null
 [ ! -e "$home/Applications/Harness Harlot.app" ]
-[ ! -e "$home/Applications/Harness Harlot.previous.app" ]
+[ ! -e "$home/Applications/.Harness Harlot.previous.app" ]
 [ ! -e "$home/.local/bin/hh" ]
 [ -f "$home/Library/Application Support/Harness Harlot/history/local" ]
 

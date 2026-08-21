@@ -38,7 +38,9 @@ use time::OffsetDateTime;
 const BUNDLE_ID: &str = "com.harnessharlot.desktop";
 const MACOS_APP_NAME: &str = "Harness Harlot.app";
 #[cfg(target_os = "macos")]
-const MACOS_BACKUP_NAME: &str = "Harness Harlot.previous.app";
+const MACOS_BACKUP_NAME: &str = ".Harness Harlot.previous.app";
+#[cfg(target_os = "macos")]
+const LEGACY_MACOS_BACKUP_NAME: &str = "Harness Harlot.previous.app";
 #[cfg(target_os = "macos")]
 enum MacAppTrust {
     CommunityAdHoc,
@@ -1078,6 +1080,7 @@ fn install_dmg(
 
     let app = prefix.join(MACOS_APP_NAME);
     let backup = prefix.join(MACOS_BACKUP_NAME);
+    let legacy_backup = prefix.join(LEGACY_MACOS_BACKUP_NAME);
     let link = bin_directory.join("hh");
     let staging = prefix.join(format!(".{MACOS_APP_NAME}.new.{}", std::process::id()));
     ensure_absent(&staging, "staging app")?;
@@ -1098,6 +1101,11 @@ fn install_dmg(
         validate_managed_app(&backup, trust)?;
         fs::remove_dir_all(&backup)
             .with_context(|| format!("remove previous backup {}", backup.display()))?;
+    }
+    if path_exists(&legacy_backup)? {
+        validate_managed_app(&legacy_backup, trust)?;
+        fs::remove_dir_all(&legacy_backup)
+            .with_context(|| format!("remove visible legacy backup {}", legacy_backup.display()))?;
     }
 
     let had_app = path_exists(&app)?;

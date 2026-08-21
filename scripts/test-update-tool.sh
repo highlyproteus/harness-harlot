@@ -90,6 +90,7 @@ EOF
 
 write_app "$work/mounted-app" new
 write_app "$work/home/Applications/Harness Harlot.app" old
+write_app "$work/home/Applications/Harness Harlot.previous.app" legacy-backup
 ln -s "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh" "$work/home/.local/bin/hh"
 
 cat > "$work/mock-bin/codesign" <<'EOF'
@@ -138,7 +139,8 @@ install_fixture() {
 
 install_fixture
 [ "$("$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh")" = new ]
-[ "$("$work/home/Applications/Harness Harlot.previous.app/Contents/MacOS/hh")" = old ]
+[ "$("$work/home/Applications/.Harness Harlot.previous.app/Contents/MacOS/hh")" = old ]
+[ ! -e "$work/home/Applications/Harness Harlot.previous.app" ]
 [ "$(readlink "$work/home/.local/bin/hh")" = "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh" ]
 [ -s "$work/open.log" ]
 
@@ -148,7 +150,7 @@ HH_UPDATE_FIXTURE_OPEN_FAIL=1 install_fixture >"$work/relaunch-failure.out" 2>&1
 grep -F "update installed, but Harness Harlot could not be relaunched" \
   "$work/relaunch-failure.out" >/dev/null
 [ "$("$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh")" = new ]
-[ "$("$work/home/Applications/Harness Harlot.previous.app/Contents/MacOS/hh")" = current-before-failure ]
+[ "$("$work/home/Applications/.Harness Harlot.previous.app/Contents/MacOS/hh")" = current-before-failure ]
 [ "$(readlink "$work/home/.local/bin/hh")" = "$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh" ]
 
 echo "hh-update-tool fixture installs atomically, preserves rollback, and reports relaunch failures"

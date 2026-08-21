@@ -17,11 +17,38 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
 
 sh -n "$repository_root/install-community-macos.sh"
-if "$repository_root/install-community-macos.sh" >"$work/no-ack.out" 2>&1; then
-  echo "community installer ran without explicit unnotarized acknowledgement" >&2
+grep -F 'unset HH_SOCKET HH_STATE_DIR' "$repository_root/install-community-macos.sh" >/dev/null
+grep -F 'codesign --verify --deep --strict --verbose=2 "$candidate" ||' \
+  "$repository_root/install-community-macos.sh" >/dev/null
+grep -F 'ln -s "$previous_link_target" "$link"' \
+  "$repository_root/install-community-macos.sh" >/dev/null
+"$repository_root/install-community-macos.sh" --help >"$work/help.out"
+grep -F -- "curl -fsSL" "$work/help.out" >/dev/null
+grep -F -- "--verbose" "$work/help.out" >/dev/null
+if grep -F -- "--acknowledge-unnotarized" "$work/help.out" >/dev/null; then
+  echo "community installer still exposes the legacy acknowledgement flag" >&2
   exit 1
 fi
-grep -F -- "--acknowledge-unnotarized" "$work/no-ack.out" >/dev/null
+
+mkdir -p "$work/home/Applications" "$work/system-apps"
+mkdir -p "$work/home/Applications/Harness Harlot.app"
+HOME="$work/home" \
+HH_RELEASE_TEST_MODE=1 \
+HH_INSTALLER_APPLICATIONS_DIR="$work/system-apps" \
+  "$repository_root/install-community-macos.sh" --plan >"$work/plan.out"
+grep -F "Install location: $work/system-apps/Harness Harlot.app" "$work/plan.out" >/dev/null
+grep -F "Another installation exists: $work/home/Applications/Harness Harlot.app" \
+  "$work/plan.out" >/dev/null
+
+preflight_line=$(grep -n '^preflight_existing_install$' \
+  "$repository_root/install-community-macos.sh" | cut -d: -f1)
+download_line=$(grep -n '^run_quiet "Download Harness Harlot' \
+  "$repository_root/install-community-macos.sh" | cut -d: -f1)
+[ -n "$preflight_line" ]
+[ "$preflight_line" -lt "$download_line" ] || {
+  echo "installer downloads the release before checking whether live terminals block replacement" >&2
+  exit 1
+}
 
 key="$work/update-key"
 printf '********************************' | base64 > "$key"
