@@ -66,7 +66,7 @@ Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profil
 Install with one copy-and-paste command:
 
 ```bash
-curl -fsSL https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh | sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh | sh
 ```
 
 The installer uses `/Applications` when it is writable and otherwise falls back
