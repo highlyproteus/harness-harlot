@@ -18,9 +18,9 @@ trap cleanup EXIT HUP INT TERM
 
 sh -n "$repository_root/install-community-macos.sh"
 grep -F 'unset HH_SOCKET HH_STATE_DIR' "$repository_root/install-community-macos.sh" >/dev/null
-grep -F 'codesign --verify --deep --strict --verbose=2 "$candidate" ||' \
+grep -F "codesign --verify --deep --strict --verbose=2 \"\$candidate\" ||" \
   "$repository_root/install-community-macos.sh" >/dev/null
-grep -F 'ln -s "$previous_link_target" "$link"' \
+grep -F "ln -s \"\$previous_link_target\" \"\$link\"" \
   "$repository_root/install-community-macos.sh" >/dev/null
 "$repository_root/install-community-macos.sh" --help >"$work/help.out"
 grep -F -- "curl -fsSL" "$work/help.out" >/dev/null
