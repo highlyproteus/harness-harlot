@@ -3,7 +3,8 @@ set -eu
 
 # A bootstrap launched from a development terminal must manage the normal app,
 # not a disposable socket or state directory inherited from that shell.
-unset HH_SOCKET HH_STATE_DIR HH_CONFIG HH_PANE_ID HH_DEVELOPMENT_BUILD
+unset HH_SOCKET HH_STATE_DIR HH_CONFIG HH_PANE_ID HH_DEVELOPMENT_BUILD \
+  HH_INSTALLER_APPLICATIONS_DIR
 
 REPOSITORY='highlyproteus/harness-harlot'
 BUNDLE_ID='com.harnessharlot.desktop'
@@ -13,7 +14,7 @@ usage() {
 Harness Harlot installer for macOS
 
 Usage:
-  curl -fsSL https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh | sh
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh | sh
 
 Options:
   --tag vVERSION  Install a specific release
@@ -30,6 +31,7 @@ tag=
 verify_only=0
 plan_only=0
 verbose=0
+test_applications_dir=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --acknowledge-unnotarized) shift ;; # Accepted for compatibility with v0.1.6 instructions.
@@ -37,6 +39,12 @@ while [ "$#" -gt 0 ]; do
     --verify-only) verify_only=1; shift ;;
     --plan) plan_only=1; shift ;;
     --verbose) verbose=1; shift ;;
+    --test-applications-dir)
+      [ "${HH_RELEASE_TEST_MODE:-0}" = 1 ] || { echo "test install location requires test mode" >&2; exit 2; }
+      [ "$#" -ge 2 ] || { echo "test install location requires a path" >&2; exit 2; }
+      test_applications_dir=$2
+      shift 2
+      ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -45,8 +53,8 @@ done
 home=${HOME:?HOME is not set}
 user_prefix="$home/Applications"
 system_prefix=/Applications
-if [ "${HH_RELEASE_TEST_MODE:-0}" = 1 ] && [ -n "${HH_INSTALLER_APPLICATIONS_DIR:-}" ]; then
-  system_prefix=$HH_INSTALLER_APPLICATIONS_DIR
+if [ -n "$test_applications_dir" ]; then
+  system_prefix=$test_applications_dir
 fi
 if [ -d "$system_prefix" ] && [ -w "$system_prefix" ]; then
   prefix=$system_prefix
@@ -230,16 +238,28 @@ validate_community_app() {
   }
 }
 
+preflight_app() {
+  candidate=$1
+  [ -d "$candidate" ] || return 0
+  candidate_plist="$candidate/Contents/Info.plist"
+  if [ ! -f "$candidate_plist" ] || \
+    [ "$(plutil -extract CFBundleIdentifier raw -o - "$candidate_plist" 2>/dev/null || true)" != "$BUNDLE_ID" ]; then
+    warn "Leaving unrelated application untouched at $candidate"
+    return 0
+  fi
+  run_quiet "Validate current installation at $candidate" validate_community_app "$candidate"
+  run_quiet "Check active Harness Harlot terminals for $candidate" \
+    "$candidate/Contents/MacOS/hh-update-tool" prepare-community-install
+}
+
 preflight_existing_install() {
   if pgrep -x hh >/dev/null 2>&1; then
     fail "Harness Harlot is running"
     echo "Quit the app and close every Harness Harlot terminal, then run this installer again." >&2
     exit 1
   fi
-  [ -d "$app" ] || return 0
-  run_quiet "Validate current installation" validate_community_app "$app"
-  run_quiet "Check active Harness Harlot terminals" \
-    "$app/Contents/MacOS/hh-update-tool" prepare-community-install
+  preflight_app "$app"
+  preflight_app "$alternate_app"
 }
 
 printf '\n%bHarness Harlot%b\n\n' "$bold" "$reset"
@@ -249,7 +269,9 @@ if [ -d "$alternate_app" ]; then
   warn "Another installation exists at $alternate_app"
   info "This installation will use $app"
 fi
-preflight_existing_install
+if [ "$verify_only" -eq 0 ]; then
+  preflight_existing_install
+fi
 
 manifest="$work/manifest-macos-community-${architecture}.update.json"
 signature="$manifest.sig"

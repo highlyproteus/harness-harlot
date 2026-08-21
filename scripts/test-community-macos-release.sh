@@ -22,25 +22,38 @@ grep -F "codesign --verify --deep --strict --verbose=2 \"\$candidate\" ||" \
   "$repository_root/install-community-macos.sh" >/dev/null
 grep -F "ln -s \"\$previous_link_target\" \"\$link\"" \
   "$repository_root/install-community-macos.sh" >/dev/null
+grep -F "if [ \"\$verify_only\" -eq 0 ]; then" \
+  "$repository_root/install-community-macos.sh" >/dev/null
+grep -F "preflight_app \"\$alternate_app\"" \
+  "$repository_root/install-community-macos.sh" >/dev/null
 "$repository_root/install-community-macos.sh" --help >"$work/help.out"
-grep -F -- "curl -fsSL" "$work/help.out" >/dev/null
+grep -F -- "curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL" \
+  "$work/help.out" >/dev/null
 grep -F -- "--verbose" "$work/help.out" >/dev/null
 if grep -F -- "--acknowledge-unnotarized" "$work/help.out" >/dev/null; then
   echo "community installer still exposes the legacy acknowledgement flag" >&2
   exit 1
 fi
 
-mkdir -p "$work/home/Applications" "$work/system-apps"
+mkdir -p "$work/home/Applications" "$work/system-apps" "$work/poisoned-apps"
 mkdir -p "$work/home/Applications/Harness Harlot.app"
 HOME="$work/home" \
 HH_RELEASE_TEST_MODE=1 \
-HH_INSTALLER_APPLICATIONS_DIR="$work/system-apps" \
-  "$repository_root/install-community-macos.sh" --plan >"$work/plan.out"
+HH_INSTALLER_APPLICATIONS_DIR="$work/poisoned-apps" \
+  "$repository_root/install-community-macos.sh" --plan >"$work/poisoned-plan.out"
+if grep -F "$work/poisoned-apps" "$work/poisoned-plan.out" >/dev/null; then
+  echo "inherited test variables redirected a normal installation" >&2
+  exit 1
+fi
+HOME="$work/home" \
+HH_RELEASE_TEST_MODE=1 \
+  "$repository_root/install-community-macos.sh" \
+    --test-applications-dir "$work/system-apps" --plan >"$work/plan.out"
 grep -F "Install location: $work/system-apps/Harness Harlot.app" "$work/plan.out" >/dev/null
 grep -F "Another installation exists: $work/home/Applications/Harness Harlot.app" \
   "$work/plan.out" >/dev/null
 
-preflight_line=$(grep -n '^preflight_existing_install$' \
+preflight_line=$(grep -n '^  preflight_existing_install$' \
   "$repository_root/install-community-macos.sh" | cut -d: -f1)
 download_line=$(grep -n '^run_quiet "Download Harness Harlot' \
   "$repository_root/install-community-macos.sh" | cut -d: -f1)
