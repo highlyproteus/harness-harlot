@@ -66,12 +66,18 @@ Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profil
 Install with one copy-and-paste command:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSLo /tmp/hh-install-macos.sh https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh && sh /tmp/hh-install-macos.sh --acknowledge-unnotarized
+curl -fsSL https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh | sh
 ```
 
-The installer creates `~/.local/bin/hh`; the DMG app repairs the same command
-link on first launch. Add `~/.local/bin` to `PATH` once if your shell does not
-already include it. After either terminal or DMG installation, use:
+The installer uses `/Applications` when it is writable and otherwise falls back
+to `~/Applications`, without requesting `sudo`. It verifies release provenance,
+the signed update manifest, the app architecture, and the bundle signature while
+showing one concise status line per step. Pass `--verbose` when running a saved
+copy of the script to see the underlying verification output.
+
+The installer creates `~/.local/bin/hh`; the app repairs the same command link
+on first launch. Add `~/.local/bin` to `PATH` once if your shell does not already
+include it. After either terminal or DMG installation, use:
 
 ```bash
 hh version

@@ -42,7 +42,8 @@ case "$prefix/" in
   */../* | */./*) echo "install prefix must be normalized" >&2; exit 1 ;;
 esac
 app="$prefix/Harness Harlot.app"
-backup="$prefix/Harness Harlot.previous.app"
+backup="$prefix/.Harness Harlot.previous.app"
+legacy_backup="$prefix/Harness Harlot.previous.app"
 bin_directory="$HOME/.local/bin"
 link="$bin_directory/hh"
 
@@ -72,7 +73,8 @@ validate_managed_link() {
 }
 
 if [ "$uninstall" = 1 ]; then
-  printf 'remove %s\nremove %s\nremove %s\n' "$app" "$backup" "$link"
+  printf 'remove %s\nremove %s\nremove %s\nremove %s\n' \
+    "$app" "$backup" "$legacy_backup" "$link"
   if [ "$print_plan" = 0 ]; then
     if [ -e "$app" ] || [ -L "$app" ]; then
       validate_managed_app "$app" "$EXPECTED_TEAM_ID"
@@ -80,9 +82,13 @@ if [ "$uninstall" = 1 ]; then
     if [ -e "$backup" ] || [ -L "$backup" ]; then
       validate_managed_app "$backup" "$EXPECTED_TEAM_ID"
     fi
+    if [ -e "$legacy_backup" ] || [ -L "$legacy_backup" ]; then
+      validate_managed_app "$legacy_backup" "$EXPECTED_TEAM_ID"
+    fi
     validate_managed_link
     rm -rf "$app"
     rm -rf "$backup"
+    rm -rf "$legacy_backup"
     if [ -L "$link" ]; then rm -f "$link"; fi
   fi
   echo "local history remains under ~/Library/Application Support/Harness Harlot"
@@ -262,6 +268,10 @@ fi
 if [ -e "$backup" ] || [ -L "$backup" ]; then
   validate_managed_app "$backup" "$expected_team_id"
   rm -rf "$backup"
+fi
+if [ -e "$legacy_backup" ] || [ -L "$legacy_backup" ]; then
+  validate_managed_app "$legacy_backup" "$expected_team_id"
+  rm -rf "$legacy_backup"
 fi
 install_in_progress=1
 if [ -d "$app" ]; then
