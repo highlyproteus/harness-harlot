@@ -1453,6 +1453,7 @@ impl MountedDmg {
             "hdiutil",
             [
                 "attach".as_ref(),
+                "-quiet".as_ref(),
                 "-nobrowse".as_ref(),
                 "-readonly".as_ref(),
                 "-mountpoint".as_ref(),
@@ -1475,7 +1476,11 @@ impl MountedDmg {
         if self.attached {
             run_status(
                 "hdiutil",
-                ["detach".as_ref(), self.directory.path.as_os_str()],
+                [
+                    "detach".as_ref(),
+                    "-quiet".as_ref(),
+                    self.directory.path.as_os_str(),
+                ],
                 "detach update DMG",
             )?;
             self.attached = false;

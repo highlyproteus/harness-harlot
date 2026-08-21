@@ -103,6 +103,7 @@ EOF
 cat > "$work/mock-bin/hdiutil" <<'EOF'
 #!/bin/sh
 set -eu
+printf '%s\n' "$*" >> "$HH_UPDATE_FIXTURE_HDIUTIL_LOG"
 case "$1" in
   attach)
     mount=
@@ -129,6 +130,7 @@ install_fixture() {
   HH_SOCKET="$work/session.sock" \
   PATH="$work/mock-bin:$PATH" \
   HH_UPDATE_FIXTURE_APP="$work/mounted-app" \
+  HH_UPDATE_FIXTURE_HDIUTIL_LOG="$work/hdiutil.log" \
   HH_UPDATE_FIXTURE_OPEN_LOG="$work/open.log" \
   "$repository_root/target/release/hh-update-tool" install \
     --fixture --community --key-id test-only-v1 --public-key "$public_key" \
@@ -138,6 +140,8 @@ install_fixture() {
 }
 
 install_fixture
+grep -F 'attach -quiet ' "$work/hdiutil.log" >/dev/null
+grep -F 'detach -quiet ' "$work/hdiutil.log" >/dev/null
 [ "$("$work/home/Applications/Harness Harlot.app/Contents/MacOS/hh")" = new ]
 [ "$("$work/home/Applications/.Harness Harlot.previous.app/Contents/MacOS/hh")" = old ]
 [ ! -e "$work/home/Applications/Harness Harlot.previous.app" ]
