@@ -19,9 +19,12 @@ can select the other mode's artifact.
 - `scripts/package-macos-release.sh VERSION BUILD` retains the separate
   Developer ID, notarization, stapling, Team-ID, and normal
   `manifest-macos-ARCH.update.json` path.
-- The attested `install-community-macos.sh` authenticates release inputs with
-  GitHub provenance before mounting a DMG, then uses the bundled verifier to
-  validate the Ed25519 manifest and exact artifact bytes.
+- `https://harnessharlot.com/install` serves `install-community-macos.sh`
+  without requiring GitHub CLI. The website release index pins the SHA-256 of
+  every release input; publication verifies GitHub provenance before updating
+  that index. The installer checks those hashes before mounting a DMG, then
+  uses the bundled verifier to validate the Ed25519 manifest and exact artifact
+  bytes.
 - Community apps notify about newer community releases but both the UI and
   `hh-update-tool install` refuse automatic replacement. Developer ID builds
   retain the verified staged-swap updater once `TRUSTED_APPLE_TEAM_ID` is set.
@@ -46,18 +49,24 @@ tradeoff visible instead of weakening the Developer ID checks:
 1. The release workflow verifies the GPG-signed tag, builds on the matching
    macOS architecture, and publishes GitHub build-provenance attestations for
    the installer, DMG, manifest, and signature.
-2. The user independently verifies the installer attestation. The installer
-   then verifies every downloaded input's attestation before mounting anything.
-3. The verifier from that authenticated DMG checks the owner-held Ed25519
+2. The publication workflow verifies every release input's attestation against
+   the exact signed-tag release workflow, then publishes their URLs, sizes, and
+   SHA-256 values through the HTTPS website trust root.
+3. The installer verifies each downloaded input against that website-pinned
+   metadata before mounting anything.
+4. The verifier from that authenticated DMG checks the owner-held Ed25519
    signature and exact DMG size/SHA-256. Ad-hoc code signatures are then checked
    for bundle integrity and exact bundle identity/architecture.
-4. Installation targets `~/Applications`; an existing Developer ID app is not
+5. Installation uses `/Applications` when writable and otherwise
+   `~/Applications`; an existing Developer ID app is not
    silently replaced by a community app. Automatic update installation remains
    disabled, so every future replacement repeats the explicit trust step.
 
-The installer never removes quarantine, disables Gatekeeper, uses `sudo`, or
-pipes network content into a shell. If Gatekeeper blocks the first launch, use
-Apple's per-app **Privacy & Security → Open Anyway** action.
+The installer never removes quarantine, disables Gatekeeper, or uses `sudo`.
+The short bootstrap pipes only the HTTPS-authenticated website script to the
+system shell; all release artifacts are downloaded to files and verified before
+they are mounted or executed. If Gatekeeper blocks the first launch, use Apple's
+per-app **Privacy & Security → Open Anyway** action.
 
 ## Why Sparkle is not bundled yet
 
@@ -127,14 +136,20 @@ Developer ID matrix entries are disabled unless repository variable
 
 ## Install, update, and rollback behavior
 
-Both modes install without `sudo` at
-`~/Applications/Harness Harlot.app` with `~/.local/bin/hh`.
+Both modes install without `sudo` at `/Applications/Harness Harlot.app` when
+writable and otherwise `~/Applications/Harness Harlot.app`, with
+`~/.local/bin/hh`.
 
-For a community first install, download `install-community-macos.sh` from the
-release, verify its GitHub attestation, and run it with the explicit
-`--acknowledge-unnotarized` flag. The script verifies all release attestations,
-the Ed25519 manifest, exact DMG bytes, ad-hoc signatures, bundle identifier,
-primary executable set, and CPU architecture before staging. It refuses a
+For a community first install, run the HTTPS-only command published at
+`harnessharlot.com`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsS https://harnessharlot.com/install | sh
+```
+
+The script verifies website-pinned checksums, the Ed25519 manifest, exact DMG
+bytes, ad-hoc signatures, bundle identifier, primary executable set, and CPU
+architecture before staging. It refuses a
 running desktop, asks the current managed service to persist and stop only
 after all terminal sessions have ended, and never overwrites a Developer ID
 app. A failed staged replacement restores the prior community bundle. Updates
@@ -228,10 +243,9 @@ Ordered owner steps from a staged repository to a real no-cost release:
    GPG-signed annotated tag `vX.Y.Z`, and push it to GitLab. The push mirror
    transfers the tag to GitHub, where the workflow packages, attests, and
    publishes community macOS plus Linux artifacts without an Apple account.
-8. **Verify from a clean Mac.** Attest and run
-   `install-community-macos.sh --acknowledge-unnotarized`, exercise first launch
-   and Open Anyway if macOS asks, then confirm a newer fixture is notification
-   only.
+8. **Verify from a clean Mac.** Run the website bootstrap with `--verify-only`
+   from a saved copy, exercise first launch and Open Anyway if macOS asks, then
+   confirm a newer fixture is notification only.
 
 Optional Developer ID upgrade, when funding/credentials become available:
 

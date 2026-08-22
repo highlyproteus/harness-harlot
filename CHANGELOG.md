@@ -4,6 +4,66 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.10] - 2026-08-22
+
+### Changed
+
+- The macOS installer no longer requires GitHub CLI. It downloads release
+  assets with the system `curl` and verifies SHA-256 values pinned by the
+  HTTPS release index at `harnessharlot.com` before mounting any disk image.
+- The landing site now presents a concise, HTTPS-only installation command.
+
+### Security
+
+- Website publication automation verifies GitHub build attestations against
+  the exact signed-tag release workflow before updating the release index.
+- Release verification and website publication use separate read-only and
+  write-scoped jobs so package lifecycle code never receives a push token.
+
+## [0.1.9] - 2026-08-21
+
+### Fixed
+
+- Prevented inherited development and fixture settings from redirecting a
+  normal macOS installation.
+- Made release verification non-disruptive to running terminal sessions.
+- Checked both system and per-user application locations during migration.
+- Restored HTTPS-only redirects and TLS 1.2 for the macOS bootstrap.
+
+## [0.1.8] - 2026-08-21
+
+### Fixed
+
+- Suppressed low-level disk-image mounting output during successful macOS
+  updates.
+
+## [0.1.7] - 2026-08-21
+
+### Added
+
+- Added a concise macOS bootstrap and the `hh version`, `hh doctor`, and
+  `hh update` maintenance workflow.
+
+### Fixed
+
+- Resolved bundled service and updater discovery when `hh` is launched through
+  `~/.local/bin/hh`.
+- Hid updater rollback applications from Finder and Spotlight.
+- Preserved the original CLI target if installation rollback is required.
+
+## [0.1.6] - 2026-08-20
+
+### Changed
+
+- Unified terminal update delivery across the desktop and command-line flows.
+- Gated edge publication on successful CI before replacing the update feed.
+
+## [0.1.5] - 2026-08-20
+
+### Added
+
+- Added hourly automatic update checks and explicit manual update checks.
+
 ## [0.1.4] - 2026-08-19
 
 ### Added

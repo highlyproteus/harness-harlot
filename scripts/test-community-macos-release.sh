@@ -18,6 +18,16 @@ trap cleanup EXIT HUP INT TERM
 
 sh -n "$repository_root/install-community-macos.sh"
 grep -F 'unset HH_SOCKET HH_STATE_DIR' "$repository_root/install-community-macos.sh" >/dev/null
+grep -F "RELEASE_INDEX_URL='https://harnessharlot.com/releases/stable-macos.json'" \
+  "$repository_root/install-community-macos.sh" >/dev/null
+if grep -F 'command -v gh' "$repository_root/install-community-macos.sh" >/dev/null || \
+  grep -F 'gh release' "$repository_root/install-community-macos.sh" >/dev/null || \
+  grep -F 'gh attestation' "$repository_root/install-community-macos.sh" >/dev/null; then
+  echo "community installer still requires GitHub CLI" >&2
+  exit 1
+fi
+grep -F "actual=\$(shasum -a 256 \"\$file\" | cut -d ' ' -f 1)" \
+  "$repository_root/install-community-macos.sh" >/dev/null
 grep -F "codesign --verify --deep --strict --verbose=2 \"\$candidate\" ||" \
   "$repository_root/install-community-macos.sh" >/dev/null
 grep -F "ln -s \"\$previous_link_target\" \"\$link\"" \
@@ -27,9 +37,13 @@ grep -F "if [ \"\$verify_only\" -eq 0 ]; then" \
 grep -F "preflight_app \"\$alternate_app\"" \
   "$repository_root/install-community-macos.sh" >/dev/null
 "$repository_root/install-community-macos.sh" --help >"$work/help.out"
-grep -F -- "curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL" \
+grep -F -- "curl --proto '=https' --tlsv1.2 -fsS https://harnessharlot.com/install | sh" \
   "$work/help.out" >/dev/null
 grep -F -- "--verbose" "$work/help.out" >/dev/null
+if grep -F -- "--tag" "$work/help.out" >/dev/null; then
+  echo "community installer advertises unsupported historical release selection" >&2
+  exit 1
+fi
 if grep -F -- "--acknowledge-unnotarized" "$work/help.out" >/dev/null; then
   echo "community installer still exposes the legacy acknowledgement flag" >&2
   exit 1
