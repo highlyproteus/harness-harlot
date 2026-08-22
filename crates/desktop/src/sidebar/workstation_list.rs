@@ -3,12 +3,12 @@ use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     HeaderDropZone, SidebarSection, WorkstationTabEntry, abbreviate_home, click_suppression_active,
     element_key, header_drop_zone, partition_workstation_entries, readable_text_color,
-    rgba_with_alpha, terminal_tab_count_label, workspace_tab_entries, workspace_terminal_tabs,
+    terminal_tab_count_label, workspace_tab_entries, workspace_terminal_tabs,
 };
 use crate::view_models::{
     TabDrag, TabDropPreview, TooltipView, WorkspaceDrag, WorkspaceDropPreview,
 };
-use crate::{HhApp, TAB_COLOR_ALPHA, THEME};
+use crate::{HhApp, THEME};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -323,6 +323,7 @@ impl HhApp {
             .collect()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_workspace_group_rows(
         &self,
         ctx: &WorkspaceSectionCtx,
@@ -366,6 +367,11 @@ impl HhApp {
         let custom_icon_path = custom_icon
             .as_deref()
             .and_then(|icon| self.custom_icon_path(icon));
+        let group_text = tab_color.map_or(THEME.foreground, |color| {
+            readable_text_color(color.as_rgb())
+        });
+        let group_detail_text =
+            tab_color.map_or(THEME.dim, |color| readable_text_color(color.as_rgb()));
         rows.push(
             div()
                 .id(("workspace-group", element_key(tab_id)))
@@ -386,13 +392,20 @@ impl HhApp {
                 .flex()
                 .items_center()
                 .gap(px(6.0))
-                .when_some(tab_color, |element, color| {
-                    element.bg(rgba(rgba_with_alpha(color.as_rgb(), TAB_COLOR_ALPHA)))
-                })
+                .when_some(tab_color, |element, color| element.bg(rgb(color.as_rgb())))
                 .when(tab_active && tab_color.is_none(), |element| {
                     element.bg(rgb(THEME.accent_soft))
                 })
-                .hover(|element| element.bg(rgb(THEME.elevated)))
+                .when(tab_color.is_none(), |element| {
+                    element.hover(|element| element.bg(rgb(THEME.elevated)))
+                })
+                .when(tab_color.is_some(), |element| {
+                    element.hover(|element| {
+                        element.border_1().border_color(rgb(readable_text_color(
+                            tab_color.map_or(THEME.foreground, |color| color.as_rgb()),
+                        )))
+                    })
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if click_suppression_active(
                         &mut this.sidebar.suppress_tab_click_until,
@@ -498,7 +511,7 @@ impl HhApp {
                         .w(px(12.0))
                         .font_family(".SystemUIFont")
                         .text_xs()
-                        .text_color(rgb(THEME.dim))
+                        .text_color(rgb(group_detail_text))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_group_collapsed(tab_id, cx);
                             cx.stop_propagation();
@@ -555,7 +568,7 @@ impl HhApp {
                         .truncate()
                         .font_family(".SystemUIFont")
                         .text_xs()
-                        .text_color(rgb(THEME.foreground))
+                        .text_color(rgb(group_text))
                         .child(label),
                 )
                 .child(
@@ -563,7 +576,7 @@ impl HhApp {
                         .flex_none()
                         .font_family(".SystemUIFont")
                         .text_xs()
-                        .text_color(rgb(THEME.dim))
+                        .text_color(rgb(group_detail_text))
                         .child(count_label),
                 )
                 .child(self.render_workspace_group_menu_button(tab_id, cx))

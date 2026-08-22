@@ -190,6 +190,9 @@ pub(super) enum ColorTarget {
 pub(super) struct ColorPickerState {
     pub(super) target: ColorTarget,
     pub(super) hex: String,
+    pub(super) hue: f32,
+    pub(super) saturation: f32,
+    pub(super) value: f32,
     pub(super) replace_on_type: bool,
     pub(super) invalid: bool,
 }
@@ -247,6 +250,7 @@ pub(super) struct TerminalLineRender {
     pub(super) cursor: Option<hh_protocol::TerminalCursor>,
     pub(super) focused: bool,
     pub(super) pane_id: Uuid,
+    pub(super) pane_accent: u32,
     pub(super) columns: u16,
     pub(super) selection: Option<TerminalSelection>,
 }

@@ -10,6 +10,7 @@ use hh_protocol::{
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -163,15 +164,20 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
                     *pane_id,
                     terminal.session.terminal_title(),
                     terminal.detected_command_profile,
+                    terminal.last_valid_cwd.clone(),
                 )
             })
         })
         .collect::<Vec<_>>();
     let mut identity_changed = false;
-    for (pane_id, title_signal, command_profile) in identity_inputs {
+    for (pane_id, title_signal, command_profile, cwd) in identity_inputs {
         if let Some(pane) = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id) {
-            identity_changed |=
-                resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
+            identity_changed |= resolve_pane_identity(
+                pane,
+                title_signal.as_deref(),
+                command_profile,
+                Some(cwd.as_path()),
+            );
         }
     }
     if identity_changed {
@@ -292,6 +298,7 @@ pub(crate) fn resolve_pane_identity(
     pane: &mut Pane,
     terminal_title: Option<&str>,
     command_profile: Option<TerminalProfile>,
+    cwd: Option<&Path>,
 ) -> bool {
     let (profile, mut source, generated_title) = if let Some(profile) = pane.profile_override {
         (
@@ -312,7 +319,9 @@ pub(crate) fn resolve_pane_identity(
             profile.display_name().to_owned(),
         )
     } else {
-        let title = if pane.identity.source == TerminalIdentitySource::Fallback
+        let title = if let Some(name) = cwd.and_then(Path::file_name) {
+            name.to_string_lossy().into_owned()
+        } else if pane.identity.source == TerminalIdentitySource::Fallback
             && pane.title.starts_with("Terminal")
         {
             pane.title.clone()
@@ -369,28 +378,71 @@ mod tests {
         pane.custom_title = Some("Release console".to_owned());
         pane.profile_override = Some(TerminalProfile::Hermes);
 
-        resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
+        resolve_pane_identity(
+            pane,
+            Some("Claude Code"),
+            Some(TerminalProfile::Codex),
+            None,
+        );
         assert_eq!(pane.title, "Release console");
         assert_eq!(pane.identity.profile, TerminalProfile::Hermes);
         assert_eq!(pane.identity.source, TerminalIdentitySource::UserProfile);
 
         pane.custom_title = None;
-        resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
+        resolve_pane_identity(
+            pane,
+            Some("Claude Code"),
+            Some(TerminalProfile::Codex),
+            None,
+        );
         assert_eq!(pane.title, "Hermes Agent");
         assert_eq!(pane.identity.source, TerminalIdentitySource::UserProfile);
 
         pane.profile_override = None;
-        resolve_pane_identity(pane, Some("Claude Code"), Some(TerminalProfile::Codex));
+        resolve_pane_identity(
+            pane,
+            Some("Claude Code"),
+            Some(TerminalProfile::Codex),
+            None,
+        );
         assert_eq!(pane.title, "Codex CLI");
         assert_eq!(pane.identity.source, TerminalIdentitySource::Command);
 
-        resolve_pane_identity(pane, Some("editor"), Some(TerminalProfile::Codex));
+        resolve_pane_identity(pane, Some("editor"), Some(TerminalProfile::Codex), None);
         assert_eq!(pane.title, "Codex CLI");
         assert_eq!(pane.identity.source, TerminalIdentitySource::Command);
 
-        resolve_pane_identity(pane, Some("editor"), None);
+        resolve_pane_identity(pane, Some("editor"), None, None);
         assert_eq!(pane.title, "Terminal");
         assert_eq!(pane.identity, TerminalIdentity::default());
+    }
+
+    #[test]
+    fn fallback_title_uses_cwd_folder_name_and_custom_title_wins() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let pane_id = first_pane_id(&snapshot).unwrap();
+        let pane = find_pane_mut_in_snapshot(&mut snapshot, pane_id).unwrap();
+        pane.custom_title = None;
+        pane.profile_override = None;
+
+        resolve_pane_identity(
+            pane,
+            Some("editor"),
+            None,
+            Some(Path::new("/Users/x/Projects/hh-ui-web")),
+        );
+        assert_eq!(pane.title, "hh-ui-web");
+        assert_eq!(pane.identity.source, TerminalIdentitySource::Fallback);
+
+        pane.custom_title = Some("My work".to_owned());
+        resolve_pane_identity(
+            pane,
+            Some("editor"),
+            None,
+            Some(Path::new("/Users/x/Projects/hh-ui-web")),
+        );
+        assert_eq!(pane.title, "My work");
+        assert_eq!(pane.identity.source, TerminalIdentitySource::UserRename);
     }
 
     #[test]

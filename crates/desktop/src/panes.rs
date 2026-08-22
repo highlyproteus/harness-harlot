@@ -14,7 +14,7 @@ use crate::helpers::{
     LiveScrollTarget, WorkspaceTabScope, append_rename_text, apply_layout_control_mutation,
     collect_terminal_tabs, constrained_sidebar_width, effective_split_ratio, find_pane,
     find_split_rect, live_scroll_target, prepare_paste, terminal_modifiers, terminal_mouse_button,
-    visible_panes, workspace_tab_set,
+    url_at_column, visible_panes, wheel_delta_lines, workspace_tab_set,
 };
 use crate::typography::{TerminalCellMetrics, adjusted_terminal_zoom_level};
 use crate::view_models::{
@@ -768,6 +768,7 @@ impl HhApp {
                     .map(|character| character.to_ascii_uppercase())
                     .take(remaining),
             );
+            Self::sync_picker_hsv(picker);
             picker.replace_on_type = false;
             picker.invalid = false;
             cx.notify();
@@ -919,6 +920,16 @@ impl HhApp {
         }
     }
 
+    /// URL under a grid position, or `None`. Mouse-reporting apps own their
+    /// clicks, so they never get the link treatment.
+    pub(crate) fn url_at_pointer(&self, pane_id: Uuid, point: TerminalPoint) -> Option<String> {
+        let screen = self.session.screens.get(&pane_id)?;
+        if screen.modes.contains(TerminalModes::MOUSE_REPORTING) {
+            return None;
+        }
+        url_at_column(screen.lines.get(usize::from(point.row))?, point.column)
+    }
+
     pub(crate) fn end_terminal_pointer(
         &mut self,
         pane_id: Uuid,
@@ -934,6 +945,15 @@ impl HhApp {
         {
             if point == selection.anchor && !selection.preserve_single_cell {
                 self.dispatch_control(ClientRequest::ClearSelection { pane_id });
+                if event.click_count <= 1
+                    && let Some(url) = self.url_at_pointer(pane_id, point)
+                {
+                    if event.modifiers.control {
+                        self.open_url_in_browser_split(pane_id, &url, cx);
+                    } else {
+                        cx.open_url(&url);
+                    }
+                }
             } else {
                 self.dispatch_control(ClientRequest::UpdateSelection { pane_id, point });
             }
@@ -966,11 +986,10 @@ impl HhApp {
     ) {
         let metrics = self.terminal_metrics(pane_id);
         let pixels = event.delta.pixel_delta(px(metrics.line_height));
-        let lines = (f32::from(pixels.y) / metrics.line_height).round() as i32;
-        let lines = if lines == 0 {
-            if pixels.y < px(0.0) { -1 } else { 1 }
-        } else {
-            lines
+        let Some(lines) = wheel_delta_lines(f32::from(pixels.y), metrics.line_height) else {
+            // Zero-pixel wheel events (trackpad momentum tails) must not
+            // ratchet the viewport into scrollback.
+            return;
         };
         if self.editor.archived_views.contains_key(&pane_id) {
             self.scroll_archived_view(pane_id, lines, cx);

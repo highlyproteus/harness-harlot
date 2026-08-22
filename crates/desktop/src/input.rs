@@ -492,6 +492,7 @@ impl HhApp {
                         &mut picker.replace_on_type,
                         &mut picker.invalid,
                     );
+                    Self::sync_picker_hsv(picker);
                     cx.notify();
                 }
                 _ => {}
@@ -646,6 +647,7 @@ impl HhApp {
         let bytes = terminal_input_bytes(
             &keystroke.key,
             keystroke.key_char.as_deref(),
+            keystroke.modifiers.shift,
             keystroke.modifiers.control,
             keystroke.modifiers.alt,
             keystroke.modifiers.platform,

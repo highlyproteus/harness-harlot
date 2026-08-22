@@ -21,6 +21,24 @@ pub(crate) const fn live_scroll_target(
     }
 }
 
+/// Converts a vertical pixel wheel delta into terminal scroll lines.
+///
+/// Zero-pixel deltas (trackpad momentum tails) return `None` so they can be
+/// dropped instead of ratcheting the viewport one line into history; any
+/// nonzero delta that rounds to zero is still coerced to one line so tiny
+/// scrolls stay responsive.
+pub(crate) fn wheel_delta_lines(pixels_y: f32, line_height: f32) -> Option<i32> {
+    if pixels_y == 0.0 || line_height <= 0.0 {
+        return None;
+    }
+    let lines = (pixels_y / line_height).round() as i32;
+    Some(if lines == 0 {
+        if pixels_y < 0.0 { -1 } else { 1 }
+    } else {
+        lines
+    })
+}
+
 pub(crate) fn history_label(label: &'static str) -> AnyElement {
     div()
         .w(px(76.0))
@@ -106,7 +124,7 @@ pub(crate) fn history_warning_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{LiveScrollTarget, format_bytes, live_scroll_target};
+    use super::{LiveScrollTarget, format_bytes, live_scroll_target, wheel_delta_lines};
 
     #[test]
     fn byte_sizes_use_the_largest_meaningful_binary_unit() {
@@ -126,5 +144,15 @@ mod tests {
             live_scroll_target(true, false, true),
             LiveScrollTarget::TerminalMouseReporting
         );
+    }
+
+    #[test]
+    fn zero_pixel_wheel_deltas_are_dropped_and_tiny_ones_coerce_to_one_line() {
+        assert_eq!(wheel_delta_lines(0.0, 18.0), None);
+        assert_eq!(wheel_delta_lines(4.0, 18.0), Some(1));
+        assert_eq!(wheel_delta_lines(-4.0, 18.0), Some(-1));
+        assert_eq!(wheel_delta_lines(36.0, 18.0), Some(2));
+        assert_eq!(wheel_delta_lines(-45.0, 18.0), Some(-3));
+        assert_eq!(wheel_delta_lines(9.0, 0.0), None);
     }
 }

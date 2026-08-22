@@ -1,38 +1,35 @@
 //! Terminal pane rendering: headers, lines, search, and drops.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, ClickEvent, Context, CursorStyle, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, Point, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, img, px,
-    relative, rgb, rgba,
+    AnyElement, Context, CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    Point, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, px, relative, rgb, rgba,
 };
-use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
+use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled};
 use hh_protocol::{
-    AppearanceColor, DropPlacement, HistoryPageFlags, Pane, PaneLayout, SplitAxis,
-    TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, Workspace, WorkspaceConnection,
+    ClientRequest, DropPlacement, HistoryPageFlags, Pane, PaneLayout, SplitAxis,
+    TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, WorkspaceConnection,
 };
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use std::collections::HashSet;
 
 use crate::browser::browser_command_available;
 use crate::commands::AppCommand;
-use crate::elements::TerminalPointerElement;
+use crate::elements::{TerminalGridElement, TerminalPointerElement};
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::helpers::visible_panes;
 use crate::helpers::{
-    IDENTITY_MARK_SIZE, WorkspaceTabScope, collect_terminal_tabs, composite_rgb,
-    effective_split_ratio, element_key, find_pane, plain_history_line, selection_span,
-    split_child_dimensions, split_control_id, split_element_key, split_placement_at,
-    split_target_for_drag, split_target_for_drag_ids, tab_identity_presentation,
-    terminal_run_display_text, terminal_tab_secondary_label, workspace_layout_for_focused_pane,
-    workspace_strip_active_tab, workspace_tab_focus_target, workspace_tab_set,
-    workspace_tab_standalone_pane, zoom_projection,
+    IDENTITY_MARK_SIZE, effective_split_ratio, element_key, find_pane, plain_history_line,
+    selection_span, split_child_dimensions, split_control_id, split_element_key,
+    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
+    tab_identity_presentation, terminal_run_display_text, terminal_tab_secondary_label,
+    workspace_layout_for_focused_pane, workspace_tab_standalone_pane, zoom_projection,
 };
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{
-    CreateMenu, CreateMenuTarget, DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag,
-    SearchEditor, SplitControlId, TabDrag, TerminalLineRender, TooltipView, WorkspaceDrag,
+    DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag, SearchEditor, SplitControlId,
+    TabDrag, TerminalLineRender, TooltipView, WorkspaceDrag,
 };
-use crate::{HhApp, PANE_HEADER_HEIGHT, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
+use crate::{HhApp, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, THEME};
 use uuid::Uuid;
 
 impl HhApp {
@@ -399,6 +396,7 @@ impl HhApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn render_terminal(
         &self,
         panes: Vec<Pane>,
@@ -438,6 +436,7 @@ impl HhApp {
                             cursor: None,
                             focused,
                             pane_id: active,
+                            pane_accent: terminal_accent,
                             columns: screen.columns,
                             selection: None,
                         },
@@ -447,30 +446,48 @@ impl HhApp {
                 })
                 .collect::<Vec<_>>()
         } else {
-            screen
-                .map(|screen| {
-                    screen
-                        .lines
-                        .iter()
-                        .enumerate()
-                        .map(|(row, line)| {
-                            self.render_terminal_line(
-                                line,
-                                TerminalLineRender {
-                                    row,
-                                    cursor: screen.cursor,
-                                    focused,
-                                    pane_id: active,
-                                    columns: screen.columns,
-                                    selection: screen.selection,
-                                },
-                                metrics,
-                                cx,
-                            )
+            Vec::new()
+        };
+        // Live screens render through the shaped-line cache element; one
+        // pointer overlay per row keeps mouse semantics identical to the
+        // div-per-row path it replaces.
+        let terminal_grid = match (archived, screen) {
+            (None, Some(screen)) => {
+                let mut pointer_rows = Vec::with_capacity(screen.lines.len());
+                for row in 0..screen.lines.len() {
+                    let row_number = u16::try_from(row).unwrap_or(u16::MAX);
+                    pointer_rows.push(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .top(px(f32::from(row_number) * metrics.line_height))
+                            .w_full()
+                            .h(px(metrics.line_height))
+                            .child(TerminalPointerElement {
+                                input: cx.entity(),
+                                pane_id: active,
+                                row: row_number,
+                                columns: screen.columns,
+                                cell_width: metrics.cell_width,
+                            })
+                            .into_any_element(),
+                    );
+                }
+                Some(
+                    div()
+                        .size_full()
+                        .child(TerminalGridElement {
+                            input: cx.entity(),
+                            pane_id: active,
+                            metrics,
+                            focused,
+                            pane_accent: terminal_accent,
                         })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
+                        .children(pointer_rows)
+                        .into_any_element(),
+                )
+            }
+            _ => None,
         };
         div()
             .id(("terminal", element_key(active)))
@@ -539,7 +556,8 @@ impl HhApp {
                     .min_h(px(0.0))
                     .flex_1()
                     .px(px(9.0))
-                    .py(px(6.0))
+                    .pt(px(6.0))
+                    .pb(px(6.0 + TERMINAL_BOTTOM_GUARD))
                     .border_l_1()
                     .border_color(if focused {
                         rgb(terminal_accent)
@@ -551,6 +569,7 @@ impl HhApp {
                     .line_height(px(metrics.line_height))
                     .text_color(rgb(THEME.foreground))
                     .children(rendered_lines)
+                    .when_some(terminal_grid, |element, grid| element.child(grid))
                     .when_some(archived, |element, view| {
                         let notice = if view.page.flags.contains(HistoryPageFlags::CORRUPT) {
                             "LOCAL HISTORY · CORRUPT CHUNK · gap preserved"
@@ -603,6 +622,43 @@ impl HhApp {
                     .when_some(
                         self.editor.modal.search().filter(|_| focused),
                         |element, editor| element.child(self.render_search_bar(editor)),
+                    )
+                    .when_some(
+                        screen
+                            .filter(|_| archived.is_none())
+                            .filter(|screen| screen.display_offset > 0),
+                        |element, screen| {
+                            let jump = -i32::try_from(screen.display_offset).unwrap_or(i32::MAX);
+                            element.child(
+                                div()
+                                    .id(("scroll-bottom", element_key(active)))
+                                    .absolute()
+                                    .right(px(8.0))
+                                    .bottom(px(8.0))
+                                    .px(px(9.0))
+                                    .h(px(24.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgb(THEME.elevated))
+                                    .border_1()
+                                    .border_color(rgb(THEME.border_strong))
+                                    .shadow_lg()
+                                    .occlude()
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .font_family(".SystemUIFont")
+                                    .text_xs()
+                                    .text_color(rgb(THEME.foreground))
+                                    .child(format!("↓ {} lines", screen.display_offset))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.dispatch_control(ClientRequest::ScrollPane {
+                                            pane_id: active,
+                                            lines: jump,
+                                        });
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        },
                     )
                     .when(exited, |element| {
                         element.child(self.render_pane_reattach_notice(active, cx))
@@ -673,6 +729,7 @@ impl HhApp {
             cursor,
             focused,
             pane_id,
+            pane_accent,
             columns,
             selection,
         } = render;
@@ -690,7 +747,6 @@ impl HhApp {
         let cursor_column = cursor
             .filter(|cursor| usize::from(cursor.row) == row)
             .map(|cursor| cursor.column);
-        let pane_accent = self.terminal_accent(pane_id).as_rgb();
         div()
             .relative()
             .h(px(metrics.line_height))
@@ -959,7 +1015,7 @@ impl HhApp {
 
     pub(crate) fn render_layout(
         &mut self,
-        layout: PaneLayout,
+        layout: &PaneLayout,
         width: f32,
         height: f32,
         show_pane_header: bool,
@@ -969,7 +1025,7 @@ impl HhApp {
             PaneLayout::Leaf { pane } => {
                 if pane.kind.is_browser() {
                     self.render_browser_workspace(
-                        &pane,
+                        pane,
                         vec![pane.clone()],
                         width,
                         height,
@@ -978,19 +1034,25 @@ impl HhApp {
                     )
                 } else {
                     let active = pane.id;
-                    self.render_terminal(vec![pane], active, show_pane_header, cx)
+                    self.render_terminal(vec![pane.clone()], active, show_pane_header, cx)
                 }
             }
             PaneLayout::Stack { panes, active } => {
                 if let Some(pane) = panes
                     .iter()
-                    .find(|pane| pane.id == active)
+                    .find(|pane| pane.id == *active)
                     .filter(|pane| pane.kind.is_browser())
-                    .cloned()
                 {
-                    self.render_browser_workspace(&pane, panes, width, height, show_pane_header, cx)
+                    self.render_browser_workspace(
+                        pane,
+                        panes.clone(),
+                        width,
+                        height,
+                        show_pane_header,
+                        cx,
+                    )
                 } else {
-                    self.render_terminal(panes, active, show_pane_header, cx)
+                    self.render_terminal(panes.clone(), *active, show_pane_header, cx)
                 }
             }
             PaneLayout::Split {
@@ -999,20 +1061,20 @@ impl HhApp {
                 first,
                 second,
             } => {
-                let split_id = split_control_id(&first, &second);
+                let split_id = split_control_id(first, second);
                 let ratio = effective_split_ratio(
-                    axis,
+                    *axis,
                     width,
                     height,
                     self.layout
                         .split_ratios
                         .get(&split_id)
                         .copied()
-                        .unwrap_or(ratio),
+                        .unwrap_or(*ratio),
                 );
-                let vertical = axis == SplitAxis::Vertical;
+                let vertical = *axis == SplitAxis::Vertical;
                 let (first_width, first_height, second_width, second_height) =
-                    split_child_dimensions(axis, width, height, ratio);
+                    split_child_dimensions(*axis, width, height, ratio);
                 div()
                     .size_full()
                     .min_w(px(0.0))
@@ -1025,16 +1087,16 @@ impl HhApp {
                             .min_h(px(0.0))
                             .when(vertical, |element| element.h(relative(ratio)).w_full())
                             .when(!vertical, |element| element.w(relative(ratio)).h_full())
-                            .child(self.render_layout(*first, first_width, first_height, true, cx)),
+                            .child(self.render_layout(first, first_width, first_height, true, cx)),
                     )
-                    .child(self.render_divider(split_id, axis, cx))
+                    .child(self.render_divider(split_id, *axis, cx))
                     .child(
                         div()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .flex_1()
                             .child(self.render_layout(
-                                *second,
+                                second,
                                 second_width,
                                 second_height,
                                 true,
@@ -1091,258 +1153,6 @@ impl HhApp {
             .join("  ")
     }
 
-    pub(crate) fn render_workspace_tab_strip(
-        &self,
-        workspace: &Workspace,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let workspace_id = workspace.id;
-        let tab_set = workspace_tab_set(workspace, self.sidebar.workspace_tab_scope);
-        let scope = tab_set.scope;
-        let target_tab = match scope {
-            WorkspaceTabScope::Workstation => None,
-            WorkspaceTabScope::Project(project_id) => Some(project_id),
-        };
-        let active_tab = workspace_strip_active_tab(workspace, scope, self.layout.focused_pane);
-        let tabs = tab_set
-            .tabs
-            .into_iter()
-            .filter(|tab| !self.sidebar.dismissed_workspace_tabs.contains(&tab.id))
-            .map(|tab| {
-                let pane_id = workspace_tab_focus_target(tab, self.layout.focused_pane);
-                let active = active_tab == Some(tab.id);
-                let standalone_pane = workspace_tab_standalone_pane(tab);
-                let is_standalone = standalone_pane.is_some();
-                let label = standalone_pane.map_or_else(
-                    || {
-                        tab.custom_title
-                            .clone()
-                            .unwrap_or_else(|| tab.title.clone())
-                    },
-                    |pane| tab_identity_presentation(pane).label,
-                );
-                let icon = if let Some(pane) = standalone_pane {
-                    let accent = pane
-                        .color
-                        .unwrap_or_else(|| self.terminal_accent(pane.id))
-                        .as_rgb();
-                    div()
-                        .flex_none()
-                        .w(px(IDENTITY_MARK_SIZE))
-                        .h(px(IDENTITY_MARK_SIZE))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(self.render_pane_identity_mark(
-                            pane,
-                            if active {
-                                THEME.foreground
-                            } else {
-                                THEME.muted
-                            },
-                            accent,
-                        ))
-                        .into_any_element()
-                } else if let Some(path) = tab
-                    .custom_icon
-                    .as_deref()
-                    .and_then(|icon| self.custom_icon_path(icon))
-                {
-                    img(path)
-                        .flex_none()
-                        .w(px(13.0))
-                        .h(px(13.0))
-                        .object_fit(gpui::ObjectFit::Contain)
-                        .rounded(px(2.0))
-                        .into_any_element()
-                } else {
-                    div()
-                        .flex_none()
-                        .w(px(7.0))
-                        .h(px(7.0))
-                        .rounded_full()
-                        .bg(rgb(tab.color.map_or(THEME.dim, AppearanceColor::as_rgb)))
-                        .into_any_element()
-                };
-                let pane_count = {
-                    let mut panes = Vec::new();
-                    collect_terminal_tabs(&tab.layout, &mut panes);
-                    panes.len()
-                };
-                let tab_id = tab.id;
-                let close_tooltip = if is_standalone {
-                    format!("Close {label}…")
-                } else {
-                    format!("Remove {label} from top bar")
-                };
-                let background = tab.color.map_or(
-                    if active {
-                        THEME.elevated
-                    } else {
-                        THEME.surface
-                    },
-                    |color| composite_rgb(color.as_rgb(), THEME.surface, TAB_COLOR_ALPHA),
-                );
-                div()
-                    .id(("workspace-strip-tab", element_key(tab_id)))
-                    .group("workspace-strip-tab")
-                    .h_full()
-                    .flex_shrink()
-                    .overflow_hidden()
-                    .min_w(px(64.0))
-                    .max_w(px(220.0))
-                    .px(px(9.0))
-                    .border_r_1()
-                    .border_color(rgb(THEME.border))
-                    .bg(rgb(background))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .when(active, |element| {
-                        element.border_b_2().border_color(rgb(THEME.accent))
-                    })
-                    .hover(|element| element.bg(rgb(THEME.elevated)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_workspace_tab_root(workspace_id, tab_id, cx);
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            if !is_standalone {
-                                return;
-                            }
-                            let Some(pane_id) = pane_id else {
-                                return;
-                            };
-                            this.open_tab_menu(pane_id, event.position, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(icon)
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .truncate()
-                            .whitespace_nowrap()
-                            .font_family(".SystemUIFont")
-                            .text_xs()
-                            .font_weight(if active {
-                                gpui::FontWeight::SEMIBOLD
-                            } else {
-                                gpui::FontWeight::NORMAL
-                            })
-                            .text_color(rgb(if active {
-                                THEME.foreground
-                            } else {
-                                THEME.muted
-                            }))
-                            .child(label),
-                    )
-                    .when(pane_count > 1, |element| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .font_family("SF Mono")
-                                .text_xs()
-                                .text_color(rgb(THEME.dim))
-                                .child(pane_count.to_string()),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(("close-workspace-strip-tab", element_key(tab_id)))
-                            .flex_none()
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .rounded(px(3.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font_family(".SystemUIFont")
-                            .text_xs()
-                            .text_color(rgb(THEME.dim))
-                            .hover(|element| {
-                                element
-                                    .bg(rgb(THEME.accent_soft))
-                                    .text_color(rgb(THEME.foreground))
-                            })
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: close_tooltip.clone(),
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.dismiss_workspace_tab(tab_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child("×"),
-                    )
-                    .into_any_element()
-            });
-        div()
-            .id(("workspace-tab-strip", element_key(workspace_id)))
-            .h(px(WORKSPACE_TAB_STRIP_HEIGHT))
-            .flex_none()
-            .border_b_1()
-            .border_color(rgb(THEME.border_strong))
-            .bg(rgb(THEME.surface))
-            .flex()
-            .items_center()
-            .child(
-                div()
-                    .id(("workspace-strip-scroll", element_key(workspace_id)))
-                    .min_w(px(0.0))
-                    .h_full()
-                    .flex_1()
-                    .overflow_hidden()
-                    .flex()
-                    .items_center()
-                    .children(tabs),
-            )
-            .child(
-                div()
-                    .id(("new-workspace-strip-tab", element_key(workspace_id)))
-                    .flex_none()
-                    .w(px(31.0))
-                    .h_full()
-                    .border_l_1()
-                    .border_color(rgb(THEME.border))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .font_family(".SystemUIFont")
-                    .text_sm()
-                    .text_color(rgb(THEME.muted))
-                    .hover(|element| {
-                        element
-                            .bg(rgb(THEME.elevated))
-                            .text_color(rgb(THEME.foreground))
-                    })
-                    .tooltip(|_, cx| {
-                        cx.new(|_| TooltipView {
-                            text: "Add project, terminal, browser, or group".to_owned(),
-                        })
-                        .into()
-                    })
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.editor.modal = Modal::CreateMenu(CreateMenu {
-                            position: event.position(),
-                            target: CreateMenuTarget::TabStrip {
-                                workspace_id,
-                                target_tab,
-                            },
-                        });
-                        cx.notify();
-                    }))
-                    .child("+"),
-            )
-            .into_any_element()
-    }
-
     pub(crate) fn render_workspace(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(snapshot) = &self.session.snapshot else {
             return div()
@@ -1380,12 +1190,12 @@ impl HhApp {
                 .find(|tab| find_pane(&tab.layout, pane_id).is_some())
                 .is_some_and(|tab| workspace_tab_standalone_pane(tab).is_some())
         });
-        let layout = canonical_layout.as_ref().map(|layout| {
+        let zoomed_layout = canonical_layout.as_ref().and_then(|layout| {
             self.layout
                 .zoomed_pane
                 .and_then(|pane_id| zoom_projection(layout, pane_id))
-                .unwrap_or_else(|| layout.clone())
         });
+        let layout = zoomed_layout.as_ref().or(canonical_layout.as_ref());
         #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         let mut visible_browsers: HashSet<Uuid> = layout
             .as_ref()

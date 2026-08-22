@@ -163,7 +163,7 @@ impl SessionRegistry {
             if state.snapshot.workspaces[workspace_index].tabs.len() >= MAX_TABS_PER_WORKSPACE {
                 bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
             }
-            let mut pane = state.new_pane(pane_id);
+            let mut pane = state.new_pane(pane_id, Some(cwd.as_path()));
             if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
                 "ssh".clone_into(&mut pane.shell);
             }
@@ -329,7 +329,7 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-            let replacement = state.new_pane(replacement_id);
+            let replacement = state.new_pane(replacement_id, Some(cwd.as_path()));
             let did_split = state.snapshot.workspaces.iter_mut().any(|workspace| {
                 workspace.tabs.iter_mut().any(|tab| {
                     split_lone_layout_with_replacement(
