@@ -29,6 +29,59 @@
 
 ---
 
+## Install
+
+The same command installs Harness Harlot on macOS and Linux:
+
+```bash
+curl -fsS https://harnessharlot.com/install | sh
+```
+
+The installer detects the operating system and CPU architecture automatically.
+It does not require `sudo`, GitHub CLI, or a GitHub account. It verifies
+website-pinned checksums, the signed update manifest, the downloaded package,
+and the application before replacing anything. HTTPS content from
+`harnessharlot.com` is the bootstrap trust root; website CI verifies GitHub
+provenance and signed release metadata before publishing those pinned bytes.
+The stable indexes do not expose arbitrary historical-tag selection, and
+publication rejects version or build rollback.
+
+On macOS, Harness Harlot installs to `/Applications` when writable and otherwise
+falls back to `~/Applications`. On Linux, it installs under `~/.local`. Both
+platforms create `~/.local/bin/hh`; add that directory to `PATH` once if your
+shell does not already include it.
+
+```bash
+hh version
+hh update --check
+```
+
+On Linux, `hh update` verifies and stages updates, retains the previous
+application for rollback, and relaunches Harness Harlot after a successful
+replacement. Community macOS builds intentionally use a notify-only update
+policy: `hh update --check` reports a newer release, and rerunning the install
+command performs the verified manual replacement. End active terminal sessions
+before an update that changes the session-service protocol. Contributors can
+opt into the independently published main-branch feed with
+`hh update --channel edge`.
+
+### Linux desktop dependencies
+
+The bootstrap requires `curl`, `python3`, GNU `sha256sum`, and `tar`; these are
+present by default on supported Ubuntu installations or available from the
+standard package repositories.
+
+Browser tabs require the matching distribution packages:
+
+```text
+Ubuntu 22.04:  libgtk-3-0 libnss3 libasound2 libgbm1
+Ubuntu 24.04+: libgtk-3-0t64 libnss3 libasound2t64 libgbm1
+Fedora:        gtk3 nss alsa-lib mesa-libgbm
+Arch:          gtk3 nss alsa-lib mesa
+```
+
+Linux packages target a glibc 2.35 baseline. Details: [Linux releases](docs/linux-release.md) · [macOS releases](docs/macos-release.md).
+
 ## Workstations
 
 A workstation is a machine — your local computer or an SSH host.
@@ -58,61 +111,6 @@ Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profil
 - Scan the local or remote tmux server from the workstation menu and open selected sessions as tabs.
 - Sessions attach exactly like a hand-run `tmux attach-session`: tmux stays in charge of its own windows and panes, and detaching leaves the session running on the server.
 - Nothing is scanned in the background — only when you ask.
-
-## Install
-
-### macOS
-
-Install with one copy-and-paste command:
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsS https://harnessharlot.com/install | sh
-```
-
-The installer uses `/Applications` when it is writable and otherwise falls back
-to `~/Applications`, without requesting `sudo` or requiring GitHub CLI. It
-verifies website-pinned release checksums, the signed update manifest, the app
-architecture, and the bundle signature while showing one concise status line
-per step. Pass `--verbose` when running a saved copy of the script to see the
-underlying verification output.
-
-The installer creates `~/.local/bin/hh`; the app repairs the same command link
-on first launch. Add `~/.local/bin` to `PATH` once if your shell does not already
-include it. After either terminal or DMG installation, use:
-
-```bash
-hh version
-hh update --check
-hh update
-```
-
-`hh update` uses the bundled signed updater, retains the previous application
-for rollback, and relaunches Harness Harlot after a successful replacement.
-End active terminal sessions before installing an update. Contributors can opt
-into the independently published main-branch feed with
-`hh update --channel edge`.
-
-### Linux
-
-Install with one copy-and-paste command:
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSLo /tmp/hh-install-linux.sh https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-linux.sh && sh /tmp/hh-install-linux.sh
-```
-
-The bootstrap installer requires GitHub CLI (`gh`) and uses GitHub release
-attestations before extracting the architecture-matched package.
-
-No `sudo` required — everything installs under `~/.local`, and the in-app update button verifies, stages, and swaps updates with rollback. Built on Ubuntu 22.04 (glibc 2.35 baseline) for x86_64 and arm64. Browser tabs need these distribution packages:
-
-```text
-Ubuntu 22.04:  libgtk-3-0 libnss3 libasound2 libgbm1
-Ubuntu 24.04+: libgtk-3-0t64 libnss3 libasound2t64 libgbm1
-Fedora:        gtk3 nss alsa-lib mesa-libgbm
-Arch:          gtk3 nss alsa-lib mesa
-```
-
-Details: [Linux releases](docs/linux-release.md) · [macOS releases](docs/macos-release.md).
 
 ## Run locally
 

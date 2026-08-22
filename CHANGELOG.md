@@ -4,6 +4,22 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.11] - 2026-08-22
+
+### Changed
+
+- A single `curl -fsS https://harnessharlot.com/install | sh` command now
+  installs Harness Harlot on both macOS and Linux.
+- The README presents installation before product concepts and uses one shared
+  command instead of separate platform instructions.
+- The Linux bootstrap no longer requires GitHub CLI or a GitHub account.
+
+### Security
+
+- Linux installation verifies website-pinned archive and manifest checksums,
+  rejects unsafe archive entries, and verifies the signed update manifest with
+  the packaged updater before installation.
+
 ## [0.1.10] - 2026-08-22
 
 ### Changed

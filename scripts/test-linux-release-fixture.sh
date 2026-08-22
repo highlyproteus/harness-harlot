@@ -114,44 +114,6 @@ done
 [ "$(cat "$work/local-launched")" = launched ]
 [ "$up_to_date" = "up to date" ]
 
-mkdir -p "$work/mock-bin"
-cat > "$work/mock-bin/gh" <<'EOF'
-#!/bin/sh
-set -eu
-case "$1:$2" in
-  release:view)
-    printf '%s\n' "$HH_TEST_RELEASE_TAG"
-    ;;
-  release:download)
-    shift 3
-    destination=
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --dir) destination=$2; shift 2 ;;
-        --repo | --pattern) shift 2 ;;
-        *) exit 2 ;;
-      esac
-    done
-    [ -n "$destination" ]
-    mkdir -p "$destination"
-    cp "$HH_TEST_RELEASE_ARTIFACT" "$destination/$(basename "$HH_TEST_RELEASE_ARTIFACT")"
-    ;;
-  attestation:verify)
-    : > "$HH_TEST_ATTESTATION_LOG"
-    ;;
-  *)
-    exit 2
-    ;;
-esac
-EOF
-chmod 0755 "$work/mock-bin/gh"
-HH_TEST_RELEASE_TAG="v$version" \
-HH_TEST_RELEASE_ARTIFACT="$artifact" \
-HH_TEST_ATTESTATION_LOG="$work/attestation-verified" \
-PATH="$work/mock-bin:$PATH" \
-  "$repository_root/install-linux.sh" --verify-only > "$work/bootstrap.out"
-grep -F "verified Harness Harlot Linux release v$version for $architecture" \
-  "$work/bootstrap.out" >/dev/null
-[ -f "$work/attestation-verified" ]
+"$repository_root/scripts/test-linux-installer-bootstrap.sh"
 
 echo "Linux release fixture bundles all runtime files, verifies the bootstrap path, signs stable manifests, and embeds its build number"
