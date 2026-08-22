@@ -40,7 +40,11 @@ curl -fsS https://harnessharlot.com/install | sh
 The installer detects the operating system and CPU architecture automatically.
 It does not require `sudo`, GitHub CLI, or a GitHub account. It verifies
 website-pinned checksums, the signed update manifest, the downloaded package,
-and the application before replacing anything.
+and the application before replacing anything. HTTPS content from
+`harnessharlot.com` is the bootstrap trust root; website CI verifies GitHub
+provenance and signed release metadata before publishing those pinned bytes.
+The stable indexes do not expose arbitrary historical-tag selection, and
+publication rejects version or build rollback.
 
 On macOS, Harness Harlot installs to `/Applications` when writable and otherwise
 falls back to `~/Applications`. On Linux, it installs under `~/.local`. Both

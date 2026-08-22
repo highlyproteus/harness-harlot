@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+unset HH_SOCKET HH_STATE_DIR HH_CONFIG HH_PANE_ID HH_DEVELOPMENT_BUILD \
+  HH_INSTALLER_APPLICATIONS_DIR || true
 unset TAR_OPTIONS GZIP BZIP2 XZ_OPT || true
 
 RELEASE_INDEX_URL='https://harnessharlot.com/releases/stable-linux.json'
@@ -59,7 +61,7 @@ run_quiet() {
 
 index="$work/stable-linux.json"
 run_quiet "Fetch the release index" \
-  curl --proto '=https' --tlsv1.2 -fsS "$RELEASE_INDEX_URL" -o "$index"
+  curl --max-filesize 1048576 --proto '=https' --tlsv1.2 -fsS "$RELEASE_INDEX_URL" -o "$index"
 
 selection="$work/selection"
 python3 -I - "$index" "$architecture" > "$selection" <<'PY'
@@ -128,11 +130,11 @@ archive="$work/$(basename "$archive_url")"
 manifest="$work/$(basename "$manifest_url")"
 signature="$work/$(basename "$signature_url")"
 run_quiet "Download Harness Harlot $version" \
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$archive_url" -o "$archive"
+  curl --max-filesize "$archive_size" --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$archive_url" -o "$archive"
 run_quiet "Download the update manifest" \
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$manifest_url" -o "$manifest"
+  curl --max-filesize "$manifest_size" --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$manifest_url" -o "$manifest"
 run_quiet "Download the update signature" \
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$signature_url" -o "$signature"
+  curl --max-filesize "$signature_size" --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$signature_url" -o "$signature"
 
 verify_file_checksum() {
   label=$1
@@ -152,24 +154,37 @@ verify_release_checksums() {
 }
 run_quiet "Verify release checksums" verify_release_checksums
 
-archive_list="$work/archive-list"
-archive_details="$work/archive-details"
-tar -tzf "$archive" > "$archive_list"
-tar -tvzf "$archive" > "$archive_details"
-while IFS= read -r entry; do
-  normalized=${entry%/}
-  case "$normalized" in
-    Harness-Harlot | Harness-Harlot/*) ;;
-    *) echo "release archive contains a path outside Harness-Harlot: $entry" >&2; exit 1 ;;
-  esac
-  case "/$normalized/" in
-    */../* | */./*) echo "release archive contains an unsafe path: $entry" >&2; exit 1 ;;
-  esac
-done < "$archive_list"
-if grep -E '^[^d-]' "$archive_details" >/dev/null; then
-  echo "release archive contains a link or special file" >&2
-  exit 1
-fi
+python3 -I - "$archive" <<'PY'
+import posixpath
+import sys
+import tarfile
+
+path = sys.argv[1]
+seen = set()
+unpacked_bytes = 0
+entry_count = 0
+with tarfile.open(path, mode="r:gz") as release:
+    for member in release:
+        entry_count += 1
+        if entry_count > 100000:
+            raise SystemExit("release archive contains too many entries")
+        name = member.name.rstrip("/")
+        if not name or any(ord(character) < 32 or ord(character) == 127 for character in name):
+            raise SystemExit("release archive contains an invalid path")
+        if name != "Harness-Harlot" and not name.startswith("Harness-Harlot/"):
+            raise SystemExit(f"release archive contains a path outside Harness-Harlot: {name}")
+        if posixpath.normpath(name) != name or name.startswith("/"):
+            raise SystemExit(f"release archive contains an unsafe path: {name}")
+        if name in seen:
+            raise SystemExit(f"release archive contains a duplicate path: {name}")
+        seen.add(name)
+        if member.isfile():
+            unpacked_bytes += member.size
+            if unpacked_bytes > 1024 * 1024 * 1024:
+                raise SystemExit("release archive exceeds unpacked size limit")
+        elif not member.isdir():
+            raise SystemExit(f"release archive contains a link or special file: {name}")
+PY
 
 extract="$work/extract"
 mkdir -p "$extract"

@@ -173,7 +173,7 @@ run_quiet() {
 
 index="$work/stable-macos.json"
 run_quiet "Fetch the release index" \
-  curl --proto '=https' --tlsv1.2 -f \
+  curl --max-filesize 1048576 --proto '=https' --tlsv1.2 -f \
     "$RELEASE_INDEX_URL" -o "$index"
 schema=$(plutil -extract schema raw -o - "$index")
 [ "$schema" = hh-web-release-index-v1 ] || {
@@ -181,32 +181,67 @@ schema=$(plutil -extract schema raw -o - "$index")
   exit 1
 }
 published_tag=$(plutil -extract tag raw -o - "$index")
-case "$published_tag" in
-  v[0-9A-Za-z.-]*) ;;
-  *) echo "invalid release tag: $published_tag" >&2; exit 2 ;;
-esac
-case "$published_tag" in *..* | *. | *[!0-9A-Za-z.v-]*) echo "invalid release tag: $published_tag" >&2; exit 2 ;; esac
+version=$(plutil -extract version raw -o - "$index")
+build=$(plutil -extract build raw -o - "$index")
+case "$version" in ''|*[!0-9.]*) echo "invalid release version: $version" >&2; exit 2 ;; esac
+old_ifs=$IFS
+IFS=.
+read -r major minor patch_version extra <<EOF
+$version
+EOF
+IFS=$old_ifs
+[ -z "$extra" ] || { echo "invalid release version: $version" >&2; exit 2; }
+for component in "$major" "$minor" "$patch_version"; do
+  case "$component" in ''|*[!0-9]*) echo "invalid release version: $version" >&2; exit 2 ;; esac
+  [ "$component" = 0 ] || [ "${component#0}" = "$component" ] || {
+    echo "invalid release version: $version" >&2
+    exit 2
+  }
+done
+[ "$published_tag" = "v$version" ] || { echo "release tag and version disagree" >&2; exit 2; }
+case "$build" in ''|*[!0-9]*|0) echo "invalid release build: $build" >&2; exit 2 ;; esac
 tag=$published_tag
-version=${tag#v}
 asset_prefix="macos.$architecture"
 dmg_url=$(plutil -extract "$asset_prefix.dmg.url" raw -o - "$index")
 dmg_sha256=$(plutil -extract "$asset_prefix.dmg.sha256" raw -o - "$index")
+dmg_size=$(plutil -extract "$asset_prefix.dmg.size" raw -o - "$index")
 manifest_url=$(plutil -extract "$asset_prefix.manifest.url" raw -o - "$index")
 manifest_sha256=$(plutil -extract "$asset_prefix.manifest.sha256" raw -o - "$index")
+manifest_size=$(plutil -extract "$asset_prefix.manifest.size" raw -o - "$index")
 signature_url=$(plutil -extract "$asset_prefix.signature.url" raw -o - "$index")
 signature_sha256=$(plutil -extract "$asset_prefix.signature.sha256" raw -o - "$index")
-for url in "$dmg_url" "$manifest_url" "$signature_url"; do
-  case "$url" in
-    "https://github.com/$REPOSITORY/releases/download/$tag/"*) ;;
-    *) echo "release index contains an untrusted download URL: $url" >&2; exit 1 ;;
-  esac
-done
+signature_size=$(plutil -extract "$asset_prefix.signature.size" raw -o - "$index")
+dmg_name="Harness-Harlot-${version}-b${build}-macos-${architecture}-community.dmg"
+manifest_name="manifest-macos-community-${architecture}.update.json"
+signature_name="$manifest_name.sig"
+[ "$dmg_url" = "https://github.com/$REPOSITORY/releases/download/$tag/$dmg_name" ] || {
+  echo "release index contains an untrusted or noncanonical DMG URL" >&2
+  exit 1
+}
+[ "$manifest_url" = "https://github.com/$REPOSITORY/releases/download/$tag/$manifest_name" ] || {
+  echo "release index contains an untrusted or noncanonical manifest URL" >&2
+  exit 1
+}
+[ "$signature_url" = "https://github.com/$REPOSITORY/releases/download/$tag/$signature_name" ] || {
+  echo "release index contains an untrusted or noncanonical signature URL" >&2
+  exit 1
+}
 for digest in "$dmg_sha256" "$manifest_sha256" "$signature_sha256"; do
   case "$digest" in
     *[!0-9a-f]*|'') echo "release index contains an invalid SHA-256 digest" >&2; exit 1 ;;
   esac
   [ "${#digest}" -eq 64 ] || { echo "release index contains an invalid SHA-256 digest" >&2; exit 1; }
 done
+validate_size() {
+  label=$1
+  value=$2
+  maximum=$3
+  case "$value" in ''|*[!0-9]*|0) echo "release index contains an invalid $label size" >&2; exit 1 ;; esac
+  [ "$value" -le "$maximum" ] || { echo "release index contains an oversized $label" >&2; exit 1; }
+}
+validate_size DMG "$dmg_size" 2147483648
+validate_size manifest "$manifest_size" 1048576
+validate_size signature "$signature_size" 4096
 
 validate_community_app() {
   candidate=$1
@@ -281,17 +316,23 @@ verify_file_checksum() {
   expected=$1
   file=$2
   label=$3
+  expected_size=$4
   actual=$(shasum -a 256 "$file" | cut -d ' ' -f 1)
   if [ "$actual" != "$expected" ]; then
     echo "$label checksum mismatch" >&2
     return 1
   fi
+  actual_size=$(wc -c < "$file" | tr -d ' ')
+  if [ "$actual_size" != "$expected_size" ]; then
+    echo "$label size mismatch" >&2
+    return 1
+  fi
 }
 
 verify_release_checksums() {
-  verify_file_checksum "$dmg_sha256" "$dmg" artifact
-  verify_file_checksum "$manifest_sha256" "$manifest" manifest
-  verify_file_checksum "$signature_sha256" "$signature" signature
+  verify_file_checksum "$dmg_sha256" "$dmg" artifact "$dmg_size"
+  verify_file_checksum "$manifest_sha256" "$manifest" manifest "$manifest_size"
+  verify_file_checksum "$signature_sha256" "$signature" signature "$signature_size"
 }
 
 preflight_existing_install() {
@@ -319,11 +360,11 @@ manifest="$work/$(basename "$manifest_url")"
 signature="$work/$(basename "$signature_url")"
 dmg="$work/$(basename "$dmg_url")"
 run_quiet "Download Harness Harlot $version" \
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$dmg_url" -o "$dmg"
+  curl --max-filesize "$dmg_size" --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$dmg_url" -o "$dmg"
 run_quiet "Download the update manifest" \
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$manifest_url" -o "$manifest"
+  curl --max-filesize "$manifest_size" --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$manifest_url" -o "$manifest"
 run_quiet "Download the update signature" \
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$signature_url" -o "$signature"
+  curl --max-filesize "$signature_size" --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$signature_url" -o "$signature"
 run_quiet "Verify release checksums" verify_release_checksums
 run_quiet "Verify disk image signature" codesign --verify --strict --verbose=2 "$dmg"
 hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg" >/dev/null
