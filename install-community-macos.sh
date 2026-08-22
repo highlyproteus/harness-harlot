@@ -190,7 +190,10 @@ read -r major minor patch_version extra <<EOF
 $version
 EOF
 IFS=$old_ifs
-[ -z "$extra" ] || { echo "invalid release version: $version" >&2; exit 2; }
+if [ -n "$extra" ] || [ "$version" != "$major.$minor.$patch_version" ]; then
+  echo "invalid release version: $version" >&2
+  exit 2
+fi
 for component in "$major" "$minor" "$patch_version"; do
   case "$component" in ''|*[!0-9]*) echo "invalid release version: $version" >&2; exit 2 ;; esac
   [ "$component" = 0 ] || [ "${component#0}" = "$component" ] || {
