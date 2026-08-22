@@ -54,6 +54,7 @@ mod session;
 mod sidebar;
 mod terminal_view;
 mod theme;
+mod workspace_tab_strip;
 mod workspaces;
 
 mod typography;
