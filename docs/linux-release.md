@@ -4,17 +4,21 @@ Harness Harlot publishes native `x86_64` and `arm64` Linux packages from Ubuntu 
 
 ## Install a release
 
-The supported bootstrap command selects the latest package for the machine's
-architecture, verifies its GitHub build-provenance attestation, rejects unsafe
-archive entries, and runs the unprivileged package installer:
+The same website command used on macOS detects Linux and selects the native
+package for the machine's architecture:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSLo /tmp/hh-install-linux.sh https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-linux.sh && sh /tmp/hh-install-linux.sh
+curl -fsS https://harnessharlot.com/install | sh
 ```
 
-GitHub CLI (`gh`) is required for provenance verification. To pin a release,
-download the bootstrap script and pass `--tag vVERSION`. To verify without
-installing, pass `--verify-only`.
+No GitHub CLI or GitHub account is required. The website publishes package
+checksums only after its read-only CI job verifies GitHub build-provenance
+attestations for the exact signed release tag. The Linux installer then verifies
+the website-pinned archive, manifest, and signature checksums; rejects unsafe
+archive entries; verifies the signed update manifest with the packaged updater;
+and runs the unprivileged package installer. To verify without installing, save
+the platform installer from `https://harnessharlot.com/install-linux` and pass
+`--verify-only`.
 
 The installer refuses root and writes only below the current user's home directory:
 

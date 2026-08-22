@@ -37,7 +37,7 @@ grep -F "if [ \"\$verify_only\" -eq 0 ]; then" \
 grep -F "preflight_app \"\$alternate_app\"" \
   "$repository_root/install-community-macos.sh" >/dev/null
 "$repository_root/install-community-macos.sh" --help >"$work/help.out"
-grep -F -- "curl --proto '=https' --tlsv1.2 -fsS https://harnessharlot.com/install | sh" \
+grep -F -- "curl -fsS https://harnessharlot.com/install | sh" \
   "$work/help.out" >/dev/null
 grep -F -- "--verbose" "$work/help.out" >/dev/null
 if grep -F -- "--tag" "$work/help.out" >/dev/null; then

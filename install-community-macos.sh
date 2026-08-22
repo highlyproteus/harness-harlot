@@ -15,7 +15,7 @@ usage() {
 Harness Harlot installer for macOS
 
 Usage:
-  curl --proto '=https' --tlsv1.2 -fsS https://harnessharlot.com/install | sh
+  curl -fsS https://harnessharlot.com/install | sh
 
 Options:
   --verify-only   Verify the release without installing it

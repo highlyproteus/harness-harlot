@@ -144,7 +144,7 @@ For a community first install, run the HTTPS-only command published at
 `harnessharlot.com`:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsS https://harnessharlot.com/install | sh
+curl -fsS https://harnessharlot.com/install | sh
 ```
 
 The script verifies website-pinned checksums, the Ed25519 manifest, exact DMG
