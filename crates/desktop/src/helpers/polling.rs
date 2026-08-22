@@ -23,7 +23,12 @@ pub(crate) fn pane_update_requires_repaint(
 pub(crate) const fn terminal_poll_wake_requested(request: &ClientRequest) -> bool {
     matches!(
         request,
-        ClientRequest::WriteInput { .. } | ClientRequest::MouseInput { .. }
+        ClientRequest::WriteInput { .. }
+            | ClientRequest::MouseInput { .. }
+            | ClientRequest::BeginSelection { .. }
+            | ClientRequest::UpdateSelection { .. }
+            | ClientRequest::ClearSelection { .. }
+            | ClientRequest::ScrollPane { .. }
     )
 }
 
@@ -56,6 +61,7 @@ mod tests {
     };
     use hh_protocol::{
         ClientRequest, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
+        TerminalSelectionKind,
     };
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -106,9 +112,30 @@ mod tests {
             action: TerminalMouseAction::Press,
             modifiers: TerminalModifiers::default(),
         }));
-        assert!(!terminal_poll_wake_requested(
+        assert!(terminal_poll_wake_requested(
+            &ClientRequest::BeginSelection {
+                pane_id,
+                point: TerminalPoint { row: 0, column: 0 },
+                kind: TerminalSelectionKind::Simple,
+            }
+        ));
+        assert!(terminal_poll_wake_requested(
+            &ClientRequest::UpdateSelection {
+                pane_id,
+                point: TerminalPoint { row: 1, column: 2 },
+            }
+        ));
+        assert!(terminal_poll_wake_requested(
             &ClientRequest::ClearSelection { pane_id }
         ));
+        assert!(terminal_poll_wake_requested(&ClientRequest::ScrollPane {
+            pane_id,
+            lines: -3,
+        }));
+        assert!(!terminal_poll_wake_requested(&ClientRequest::RenameTab {
+            tab_id: Uuid::from_u128(2),
+            title: "work".to_string(),
+        }));
     }
 
     #[test]

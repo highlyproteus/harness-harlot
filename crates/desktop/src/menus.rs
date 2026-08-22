@@ -262,12 +262,30 @@ impl HhApp {
                     .text_color(rgb(THEME.dim))
                     .child("Terminal color"),
             )
-            .child(self.create_menu_item(
-                ("pick-terminal-color", element_key(pane_id)),
-                "Pick color…",
-                cx,
-                move |this, cx| this.open_color_picker(ColorTarget::Pane(pane_id), cx),
-            ))
+            .child(
+                div()
+                    .id(("pick-terminal-color", element_key(pane_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_color_picker(ColorTarget::Pane(pane_id), cx)
+                    }))
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().child("Pick color…"))
+                    .child(if inline_color_picker.is_some() {
+                        "⌄"
+                    } else {
+                        "›"
+                    }),
+            )
             .when_some(inline_color_picker, |element, picker| {
                 element.child(self.render_inline_color_picker(picker, "inline-terminal-color", cx))
             })
@@ -507,12 +525,30 @@ impl HhApp {
             .when(menu.icon_picker_open, |element| {
                 element.child(self.render_group_icon_choices(tab_id, cx))
             })
-            .child(self.create_menu_item(
-                ("pick-group-color", element_key(tab_id)),
-                "Pick color…",
-                cx,
-                move |this, cx| this.open_color_picker(ColorTarget::Tab(tab_id), cx),
-            ))
+            .child(
+                div()
+                    .id(("pick-group-color", element_key(tab_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_color_picker(ColorTarget::Tab(tab_id), cx)
+                    }))
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().child("Pick color…"))
+                    .child(if inline_color_picker.is_some() {
+                        "⌄"
+                    } else {
+                        "›"
+                    }),
+            )
             .when_some(inline_color_picker, |element, picker| {
                 element.child(self.render_inline_color_picker(picker, "inline-group-color", cx))
             })
@@ -688,12 +724,30 @@ impl HhApp {
                     move |this, cx| this.scan_tmux_sessions(workspace_id, cx),
                 ))
             })
-            .child(self.create_menu_item(
-                ("workspace-pick-color", element_key(workspace_id)),
-                "Pick color…",
-                cx,
-                move |this, cx| this.open_color_picker(ColorTarget::Workspace(workspace_id), cx),
-            ))
+            .child(
+                div()
+                    .id(("workspace-pick-color", element_key(workspace_id)))
+                    .mx(px(5.0))
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_color_picker(ColorTarget::Workspace(workspace_id), cx)
+                    }))
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().child("Pick color…"))
+                    .child(if inline_color_picker.is_some() {
+                        "⌄"
+                    } else {
+                        "›"
+                    }),
+            )
             .when_some(inline_color_picker, |element, picker| {
                 element.child(self.render_inline_color_picker(
                     picker,

@@ -346,6 +346,19 @@ impl PtySession {
         if bytes.len() > MAX_INPUT_FRAME {
             bail!("terminal input exceeds {MAX_INPUT_FRAME}-byte frame limit");
         }
+        // Typing snaps the viewport back to the live bottom (stock terminal
+        // behavior). While `display_offset` is nonzero, `Grid::scroll_up`
+        // anchors streaming output to old content and the typed line recedes
+        // below the fold. The revision bump makes the next poll deliver the
+        // re-anchored screen.
+        {
+            let mut terminal = self.terminal.lock();
+            if terminal.display_offset() != 0 {
+                terminal.scroll_bottom();
+                drop(terminal);
+                self.revision.fetch_add(1, Ordering::Release);
+            }
+        }
         let input_tx = self.input_tx.lock();
         let Some(input_tx) = input_tx.as_ref() else {
             bail!("terminal is not accepting input");

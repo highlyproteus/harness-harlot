@@ -1,8 +1,8 @@
 use crate::typography;
 
 use crate::{
-    MAX_PASTE_BYTES, PANE_HEADER_HEIGHT, TERMINAL_FOCUS_BORDER_WIDTH, TERMINAL_HORIZONTAL_PADDING,
-    TERMINAL_VERTICAL_PADDING,
+    MAX_PASTE_BYTES, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, TERMINAL_FOCUS_BORDER_WIDTH,
+    TERMINAL_HORIZONTAL_PADDING, TERMINAL_VERTICAL_PADDING,
 };
 use gpui::{Bounds, MouseButton, Pixels, Point};
 use hh_protocol::{
@@ -119,9 +119,90 @@ pub(crate) fn terminal_run_display_text(run: &TerminalRun, _start_column: u16) -
     run.text.replace('\t', " ")
 }
 
+/// Extracts the URL under one grid column of a terminal row, if any.
+///
+/// Runs are concatenated first so links recolored mid-token still match
+/// whole. The clicked column maps to a character via display width, the
+/// surrounding token expands over non-whitespace characters, and surrounding
+/// quotes/brackets plus trailing punctuation and unbalanced parentheses are
+/// trimmed before the `http(s)://` (or `www.`) prefix check.
+pub(crate) fn url_at_column(line: &TerminalLine, column: u16) -> Option<String> {
+    let text = line
+        .runs
+        .iter()
+        .flat_map(|run| run.text.chars())
+        .collect::<String>();
+
+    // Locate the character whose display cells contain the clicked column.
+    let mut cell = 0_u16;
+    let mut clicked_byte = text.len();
+    for (byte, character) in text.char_indices() {
+        let width = u16::try_from(character.width().unwrap_or(0)).unwrap_or(0);
+        if width == 0 || cell >= column || cell + width > column {
+            clicked_byte = byte;
+            break;
+        }
+        cell += width;
+    }
+
+    let token_character =
+        |character: char| !character.is_whitespace() && character.width().is_some_and(|w| w > 0);
+    if !text[clicked_byte..]
+        .chars()
+        .next()
+        .is_some_and(token_character)
+    {
+        return None;
+    }
+
+    let mut start = clicked_byte;
+    while start > 0
+        && let Some(previous) = text[..start].chars().next_back()
+        && token_character(previous)
+    {
+        start -= previous.len_utf8();
+    }
+    let mut end = clicked_byte;
+    while let Some(character) = text[end..].chars().next()
+        && token_character(character)
+    {
+        end += character.len_utf8();
+    }
+
+    let token = text[start..end]
+        .trim_matches(|c: char| matches!(c, '(' | ')' | '<' | '>' | '"' | '\'' | '`'))
+        .trim_end_matches(['.', ',', ';', ':', '!', '?']);
+    let mut token = token
+        .trim_start_matches(|c: char| !c.is_ascii())
+        .trim_end_matches(|c: char| !c.is_ascii())
+        .to_owned();
+    while token.ends_with(')') && token.matches('(').count() < token.matches(')').count() {
+        token.pop();
+    }
+    if token.is_empty() || token.len() > 2_048 {
+        return None;
+    }
+
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        let host = token
+            .split_once("://")
+            .map_or(token.as_str(), |(_, rest)| rest);
+        host.chars()
+            .any(|c| c.is_ascii_alphanumeric())
+            .then_some(token)
+    } else if lower.starts_with("www.") && token[4..].contains(['.', '/']) {
+        Some(format!("https://{token}"))
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
 pub(crate) fn terminal_input_bytes(
     key: &str,
     key_char: Option<&str>,
+    shift: bool,
     control: bool,
     alt: bool,
     platform: bool,
@@ -137,16 +218,27 @@ pub(crate) fn terminal_input_bytes(
             .first()
             .map(|byte| vec![byte.to_ascii_lowercase() & 0x1f]);
     }
+    // Shift uses the standard xterm legacy encodings: CSI Z for backtab and
+    // the modifier parameter (2 = shift) on navigation keys. Shifted
+    // printables already arrive shifted in `key_char` and ctrl combinations
+    // are handled above, so shift never affects those arms.
     let mut bytes = match key {
         "enter" => vec![b'\r'],
         "backspace" => vec![0x7f],
+        "tab" if shift => b"\x1b[Z".to_vec(),
         "tab" => vec![b'\t'],
         "escape" => vec![0x1b],
+        "left" if shift => b"\x1b[1;2D".to_vec(),
         "left" => b"\x1b[D".to_vec(),
+        "right" if shift => b"\x1b[1;2C".to_vec(),
         "right" => b"\x1b[C".to_vec(),
+        "up" if shift => b"\x1b[1;2A".to_vec(),
         "up" => b"\x1b[A".to_vec(),
+        "down" if shift => b"\x1b[1;2B".to_vec(),
         "down" => b"\x1b[B".to_vec(),
+        "home" if shift => b"\x1b[1;2H".to_vec(),
         "home" => b"\x1b[H".to_vec(),
+        "end" if shift => b"\x1b[1;2F".to_vec(),
         "end" => b"\x1b[F".to_vec(),
         "delete" => b"\x1b[3~".to_vec(),
         _ => key_char?.as_bytes().to_vec(),
@@ -170,7 +262,9 @@ pub(crate) fn terminal_grid_for_pane(
     } else {
         0.0
     };
-    let content_height = (pane_height - pane_chrome_height - TERMINAL_VERTICAL_PADDING).max(1.0);
+    let content_height =
+        (pane_height - pane_chrome_height - TERMINAL_VERTICAL_PADDING - TERMINAL_BOTTOM_GUARD)
+            .max(1.0);
     let columns = metrics.columns_for_width(content_width);
     let rows = metrics.rows_for_height(content_height);
     let max_rows_for_columns = (hh_protocol::MAX_TERMINAL_CELLS / u32::from(columns)) as u16;
@@ -180,9 +274,11 @@ pub(crate) fn terminal_grid_for_pane(
 #[cfg(test)]
 mod tests {
     use super::{
-        Bounds, MAX_PASTE_BYTES, TerminalAttributes, TerminalColor, TerminalPoint, TerminalRun,
-        TerminalSelection, prepare_paste, selection_span, terminal_input_bytes, terminal_point_at,
-        terminal_run_display_text,
+        Bounds, MAX_PASTE_BYTES, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD,
+        TERMINAL_VERTICAL_PADDING, TerminalAttributes, TerminalColor, TerminalLine, TerminalPoint,
+        TerminalRun, TerminalSelection, prepare_paste, selection_span, terminal_grid_for_pane,
+        terminal_input_bytes, terminal_point_at, terminal_run_display_text, typography,
+        url_at_column,
     };
     use gpui::point;
     use gpui::px;
@@ -208,7 +304,6 @@ mod tests {
             origin: point(px(100.0), px(40.0)),
             size: size(px(80.0), px(18.0)),
         };
-
         assert_eq!(
             terminal_point_at(point(px(100.0), px(49.0)), bounds, 7, 10, 8.0),
             TerminalPoint { row: 7, column: 0 }
@@ -224,26 +319,79 @@ mod tests {
     }
 
     #[test]
+    fn terminal_grid_reserves_the_bottom_guard_before_adding_a_row() {
+        let metrics = typography::TerminalCellMetrics {
+            font_size: 13.5,
+            cell_width: 8.0,
+            ascent: 10.0,
+            descent: 3.0,
+            baseline: 13.0,
+            line_height: 19.0,
+        };
+        let exact_two_rows_without_guard =
+            PANE_HEADER_HEIGHT + TERMINAL_VERTICAL_PADDING + metrics.line_height * 2.0;
+
+        assert_eq!(
+            terminal_grid_for_pane(320.0, exact_two_rows_without_guard, metrics, true).1,
+            1
+        );
+        assert_eq!(
+            terminal_grid_for_pane(
+                320.0,
+                exact_two_rows_without_guard + TERMINAL_BOTTOM_GUARD,
+                metrics,
+                true,
+            )
+            .1,
+            2
+        );
+    }
+
+    #[test]
     fn terminal_input_encodes_unmatched_keys_once_with_control_and_alt_semantics() {
         assert_eq!(
-            terminal_input_bytes("x", Some("x"), false, false, false),
+            terminal_input_bytes("x", Some("x"), false, false, false, false),
             Some(vec![b'x'])
         );
         assert_eq!(
-            terminal_input_bytes("c", Some("c"), true, false, false),
+            terminal_input_bytes("c", Some("c"), false, true, false, false),
             Some(vec![0x03])
         );
         assert_eq!(
-            terminal_input_bytes("x", Some("x"), false, true, false),
+            terminal_input_bytes("x", Some("x"), false, false, true, false),
             Some(vec![0x1b, b'x'])
         );
         assert_eq!(
-            terminal_input_bytes("up", None, false, false, false),
+            terminal_input_bytes("up", None, false, false, false, false),
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            terminal_input_bytes("x", Some("x"), false, false, true),
+            terminal_input_bytes("x", Some("x"), false, false, false, true),
             None
+        );
+    }
+
+    #[test]
+    fn shifted_keys_use_xterm_backtab_and_modifier_sequences() {
+        assert_eq!(
+            terminal_input_bytes("tab", None, true, false, false, false),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            terminal_input_bytes("tab", None, false, false, false, false),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            terminal_input_bytes("left", None, true, false, false, false),
+            Some(b"\x1b[1;2D".to_vec())
+        );
+        assert_eq!(
+            terminal_input_bytes("a", Some("A"), true, false, false, false),
+            Some(b"A".to_vec())
+        );
+        assert_eq!(
+            terminal_input_bytes("tab", None, true, false, true, false),
+            Some(b"\x1b\x1b[Z".to_vec())
         );
     }
 
@@ -279,5 +427,66 @@ mod tests {
         assert_eq!(selection_span(selection, 0, 10), None);
         assert_eq!(selection_span(selection, 1, 10), Some((3, 7)));
         assert_eq!(selection_span(selection, 2, 10), Some((0, 5)));
+    }
+
+    fn url_line(text: &str) -> TerminalLine {
+        TerminalLine {
+            runs: vec![TerminalRun {
+                text: text.to_owned(),
+                columns: text
+                    .chars()
+                    .map(|c| {
+                        unicode_width::UnicodeWidthChar::width(c)
+                            .unwrap_or(0)
+                            .max(1) as u16
+                    })
+                    .sum(),
+                foreground: TerminalColor::DefaultForeground,
+                background: TerminalColor::DefaultBackground,
+                attributes: TerminalAttributes::default(),
+            }],
+        }
+    }
+
+    #[test]
+    fn url_clicks_extract_the_link_under_the_pointed_column() {
+        let line = url_line("see https://example.com/docs now");
+        assert_eq!(
+            url_at_column(&line, 7),
+            Some("https://example.com/docs".to_owned())
+        );
+        assert_eq!(
+            url_at_column(&line, 20),
+            Some("https://example.com/docs".to_owned())
+        );
+        assert_eq!(url_at_column(&line, 3), None);
+        assert_eq!(url_at_column(&line, 31), None);
+    }
+
+    #[test]
+    fn url_extraction_trims_wrapping_punctuation_and_keeps_balanced_parens() {
+        let line = url_line("(https://en.wikipedia.org/wiki/Kernel_(computing)).");
+        assert_eq!(
+            url_at_column(&line, 5),
+            Some("https://en.wikipedia.org/wiki/Kernel_(computing)".to_owned())
+        );
+
+        let quoted = url_line("\"https://example.com,\"");
+        assert_eq!(
+            url_at_column(&quoted, 5),
+            Some("https://example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn url_extraction_accepts_bare_www_and_stops_at_wide_characters() {
+        let line = url_line("www.github.com/rust-lang/rust界");
+        assert_eq!(
+            url_at_column(&line, 4),
+            Some("https://www.github.com/rust-lang/rust".to_owned())
+        );
+
+        let plain = url_line("go to example.com for docs");
+        assert_eq!(url_at_column(&plain, 8), None);
     }
 }

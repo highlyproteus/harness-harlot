@@ -155,9 +155,15 @@ pub(crate) struct RegistryState {
 }
 
 impl RegistryState {
-    pub(crate) fn new_pane(&mut self, id: Uuid) -> Pane {
-        let title = format!("Terminal {}", self.next_terminal_number);
-        self.next_terminal_number += 1;
+    pub(crate) fn new_pane(&mut self, id: Uuid, cwd: Option<&Path>) -> Pane {
+        let title = cwd.and_then(Path::file_name).map_or_else(
+            || {
+                let fallback = format!("Terminal {}", self.next_terminal_number);
+                self.next_terminal_number += 1;
+                fallback
+            },
+            |name| name.to_string_lossy().into_owned(),
+        );
         Pane {
             id,
             kind: PaneKind::Terminal,

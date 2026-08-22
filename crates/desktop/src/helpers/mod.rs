@@ -18,13 +18,14 @@ pub(crate) use dnd::{
 };
 pub(crate) use geometry::{
     banner_fit_size, collect_pane_sizes, composite_rgb, constrained_sidebar_width,
-    default_sidebar_width, effective_split_ratio, find_split_rect, migrated_sidebar_width,
-    parse_hex_color, readable_text_color, rgba_with_alpha, sidebar_width_for_visibility,
-    split_child_dimensions, workspace_pixel_size, workstation_banner_header_height,
+    default_sidebar_width, effective_split_ratio, find_split_rect, hsv_to_rgb,
+    migrated_sidebar_width, parse_hex_color, readable_text_color, rgb_to_hsv, rgba_with_alpha,
+    sidebar_width_for_visibility, split_child_dimensions, workspace_pixel_size,
+    workstation_banner_header_height,
 };
 pub(crate) use history_ui::{
     LiveScrollTarget, format_bytes, format_history_date, history_label, history_scope_key,
-    history_warning_text, live_scroll_target,
+    history_warning_text, live_scroll_target, wheel_delta_lines,
 };
 pub(crate) use icons::{
     IDENTITY_MARK_SIZE, render_bell_icon, render_sidebar_toggle_icon, render_terminal_profile_icon,
@@ -50,5 +51,5 @@ pub(crate) use tabs::{
 pub(crate) use terminal_io::{
     plain_history_line, prepare_paste, selection_span, terminal_grid_for_pane,
     terminal_input_bytes, terminal_modifiers, terminal_mouse_button, terminal_point_at,
-    terminal_run_display_text,
+    terminal_run_display_text, url_at_column,
 };

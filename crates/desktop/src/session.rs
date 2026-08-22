@@ -173,6 +173,9 @@ impl HhApp {
                     },
                     Instant::now(),
                 );
+                self.terminal_shape_cache
+                    .borrow_mut()
+                    .retain(|id, _| self.session.screens.contains_key(id));
                 if let Some(pane_id) = outcome.reassert_tab {
                     self.dispatch_control(ClientRequest::ActivateTab { pane_id });
                 }

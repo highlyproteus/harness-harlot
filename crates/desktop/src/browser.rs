@@ -12,7 +12,7 @@ use gpui::{
 };
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use gpui::{AppContext, Image, ImageFormat};
-use hh_protocol::{ClientRequest, Pane, PaneKind, ServiceResponse};
+use hh_protocol::{ClientRequest, DropPlacement, Pane, PaneKind, ServiceResponse};
 #[cfg(all(target_os = "macos", feature = "browser"))]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -234,6 +234,45 @@ impl HhApp {
                 }
                 this.layout.last_sizes.clear();
                 this.editor.modal = Modal::None;
+                cx.notify();
+            }),
+        );
+    }
+
+    /// Opens a terminal-detected URL as an embedded browser pane split to the
+    /// right of the terminal it came from. Falls back to the default browser
+    /// when the embedded browser build is unavailable.
+    pub(crate) fn open_url_in_browser_split(
+        &mut self,
+        target_pane: Uuid,
+        url: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !browser_command_available() {
+            cx.open_url(url);
+            cx.notify();
+            return;
+        }
+        self.dispatch_with(
+            ClientRequest::CreateGroupBrowser {
+                target_pane,
+                url: Some(url.to_owned()),
+            },
+            Box::new(move |this, cx, result| {
+                match result {
+                    Ok(ServiceResponse::PaneCreated {
+                        pane_id: browser_pane,
+                    }) => {
+                        this.move_pane_to_split(
+                            browser_pane,
+                            target_pane,
+                            DropPlacement::Right,
+                            cx,
+                        );
+                    }
+                    Ok(response) => this.report_unexpected(&response),
+                    Err(error) => this.report(&error),
+                }
                 cx.notify();
             }),
         );

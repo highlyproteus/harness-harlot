@@ -69,7 +69,7 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-            let mut new_pane = state.new_pane(new_id);
+            let mut new_pane = state.new_pane(new_id, Some(cwd.as_path()));
             if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
                 "ssh".clone_into(&mut new_pane.shell);
             }
@@ -147,7 +147,7 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-            let mut pane = state.new_pane(new_id);
+            let mut pane = state.new_pane(new_id, Some(cwd.as_path()));
             if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
                 "ssh".clone_into(&mut pane.shell);
             }
@@ -545,9 +545,10 @@ impl SessionRegistry {
     pub fn set_pane_profile(&self, pane_id: Uuid, profile: Option<TerminalProfile>) -> Result<()> {
         let mut state = self.state.write();
         let terminal = state.terminal_pane(pane_id)?;
-        let (title_signal, command_profile) = (
+        let (title_signal, command_profile, cwd) = (
             terminal.session.terminal_title(),
             terminal.detected_command_profile,
+            terminal.last_valid_cwd.clone(),
         );
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
@@ -556,7 +557,12 @@ impl SessionRegistry {
         }
         pane.profile_override = profile;
         pane.custom_icon = None;
-        resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
+        resolve_pane_identity(
+            pane,
+            title_signal.as_deref(),
+            command_profile,
+            Some(cwd.as_path()),
+        );
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
@@ -583,16 +589,22 @@ impl SessionRegistry {
     pub fn reset_pane_identity(&self, pane_id: Uuid) -> Result<()> {
         let mut state = self.state.write();
         let terminal = state.terminal_pane(pane_id)?;
-        let (title_signal, command_profile) = (
+        let (title_signal, command_profile, cwd) = (
             terminal.session.terminal_title(),
             terminal.detected_command_profile,
+            terminal.last_valid_cwd.clone(),
         );
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         pane.custom_title = None;
         pane.profile_override = None;
         pane.custom_icon = None;
-        resolve_pane_identity(pane, title_signal.as_deref(), command_profile);
+        resolve_pane_identity(
+            pane,
+            title_signal.as_deref(),
+            command_profile,
+            Some(cwd.as_path()),
+        );
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
@@ -1006,11 +1018,17 @@ mod tests {
         let second = registry.create_group_terminal(first).unwrap();
         registry.rename_pane(second, "Build logs").unwrap();
 
+        // Panes spawn at the fallback cwd ($HOME), so their default titles
+        // are that directory's folder name rather than "Terminal N".
+        let home_folder = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .and_then(|home| home.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "Terminal 1".to_owned());
         let snapshot = registry.snapshot().unwrap();
         let PaneLayout::Stack { panes, .. } = &snapshot.workspaces[0].tabs[0].layout else {
             panic!("expected a pane-local tab stack");
         };
-        assert_eq!(panes[0].title, "Terminal 1");
+        assert_eq!(panes[0].title, home_folder);
         assert_eq!(panes[1].title, "Build logs");
         assert_eq!(panes[1].shell, shell_title());
     }

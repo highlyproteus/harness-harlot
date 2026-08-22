@@ -445,7 +445,10 @@ impl HhApp {
                     .text_sm()
                     .text_color(rgb(THEME.muted))
                     .when(self.sidebar.sidebar_activity, |element| {
-                        element.bg(rgb(THEME.elevated))
+                        element
+                            .bg(rgb(THEME.accent_soft))
+                            .border_1()
+                            .border_color(rgb(THEME.accent))
                     })
                     .hover(|element| {
                         element
@@ -591,12 +594,14 @@ impl HhApp {
                     preview.target_tab_id == tab_id && !preview.into_group && preview.after
                 })
             });
-        let pane_accent = pane
-            .color
-            .or(tab_color)
+        let user_color = pane.color.or(tab_color);
+        let pane_accent = user_color
             .unwrap_or_else(|| self.terminal_accent(pane_id))
             .as_rgb();
-        let row_background = composite_rgb(pane_accent, THEME.sidebar, TAB_COLOR_ALPHA);
+        let row_background = user_color.map_or(
+            composite_rgb(pane_accent, THEME.sidebar, TAB_COLOR_ALPHA),
+            |color| color.as_rgb(),
+        );
         let row_text = readable_text_color(row_background);
         div()
             .id(("workspace-tab", element_key(pane_id)))
@@ -609,7 +614,10 @@ impl HhApp {
             .flex()
             .items_center()
             .gap(px(7.0))
-            .bg(rgba(rgba_with_alpha(pane_accent, TAB_COLOR_ALPHA)))
+            .bg(user_color.map_or(
+                rgba(rgba_with_alpha(pane_accent, TAB_COLOR_ALPHA)),
+                |color| rgb(color.as_rgb()),
+            ))
             .border_t(if drop_above { px(2.0) } else { px(0.0) })
             .border_b(if drop_below { px(2.0) } else { px(0.0) })
             .border_color(rgb(if drop_above || drop_below {

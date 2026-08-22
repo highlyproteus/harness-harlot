@@ -117,6 +117,68 @@ pub(crate) fn parse_hex_color(value: &str) -> Option<AppearanceColor> {
         (rgb & 0xff) as u8,
     ))
 }
+/// Converts HSV channels to an RGB value encoded as `0xRRGGBB`.
+///
+/// Hue is clamped to `0..=360`; saturation and value are clamped to `0..=1`.
+pub(crate) fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> u32 {
+    let hue = hue.clamp(0.0, 360.0) / 60.0;
+    let saturation = saturation.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    let sector = hue.floor().rem_euclid(6.0);
+    let fraction = hue - hue.floor();
+    let p = value * (1.0 - saturation);
+    let q = value * (1.0 - saturation * fraction);
+    let t = value * (1.0 - saturation * (1.0 - fraction));
+    let (red, green, blue) = if sector < 1.0 {
+        (value, t, p)
+    } else if sector < 2.0 {
+        (q, value, p)
+    } else if sector < 3.0 {
+        (p, value, t)
+    } else if sector < 4.0 {
+        (p, q, value)
+    } else if sector < 5.0 {
+        (t, p, value)
+    } else {
+        (value, p, q)
+    };
+    let channel = |component: f32| (component * 255.0 + 0.5) as u32;
+    (channel(red) << 16) | (channel(green) << 8) | channel(blue)
+}
+
+/// Converts an RGB value encoded as `0xRRGGBB` to HSV channels.
+///
+/// Hue is in `0..=360`; saturation and value are in `0..=1`. Gray inputs use
+/// hue zero.
+pub(crate) fn rgb_to_hsv(rgb: u32) -> (f32, f32, f32) {
+    let red_channel = u8::try_from((rgb >> 16) & 0xff).unwrap_or_default();
+    let green_channel = u8::try_from((rgb >> 8) & 0xff).unwrap_or_default();
+    let blue_channel = u8::try_from(rgb & 0xff).unwrap_or_default();
+    let red = f32::from(red_channel) / 255.0;
+    let green = f32::from(green_channel) / 255.0;
+    let blue = f32::from(blue_channel) / 255.0;
+    let maximum_channel = red_channel.max(green_channel).max(blue_channel);
+    let maximum = red.max(green).max(blue);
+    let minimum = red.min(green).min(blue);
+    let delta = maximum - minimum;
+    if maximum_channel == red_channel.min(green_channel).min(blue_channel) {
+        return (0.0, 0.0, maximum);
+    }
+
+    let hue = if maximum_channel == red_channel {
+        60.0 * ((green - blue) / delta).rem_euclid(6.0)
+    } else if maximum_channel == green_channel {
+        60.0 * ((blue - red) / delta + 2.0)
+    } else {
+        60.0 * ((red - green) / delta + 4.0)
+    };
+    let saturation = if maximum_channel == 0 {
+        0.0
+    } else {
+        delta / maximum
+    };
+    (hue, saturation, maximum)
+}
 
 pub(crate) fn effective_split_ratio(axis: SplitAxis, width: f32, height: f32, ratio: f32) -> f32 {
     let extent = match axis {
@@ -311,8 +373,8 @@ mod tests {
         SPLIT_DIVIDER_SIZE, SplitAxis, Uuid, WORKSTATION_BANNER_ASPECT_RATIO,
         WORKSTATION_BANNER_MAX_HEIGHT, WORKSTATION_BANNER_MIN_HEIGHT, banner_fit_size,
         collect_pane_sizes, composite_rgb, constrained_sidebar_width, default_sidebar_width,
-        default_sidebar_width_for, effective_split_ratio, migrated_sidebar_width_for,
-        parse_hex_color, rgba_with_alpha, sanitized_banner_aspect_ratio,
+        default_sidebar_width_for, effective_split_ratio, hsv_to_rgb, migrated_sidebar_width_for,
+        parse_hex_color, rgb_to_hsv, rgba_with_alpha, sanitized_banner_aspect_ratio,
         sidebar_width_for_visibility, split_child_dimensions, typography, workspace_pixel_size,
         workstation_banner_header_height,
     };
@@ -331,6 +393,21 @@ mod tests {
         );
         assert_eq!(parse_hex_color("FFF"), None);
         assert_eq!(parse_hex_color("GGADFF"), None);
+    }
+
+    #[test]
+    fn hsv_conversion_covers_primary_and_achromatic_colors() {
+        assert_eq!(hsv_to_rgb(0.0, 1.0, 1.0), 0xff0000);
+        assert_eq!(hsv_to_rgb(120.0, 1.0, 1.0), 0x00ff00);
+        assert_eq!(hsv_to_rgb(0.0, 0.0, 1.0), 0xffffff);
+        assert_eq!(hsv_to_rgb(0.0, 0.0, 0.0), 0x000000);
+    }
+
+    #[test]
+    fn hsv_conversion_round_trips_rgb_and_uses_zero_hue_for_gray() {
+        let (hue, saturation, value) = rgb_to_hsv(0x67c8c6);
+        assert_eq!(hsv_to_rgb(hue, saturation, value), 0x67c8c6);
+        assert_eq!(rgb_to_hsv(0x808080), (0.0, 0.0, 128.0 / 255.0));
     }
 
     #[test]

@@ -213,7 +213,7 @@ impl SessionRegistry {
             }
             let number = state.snapshot.workspaces.len() + 1;
             let order = next_workspace_order(&state.snapshot.workspaces, false);
-            let pane = state.new_pane(pane_id);
+            let pane = state.new_pane(pane_id, Some(cwd.as_path()));
             state.snapshot.workspaces.push(Workspace {
                 id: workspace_id,
                 title: title.unwrap_or_else(|| format!("Workstation {number}")),

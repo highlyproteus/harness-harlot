@@ -20,6 +20,7 @@ use hh_protocol::{
     TerminalScreen,
 };
 use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 #[cfg(all(target_os = "macos", feature = "browser"))]
 use std::ffi::c_void;
@@ -137,6 +138,8 @@ const PANE_HEADER_HEIGHT: f32 = 29.0;
 const SPLIT_DIVIDER_SIZE: f32 = 4.0;
 const TERMINAL_HORIZONTAL_PADDING: f32 = 18.0;
 const TERMINAL_VERTICAL_PADDING: f32 = 12.0;
+/// Keep the last PTY row clear of the viewport's clipped bottom edge.
+const TERMINAL_BOTTOM_GUARD: f32 = 1.0;
 const TERMINAL_FOCUS_BORDER_WIDTH: f32 = 1.0;
 const MIN_PANE_WIDTH: f32 = 140.0;
 const MIN_PANE_HEIGHT: f32 = 90.0;
@@ -404,6 +407,7 @@ struct HhApp {
     keymap: ResolvedKeymap,
     terminal_font: TerminalFontProfile,
     terminal_zoom_levels: HashMap<Uuid, i8>,
+    terminal_shape_cache: RefCell<HashMap<Uuid, elements::PaneShapeCache>>,
     custom_icons: Vec<CustomIcon>,
     ui_state_store: Option<UiStateStore>,
     session: SessionState,
@@ -485,6 +489,7 @@ impl HhApp {
             keymap,
             terminal_font,
             terminal_zoom_levels: HashMap::new(),
+            terminal_shape_cache: RefCell::new(HashMap::new()),
             custom_icons: load_custom_icons(),
             ui_state_store,
             session: SessionState::new(

@@ -7,7 +7,7 @@ use gpui::{
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{
-    AppearanceColor, DropPlacement, HistoryPageFlags, Pane, PaneLayout, SplitAxis,
+    AppearanceColor, ClientRequest, DropPlacement, HistoryPageFlags, Pane, PaneLayout, SplitAxis,
     TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, Workspace, WorkspaceConnection,
 };
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -15,24 +15,29 @@ use std::collections::HashSet;
 
 use crate::browser::browser_command_available;
 use crate::commands::AppCommand;
-use crate::elements::TerminalPointerElement;
+use crate::elements::{TerminalGridElement, TerminalPointerElement};
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::helpers::visible_panes;
 use crate::helpers::{
-    IDENTITY_MARK_SIZE, WorkspaceTabScope, collect_terminal_tabs, composite_rgb,
-    effective_split_ratio, element_key, find_pane, plain_history_line, selection_span,
-    split_child_dimensions, split_control_id, split_element_key, split_placement_at,
-    split_target_for_drag, split_target_for_drag_ids, tab_identity_presentation,
-    terminal_run_display_text, terminal_tab_secondary_label, workspace_layout_for_focused_pane,
-    workspace_strip_active_tab, workspace_tab_focus_target, workspace_tab_set,
-    workspace_tab_standalone_pane, zoom_projection,
+    IDENTITY_MARK_SIZE, WorkspaceTabScope, click_suppression_active, collect_terminal_tabs,
+    composite_rgb, effective_split_ratio, element_key, find_pane, plain_history_line,
+    selection_span, split_child_dimensions, split_control_id, split_element_key,
+    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
+    tab_identity_presentation, terminal_run_display_text, terminal_tab_secondary_label,
+    workspace_layout_for_focused_pane, workspace_strip_active_tab, workspace_tab_focus_target,
+    workspace_tab_set, workspace_tab_standalone_pane, zoom_projection,
 };
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag,
-    SearchEditor, SplitControlId, TabDrag, TerminalLineRender, TooltipView, WorkspaceDrag,
+    SearchEditor, SplitControlId, TabDrag, TabDropPreview, TerminalLineRender, TooltipView,
+    WorkspaceDrag,
 };
-use crate::{HhApp, PANE_HEADER_HEIGHT, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
+use crate::{
+    HhApp, PANE_HEADER_HEIGHT, TAB_COLOR_ALPHA, TERMINAL_BOTTOM_GUARD, THEME,
+    WORKSPACE_TAB_STRIP_HEIGHT,
+};
+use std::time::Instant;
 use uuid::Uuid;
 
 impl HhApp {
@@ -399,6 +404,7 @@ impl HhApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn render_terminal(
         &self,
         panes: Vec<Pane>,
@@ -438,6 +444,7 @@ impl HhApp {
                             cursor: None,
                             focused,
                             pane_id: active,
+                            pane_accent: terminal_accent,
                             columns: screen.columns,
                             selection: None,
                         },
@@ -447,30 +454,48 @@ impl HhApp {
                 })
                 .collect::<Vec<_>>()
         } else {
-            screen
-                .map(|screen| {
-                    screen
-                        .lines
-                        .iter()
-                        .enumerate()
-                        .map(|(row, line)| {
-                            self.render_terminal_line(
-                                line,
-                                TerminalLineRender {
-                                    row,
-                                    cursor: screen.cursor,
-                                    focused,
-                                    pane_id: active,
-                                    columns: screen.columns,
-                                    selection: screen.selection,
-                                },
-                                metrics,
-                                cx,
-                            )
+            Vec::new()
+        };
+        // Live screens render through the shaped-line cache element; one
+        // pointer overlay per row keeps mouse semantics identical to the
+        // div-per-row path it replaces.
+        let terminal_grid = match (archived, screen) {
+            (None, Some(screen)) => {
+                let mut pointer_rows = Vec::with_capacity(screen.lines.len());
+                for row in 0..screen.lines.len() {
+                    let row_number = u16::try_from(row).unwrap_or(u16::MAX);
+                    pointer_rows.push(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .top(px(f32::from(row_number) * metrics.line_height))
+                            .w_full()
+                            .h(px(metrics.line_height))
+                            .child(TerminalPointerElement {
+                                input: cx.entity(),
+                                pane_id: active,
+                                row: row_number,
+                                columns: screen.columns,
+                                cell_width: metrics.cell_width,
+                            })
+                            .into_any_element(),
+                    );
+                }
+                Some(
+                    div()
+                        .size_full()
+                        .child(TerminalGridElement {
+                            input: cx.entity(),
+                            pane_id: active,
+                            metrics,
+                            focused,
+                            pane_accent: terminal_accent,
                         })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
+                        .children(pointer_rows)
+                        .into_any_element(),
+                )
+            }
+            _ => None,
         };
         div()
             .id(("terminal", element_key(active)))
@@ -539,7 +564,8 @@ impl HhApp {
                     .min_h(px(0.0))
                     .flex_1()
                     .px(px(9.0))
-                    .py(px(6.0))
+                    .pt(px(6.0))
+                    .pb(px(6.0 + TERMINAL_BOTTOM_GUARD))
                     .border_l_1()
                     .border_color(if focused {
                         rgb(terminal_accent)
@@ -551,6 +577,7 @@ impl HhApp {
                     .line_height(px(metrics.line_height))
                     .text_color(rgb(THEME.foreground))
                     .children(rendered_lines)
+                    .when_some(terminal_grid, |element, grid| element.child(grid))
                     .when_some(archived, |element, view| {
                         let notice = if view.page.flags.contains(HistoryPageFlags::CORRUPT) {
                             "LOCAL HISTORY · CORRUPT CHUNK · gap preserved"
@@ -603,6 +630,43 @@ impl HhApp {
                     .when_some(
                         self.editor.modal.search().filter(|_| focused),
                         |element, editor| element.child(self.render_search_bar(editor)),
+                    )
+                    .when_some(
+                        screen
+                            .filter(|_| archived.is_none())
+                            .filter(|screen| screen.display_offset > 0),
+                        |element, screen| {
+                            let jump = -i32::try_from(screen.display_offset).unwrap_or(i32::MAX);
+                            element.child(
+                                div()
+                                    .id(("scroll-bottom", element_key(active)))
+                                    .absolute()
+                                    .right(px(8.0))
+                                    .bottom(px(8.0))
+                                    .px(px(9.0))
+                                    .h(px(24.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgb(THEME.elevated))
+                                    .border_1()
+                                    .border_color(rgb(THEME.border_strong))
+                                    .shadow_lg()
+                                    .occlude()
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .font_family(".SystemUIFont")
+                                    .text_xs()
+                                    .text_color(rgb(THEME.foreground))
+                                    .child(format!("↓ {} lines", screen.display_offset))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.dispatch_control(ClientRequest::ScrollPane {
+                                            pane_id: active,
+                                            lines: jump,
+                                        });
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                        },
                     )
                     .when(exited, |element| {
                         element.child(self.render_pane_reattach_notice(active, cx))
@@ -673,6 +737,7 @@ impl HhApp {
             cursor,
             focused,
             pane_id,
+            pane_accent,
             columns,
             selection,
         } = render;
@@ -690,7 +755,6 @@ impl HhApp {
         let cursor_column = cursor
             .filter(|cursor| usize::from(cursor.row) == row)
             .map(|cursor| cursor.column);
-        let pane_accent = self.terminal_accent(pane_id).as_rgb();
         div()
             .relative()
             .h(px(metrics.line_height))
@@ -959,7 +1023,7 @@ impl HhApp {
 
     pub(crate) fn render_layout(
         &mut self,
-        layout: PaneLayout,
+        layout: &PaneLayout,
         width: f32,
         height: f32,
         show_pane_header: bool,
@@ -969,7 +1033,7 @@ impl HhApp {
             PaneLayout::Leaf { pane } => {
                 if pane.kind.is_browser() {
                     self.render_browser_workspace(
-                        &pane,
+                        pane,
                         vec![pane.clone()],
                         width,
                         height,
@@ -978,19 +1042,25 @@ impl HhApp {
                     )
                 } else {
                     let active = pane.id;
-                    self.render_terminal(vec![pane], active, show_pane_header, cx)
+                    self.render_terminal(vec![pane.clone()], active, show_pane_header, cx)
                 }
             }
             PaneLayout::Stack { panes, active } => {
                 if let Some(pane) = panes
                     .iter()
-                    .find(|pane| pane.id == active)
+                    .find(|pane| pane.id == *active)
                     .filter(|pane| pane.kind.is_browser())
-                    .cloned()
                 {
-                    self.render_browser_workspace(&pane, panes, width, height, show_pane_header, cx)
+                    self.render_browser_workspace(
+                        pane,
+                        panes.clone(),
+                        width,
+                        height,
+                        show_pane_header,
+                        cx,
+                    )
                 } else {
-                    self.render_terminal(panes, active, show_pane_header, cx)
+                    self.render_terminal(panes.clone(), *active, show_pane_header, cx)
                 }
             }
             PaneLayout::Split {
@@ -999,20 +1069,20 @@ impl HhApp {
                 first,
                 second,
             } => {
-                let split_id = split_control_id(&first, &second);
+                let split_id = split_control_id(first, second);
                 let ratio = effective_split_ratio(
-                    axis,
+                    *axis,
                     width,
                     height,
                     self.layout
                         .split_ratios
                         .get(&split_id)
                         .copied()
-                        .unwrap_or(ratio),
+                        .unwrap_or(*ratio),
                 );
-                let vertical = axis == SplitAxis::Vertical;
+                let vertical = *axis == SplitAxis::Vertical;
                 let (first_width, first_height, second_width, second_height) =
-                    split_child_dimensions(axis, width, height, ratio);
+                    split_child_dimensions(*axis, width, height, ratio);
                 div()
                     .size_full()
                     .min_w(px(0.0))
@@ -1025,16 +1095,16 @@ impl HhApp {
                             .min_h(px(0.0))
                             .when(vertical, |element| element.h(relative(ratio)).w_full())
                             .when(!vertical, |element| element.w(relative(ratio)).h_full())
-                            .child(self.render_layout(*first, first_width, first_height, true, cx)),
+                            .child(self.render_layout(first, first_width, first_height, true, cx)),
                     )
-                    .child(self.render_divider(split_id, axis, cx))
+                    .child(self.render_divider(split_id, *axis, cx))
                     .child(
                         div()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .flex_1()
                             .child(self.render_layout(
-                                *second,
+                                second,
                                 second_width,
                                 second_height,
                                 true,
@@ -1091,6 +1161,7 @@ impl HhApp {
             .join("  ")
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn render_workspace_tab_strip(
         &self,
         workspace: &Workspace,
@@ -1183,6 +1254,23 @@ impl HhApp {
                     },
                     |color| composite_rgb(color.as_rgb(), THEME.surface, TAB_COLOR_ALPHA),
                 );
+                // The top bar mirrors the sidebar's drag contract: strip tabs
+                // reorder against each other and drag into terminal views to
+                // split, sharing the same TabDrag payload and drop preview.
+                let strip_drag = TabDrag {
+                    workspace_id,
+                    tab_id,
+                    pane_id,
+                    from_group: false,
+                    title: label.clone(),
+                    position: Point::default(),
+                };
+                let drop_before = self.sidebar.tab_drop_preview.is_some_and(|preview| {
+                    preview.target_tab_id == tab_id && !preview.into_group && !preview.after
+                });
+                let drop_after = self.sidebar.tab_drop_preview.is_some_and(|preview| {
+                    preview.target_tab_id == tab_id && !preview.into_group && preview.after
+                });
                 div()
                     .id(("workspace-strip-tab", element_key(tab_id)))
                     .group("workspace-strip-tab")
@@ -1202,9 +1290,69 @@ impl HhApp {
                     .when(active, |element| {
                         element.border_b_2().border_color(rgb(THEME.accent))
                     })
+                    .when(drop_before, |element| {
+                        element.border_l_2().border_color(rgb(THEME.accent))
+                    })
+                    .when(drop_after, |element| {
+                        element.border_r_2().border_color(rgb(THEME.accent))
+                    })
                     .hover(|element| element.bg(rgb(THEME.elevated)))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if click_suppression_active(
+                            &mut this.sidebar.suppress_tab_click_until,
+                            Instant::now(),
+                        ) {
+                            cx.notify();
+                            return;
+                        }
                         this.select_workspace_tab_root(workspace_id, tab_id, cx);
+                    }))
+                    .on_drag(strip_drag, |info: &TabDrag, position, _, cx| {
+                        cx.new(|_| TabDrag {
+                            position,
+                            ..info.clone()
+                        })
+                    })
+                    .on_drag_move::<TabDrag>(cx.listener(
+                        move |this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                            let drag = event.drag(cx);
+                            if drag.workspace_id != workspace_id
+                                || (drag.tab_id == tab_id && !drag.from_group)
+                            {
+                                if this.sidebar.tab_drop_preview.take().is_some() {
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            if event.bounds.contains(&event.event.position) {
+                                this.sidebar.tab_drop_preview = Some(TabDropPreview {
+                                    target_tab_id: tab_id,
+                                    after: event.event.position.x > event.bounds.center().x,
+                                    into_group: false,
+                                });
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, info: &TabDrag, _, cx| {
+                        if info.workspace_id == workspace_id {
+                            let after = this.sidebar.tab_drop_preview.is_some_and(|preview| {
+                                preview.target_tab_id == tab_id && preview.after
+                            });
+                            if let Some(source_pane) = info.pane_id.filter(|_| info.from_group) {
+                                this.move_sidebar_pane_to_new_tab(
+                                    source_pane,
+                                    tab_id,
+                                    after,
+                                    None,
+                                    cx,
+                                );
+                            } else if info.tab_id != tab_id {
+                                this.reorder_workspace_tab(info.tab_id, tab_id, after, cx);
+                            }
+                        }
+                        cx.stop_propagation();
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
@@ -1380,12 +1528,12 @@ impl HhApp {
                 .find(|tab| find_pane(&tab.layout, pane_id).is_some())
                 .is_some_and(|tab| workspace_tab_standalone_pane(tab).is_some())
         });
-        let layout = canonical_layout.as_ref().map(|layout| {
+        let zoomed_layout = canonical_layout.as_ref().and_then(|layout| {
             self.layout
                 .zoomed_pane
                 .and_then(|pane_id| zoom_projection(layout, pane_id))
-                .unwrap_or_else(|| layout.clone())
         });
+        let layout = zoomed_layout.as_ref().or(canonical_layout.as_ref());
         #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         let mut visible_browsers: HashSet<Uuid> = layout
             .as_ref()

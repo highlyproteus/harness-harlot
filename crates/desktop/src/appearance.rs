@@ -8,7 +8,8 @@ use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, Styled
 use hh_protocol::{AppearanceColor, ClientRequest, validate_workspace_dir};
 use std::sync::{Arc, LazyLock};
 
-use crate::helpers::{banner_fit_size, parse_hex_color};
+use crate::elements::{HsvFieldElement, HsvFieldKind};
+use crate::helpers::{banner_fit_size, hsv_to_rgb, parse_hex_color, rgb_to_hsv};
 use crate::view_models::{ColorPickerState, ColorTarget, Modal, TooltipView};
 use crate::{
     APPEARANCE_PRESETS, BUNDLED_BANNER_PIXEL_HEIGHT, BUNDLED_BANNER_PIXEL_WIDTH, HhApp,
@@ -140,9 +141,13 @@ impl HhApp {
 
     pub(crate) fn open_color_picker(&mut self, target: ColorTarget, cx: &mut Context<Self>) {
         let current = self.color_for_target(target).as_rgb();
+        let (hue, saturation, value) = rgb_to_hsv(current);
         self.editor.color_picker = Some(ColorPickerState {
             target,
             hex: format!("{current:06X}"),
+            hue,
+            saturation,
+            value,
             replace_on_type: true,
             invalid: false,
         });
@@ -153,6 +158,32 @@ impl HhApp {
             self.editor.modal = Modal::None;
         }
         cx.notify();
+    }
+
+    pub(crate) fn toggle_color_picker(&mut self, target: ColorTarget, cx: &mut Context<Self>) {
+        if self
+            .editor
+            .color_picker
+            .as_ref()
+            .is_some_and(|picker| picker.target == target)
+        {
+            self.editor.color_picker = None;
+        } else {
+            self.open_color_picker(target, cx);
+        }
+        if let Modal::TabMenu(menu) = &mut self.editor.modal {
+            menu.identity_picker_open = false;
+        }
+        if let Modal::GroupMenu(menu) = &mut self.editor.modal {
+            menu.icon_picker_open = false;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn sync_picker_hsv(picker: &mut ColorPickerState) {
+        if let Some(color) = parse_hex_color(&format!("#{}", picker.hex)) {
+            (picker.hue, picker.saturation, picker.value) = rgb_to_hsv(color.as_rgb());
+        }
     }
 
     pub(crate) fn submit_color_picker(&mut self, cx: &mut Context<Self>) {
@@ -349,21 +380,27 @@ impl HhApp {
             .flex()
             .flex_wrap()
             .gap(px(6.0))
-            .children(
+            .children({
+                let applied = self.color_for_target(target);
                 self.appearance_choices()
                     .into_iter()
                     .enumerate()
-                    .map(|(index, color)| {
+                    .map(move |(index, color)| {
                         let rgb_value = color.as_rgb();
+                        let selected = applied == color;
                         div()
                             .id((id_prefix, index))
                             .w(px(20.0))
                             .h(px(20.0))
-                            .rounded(px(5.0))
+                            .rounded(px(if selected { 7.0 } else { 5.0 }))
                             .cursor_pointer()
                             .bg(rgb(rgb_value))
-                            .border_1()
-                            .border_color(rgb(THEME.border_strong))
+                            .when(selected, |element| {
+                                element.border_2().border_color(rgb(THEME.foreground))
+                            })
+                            .when(!selected, |element| {
+                                element.border_1().border_color(rgb(THEME.border_strong))
+                            })
                             .hover(|element| element.border_color(rgb(THEME.foreground)))
                             .tooltip(move |_, cx| {
                                 cx.new(|_| TooltipView {
@@ -374,8 +411,102 @@ impl HhApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.apply_color(target, Some(color), cx)
                             }))
+                    })
+            })
+            .into_any_element()
+    }
+
+    fn render_color_picker_body(
+        &self,
+        picker: &ColorPickerState,
+        id_prefix: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .h(px(120.0))
+                    .w_full()
+                    .rounded(px(4.0))
+                    .overflow_hidden()
+                    .child(HsvFieldElement {
+                        input: cx.entity(),
+                        kind: HsvFieldKind::SquareSv,
                     }),
             )
+            .child(
+                div()
+                    .h(px(14.0))
+                    .w_full()
+                    .rounded(px(4.0))
+                    .overflow_hidden()
+                    .child(HsvFieldElement {
+                        input: cx.entity(),
+                        kind: HsvFieldKind::HueStrip,
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .rounded(px(4.0))
+                            .bg(rgb(hsv_to_rgb(picker.hue, picker.saturation, picker.value))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(32.0))
+                            .px(px(8.0))
+                            .rounded(px(5.0))
+                            .bg(rgb(THEME.terminal))
+                            .border_1()
+                            .border_color(if picker.invalid {
+                                rgb(THEME.danger)
+                            } else {
+                                rgb(THEME.border_strong)
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .font_family("SF Mono")
+                            .text_xs()
+                            .text_color(rgb(THEME.foreground))
+                            .child("#")
+                            .child(
+                                div()
+                                    .when(picker.replace_on_type, |element| {
+                                        element.bg(rgb(THEME.selection))
+                                    })
+                                    .child(picker.hex.clone()),
+                            )
+                            .when(picker.invalid, |element| {
+                                element.child(
+                                    div()
+                                        .ml(px(4.0))
+                                        .font_family(".SystemUIFont")
+                                        .text_xs()
+                                        .text_color(rgb(THEME.danger))
+                                        .child("Six hex digits"),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.muted))
+                    .child("Recent and Harbor Night colors"),
+            )
+            .child(self.render_color_choices(picker.target, id_prefix, cx))
             .into_any_element()
     }
 
@@ -399,51 +530,7 @@ impl HhApp {
             .flex()
             .flex_col()
             .gap(px(7.0))
-            .child(
-                div()
-                    .font_family(".SystemUIFont")
-                    .text_xs()
-                    .text_color(rgb(THEME.muted))
-                    .child("Recent and Harbor Night colors"),
-            )
-            .child(self.render_color_choices(target, id_prefix, cx))
-            .child(
-                div()
-                    .h(px(32.0))
-                    .px(px(8.0))
-                    .rounded(px(5.0))
-                    .bg(rgb(THEME.terminal))
-                    .border_1()
-                    .border_color(if picker.invalid {
-                        rgb(THEME.danger)
-                    } else {
-                        rgb(THEME.border_strong)
-                    })
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .font_family("SF Mono")
-                    .text_xs()
-                    .text_color(rgb(THEME.foreground))
-                    .child("#")
-                    .child(
-                        div()
-                            .when(picker.replace_on_type, |element| {
-                                element.bg(rgb(THEME.selection))
-                            })
-                            .child(picker.hex.clone()),
-                    )
-                    .when(picker.invalid, |element| {
-                        element.child(
-                            div()
-                                .ml(px(4.0))
-                                .font_family(".SystemUIFont")
-                                .text_xs()
-                                .text_color(rgb(THEME.danger))
-                                .child("Six hex digits"),
-                        )
-                    }),
-            )
+            .child(self.render_color_picker_body(picker, id_prefix, cx))
             .child(
                 div()
                     .flex()
@@ -925,52 +1012,7 @@ impl HhApp {
                             .text_color(rgb(THEME.foreground))
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .font_family(".SystemUIFont")
-                            .text_xs()
-                            .text_color(rgb(THEME.muted))
-                            .child("Recent colors first, followed by Harbor Night presets."),
-                    )
-                    .child(self.render_color_choices(target, "color-picker", cx))
-                    .child(
-                        div()
-                            .h(px(36.0))
-                            .px(px(10.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(THEME.terminal))
-                            .border_1()
-                            .border_color(if picker.invalid {
-                                rgb(THEME.danger)
-                            } else {
-                                rgb(THEME.border_strong)
-                            })
-                            .flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            .font_family("SF Mono")
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .child("#")
-                            .child(
-                                div()
-                                    .when(picker.replace_on_type, |element| {
-                                        element.bg(rgb(THEME.selection))
-                                    })
-                                    .child(picker.hex.clone()),
-                            )
-                            .child("│")
-                            .when(picker.invalid, |element| {
-                                element.child(
-                                    div()
-                                        .ml(px(6.0))
-                                        .font_family(".SystemUIFont")
-                                        .text_xs()
-                                        .text_color(rgb(THEME.danger))
-                                        .child("Enter six hex digits"),
-                                )
-                            }),
-                    )
+                    .child(self.render_color_picker_body(picker, "modal-color", cx))
                     .child(
                         div()
                             .flex()

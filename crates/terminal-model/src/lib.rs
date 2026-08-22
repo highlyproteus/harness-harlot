@@ -470,6 +470,13 @@ impl TerminalModel {
         self.terminal.scroll_display(Scroll::Delta(lines));
     }
 
+    /// Returns the viewport to the live bottom. `Grid::scroll_up` anchors to
+    /// old content whenever `display_offset` is nonzero, so streaming output
+    /// otherwise leaves the typed line below the fold until this is called.
+    pub fn scroll_bottom(&mut self) {
+        self.terminal.scroll_display(Scroll::Bottom);
+    }
+
     pub fn search_literal(&mut self, query: &str, forward: bool) -> bool {
         if query.is_empty() {
             return false;
@@ -807,6 +814,23 @@ mod tests {
         assert_eq!(model.display_offset(), 1);
         assert_ne!(model.styled_lines(), bottom);
         assert_eq!(model.cursor(), None);
+    }
+
+    #[test]
+    fn scroll_bottom_returns_the_viewport_to_the_live_display() {
+        let mut model = TerminalModel::new(20, 3);
+        for line in 0..40 {
+            model.process_output(format!("line {line}\r\n").as_bytes());
+        }
+        assert!(model.history_size() > 0);
+
+        model.scroll(10);
+        assert_eq!(model.display_offset(), 10);
+        assert_eq!(model.cursor(), None);
+
+        model.scroll_bottom();
+        assert_eq!(model.display_offset(), 0);
+        assert!(model.cursor().is_some());
     }
 
     #[test]

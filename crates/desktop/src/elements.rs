@@ -1,14 +1,21 @@
 //! Custom gpui elements for terminals, input, and resize capture.
 
 use gpui::{
-    App, Bounds, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    App, BorderStyle, Bounds, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
+    Entity, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ScrollWheelEvent,
-    ShapedLine, Style, TextRun, UnderlineStyle, Window, fill, point, px, relative, rgb, rgba, size,
+    ShapedLine, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill,
+    linear_color_stop, linear_gradient, point, px, quad, relative, rgb, rgba, size,
+    transparent_black,
 };
-use hh_protocol::AppearanceColor;
+use hh_protocol::{
+    AppearanceColor, TerminalAttributes, TerminalColor, TerminalCursor, TerminalRun,
+    TerminalScreen, TerminalSelection,
+};
+use std::rc::Rc;
 
-use crate::helpers::terminal_point_at;
+use crate::helpers::{hsv_to_rgb, selection_span, terminal_point_at, terminal_run_display_text};
+use crate::typography::TerminalCellMetrics;
 use crate::view_models::{DialogTextEditor, WorkspaceCreationField, WorkspaceCreationStep};
 use crate::{HhApp, THEME};
 use uuid::Uuid;
@@ -385,6 +392,239 @@ impl Element for SidebarResizeCaptureElement {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum HsvFieldKind {
+    SquareSv,
+    HueStrip,
+}
+
+pub(crate) struct HsvFieldElement {
+    pub(crate) input: Entity<HhApp>,
+    pub(crate) kind: HsvFieldKind,
+}
+
+impl IntoElement for HsvFieldElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for HsvFieldElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+        window.insert_hitbox(bounds, HitboxBehavior::BlockMouse)
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.set_cursor_style(
+            match self.kind {
+                HsvFieldKind::SquareSv => CursorStyle::Crosshair,
+                HsvFieldKind::HueStrip => CursorStyle::ResizeLeftRight,
+            },
+            hitbox,
+        );
+        let Some(picker) = self.input.read(cx).editor.color_picker.as_ref() else {
+            return;
+        };
+        let hue = picker.hue;
+        let saturation = picker.saturation;
+        let value = picker.value;
+
+        match self.kind {
+            HsvFieldKind::SquareSv => {
+                window.paint_quad(fill(
+                    bounds,
+                    linear_gradient(
+                        90.0,
+                        linear_color_stop(rgb(0xffffff), 0.0),
+                        linear_color_stop(rgb(hsv_to_rgb(hue, 1.0, 1.0)), 1.0),
+                    ),
+                ));
+                window.paint_quad(fill(
+                    bounds,
+                    linear_gradient(
+                        180.0,
+                        linear_color_stop(transparent_black(), 0.0),
+                        linear_color_stop(rgb(0x000000), 1.0),
+                    ),
+                ));
+                let center_x = bounds.left() + bounds.size.width * saturation;
+                let center_y = bounds.top() + bounds.size.height * (1.0 - value);
+                window.paint_quad(quad(
+                    Bounds::new(
+                        point(center_x - px(5.0), center_y - px(5.0)),
+                        size(px(10.0), px(10.0)),
+                    ),
+                    px(5.0),
+                    transparent_black(),
+                    px(2.0),
+                    rgb(0xffffff),
+                    BorderStyle::default(),
+                ));
+            }
+            HsvFieldKind::HueStrip => {
+                let anchors = [
+                    0xff0000, 0xffff00, 0x00ff00, 0x00ffff, 0x0000ff, 0xff00ff, 0xff0000,
+                ];
+                let segment_width = bounds.size.width / 6.0;
+                for index in 0_u8..6 {
+                    let anchor = usize::from(index);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(
+                                bounds.left() + segment_width * f32::from(index),
+                                bounds.top(),
+                            ),
+                            size(segment_width, bounds.size.height),
+                        ),
+                        linear_gradient(
+                            90.0,
+                            linear_color_stop(rgb(anchors[anchor]), 0.0),
+                            linear_color_stop(rgb(anchors[anchor + 1]), 1.0),
+                        ),
+                    ));
+                }
+                let thumb_x = bounds.left() + bounds.size.width * (hue / 360.0) - px(2.5);
+                window.paint_quad(quad(
+                    Bounds::new(
+                        point(thumb_x, bounds.top()),
+                        size(px(5.0), bounds.size.height),
+                    ),
+                    px(2.0),
+                    transparent_black(),
+                    px(2.0),
+                    rgb(0xffffff),
+                    BorderStyle::default(),
+                ));
+            }
+        }
+
+        let input = self.input.clone();
+        let kind = self.kind;
+        let pointer_hitbox = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if event.button == MouseButton::Left
+                && phase == DispatchPhase::Capture
+                && pointer_hitbox.is_hovered(window)
+            {
+                cx.stop_propagation();
+                input.update(cx, |this, cx| {
+                    let Some(picker) = this.editor.color_picker.as_mut() else {
+                        return;
+                    };
+                    let width = f32::from(bounds.size.width).max(f32::EPSILON);
+                    let height = f32::from(bounds.size.height).max(f32::EPSILON);
+                    match kind {
+                        HsvFieldKind::SquareSv => {
+                            picker.saturation = (f32::from(event.position.x - bounds.left())
+                                / width)
+                                .clamp(0.0, 1.0);
+                            picker.value = (1.0
+                                - f32::from(event.position.y - bounds.top()) / height)
+                                .clamp(0.0, 1.0);
+                        }
+                        HsvFieldKind::HueStrip => {
+                            picker.hue = (f32::from(event.position.x - bounds.left()) / width
+                                * 360.0)
+                                .clamp(0.0, 360.0);
+                        }
+                    }
+                    picker.hex = format!(
+                        "{:06X}",
+                        hsv_to_rgb(picker.hue, picker.saturation, picker.value)
+                    );
+                    picker.invalid = false;
+                    picker.replace_on_type = false;
+                    cx.notify();
+                });
+            }
+        });
+
+        let input = self.input.clone();
+        let kind = self.kind;
+        let pointer_hitbox = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if event.pressed_button == Some(MouseButton::Left)
+                && phase == DispatchPhase::Capture
+                && pointer_hitbox.is_hovered(window)
+            {
+                cx.stop_propagation();
+                input.update(cx, |this, cx| {
+                    let Some(picker) = this.editor.color_picker.as_mut() else {
+                        return;
+                    };
+                    let width = f32::from(bounds.size.width).max(f32::EPSILON);
+                    let height = f32::from(bounds.size.height).max(f32::EPSILON);
+                    match kind {
+                        HsvFieldKind::SquareSv => {
+                            picker.saturation = (f32::from(event.position.x - bounds.left())
+                                / width)
+                                .clamp(0.0, 1.0);
+                            picker.value = (1.0
+                                - f32::from(event.position.y - bounds.top()) / height)
+                                .clamp(0.0, 1.0);
+                        }
+                        HsvFieldKind::HueStrip => {
+                            picker.hue = (f32::from(event.position.x - bounds.left()) / width
+                                * 360.0)
+                                .clamp(0.0, 360.0);
+                        }
+                    }
+                    picker.hex = format!(
+                        "{:06X}",
+                        hsv_to_rgb(picker.hue, picker.saturation, picker.value)
+                    );
+                    picker.invalid = false;
+                    picker.replace_on_type = false;
+                    cx.notify();
+                });
+            }
+        });
+    }
+}
+
 /// One hit surface per terminal row keeps pointer semantics exact without
 /// forcing GPUI/Taffy to lay out an element for every visible grid cell.
 pub(crate) struct TerminalPointerElement {
@@ -499,5 +739,279 @@ impl Element for TerminalPointerElement {
                 });
             }
         });
+    }
+}
+
+/// One shaped text run inside a cached terminal row.
+///
+/// Content depends only on (screen revision, columns, font metrics); selection,
+/// cursor, and focus are painted as quads every frame and never cached.
+pub(crate) struct CachedRun {
+    pub(crate) x: f32,
+    pub(crate) width: f32,
+    pub(crate) background: Option<u32>,
+    pub(crate) shaped: ShapedLine,
+}
+
+/// Shaped lines for one pane's current screen revision. Stored on `HhApp`
+/// behind a `RefCell` because element prepaint only observes `&HhApp`.
+pub(crate) struct PaneShapeCache {
+    pub(crate) revision: u64,
+    pub(crate) columns: u16,
+    pub(crate) font_size: f32,
+    pub(crate) cell_width: f32,
+    pub(crate) rows: Rc<Vec<Vec<CachedRun>>>,
+}
+
+pub(crate) struct TerminalGridElement {
+    pub(crate) input: Entity<HhApp>,
+    pub(crate) pane_id: Uuid,
+    pub(crate) metrics: TerminalCellMetrics,
+    pub(crate) focused: bool,
+    pub(crate) pane_accent: u32,
+}
+
+pub(crate) struct TerminalGridPrepaintState {
+    rows: Rc<Vec<Vec<CachedRun>>>,
+    selection: Option<TerminalSelection>,
+    cursor: Option<TerminalCursor>,
+    columns: u16,
+}
+
+/// Shapes every run of one screen with the same attribute mapping as
+/// `render_terminal_run` (bold/dim/italic/underline/strikethrough, theme
+/// colors, tab expansion), so a cached frame is pixel-identical to the
+/// div-based path at revision-change time.
+fn build_pane_shape_cache(
+    app: &HhApp,
+    screen: &TerminalScreen,
+    metrics: TerminalCellMetrics,
+    window: &mut Window,
+) -> PaneShapeCache {
+    let rows = screen
+        .lines
+        .iter()
+        .map(|line| {
+            let mut start_column = 0_u16;
+            line.runs
+                .iter()
+                .filter_map(|run| {
+                    let columns = run.columns;
+                    let cached = cache_terminal_run(app, run, metrics, start_column, window);
+                    start_column = start_column.saturating_add(columns);
+                    cached
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    PaneShapeCache {
+        revision: screen.revision,
+        columns: screen.columns,
+        font_size: metrics.font_size,
+        cell_width: metrics.cell_width,
+        rows: Rc::new(rows),
+    }
+}
+
+fn cache_terminal_run(
+    app: &HhApp,
+    style: &TerminalRun,
+    metrics: TerminalCellMetrics,
+    start_column: u16,
+    window: &mut Window,
+) -> Option<CachedRun> {
+    let bold = style.attributes.contains(TerminalAttributes::BOLD);
+    let dim = style.attributes.contains(TerminalAttributes::DIM);
+    let italic = style.attributes.contains(TerminalAttributes::ITALIC);
+    let underline = style.attributes.contains(TerminalAttributes::UNDERLINE);
+    let strikethrough = style.attributes.contains(TerminalAttributes::STRIKETHROUGH);
+    let foreground = THEME.terminal_color(style.foreground, bold, dim);
+    let background = (style.background != TerminalColor::DefaultBackground)
+        .then(|| THEME.terminal_color(style.background, false, false));
+    let span = metrics.span(start_column, style.columns);
+    let text = if style.text.contains('\t') {
+        terminal_run_display_text(style, start_column)
+    } else {
+        style.text.clone()
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: app.terminal_font.font(bold, italic),
+        color: rgb(foreground).into(),
+        background_color: None,
+        underline: underline.then_some(UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(rgb(foreground).into()),
+            wavy: false,
+        }),
+        strikethrough: strikethrough.then_some(StrikethroughStyle {
+            thickness: px(1.0),
+            color: Some(rgb(foreground).into()),
+        }),
+    };
+    let shaped = window.text_system().shape_line(
+        text.into(),
+        px(metrics.font_size),
+        std::slice::from_ref(&run),
+        None,
+    );
+    Some(CachedRun {
+        x: span.x,
+        width: span.width,
+        background,
+        shaped,
+    })
+}
+
+impl IntoElement for TerminalGridElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TerminalGridElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<TerminalGridPrepaintState>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let app = self.input.read(cx);
+        let screen = app.session.screens.get(&self.pane_id)?;
+        let mut cache = app.terminal_shape_cache.borrow_mut();
+        let stale = match cache.get(&self.pane_id) {
+            Some(entry) => {
+                entry.revision != screen.revision
+                    || entry.columns != screen.columns
+                    || entry.font_size.to_bits() != self.metrics.font_size.to_bits()
+                    || entry.cell_width.to_bits() != self.metrics.cell_width.to_bits()
+            }
+            None => true,
+        };
+        if stale {
+            cache.insert(
+                self.pane_id,
+                build_pane_shape_cache(app, screen, self.metrics, window),
+            );
+        }
+        let rows = cache.get(&self.pane_id)?.rows.clone();
+        Some(TerminalGridPrepaintState {
+            rows,
+            selection: screen.selection,
+            cursor: screen.cursor,
+            columns: screen.columns,
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        state: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(state) = state.as_mut() else {
+            return;
+        };
+        let metrics = self.metrics;
+        let glyph_top = (metrics.baseline - metrics.ascent).max(0.0);
+        let glyph_height = metrics.ascent + metrics.descent;
+        for (row, row_runs) in state.rows.iter().enumerate() {
+            let row_number = u16::try_from(row).unwrap_or(u16::MAX);
+            let row_top = bounds.origin.y + px(f32::from(row_number) * metrics.line_height);
+            if let Some((start, width)) = state
+                .selection
+                .and_then(|selection| selection_span(selection, row, state.columns))
+            {
+                let span = metrics.span(start, width);
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.origin.x + px(span.x), row_top),
+                        size(px(span.width), px(span.height)),
+                    ),
+                    rgb(THEME.selection),
+                ));
+            }
+            for run in row_runs {
+                if let Some(background) = run.background {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.origin.x + px(run.x), row_top),
+                            size(px(run.width), px(metrics.line_height)),
+                        ),
+                        rgb(background),
+                    ));
+                }
+                let _ = run.shaped.paint(
+                    point(bounds.origin.x + px(run.x), row_top + px(glyph_top)),
+                    px(glyph_height),
+                    window,
+                    cx,
+                );
+            }
+        }
+        if let Some(cursor) = state.cursor {
+            let span = metrics.span(cursor.column, 1);
+            let cursor_bounds = Bounds::new(
+                point(
+                    bounds.origin.x + px(span.x),
+                    bounds.origin.y + px(f32::from(cursor.row) * metrics.line_height),
+                ),
+                size(px(span.width), px(span.height)),
+            );
+            let accent = if self.focused {
+                self.pane_accent
+            } else {
+                THEME.muted
+            };
+            let background = if self.focused {
+                rgba((self.pane_accent << 8) | 0x30)
+            } else {
+                gpui::transparent_black().into()
+            };
+            window.paint_quad(quad(
+                cursor_bounds,
+                px(1.0),
+                background,
+                px(1.0),
+                rgb(accent),
+                gpui::BorderStyle::default(),
+            ));
+        }
     }
 }
