@@ -77,7 +77,7 @@ if index.get("schema") != "hh-web-release-index-v1":
 tag = index.get("tag")
 version = index.get("version")
 build = index.get("build")
-if not isinstance(tag, str) or not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+if not isinstance(tag, str) or not re.fullmatch(r"v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", tag):
     raise SystemExit("invalid release tag")
 if version != tag[1:] or not isinstance(build, int) or isinstance(build, bool) or build <= 0:
     raise SystemExit("inconsistent release identity")
