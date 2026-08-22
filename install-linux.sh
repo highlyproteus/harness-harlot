@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+unset TAR_OPTIONS GZIP BZIP2 XZ_OPT || true
 
 RELEASE_INDEX_URL='https://harnessharlot.com/releases/stable-linux.json'
 
@@ -61,7 +62,7 @@ run_quiet "Fetch the release index" \
   curl --proto '=https' --tlsv1.2 -fsS "$RELEASE_INDEX_URL" -o "$index"
 
 selection="$work/selection"
-python3 - "$index" "$architecture" > "$selection" <<'PY'
+python3 -I - "$index" "$architecture" > "$selection" <<'PY'
 import json, re, sys
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
@@ -87,6 +88,11 @@ expected = {
     "signature": f"manifest-linux-{architecture}.update.json.sig",
 }
 values = [tag, version, str(build)]
+maximum_sizes = {
+    "archive": 2 * 1024 * 1024 * 1024,
+    "manifest": 1024 * 1024,
+    "signature": 4 * 1024,
+}
 for kind in ("archive", "manifest", "signature"):
     asset = entry.get(kind)
     if not isinstance(asset, dict):
@@ -104,7 +110,7 @@ for kind in ("archive", "manifest", "signature"):
         raise SystemExit(f"unexpected {kind} filename")
     if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
         raise SystemExit(f"invalid {kind} digest")
-    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0 or size > maximum_sizes[kind]:
         raise SystemExit(f"invalid {kind} size")
     values.extend((url, digest, str(size)))
 print("\t".join(values))
