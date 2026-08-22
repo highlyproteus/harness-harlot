@@ -8,16 +8,16 @@ unset HH_SOCKET HH_STATE_DIR HH_CONFIG HH_PANE_ID HH_DEVELOPMENT_BUILD \
 
 REPOSITORY='highlyproteus/harness-harlot'
 BUNDLE_ID='com.harnessharlot.desktop'
+RELEASE_INDEX_URL='https://harnessharlot.com/releases/stable-macos.json'
 
 usage() {
   cat <<'EOF'
 Harness Harlot installer for macOS
 
 Usage:
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://github.com/highlyproteus/harness-harlot/releases/latest/download/install-community-macos.sh | sh
+  curl --proto '=https' --tlsv1.2 -fsS https://harnessharlot.com/install | sh
 
 Options:
-  --tag vVERSION  Install a specific release
   --verify-only   Verify the release without installing it
   --plan          Show the selected install location without changing anything
   --verbose       Show verification command output
@@ -27,7 +27,6 @@ EOF
 
 [ "$(id -u)" -ne 0 ] || { echo "refusing to install as root" >&2; exit 1; }
 
-tag=
 verify_only=0
 plan_only=0
 verbose=0
@@ -35,7 +34,6 @@ test_applications_dir=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --acknowledge-unnotarized) shift ;; # Accepted for compatibility with v0.1.6 instructions.
-    --tag) [ "$#" -ge 2 ] || usage; tag=$2; shift 2 ;;
     --verify-only) verify_only=1; shift ;;
     --plan) plan_only=1; shift ;;
     --verbose) verbose=1; shift ;;
@@ -78,9 +76,8 @@ if [ "$plan_only" -eq 1 ]; then
   exit 0
 fi
 
-command -v gh >/dev/null 2>&1 || {
-  echo "GitHub CLI (gh) is required to verify the downloaded release." >&2
-  echo "Install it with: brew install gh" >&2
+command -v curl >/dev/null 2>&1 || {
+  echo "curl is required to download Harness Harlot." >&2
   exit 1
 }
 case "$(uname -m)" in
@@ -88,15 +85,6 @@ case "$(uname -m)" in
   x86_64) architecture=x86_64 ;;
   *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
 esac
-if [ -z "$tag" ]; then
-  tag=$(gh release view --repo "$REPOSITORY" --json tagName --jq .tagName)
-fi
-case "$tag" in
-  v[0-9A-Za-z.-]*) ;;
-  *) echo "invalid release tag: $tag" >&2; exit 2 ;;
-esac
-case "$tag" in *..* | *. | *[!0-9A-Za-z.v-]*) echo "invalid release tag: $tag" >&2; exit 2 ;; esac
-version=${tag#v}
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/hh-community-install.XXXXXX")
 mount="$work/mount"
@@ -183,6 +171,43 @@ run_quiet() {
   fi
 }
 
+index="$work/stable-macos.json"
+run_quiet "Fetch the release index" \
+  curl --proto '=https' --tlsv1.2 -f \
+    "$RELEASE_INDEX_URL" -o "$index"
+schema=$(plutil -extract schema raw -o - "$index")
+[ "$schema" = hh-web-release-index-v1 ] || {
+  echo "unsupported release index schema: $schema" >&2
+  exit 1
+}
+published_tag=$(plutil -extract tag raw -o - "$index")
+case "$published_tag" in
+  v[0-9A-Za-z.-]*) ;;
+  *) echo "invalid release tag: $published_tag" >&2; exit 2 ;;
+esac
+case "$published_tag" in *..* | *. | *[!0-9A-Za-z.v-]*) echo "invalid release tag: $published_tag" >&2; exit 2 ;; esac
+tag=$published_tag
+version=${tag#v}
+asset_prefix="macos.$architecture"
+dmg_url=$(plutil -extract "$asset_prefix.dmg.url" raw -o - "$index")
+dmg_sha256=$(plutil -extract "$asset_prefix.dmg.sha256" raw -o - "$index")
+manifest_url=$(plutil -extract "$asset_prefix.manifest.url" raw -o - "$index")
+manifest_sha256=$(plutil -extract "$asset_prefix.manifest.sha256" raw -o - "$index")
+signature_url=$(plutil -extract "$asset_prefix.signature.url" raw -o - "$index")
+signature_sha256=$(plutil -extract "$asset_prefix.signature.sha256" raw -o - "$index")
+for url in "$dmg_url" "$manifest_url" "$signature_url"; do
+  case "$url" in
+    "https://github.com/$REPOSITORY/releases/download/$tag/"*) ;;
+    *) echo "release index contains an untrusted download URL: $url" >&2; exit 1 ;;
+  esac
+done
+for digest in "$dmg_sha256" "$manifest_sha256" "$signature_sha256"; do
+  case "$digest" in
+    *[!0-9a-f]*|'') echo "release index contains an invalid SHA-256 digest" >&2; exit 1 ;;
+  esac
+  [ "${#digest}" -eq 64 ] || { echo "release index contains an invalid SHA-256 digest" >&2; exit 1; }
+done
+
 validate_community_app() {
   candidate=$1
   [ ! -L "$candidate" ] || { echo "refusing symlink app path: $candidate" >&2; return 1; }
@@ -252,6 +277,23 @@ preflight_app() {
     "$candidate/Contents/MacOS/hh-update-tool" prepare-community-install
 }
 
+verify_file_checksum() {
+  expected=$1
+  file=$2
+  label=$3
+  actual=$(shasum -a 256 "$file" | cut -d ' ' -f 1)
+  if [ "$actual" != "$expected" ]; then
+    echo "$label checksum mismatch" >&2
+    return 1
+  fi
+}
+
+verify_release_checksums() {
+  verify_file_checksum "$dmg_sha256" "$dmg" artifact
+  verify_file_checksum "$manifest_sha256" "$manifest" manifest
+  verify_file_checksum "$signature_sha256" "$signature" signature
+}
+
 preflight_existing_install() {
   if pgrep -x hh >/dev/null 2>&1; then
     fail "Harness Harlot is running"
@@ -273,32 +315,16 @@ if [ "$verify_only" -eq 0 ]; then
   preflight_existing_install
 fi
 
-manifest="$work/manifest-macos-community-${architecture}.update.json"
-signature="$manifest.sig"
-artifact_pattern="Harness-Harlot-${version}-b*-macos-${architecture}-community.dmg"
-run_quiet "Download Harness Harlot $version" gh release download "$tag" --repo "$REPOSITORY" --dir "$work" \
-  --pattern "$(basename "$manifest")" \
-  --pattern "$(basename "$signature")" \
-  --pattern "$artifact_pattern"
-# The unquoted pattern is intentional: exactly one downloaded artifact must match.
-# shellcheck disable=SC2086
-set -- "$work"/$artifact_pattern
-if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-  echo "release must contain exactly one architecture-matched community DMG" >&2
-  exit 1
-fi
-dmg=$1
-if [ ! -f "$manifest" ] || [ ! -f "$signature" ]; then
-  echo "release is missing the community update manifest or signature" >&2
-  exit 1
-fi
-
-# GitHub's signed workflow provenance is the bootstrap trust root. Only after
-# all downloaded inputs pass this check do we inspect or mount the DMG.
-for subject in "$dmg" "$manifest" "$signature"; do
-  run_quiet "Verify release provenance: $(basename "$subject")" \
-    gh attestation verify "$subject" --repo "$REPOSITORY"
-done
+manifest="$work/$(basename "$manifest_url")"
+signature="$work/$(basename "$signature_url")"
+dmg="$work/$(basename "$dmg_url")"
+run_quiet "Download Harness Harlot $version" \
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$dmg_url" -o "$dmg"
+run_quiet "Download the update manifest" \
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$manifest_url" -o "$manifest"
+run_quiet "Download the update signature" \
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL "$signature_url" -o "$signature"
+run_quiet "Verify release checksums" verify_release_checksums
 run_quiet "Verify disk image signature" codesign --verify --strict --verbose=2 "$dmg"
 hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg" >/dev/null
 mounted=1
