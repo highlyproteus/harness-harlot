@@ -4,6 +4,21 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.12] - 2026-08-22
+
+### Added
+
+- Added a visual HSV color picker with clearer selected-color states for
+  terminal and workspace appearance controls.
+- Added richer top-tab drag-and-drop behavior and human-readable terminal
+  identity naming.
+
+### Changed
+
+- Improved terminal rendering, polling, input, selection, URL interaction, and
+  scroll-to-bottom behavior.
+- Refined workspace, sidebar, menu, and embedded-browser interactions.
+
 ## [0.1.11] - 2026-08-22
 
 ### Changed
