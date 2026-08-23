@@ -4,6 +4,17 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.13] - 2026-08-23
+
+### Fixed
+
+- Restored local and SSH tmux session discovery with printable, bounded metadata
+  that current tmux releases do not sanitize into an unparseable form.
+- Made ordinary left-button drags create native text selections inside tmux and
+  other mouse-aware terminal programs while preserving normal click handling.
+- Preserved word, line, and block selection along with macOS and Linux clipboard
+  copy/paste shortcuts and bracketed-paste protections.
+
 ## [0.1.12] - 2026-08-22
 
 ### Added
