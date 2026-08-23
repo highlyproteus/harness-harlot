@@ -1,8 +1,8 @@
 use gpui::{IntoElement, ParentElement, Pixels, Point, Render, Styled, Window, div, px, rgb};
 use hh_protocol::{
     ClientRequest, DropPlacement, MAX_SSH_INPUT_LEN, Pane, SplitAxis, TerminalHistoryPage,
-    TerminalPoint, TerminalProfile, TerminalSelection, TmuxScanScope, TmuxSession, TmuxSessionId,
-    normalize_ssh_input, validate_ssh_host,
+    TerminalPoint, TerminalProfile, TerminalSelection, TerminalSelectionKind, TmuxScanScope,
+    TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -259,6 +259,8 @@ pub(super) struct TerminalLineRender {
 pub(super) struct SelectionDrag {
     pub(super) pane_id: Uuid,
     pub(super) anchor: TerminalPoint,
+    pub(super) kind: TerminalSelectionKind,
+    pub(super) deferred_mouse_click: bool,
     pub(super) preserve_single_cell: bool,
 }
 
