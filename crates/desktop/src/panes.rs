@@ -11,10 +11,11 @@ use hh_protocol::{
 };
 
 use crate::helpers::{
-    LiveScrollTarget, WorkspaceTabScope, append_rename_text, apply_layout_control_mutation,
-    collect_terminal_tabs, constrained_sidebar_width, effective_split_ratio, find_pane,
-    find_split_rect, live_scroll_target, prepare_paste, terminal_modifiers, terminal_mouse_button,
-    url_at_column, visible_panes, wheel_delta_lines, workspace_tab_set,
+    LiveScrollTarget, TerminalPointerAction, WorkspaceTabScope, append_rename_text,
+    apply_layout_control_mutation, collect_terminal_tabs, constrained_sidebar_width,
+    effective_split_ratio, find_pane, find_split_rect, live_scroll_target, prepare_paste,
+    terminal_modifiers, terminal_mouse_button, terminal_pointer_action, url_at_column,
+    visible_panes, wheel_delta_lines, workspace_tab_set,
 };
 use crate::typography::{TerminalCellMetrics, adjusted_terminal_zoom_level};
 use crate::view_models::{
@@ -847,39 +848,52 @@ impl HhApp {
             .screens
             .get(&pane_id)
             .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING));
-        if mouse_reporting && !event.modifiers.shift {
-            if let Some(button) = terminal_mouse_button(event.button) {
-                self.dispatch_control(ClientRequest::MouseInput {
+        let action = terminal_pointer_action(
+            mouse_reporting,
+            event.button,
+            event.modifiers.shift,
+            event.modifiers.alt,
+            event.click_count,
+        );
+        match action {
+            TerminalPointerAction::ReportMouse => {
+                if let Some(button) = terminal_mouse_button(event.button) {
+                    self.dispatch_control(ClientRequest::MouseInput {
+                        pane_id,
+                        point,
+                        button,
+                        action: TerminalMouseAction::Press,
+                        modifiers: terminal_modifiers(event.modifiers),
+                    });
+                }
+            }
+            TerminalPointerAction::DeferLeftClick(kind) => {
+                self.layout.selection_drag = Some(SelectionDrag {
                     pane_id,
-                    point,
-                    button,
-                    action: TerminalMouseAction::Press,
-                    modifiers: terminal_modifiers(event.modifiers),
+                    anchor: point,
+                    kind,
+                    deferred_mouse_click: true,
+                    preserve_single_cell: false,
                 });
             }
-        } else if event.button == MouseButton::Left {
-            let kind = if event.modifiers.alt {
-                TerminalSelectionKind::Block
-            } else if event.click_count >= 3 {
-                TerminalSelectionKind::Lines
-            } else if event.click_count == 2 {
-                TerminalSelectionKind::Semantic
-            } else {
-                TerminalSelectionKind::Simple
-            };
-            self.layout.selection_drag = Some(SelectionDrag {
-                pane_id,
-                anchor: point,
-                preserve_single_cell: matches!(
+            TerminalPointerAction::Select(kind) => {
+                self.layout.selection_drag = Some(SelectionDrag {
+                    pane_id,
+                    anchor: point,
                     kind,
-                    TerminalSelectionKind::Semantic | TerminalSelectionKind::Lines
-                ),
-            });
-            self.dispatch_control(ClientRequest::BeginSelection {
-                pane_id,
-                point,
-                kind,
-            });
+                    deferred_mouse_click: false,
+                    preserve_single_cell: matches!(
+                        kind,
+                        TerminalSelectionKind::Semantic | TerminalSelectionKind::Lines
+                    ),
+                });
+                self.dispatch_control(ClientRequest::BeginSelection {
+                    pane_id,
+                    point,
+                    kind,
+                });
+            }
+            TerminalPointerAction::Ignore => {}
         }
         cx.stop_propagation();
         cx.notify();
@@ -892,13 +906,30 @@ impl HhApp {
         event: &MouseMoveEvent,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .layout
-            .selection_drag
-            .is_some_and(|selection| selection.pane_id == pane_id)
-            && event.dragging()
+        if event.dragging()
+            && let Some(selection) = self
+                .layout
+                .selection_drag
+                .as_mut()
+                .filter(|selection| selection.pane_id == pane_id)
         {
-            self.dispatch_control(ClientRequest::UpdateSelection { pane_id, point });
+            let begin = if selection.deferred_mouse_click && point != selection.anchor {
+                selection.deferred_mouse_click = false;
+                Some((selection.anchor, selection.kind))
+            } else {
+                None
+            };
+            let selecting = !selection.deferred_mouse_click;
+            if let Some((anchor, kind)) = begin {
+                self.dispatch_control(ClientRequest::BeginSelection {
+                    pane_id,
+                    point: anchor,
+                    kind,
+                });
+            }
+            if selecting {
+                self.dispatch_control(ClientRequest::UpdateSelection { pane_id, point });
+            }
             cx.stop_propagation();
             cx.notify();
             return;
@@ -943,7 +974,25 @@ impl HhApp {
             .take()
             .filter(|selection| selection.pane_id == pane_id)
         {
-            if point == selection.anchor && !selection.preserve_single_cell {
+            if selection.deferred_mouse_click {
+                if let Some(button) = terminal_mouse_button(event.button) {
+                    let modifiers = terminal_modifiers(event.modifiers);
+                    self.dispatch_control(ClientRequest::MouseInput {
+                        pane_id,
+                        point: selection.anchor,
+                        button,
+                        action: TerminalMouseAction::Press,
+                        modifiers,
+                    });
+                    self.dispatch_control(ClientRequest::MouseInput {
+                        pane_id,
+                        point,
+                        button,
+                        action: TerminalMouseAction::Release,
+                        modifiers,
+                    });
+                }
+            } else if point == selection.anchor && !selection.preserve_single_cell {
                 self.dispatch_control(ClientRequest::ClearSelection { pane_id });
                 if event.click_count <= 1
                     && let Some(url) = self.url_at_pointer(pane_id, point)

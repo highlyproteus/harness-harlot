@@ -7,7 +7,7 @@ use crate::{
 use gpui::{Bounds, MouseButton, Pixels, Point};
 use hh_protocol::{
     TerminalAttributes, TerminalColor, TerminalLine, TerminalModifiers, TerminalMouseButton,
-    TerminalPoint, TerminalRun, TerminalSelection,
+    TerminalPoint, TerminalRun, TerminalSelection, TerminalSelectionKind,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -36,6 +36,47 @@ pub(crate) fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouse
         MouseButton::Middle => Some(TerminalMouseButton::Middle),
         MouseButton::Right => Some(TerminalMouseButton::Right),
         MouseButton::Navigate(_) => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalPointerAction {
+    ReportMouse,
+    DeferLeftClick(TerminalSelectionKind),
+    Select(TerminalSelectionKind),
+    Ignore,
+}
+
+/// Preserve clicks for mouse-aware programs while letting a normal left drag
+/// become a native terminal selection. This avoids requiring a hidden Shift
+/// modifier just to copy text from tmux, vim, and similar programs.
+pub(crate) fn terminal_pointer_action(
+    mouse_reporting: bool,
+    button: MouseButton,
+    shift: bool,
+    alt: bool,
+    click_count: usize,
+) -> TerminalPointerAction {
+    if button != MouseButton::Left {
+        return if mouse_reporting && !shift {
+            TerminalPointerAction::ReportMouse
+        } else {
+            TerminalPointerAction::Ignore
+        };
+    }
+    let kind = if alt {
+        TerminalSelectionKind::Block
+    } else if click_count >= 3 {
+        TerminalSelectionKind::Lines
+    } else if click_count == 2 {
+        TerminalSelectionKind::Semantic
+    } else {
+        TerminalSelectionKind::Simple
+    };
+    if mouse_reporting && !shift && click_count <= 1 {
+        TerminalPointerAction::DeferLeftClick(kind)
+    } else {
+        TerminalPointerAction::Select(kind)
     }
 }
 
@@ -276,13 +317,14 @@ mod tests {
     use super::{
         Bounds, MAX_PASTE_BYTES, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD,
         TERMINAL_VERTICAL_PADDING, TerminalAttributes, TerminalColor, TerminalLine, TerminalPoint,
-        TerminalRun, TerminalSelection, prepare_paste, selection_span, terminal_grid_for_pane,
-        terminal_input_bytes, terminal_point_at, terminal_run_display_text, typography,
-        url_at_column,
+        TerminalPointerAction, TerminalRun, TerminalSelection, prepare_paste, selection_span,
+        terminal_grid_for_pane, terminal_input_bytes, terminal_point_at, terminal_pointer_action,
+        terminal_run_display_text, typography, url_at_column,
     };
-    use gpui::point;
     use gpui::px;
     use gpui::size;
+    use gpui::{MouseButton, point};
+    use hh_protocol::TerminalSelectionKind;
 
     #[test]
     fn multi_column_terminal_rows_keep_spaces_and_wide_cells_on_one_grid() {
@@ -406,6 +448,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn mouse_reporting_clicks_survive_while_drags_can_select_locally() {
+        assert!(matches!(
+            terminal_pointer_action(true, MouseButton::Left, false, false, 1),
+            TerminalPointerAction::DeferLeftClick(TerminalSelectionKind::Simple)
+        ));
+        assert!(matches!(
+            terminal_pointer_action(true, MouseButton::Left, false, false, 2),
+            TerminalPointerAction::Select(TerminalSelectionKind::Semantic)
+        ));
+        assert!(matches!(
+            terminal_pointer_action(true, MouseButton::Left, true, false, 1),
+            TerminalPointerAction::Select(TerminalSelectionKind::Simple)
+        ));
+        assert!(matches!(
+            terminal_pointer_action(true, MouseButton::Right, false, false, 1),
+            TerminalPointerAction::ReportMouse
+        ));
     }
 
     #[test]

@@ -25,9 +25,9 @@ pub(crate) const TMUX_PROBE_MAX_SESSIONS: usize = 64;
 pub(crate) const MAX_TMUX_ATTACH_SESSIONS: usize = 32;
 
 pub(crate) const TMUX_SESSION_LIST_FORMAT: &str =
-    "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}";
+    "S #{session_id} #{session_windows} #{session_attached} #{session_name}";
 
-pub(crate) const TMUX_REMOTE_LIST_COMMAND: &str = "LC_ALL=C exec tmux list-sessions -F 'S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}'";
+pub(crate) const TMUX_REMOTE_LIST_COMMAND: &str = "LC_ALL=C exec tmux list-sessions -F 'S #{session_id} #{session_windows} #{session_attached} #{session_name}'";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct TmuxAttachmentPlan {
@@ -204,13 +204,17 @@ pub(crate) fn parse_tmux_scan(output: &str) -> Result<Vec<TmuxSession>> {
         if line.is_empty() {
             continue;
         }
-        let mut fields = line.split('\t');
+        // tmux sanitizes control characters in format output on current
+        // releases, turning tab delimiters into underscores. Keep the three
+        // machine fields first and split only four times so session names may
+        // still contain spaces.
+        let mut fields = line.splitn(5, ' ');
         match fields.next() {
             Some("S") => {
                 if sessions.len() >= TMUX_PROBE_MAX_SESSIONS {
                     bail!("tmux scan returned more than {TMUX_PROBE_MAX_SESSIONS} sessions");
                 }
-                let (Some(id), Some(name), Some(window_count), Some(attached), None) = (
+                let (Some(id), Some(window_count), Some(attached), Some(name), None) = (
                     fields.next(),
                     fields.next(),
                     fields.next(),
@@ -380,8 +384,18 @@ mod tests {
     }
 
     #[test]
+    fn tmux_scan_parser_accepts_printable_metadata_from_real_tmux() {
+        let sessions = parse_tmux_scan("S $9 3 1 build shell\n").unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id.as_str(), "$9");
+        assert_eq!(sessions[0].name, "build shell");
+        assert_eq!(sessions[0].windows, 3);
+        assert_eq!(sessions[0].attached_clients, 1);
+    }
+
+    #[test]
     fn tmux_scan_parser_bounds_and_rejects_malicious_metadata() {
-        let sessions = parse_tmux_scan("S\t$1\tbuild\t2\t1\nS\t$2\tresearch\t1\t0\n").unwrap();
+        let sessions = parse_tmux_scan("S $1 2 1 build\nS $2 1 0 research\n").unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id.as_str(), "$1");
         assert_eq!(sessions[0].windows, 2);
@@ -389,13 +403,13 @@ mod tests {
         assert_eq!(sessions[1].attached_clients, 0);
 
         for output in [
-            "build\tname\t1\t0\n",
-            "S\t$1\tname\t1\t0\textra\n",
-            "S\t$1\tbad\u{0007}name\t1\t0\n",
-            "S\t$1;bad\tname\t1\t0\n",
-            "S\t$1\tname\tnot-a-number\t0\n",
-            "S\t$1\tname\t1\t0\nS\t$1\tother\t1\t0\n",
-            "S\t$1\tname\t1\t0\nW\t$1\t@1\t0\teditor\t1\t1\n",
+            "build $1 1 0 name\n",
+            "S $1 1 0\n",
+            "S $1 1 0 bad\u{0007}name\n",
+            "S $1;bad 1 0 name\n",
+            "S $1 not-a-number 0 name\n",
+            "S $1 1 0 name\nS $1 1 0 other\n",
+            "S $1 1 0 name\nW $1 1 0 editor\n",
         ] {
             assert!(parse_tmux_scan(output).is_err(), "output: {output:?}");
         }
