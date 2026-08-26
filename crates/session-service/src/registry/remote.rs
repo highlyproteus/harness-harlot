@@ -420,6 +420,7 @@ impl SessionRegistry {
                             profile: TerminalProfile::Tmux,
                             source: TerminalIdentitySource::Command,
                         },
+                        status: hh_protocol::PaneStatus::default(),
                         custom_title: None,
                         profile_override: None,
                         custom_icon: None,
@@ -437,6 +438,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );

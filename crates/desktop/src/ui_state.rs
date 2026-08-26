@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Weak};
 
 use anyhow::{Context, Result, bail};
 use image::GenericImageView as _;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: u16 = 1;
@@ -12,6 +15,19 @@ const WORKSTATION_BANNER_FILE_NAME: &str = "workstation-banner.png";
 const MAX_WORKSTATION_BANNER_BYTES: u64 = 12 * 1024 * 1024;
 const MAX_WORKSTATION_BANNER_DIMENSION: u32 = 8_192;
 const MAX_WORKSTATION_BANNER_PIXELS: u64 = 24_000_000;
+
+static UI_STATE_WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn shared_write_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = UI_STATE_WRITE_LOCKS.lock();
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +39,9 @@ struct PersistedUiState {
     workspace_sidebar_width: Option<f32>,
     #[serde(default)]
     workstation_banner_hidden: bool,
+    #[serde(default)]
+    /// Legacy; retained only for file compatibility.
+    voice_dock_visible: bool,
 }
 
 /// Canonical banner PNG plus the pixel dimensions the renderer needs to size
@@ -37,18 +56,24 @@ pub(crate) struct StoredBanner {
 #[derive(Clone, Debug)]
 pub(crate) struct UiStateStore {
     path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl UiStateStore {
     pub(crate) fn from_default_path() -> Result<Self> {
+        let path = default_ui_state_path()?;
         Ok(Self {
-            path: default_ui_state_path()?,
+            write_lock: shared_write_lock(&path),
+            path,
         })
     }
 
     #[cfg(test)]
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            write_lock: shared_write_lock(&path),
+            path,
+        }
     }
 
     /// `None` when no state file exists yet.
@@ -89,10 +114,12 @@ impl UiStateStore {
         if !width.is_finite() || width <= 0.0 {
             bail!("workstation sidebar width must be finite and positive");
         }
+        let _guard = self.write_lock.lock();
         let mut state = self.read_state()?.unwrap_or(PersistedUiState {
             schema_version: SCHEMA_VERSION,
             workspace_sidebar_width: None,
             workstation_banner_hidden: false,
+            voice_dock_visible: false,
         });
         state.schema_version = SCHEMA_VERSION;
         state.workspace_sidebar_width = Some(width);
@@ -106,10 +133,12 @@ impl UiStateStore {
     }
 
     pub(crate) fn save_workstation_banner_hidden(&self, hidden: bool) -> Result<()> {
+        let _guard = self.write_lock.lock();
         let mut state = self.read_state()?.unwrap_or(PersistedUiState {
             schema_version: SCHEMA_VERSION,
             workspace_sidebar_width: None,
             workstation_banner_hidden: false,
+            voice_dock_visible: false,
         });
         state.schema_version = SCHEMA_VERSION;
         state.workstation_banner_hidden = hidden;
@@ -287,6 +316,7 @@ fn canonical_workstation_banner(bytes: &[u8]) -> Result<StoredBanner> {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
 
     use super::{
         CanonicalPngLimits, Cursor, Path, PathBuf, UiStateStore, WORKSTATION_BANNER_FILE_NAME,
@@ -413,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn banner_visibility_and_sidebar_width_persist_independently() {
+    fn banner_and_sidebar_state_persist_independently() {
         let (root, store) = temp_store("visibility");
         assert!(!store.load_workstation_banner_hidden().unwrap());
 
@@ -434,6 +464,35 @@ mod tests {
             restarted.load_workspace_sidebar_width().unwrap(),
             Some(300.0)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_ui_state_saves_preserve_independent_fields() {
+        let (root, store) = temp_store("concurrent");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let width_store = UiStateStore::new(root.join("ui-state.json"));
+        let width_barrier = Arc::clone(&barrier);
+        let width = std::thread::spawn(move || {
+            width_barrier.wait();
+            for offset in 0_u16..32 {
+                width_store
+                    .save_workspace_sidebar_width(280.0 + f32::from(offset))
+                    .unwrap();
+            }
+        });
+        let banner_store = UiStateStore::new(root.join("ui-state.json"));
+        let banner = std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..32 {
+                banner_store.save_workstation_banner_hidden(true).unwrap();
+            }
+        });
+        width.join().unwrap();
+        banner.join().unwrap();
+
+        assert!(store.load_workspace_sidebar_width().unwrap().is_some());
+        assert!(store.load_workstation_banner_hidden().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

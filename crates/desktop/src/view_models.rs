@@ -107,6 +107,61 @@ fn drag_ghost(title: &str, position: gpui::Point<Pixels>, terminal: bool) -> imp
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct ComposerAttachment {
+    pub(super) filename: String,
+    pub(super) data_url: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct AssistantComposer {
+    pub(super) pane_id: Uuid,
+    pub(super) text: String,
+    pub(super) selection: Option<Range<usize>>,
+    pub(super) attachment: Option<ComposerAttachment>,
+}
+
+impl AssistantComposer {
+    pub(super) fn insert(&mut self, text: &str) {
+        if let Some(selection) = self.selection.take() {
+            self.text.replace_range(selection, text);
+        } else {
+            self.text.push_str(text);
+        }
+    }
+
+    pub(super) fn backspace(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            self.text.replace_range(selection, "");
+        } else {
+            self.text.pop();
+        }
+    }
+
+    pub(super) fn select_all(&mut self) {
+        self.selection = (!self.text.is_empty()).then_some(0..self.text.len());
+    }
+
+    pub(super) fn selected_text(&self) -> Option<&str> {
+        self.selection
+            .as_ref()
+            .and_then(|selection| self.text.get(selection.clone()))
+    }
+
+    pub(super) fn cut_selection(&mut self) -> Option<String> {
+        let selection = self.selection.take()?;
+        let selected = self.text.get(selection.clone())?.to_owned();
+        self.text.replace_range(selection, "");
+        Some(selected)
+    }
+
+    pub(super) fn all_selected(&self) -> bool {
+        self.selection
+            .as_ref()
+            .is_some_and(|selection| selection.start == 0 && selection.end == self.text.len())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct TooltipView {
     pub(super) text: String,
 }
@@ -269,7 +324,15 @@ pub(super) struct CloseConfirmation {
     pub(super) pane_id: Uuid,
     pub(super) title: String,
     pub(super) leaves_workspace_empty: bool,
-    pub(super) is_browser: bool,
+    pub(super) kind: CloseConfirmationKind,
+}
+
+/// Drives the close-dialog copy for the pane kind being closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CloseConfirmationKind {
+    Terminal,
+    Browser,
+    Assistant,
 }
 #[derive(Clone, Debug)]
 pub(super) struct TabCloseConfirmation {
@@ -793,11 +856,18 @@ pub(super) fn route_workspace_creation_paste(
 
 impl CloseConfirmation {
     pub(super) fn for_pane(pane: &Pane, leaves_workspace_empty: bool) -> Self {
+        let kind = if pane.kind.is_browser() {
+            CloseConfirmationKind::Browser
+        } else if pane.kind.is_assistant() {
+            CloseConfirmationKind::Assistant
+        } else {
+            CloseConfirmationKind::Terminal
+        };
         Self {
             pane_id: pane.id,
             title: pane.title.clone(),
-            is_browser: pane.kind.is_browser(),
             leaves_workspace_empty,
+            kind,
         }
     }
 
@@ -1107,11 +1177,11 @@ impl DragHoverState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientRequest, CloseConfirmation, DialogTextEditor, DragDestination, DragHoverState,
-        DropPlacement, HashSet, MAX_SSH_INPUT_LEN, MouseButton, Pane, SidebarResizeLifecycle,
-        SidebarResizeMove, TmuxScanScope, TmuxSession, TmuxSessionId, TmuxSessionPicker, Uuid,
-        WorkspaceCreationDialog, WorkspaceCreationField, WorkspaceCreationKind,
-        WorkspaceCreationStep, route_workspace_creation_paste,
+        ClientRequest, CloseConfirmation, CloseConfirmationKind, DialogTextEditor, DragDestination,
+        DragHoverState, DropPlacement, HashSet, MAX_SSH_INPUT_LEN, MouseButton, Pane,
+        SidebarResizeLifecycle, SidebarResizeMove, TmuxScanScope, TmuxSession, TmuxSessionId,
+        TmuxSessionPicker, Uuid, WorkspaceCreationDialog, WorkspaceCreationField,
+        WorkspaceCreationKind, WorkspaceCreationStep, route_workspace_creation_paste,
     };
 
     #[test]
@@ -1123,6 +1193,7 @@ mod tests {
             shell: "zsh".to_owned(),
             color: None,
             identity: hh_protocol::TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: Some("build".to_owned()),
             profile_override: None,
             custom_icon: None,
@@ -1132,7 +1203,7 @@ mod tests {
 
         assert_eq!(confirmation.pane_id, pane.id);
         assert_eq!(confirmation.title, "build");
-        assert!(!confirmation.is_browser);
+        assert_eq!(confirmation.kind, CloseConfirmationKind::Terminal);
         assert!(confirmation.leaves_workspace_empty);
         assert_eq!(
             confirmation.request(),

@@ -1,9 +1,9 @@
 //! Modal dialogs: renames, creation, directories, and confirmations.
 use crate::elements::WorkspaceTextInputElement;
 use crate::view_models::{
-    CloseConfirmation, DialogAction, DialogSpec, DialogTone, DirEditor, DirEditorTarget, Modal,
-    TabCloseConfirmation, TmuxSelectionChange, TmuxSessionPicker, WorkspaceCreationDialog,
-    WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
+    CloseConfirmation, CloseConfirmationKind, DialogAction, DialogSpec, DialogTone, DirEditor,
+    DirEditorTarget, Modal, TabCloseConfirmation, TmuxSelectionChange, TmuxSessionPicker,
+    WorkspaceCreationDialog, WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
     WorkspaceDeleteConfirmation, WorkspaceDisconnectConfirmation,
 };
 use crate::{HhApp, THEME};
@@ -983,15 +983,20 @@ impl HhApp {
         confirmation: &CloseConfirmation,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let message = match (confirmation.is_browser, confirmation.leaves_workspace_empty) {
-            (true, true) => {
+        let message = match (confirmation.kind, confirmation.leaves_workspace_empty) {
+            (CloseConfirmationKind::Browser, true) => {
                 "This will close the last browser and leave the saved workstation empty. You can open a new terminal or browser from its empty state."
             }
-            (true, false) => "This permanently closes this browser tab. Other tabs stay open.",
-            (false, true) => {
+            (CloseConfirmationKind::Browser, false) => {
+                "This permanently closes this browser tab. Other tabs stay open."
+            }
+            (CloseConfirmationKind::Assistant, _) => {
+                "This closes the voice assistant session. Its transcript summary is kept on disk only until this pane is removed."
+            }
+            (CloseConfirmationKind::Terminal, true) => {
                 "This will terminate the last terminal and leave the saved workstation empty. You can open a new terminal from its empty state."
             }
-            (false, false) => {
+            (CloseConfirmationKind::Terminal, false) => {
                 "This will terminate this terminal and its running shell process. Other terminal tabs stay open."
             }
         };
@@ -1005,10 +1010,10 @@ impl HhApp {
             body,
             DialogSpec {
                 title: format!("Close {}?", confirmation.title),
-                confirm_label: if confirmation.is_browser {
-                    "Close Browser"
-                } else {
-                    "Close Terminal"
+                confirm_label: match confirmation.kind {
+                    CloseConfirmationKind::Browser => "Close Browser",
+                    CloseConfirmationKind::Assistant => "Close Assistant",
+                    CloseConfirmationKind::Terminal => "Close Terminal",
                 },
                 confirm_tone: DialogTone::Danger,
                 confirm_id: "confirm-close",

@@ -216,6 +216,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );
@@ -353,6 +354,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );

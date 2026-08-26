@@ -4,7 +4,30 @@ All notable changes to Harness Harlot are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Added typed text and image attachments to Assistant panes, including focused
+  keyboard and clipboard routing.
+
+### Fixed
+
+- Kept Assistant transcripts visible while suspended, added live listening
+  feedback, and prevented idle suspension during active voice exchanges.
+- Made Assistant tab rename, color, and custom-icon controls behave consistently
+  with other pane types.
+
 ## [0.1.13] - 2026-08-23
+
+### Added
+
+- Added Voice Mode with OpenAI Realtime audio, transcript and approval controls,
+  trust-tiered workstation tools, and optional Honcho-backed memory.
+- Added service-projected agent status badges for workspace tabs and pane tabs,
+  including stable OSC 777 status events and omp/Codex heuristics.
+- Added persistent Voice settings and dock state, coding-agent launch adapters,
+  and reusable session-client support for the desktop and voice engine.
 
 ### Fixed
 

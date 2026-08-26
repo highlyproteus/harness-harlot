@@ -551,6 +551,7 @@ pub(crate) fn pane_fixture(id: Uuid) -> Pane {
         shell: "shell".to_owned(),
         color: None,
         identity: TerminalIdentity::default(),
+        status: hh_protocol::PaneStatus::default(),
         custom_title: None,
         profile_override: None,
         custom_icon: None,

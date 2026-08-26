@@ -246,6 +246,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );
@@ -306,6 +307,7 @@ impl SessionRegistry {
             shell: "ssh".to_owned(),
             color: None,
             identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -377,6 +379,7 @@ impl SessionRegistry {
                     recovered: false,
                     exit_status: None,
                     detected_command_profile: None,
+                    omp_title_status: None,
                 }),
             },
         );
@@ -729,6 +732,7 @@ impl SessionRegistry {
                 shell: "ssh".to_owned(),
                 color: None,
                 identity: TerminalIdentity::default(),
+                status: hh_protocol::PaneStatus::default(),
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
@@ -774,6 +778,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );

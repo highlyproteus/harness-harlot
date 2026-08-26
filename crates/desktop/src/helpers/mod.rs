@@ -28,9 +28,10 @@ pub(crate) use history_ui::{
     history_warning_text, live_scroll_target, wheel_delta_lines,
 };
 pub(crate) use icons::{
-    IDENTITY_MARK_SIZE, render_bell_icon, render_sidebar_toggle_icon, render_terminal_profile_icon,
-    render_terminal_profile_mark, resolved_terminal_accent, resolved_workspace_color,
-    tab_identity_presentation, workspace_is_selectable,
+    IDENTITY_MARK_SIZE, render_bell_icon, render_headphones_icon, render_microphone_icon,
+    render_sidebar_toggle_icon, render_terminal_profile_icon, render_terminal_profile_mark,
+    resolved_terminal_accent, resolved_workspace_color, tab_identity_presentation,
+    workspace_is_selectable,
 };
 pub(crate) use layout::{
     apply_layout_control_mutation, collect_terminal_tabs, find_pane, inactive_stack_contains,

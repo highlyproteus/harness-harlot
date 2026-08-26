@@ -6,7 +6,7 @@ use gpui::{
     MouseDownEvent, ParentElement, Point, StatefulInteractiveElement, Styled, StyledImage, div,
     img, px, rgb,
 };
-use hh_protocol::{AppearanceColor, Workspace};
+use hh_protocol::{AppearanceColor, PaneStatus, Workspace};
 use std::time::Instant;
 
 use crate::helpers::{
@@ -17,7 +17,9 @@ use crate::helpers::{
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
 };
-use crate::{HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
+use crate::{
+    HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT, max_pane_status, pane_status_color,
+};
 
 impl HhApp {
     #[allow(clippy::too_many_lines)]
@@ -94,11 +96,13 @@ impl HhApp {
                         .bg(rgb(tab.color.map_or(THEME.dim, AppearanceColor::as_rgb)))
                         .into_any_element()
                 };
-                let pane_count = {
+                let (pane_count, status) = {
                     let mut panes = Vec::new();
                     collect_terminal_tabs(&tab.layout, &mut panes);
-                    panes.len()
+                    let status = max_pane_status(panes.iter().map(|pane| pane.status));
+                    (panes.len(), status)
                 };
+                let status_color = pane_status_color(status);
                 let tab_id = tab.id;
                 let close_tooltip = if is_standalone {
                     format!("Close {label}…")
@@ -255,6 +259,16 @@ impl HhApp {
                                 .text_xs()
                                 .text_color(rgb(THEME.dim))
                                 .child(pane_count.to_string()),
+                        )
+                    })
+                    .when(status != PaneStatus::Idle, |element| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .rounded_full()
+                                .bg(rgb(status_color.expect("non-idle status has a color"))),
                         )
                     })
                     .child(

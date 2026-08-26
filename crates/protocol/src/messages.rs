@@ -62,6 +62,12 @@ pub enum ClientRequest {
         target_pane: Uuid,
         url: Option<String>,
     },
+    CreateAssistantTab {
+        workspace_id: Uuid,
+    },
+    CreateGroupAssistant {
+        target_pane: Uuid,
+    },
     CreateWorkspaceGroup {
         workspace_id: Uuid,
         #[serde(default)]
@@ -386,6 +392,22 @@ mod tests {
                     "type": "create_browser_tab",
                     "workspace_id": workspace_id,
                     "url": "https://example.com",
+                }),
+            ),
+            (
+                ClientRequest::CreateAssistantTab { workspace_id },
+                serde_json::json!({
+                    "type": "create_assistant_tab",
+                    "workspace_id": workspace_id,
+                }),
+            ),
+            (
+                ClientRequest::CreateGroupAssistant {
+                    target_pane: pane_id,
+                },
+                serde_json::json!({
+                    "type": "create_group_assistant",
+                    "target_pane": pane_id,
                 }),
             ),
             (

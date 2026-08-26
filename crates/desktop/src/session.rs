@@ -2,11 +2,11 @@
 
 use gpui::AppContext;
 use gpui::{Context, Window};
-use hh_desktop::SessionClient;
 use hh_protocol::{
     ClientRequest, PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse,
     SessionSnapshot, Workspace,
 };
+use hh_session_client::SessionClient;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -211,6 +211,22 @@ impl HhApp {
                 self.session.connection_error != previous
             }
         };
+        let mut live_assistants = std::collections::HashSet::new();
+        if let Some(snapshot) = self.session.snapshot.as_ref() {
+            for workspace in &snapshot.workspaces {
+                for tab in &workspace.tabs {
+                    let mut panes = Vec::new();
+                    crate::helpers::collect_terminal_tabs(&tab.layout, &mut panes);
+                    live_assistants.extend(
+                        panes
+                            .into_iter()
+                            .filter(|pane| pane.kind.is_assistant())
+                            .map(|pane| pane.id),
+                    );
+                }
+            }
+        }
+        self.prune_assistant_sessions(&live_assistants, cx);
         state_changed | self.sync_browser_callback_state()
     }
 
@@ -233,7 +249,7 @@ impl HhApp {
         let notifications_changed = self.auto_read_pane_notifications(pane_id, cx);
         if self
             .pane_metadata(pane_id)
-            .is_some_and(|pane| pane.kind.is_browser())
+            .is_some_and(|pane| !pane.kind.is_terminal())
         {
             let changed = self.layout.focused_pane != Some(pane_id);
             self.layout.focused_pane = Some(pane_id);

@@ -647,7 +647,7 @@ impl DesiredPane {
                 .clone()
                 .unwrap_or_else(|| match &pane.kind {
                     PaneKind::Terminal => "Terminal".to_owned(),
-                    PaneKind::Browser { .. } => pane.title.clone(),
+                    PaneKind::Browser { .. } | PaneKind::Assistant => pane.title.clone(),
                 }),
             color: pane.color,
             custom_title: pane.custom_title.clone(),
@@ -680,7 +680,7 @@ impl DesiredPane {
                 PaneKind::Terminal => self
                     .profile_override
                     .map(|profile| profile.display_name().to_owned()),
-                PaneKind::Browser { .. } => Some(self.title.clone()),
+                PaneKind::Browser { .. } | PaneKind::Assistant => Some(self.title.clone()),
             })
             .unwrap_or_else(|| "Terminal".to_owned());
         Pane {
@@ -690,6 +690,7 @@ impl DesiredPane {
             shell: String::new(),
             color: self.color,
             identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title,
             profile_override: self.profile_override,
             custom_icon: self.custom_icon,
@@ -723,6 +724,11 @@ impl DesiredPane {
                 }
                 if self.local_cwd.is_some() {
                     bail!("browser panes may not persist terminal CWD metadata");
+                }
+            }
+            PaneKind::Assistant => {
+                if self.local_cwd.is_some() {
+                    bail!("assistant panes may not persist terminal CWD metadata");
                 }
             }
         }
@@ -877,6 +883,7 @@ mod tests {
             shell: "ssh".to_owned(),
             color: None,
             identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -978,6 +985,7 @@ mod tests {
             profile: TerminalProfile::Claude,
             source: hh_protocol::TerminalIdentitySource::Command,
         };
+        pane.status = hh_protocol::PaneStatus::Working;
         pane.custom_title = Some("Release shell".to_owned());
         pane.profile_override = Some(TerminalProfile::Gemini);
         pane.custom_icon = Some("00000000-0000-4000-8000-000000000001.png".to_owned());
@@ -1011,6 +1019,7 @@ mod tests {
             Some("00000000-0000-4000-8000-000000000001.png")
         );
         assert_eq!(recovered_pane.identity, TerminalIdentity::default());
+        assert_eq!(recovered_pane.status, hh_protocol::PaneStatus::Idle);
 
         let old: DesiredState = serde_json::from_str(
             r#"{

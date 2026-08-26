@@ -18,11 +18,14 @@ community-macos = ["hh-updater/community-macos"]
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 futures.workspace = true
 gpui.workspace = true
 image.workspace = true
 libc.workspace = true
 hh-protocol = { path = "../protocol" }
+hh-session-client.workspace = true
+hh-voice.workspace = true
 parking_lot.workspace = true
 rustix.workspace = true
 serde.workspace = true

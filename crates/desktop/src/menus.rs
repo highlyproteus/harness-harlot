@@ -13,7 +13,9 @@ use gpui::{
     relative, rgb, rgba,
 };
 use gpui::{ParentElement, StatefulInteractiveElement, Styled};
-use hh_protocol::{ClientRequest, ServiceResponse, WorkspaceConnection, WorkspaceConnectionStatus};
+use hh_protocol::{
+    ClientRequest, PaneKind, ServiceResponse, WorkspaceConnection, WorkspaceConnectionStatus,
+};
 use uuid::Uuid;
 
 impl HhApp {
@@ -98,6 +100,15 @@ impl HhApp {
         cx.notify();
     }
 
+    pub(crate) fn new_group_assistant(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        let Some(target_pane) = self.group_metadata(tab_id).map(|(_, pane_id)| pane_id) else {
+            self.editor.modal = Modal::None;
+            cx.notify();
+            return;
+        };
+        self.editor.modal = Modal::None;
+        self.create_group_assistant_at(target_pane, cx);
+    }
     pub(crate) fn toggle_tab_identity_picker(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
         if let Modal::TabMenu(menu) = &mut self.editor.modal
             && menu.pane_id == pane_id
@@ -126,7 +137,9 @@ impl HhApp {
             .as_ref()
             .filter(|picker| picker.target == ColorTarget::Pane(pane_id));
         let pane = self.pane_metadata(pane_id);
-        let is_browser = pane.as_ref().is_some_and(|pane| pane.kind.is_browser());
+        let pane_kind = pane
+            .as_ref()
+            .map_or(PaneKind::Terminal, |pane| pane.kind.clone());
         let pinnable_tab = self.session.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .workspaces
@@ -152,7 +165,6 @@ impl HhApp {
             .border_1()
             .border_color(rgb(THEME.border_strong))
             .shadow_lg()
-            .occlude()
             .when_some(
                 workspace_id.filter(|_| browser_command_available()),
                 |element, workspace_id| {
@@ -164,6 +176,12 @@ impl HhApp {
                     ))
                 },
             )
+            .child(self.create_menu_item(
+                ("new-assistant-from-tab-menu", element_key(pane_id)),
+                "Add AI Assistant",
+                cx,
+                move |this, cx| this.create_group_assistant_at(pane_id, cx),
+            ))
             .when_some(pinnable_tab, |element, (tab_id, pinned)| {
                 element.child(
                     div()
@@ -302,10 +320,10 @@ impl HhApp {
                     .text_color(rgb(THEME.danger))
                     .hover(|element| element.bg(rgb(THEME.accent_soft)))
                     .on_click(cx.listener(move |this, _, _, cx| this.begin_close(pane_id, cx)))
-                    .child(if is_browser {
-                        "Close Browser…"
-                    } else {
-                        "Close Terminal…"
+                    .child(match pane_kind {
+                        PaneKind::Browser { .. } => "Close Browser…",
+                        PaneKind::Assistant => "Close Assistant…",
+                        PaneKind::Terminal => "Close Terminal…",
                     }),
             )
             .into_any_element()
@@ -381,6 +399,14 @@ impl HhApp {
                 self.create_menu_item("strip-add-browser", "Add Browser", cx, move |this, cx| {
                     this.add_browser_to_context(workspace_id, target_tab, cx);
                 }),
+                self.create_menu_item(
+                    "strip-add-assistant",
+                    "Add Assistant",
+                    cx,
+                    move |this, cx| {
+                        this.add_assistant_to_context(workspace_id, target_tab, cx);
+                    },
+                ),
                 self.create_menu_item("strip-add-group", "Add Group", cx, move |this, cx| {
                     this.add_group_to_context(workspace_id, target_tab, cx);
                 }),
@@ -474,6 +500,12 @@ impl HhApp {
                     move |this, cx| this.new_group_browser(tab_id, cx),
                 ))
             })
+            .child(self.create_menu_item(
+                ("new-assistant-in-group", element_key(tab_id)),
+                "Add AI Assistant",
+                cx,
+                move |this, cx| this.new_group_assistant(tab_id, cx),
+            ))
             .when_some(
                 workspace_id.filter(|_| is_project && !has_parent),
                 |element, workspace_id| {
@@ -616,12 +648,6 @@ impl HhApp {
             .border_color(rgb(THEME.border_strong))
             .shadow_lg()
             .occlude()
-            .child(self.create_menu_item(
-                ("new-workspace-tab-menu", element_key(workspace_id)),
-                "New Tab",
-                cx,
-                move |this, cx| this.new_workspace_tab(workspace_id, cx),
-            ))
             .when(browser_command_available(), |element| {
                 element.child(self.create_menu_item(
                     ("new-browser-tab-menu", element_key(workspace_id)),
@@ -630,6 +656,12 @@ impl HhApp {
                     move |this, cx| this.new_browser_tab_in(workspace_id, cx),
                 ))
             })
+            .child(self.create_menu_item(
+                ("new-assistant-tab-menu", element_key(workspace_id)),
+                "Add AI Assistant",
+                cx,
+                move |this, cx| this.new_assistant_tab(workspace_id, cx),
+            ))
             .child(self.create_menu_item(
                 ("new-workspace-group-menu", element_key(workspace_id)),
                 "New Group",

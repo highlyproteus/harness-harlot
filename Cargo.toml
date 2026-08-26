@@ -5,6 +5,8 @@ members = [
   "crates/macos-icon",
   "crates/protocol",
   "crates/session-service",
+  "crates/session-client",
+  "crates/voice",
   "crates/release-signer",
   "crates/terminal-model",
   "crates/updater",
@@ -31,14 +33,16 @@ libc = "0.2.175"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile", "NSImage"] }
 objc2-foundation = { version = "0.3.2", features = ["NSBundle", "NSError", "NSString", "NSURL", "NSValue"] }
-time = { version = "0.3.41", features = ["formatting", "macros", "parsing"] }
+time = { version = "0.3.41", features = ["formatting", "local-offset", "macros", "parsing"] }
 parking_lot = "0.12"
 raw-window-handle = "0.6.2"
 portable-pty = "0.9.0"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
+hh-session-client = { path = "crates/session-client" }
 semver = "1.0.27"
+hh-voice = { path = "crates/voice" }
 sha2 = "0.10.9"
 sysinfo = "0.31.4"
 thiserror = "2.0.16"

@@ -121,6 +121,8 @@ pub(crate) fn handle_request(
         | ClientRequest::CreateWorkspaceTab { .. }
         | ClientRequest::CreateBrowserTab { .. }
         | ClientRequest::CreateGroupBrowser { .. }
+        | ClientRequest::CreateAssistantTab { .. }
+        | ClientRequest::CreateGroupAssistant { .. }
         | ClientRequest::CreateWorkspaceGroup { .. }
         | ClientRequest::ConnectSsh { .. }
         | ClientRequest::RenamePane { .. }
@@ -245,6 +247,12 @@ fn handle_panes_request(
                 pane_id: sessions.create_group_browser(target_pane, url.as_deref())?,
             })
         }
+        ClientRequest::CreateAssistantTab { workspace_id } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_assistant_tab(workspace_id)?,
+        }),
+        ClientRequest::CreateGroupAssistant { target_pane } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_group_assistant(target_pane)?,
+        }),
         ClientRequest::CreateWorkspaceGroup {
             workspace_id,
             parent_tab,
