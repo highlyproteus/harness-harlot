@@ -272,6 +272,7 @@ impl SessionRegistry {
     /// This request is rejected once any layout exists, so a repeated click or
     /// retried request cannot create duplicate terminals.
     pub fn create_workspace_terminal(&self, workspace_id: Uuid) -> Result<Uuid> {
+        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
         let (connection, working_dir) = {
             let state = self.state.read();
             if state.panes.len() >= MAX_PANES {
@@ -454,6 +455,7 @@ impl SessionRegistry {
     }
 
     pub fn create_browser_tab(&self, workspace_id: Uuid, url: Option<&str>) -> Result<Uuid> {
+        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
         let url = normalize_browser_url_or_default(url)?;
         let title = browser_title(&url, None);
         let pane_id = Uuid::new_v4();
@@ -522,9 +524,14 @@ impl SessionRegistry {
         if workspace.tabs.len() >= MAX_TABS_PER_WORKSPACE {
             bail!("workstation tab limit of {MAX_TABS_PER_WORKSPACE} reached");
         }
+        let tab_title = if workspace.is_assistant() {
+            format!("Thread {}", workspace.tabs.len() + 1)
+        } else {
+            "Assistant".to_owned()
+        };
         workspace.tabs.push(Tab {
             id: Uuid::new_v4(),
-            title: "Assistant".to_owned(),
+            title: tab_title,
             custom_title: None,
             project_dir: None,
             color: None,

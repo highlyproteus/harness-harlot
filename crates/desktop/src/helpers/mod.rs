@@ -10,7 +10,8 @@ mod tabs;
 mod terminal_io;
 
 pub(crate) use bindings::{
-    abbreviate_home, append_rename_text, element_key, gpui_binding, product_name, split_element_key,
+    abbreviate_home, append_rename_text, element_key, expand_home, gpui_binding, product_name,
+    split_element_key,
 };
 pub(crate) use dnd::{
     HeaderDropZone, click_suppression_active, header_drop_zone, split_placement_at,

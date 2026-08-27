@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub(crate) enum CustomIconTarget {
     Pane(Uuid),
     Tab(Uuid),
+    Workspace(Uuid),
 }
 
 pub(crate) fn detected_project_icon(project_dir: &Path) -> Option<PathBuf> {
@@ -65,6 +66,9 @@ impl HhApp {
             }
             CustomIconTarget::Tab(tab_id) => {
                 self.dispatch(ClientRequest::SetTabCustomIcon { tab_id, icon });
+            }
+            CustomIconTarget::Workspace(workspace_id) => {
+                self.dispatch(ClientRequest::SetWorkspaceCustomIcon { workspace_id, icon });
             }
         }
         self.editor.modal = Modal::None;
@@ -149,6 +153,23 @@ impl HhApp {
 
     pub(crate) fn import_tab_custom_icon(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
         self.import_custom_icon_for(CustomIconTarget::Tab(tab_id), cx);
+    }
+
+    pub(crate) fn set_workspace_custom_icon(
+        &mut self,
+        workspace_id: Uuid,
+        icon: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_custom_icon(CustomIconTarget::Workspace(workspace_id), icon, cx);
+    }
+
+    pub(crate) fn import_workspace_custom_icon(
+        &mut self,
+        workspace_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        self.import_custom_icon_for(CustomIconTarget::Workspace(workspace_id), cx);
     }
 
     pub(crate) fn detect_and_set_project_icon(
@@ -241,11 +262,15 @@ impl HhApp {
                 .into_any_element();
         }
         if pane.kind.is_assistant() {
+            let active = self.voice.sessions.get(&pane.id).is_some_and(|session| {
+                !crate::voice::assistant_session_is_idle(session)
+                    && !matches!(session.engine_state, hh_voice::EngineState::Error(_))
+            });
             return div()
                 .w(px(8.0))
                 .h(px(8.0))
                 .rounded_full()
-                .bg(rgb(frame_color))
+                .bg(rgb(if active { THEME.ansi[2] } else { THEME.dim }))
                 .into_any_element();
         }
 
@@ -505,6 +530,113 @@ impl HhApp {
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.import_tab_custom_icon(tab_id, cx)),
                     )
+                    .child("Upload image…"),
+            )
+            .into_any_element()
+    }
+
+    pub(crate) fn render_workspace_icon_choices(
+        &self,
+        workspace_id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.session.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .and_then(|workspace| workspace.custom_icon.clone())
+        });
+        div()
+            .mx(px(8.0))
+            .my(px(6.0))
+            .flex()
+            .flex_wrap()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .id(("automatic-workspace-icon", element_key(workspace_id)))
+                    .w(px(30.0))
+                    .h(px(28.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if selected.is_none() {
+                        rgb(THEME.accent)
+                    } else {
+                        rgb(THEME.border_strong)
+                    })
+                    .bg(rgb(THEME.surface))
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.muted))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|element| element.border_color(rgb(THEME.foreground)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_workspace_custom_icon(workspace_id, None, cx)
+                    }))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: "Default marker".to_owned(),
+                        })
+                        .into()
+                    })
+                    .child("A"),
+            )
+            .children(self.custom_icons.iter().enumerate().map(|(index, icon)| {
+                let active = selected.as_deref() == Some(icon.id.as_str());
+                let icon_id = icon.id.clone();
+                let path = icon.path.clone();
+                div()
+                    .id(("workspace-custom-icon", index))
+                    .w(px(30.0))
+                    .h(px(28.0))
+                    .p(px(3.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if active {
+                        rgb(THEME.accent)
+                    } else {
+                        rgb(THEME.border_strong)
+                    })
+                    .bg(if active {
+                        rgb(THEME.accent_soft)
+                    } else {
+                        rgb(THEME.surface)
+                    })
+                    .hover(|element| element.border_color(rgb(THEME.foreground)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_workspace_custom_icon(workspace_id, Some(icon_id.clone()), cx)
+                    }))
+                    .child(
+                        img(path)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .rounded(px(3.0)),
+                    )
+            }))
+            .child(
+                div()
+                    .id(("upload-workspace-icon", element_key(workspace_id)))
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
+                    .bg(rgb(THEME.surface))
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.import_workspace_custom_icon(workspace_id, cx)
+                    }))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|element| element.border_color(rgb(THEME.foreground)))
                     .child("Upload image…"),
             )
             .into_any_element()

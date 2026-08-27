@@ -216,6 +216,96 @@ impl HhApp {
             .into_any_element()
     }
 
+    fn render_workspace_kind_card(
+        id: &'static str,
+        label: &'static str,
+        card_kind: WorkspaceCreationKind,
+        initial_field: WorkspaceCreationField,
+        selected_kind: WorkspaceCreationKind,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .px(px(12.0))
+            .py(px(7.0))
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .border_1()
+            .border_color(rgb(if selected_kind == card_kind {
+                THEME.accent
+            } else {
+                THEME.border_strong
+            }))
+            .bg(rgb(if selected_kind == card_kind {
+                THEME.accent_soft
+            } else {
+                THEME.surface
+            }))
+            .text_sm()
+            .text_color(rgb(THEME.foreground))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(dialog) = this.editor.modal.workspace_creation_mut() {
+                    dialog.kind = card_kind;
+                    dialog.field = initial_field;
+                    dialog.error = None;
+                }
+                cx.notify();
+            }))
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_workspace_creation_input(
+        &self,
+        id: &'static str,
+        active_field: WorkspaceCreationField,
+        field: WorkspaceCreationField,
+        placeholder: &'static str,
+        font_family: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focus = self.editor.workspace_input_focus[field.index()].clone();
+        div()
+            .id(id)
+            .track_focus(&focus)
+            .h(px(36.0))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .bg(rgb(THEME.terminal))
+            .border_1()
+            .border_color(rgb(if active_field == field {
+                THEME.accent
+            } else {
+                THEME.border_strong
+            }))
+            .overflow_hidden()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .font_family(font_family)
+            .text_sm()
+            .text_color(rgb(THEME.foreground))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.focus_workspace_creation_field(
+                        field,
+                        Some(event.position),
+                        event.modifiers.shift,
+                        event.click_count,
+                        window,
+                    );
+                    cx.notify();
+                }),
+            )
+            .child(WorkspaceTextInputElement {
+                input: cx.entity(),
+                field,
+                placeholder,
+            })
+            .into_any_element()
+    }
+
     fn render_workspace_creation_details(
         &self,
         dialog: &WorkspaceCreationDialog,
@@ -224,10 +314,28 @@ impl HhApp {
         let kind = dialog.kind;
         let field = dialog.field;
         let error = dialog.error.clone();
-        let name_input_focus =
-            self.editor.workspace_input_focus[WorkspaceCreationField::Name.index()].clone();
-        let destination_input_focus =
-            self.editor.workspace_input_focus[WorkspaceCreationField::Destination.index()].clone();
+        let assistant = kind == WorkspaceCreationKind::Assistant;
+        let heading = if assistant {
+            "New Assistant"
+        } else {
+            "New Workstation"
+        };
+        let name_label = if assistant {
+            "Assistant name (optional)"
+        } else {
+            "Workstation name (optional)"
+        };
+        let name_placeholder = if assistant {
+            "Assistant name"
+        } else {
+            "Workstation name"
+        };
+        let submit_label = match kind {
+            WorkspaceCreationKind::Local => "Create workstation",
+            WorkspaceCreationKind::SystemSsh => "Review connection",
+            WorkspaceCreationKind::Assistant => "Create assistant",
+        };
+
         div()
             .flex()
             .flex_col()
@@ -237,120 +345,85 @@ impl HhApp {
                     .font_family(".SystemUIFont")
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(THEME.foreground))
-                    .child("New Workstation"),
+                    .child(heading),
             )
             .child(
                 div()
                     .flex()
                     .gap(px(8.0))
-                    .child(
-                        div()
-                            .id("new-workspace-local")
-                            .px(px(12.0))
-                            .py(px(7.0))
-                            .rounded(px(5.0))
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(rgb(if kind == WorkspaceCreationKind::Local {
-                                THEME.accent
-                            } else {
-                                THEME.border_strong
-                            }))
-                            .bg(rgb(if kind == WorkspaceCreationKind::Local {
-                                THEME.accent_soft
-                            } else {
-                                THEME.surface
-                            }))
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(dialog) = this.editor.modal.workspace_creation_mut() {
-                                    dialog.kind = WorkspaceCreationKind::Local;
-                                    dialog.field = WorkspaceCreationField::Name;
-                                    dialog.error = None;
-                                }
-                                cx.notify();
-                            }))
-                            .child("Local shell"),
-                    )
-                    .child(
-                        div()
-                            .id("new-workspace-ssh")
-                            .px(px(12.0))
-                            .py(px(7.0))
-                            .rounded(px(5.0))
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(rgb(if kind == WorkspaceCreationKind::SystemSsh {
-                                THEME.accent
-                            } else {
-                                THEME.border_strong
-                            }))
-                            .bg(rgb(if kind == WorkspaceCreationKind::SystemSsh {
-                                THEME.accent_soft
-                            } else {
-                                THEME.surface
-                            }))
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(dialog) = this.editor.modal.workspace_creation_mut() {
-                                    dialog.kind = WorkspaceCreationKind::SystemSsh;
-                                    dialog.field = WorkspaceCreationField::Destination;
-                                    dialog.error = None;
-                                }
-                                cx.notify();
-                            }))
-                            .child("System SSH"),
-                    ),
+                    .child(Self::render_workspace_kind_card(
+                        "new-workspace-local",
+                        "Local shell",
+                        WorkspaceCreationKind::Local,
+                        WorkspaceCreationField::Name,
+                        kind,
+                        cx,
+                    ))
+                    .child(Self::render_workspace_kind_card(
+                        "new-workspace-ssh",
+                        "System SSH",
+                        WorkspaceCreationKind::SystemSsh,
+                        WorkspaceCreationField::Destination,
+                        kind,
+                        cx,
+                    ))
+                    .child(Self::render_workspace_kind_card(
+                        "new-workspace-assistant",
+                        "Assistant",
+                        WorkspaceCreationKind::Assistant,
+                        WorkspaceCreationField::Name,
+                        kind,
+                        cx,
+                    )),
             )
             .child(
                 div()
                     .font_family(".SystemUIFont")
                     .text_xs()
                     .text_color(rgb(THEME.dim))
-                    .child("Workstation name (optional)"),
+                    .child(name_label),
             )
-            .child(
-                div()
-                    .id("workspace-name-input")
-                    .track_focus(&name_input_focus)
-                    .h(px(36.0))
-                    .px(px(10.0))
-                    .rounded(px(6.0))
-                    .bg(rgb(THEME.terminal))
-                    .border_1()
-                    .border_color(rgb(if field == WorkspaceCreationField::Name {
-                        THEME.accent
-                    } else {
-                        THEME.border_strong
-                    }))
-                    .overflow_hidden()
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .font_family(".SystemUIFont")
-                    .text_sm()
-                    .text_color(rgb(THEME.foreground))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                        this.focus_workspace_creation_field(
-                            WorkspaceCreationField::Name,
-                            Some(event.position),
-                            event.modifiers.shift,
-                            event.click_count,
-                            window,
-                        );
-                        cx.notify();
-                        }),
+            .child(self.render_workspace_creation_input(
+                "workspace-name-input",
+                field,
+                WorkspaceCreationField::Name,
+                name_placeholder,
+                ".SystemUIFont",
+                cx,
+            ))
+            .when(assistant, |element| {
+                element
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child("Working directory (optional)"),
                     )
-                    .child(WorkspaceTextInputElement {
-                        input: cx.entity(),
-                        field: WorkspaceCreationField::Name,
-                        placeholder: "Workstation name",
-                    }),
-            )
+                    .child(self.render_workspace_creation_input(
+                        "workspace-working-dir-input",
+                        field,
+                        WorkspaceCreationField::WorkingDir,
+                        "Working directory (optional)",
+                        "SF Mono",
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child("Custom instructions (optional)"),
+                    )
+                    .child(self.render_workspace_creation_input(
+                        "workspace-instructions-input",
+                        field,
+                        WorkspaceCreationField::Instructions,
+                        "Custom instructions (optional)",
+                        ".SystemUIFont",
+                        cx,
+                    ))
+            })
             .when(kind == WorkspaceCreationKind::SystemSsh, |element| {
                 element
                     .child(
@@ -360,58 +433,24 @@ impl HhApp {
                             .text_color(rgb(THEME.dim))
                             .child("SSH destination or exact ssh command"),
                     )
-                    .child(
-                        div()
-                            .id("workspace-ssh-input")
-                            .track_focus(&destination_input_focus)
-                            .h(px(36.0))
-                            .px(px(10.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(THEME.terminal))
-                            .border_1()
-                            .border_color(rgb(
-                                if field == WorkspaceCreationField::Destination {
-                                    THEME.accent
-                                } else {
-                                    THEME.border_strong
-                                },
-                            ))
-                            .overflow_hidden()
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .font_family("SF Mono")
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                this.focus_workspace_creation_field(
-                                    WorkspaceCreationField::Destination,
-                                    Some(event.position),
-                                    event.modifiers.shift,
-                                    event.click_count,
-                                    window,
-                                );
-                                cx.notify();
-                                }),
-                            )
-                            .child(WorkspaceTextInputElement {
-                                input: cx.entity(),
-                                field: WorkspaceCreationField::Destination,
-                                placeholder: "ssh user@host-or-alias",
-                            }),
-                    )
+                    .child(self.render_workspace_creation_input(
+                        "workspace-ssh-input",
+                        field,
+                        WorkspaceCreationField::Destination,
+                        "ssh user@host-or-alias",
+                        "SF Mono",
+                        cx,
+                    ))
             })
             .when(kind == WorkspaceCreationKind::SystemSsh, |element| {
                 element.child(
                     div()
-                    .font_family(".SystemUIFont")
-                    .text_sm()
-                    .text_color(rgb(THEME.muted))
-                    .child(
-                        "The workstation connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Harness Harlot stores no credentials or SSH config contents.",
-                    ),
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.muted))
+                        .child(
+                            "The workstation connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Harness Harlot stores no credentials or SSH config contents.",
+                        ),
                 )
             })
             .when_some(error, |element, message| {
@@ -454,13 +493,9 @@ impl HhApp {
                             .text_sm()
                             .text_color(rgb(0xffffff))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.submit_workspace_creation(cx)
+                                this.submit_workspace_creation(cx);
                             }))
-                            .child(if kind == WorkspaceCreationKind::SystemSsh {
-                                "Review connection"
-                            } else {
-                                "Create workstation"
-                            }),
+                            .child(submit_label),
                     ),
             )
             .into_any_element()

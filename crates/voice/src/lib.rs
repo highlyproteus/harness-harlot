@@ -4,6 +4,7 @@ mod harness;
 mod memory;
 mod realtime;
 mod settings;
+pub mod threads;
 mod tools;
 
 use std::thread::JoinHandle;
@@ -11,11 +12,16 @@ use std::thread::JoinHandle;
 use futures::channel::mpsc::UnboundedSender;
 
 pub use settings::{HonchoSettings, VoiceSettings};
+pub use threads::{
+    Thread, ThreadRecord, ThreadRole, ThreadSummary, adopt_thread, append_record, list_threads,
+    read_thread,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineState {
     Connecting,
     Listening,
+    Thinking,
     Speaking,
     ToolRunning,
     Suspended,
@@ -53,6 +59,9 @@ pub enum VoiceUiEvent {
     PlaybackProgress {
         played_ms: u64,
         total_ms: u64,
+    },
+    ToolCallStarted {
+        name: String,
     },
     ToolCall {
         name: String,
@@ -110,7 +119,9 @@ pub struct AssistantContext {
     pub workspace_id: Option<uuid::Uuid>,
     pub pane_id: Option<uuid::Uuid>,
     pub workspace_title: String,
+    pub workspace_kind: hh_protocol::WorkspaceKind,
     pub working_dir: Option<String>,
+    pub instructions: Option<String>,
     pub prior_context: Option<String>,
 }
 

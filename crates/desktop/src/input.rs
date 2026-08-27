@@ -205,6 +205,12 @@ impl HhApp {
                         (WorkspaceCreationKind::SystemSsh, WorkspaceCreationField::Name) => {
                             WorkspaceCreationField::Destination
                         }
+                        (WorkspaceCreationKind::Assistant, WorkspaceCreationField::Name) => {
+                            WorkspaceCreationField::WorkingDir
+                        }
+                        (WorkspaceCreationKind::Assistant, WorkspaceCreationField::WorkingDir) => {
+                            WorkspaceCreationField::Instructions
+                        }
                         _ => WorkspaceCreationField::Name,
                     };
                     cx.notify();

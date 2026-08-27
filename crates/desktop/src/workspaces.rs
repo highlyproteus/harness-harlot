@@ -264,11 +264,28 @@ impl HhApp {
         })
     }
 
+    pub(crate) fn workspace_is_assistant(&self, workspace_id: Uuid) -> bool {
+        self.session.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .is_some_and(hh_protocol::Workspace::is_assistant)
+        })
+    }
+
     pub(crate) fn begin_workspace_creation(&mut self, cx: &mut Context<Self>) {
         self.editor.modal = Modal::WorkspaceCreation(WorkspaceCreationDialog::new());
-        self.editor.workspace_input_layouts = [None, None];
-        self.editor.workspace_input_bounds = [None, None];
+        self.editor.workspace_input_layouts = [None, None, None, None];
+        self.editor.workspace_input_bounds = [None, None, None, None];
         cx.notify();
+    }
+
+    pub(crate) fn begin_assistant_creation(&mut self, cx: &mut Context<Self>) {
+        self.begin_workspace_creation(cx);
+        if let Some(dialog) = self.editor.modal.workspace_creation_mut() {
+            dialog.kind = WorkspaceCreationKind::Assistant;
+        }
     }
 
     pub(crate) fn focus_workspace_creation_field(

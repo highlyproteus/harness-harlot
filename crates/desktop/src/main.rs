@@ -375,9 +375,9 @@ struct EditorUi {
     browser_url_editor: Option<BrowserUrlEditor>,
     assistant_composer: Option<AssistantComposer>,
     ime_preedit: String,
-    workspace_input_focus: [FocusHandle; 2],
-    workspace_input_layouts: [Option<ShapedLine>; 2],
-    workspace_input_bounds: [Option<Bounds<Pixels>>; 2],
+    workspace_input_focus: [FocusHandle; 4],
+    workspace_input_layouts: [Option<ShapedLine>; 4],
+    workspace_input_bounds: [Option<Bounds<Pixels>>; 4],
     /// Archived-history views per pane; belongs with editing UI state.
     archived_views: HashMap<Uuid, ArchivedView>,
     update_available: Option<AvailableUpdateBanner>,
@@ -385,7 +385,7 @@ struct EditorUi {
 }
 
 impl EditorUi {
-    fn new(workspace_input_focus: [FocusHandle; 2]) -> Self {
+    fn new(workspace_input_focus: [FocusHandle; 4]) -> Self {
         Self {
             modal: Modal::None,
             history_editor: None,
@@ -395,8 +395,8 @@ impl EditorUi {
             assistant_composer: None,
             ime_preedit: String::new(),
             workspace_input_focus,
-            workspace_input_layouts: [None, None],
-            workspace_input_bounds: [None, None],
+            workspace_input_layouts: [None, None, None, None],
+            workspace_input_bounds: [None, None, None, None],
             archived_views: HashMap::new(),
             update_available: None,
             update_check: UpdateCheckState::default(),
@@ -459,7 +459,12 @@ impl HhApp {
     fn new(window: &mut Window, keymap: ResolvedKeymap, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        let workspace_input_focus = [cx.focus_handle(), cx.focus_handle()];
+        let workspace_input_focus = [
+            cx.focus_handle(),
+            cx.focus_handle(),
+            cx.focus_handle(),
+            cx.focus_handle(),
+        ];
         let terminal_font = TerminalFontProfile::resolve(cx.text_system());
         let ui_state_store = match UiStateStore::from_default_path() {
             Ok(store) => Some(store),

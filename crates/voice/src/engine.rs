@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::channel::mpsc::UnboundedSender;
-use hh_protocol::{NotificationKind, SessionNotification};
+use hh_protocol::{NotificationKind, SessionNotification, WorkspaceKind};
 
 use crate::audio::{AudioInputEvent, AudioSystem};
 use crate::memory::{MemoryBackend, NullBackend, Role, backend};
@@ -14,6 +14,7 @@ use crate::realtime::{
     ClientEvent, ConversationItem, ConversationRole, InputContent, RealtimeHandle, RealtimeInbound,
     ServerEvent, SessionConfig,
 };
+use crate::threads::{self, ThreadRecord, ThreadRole};
 use crate::tools::{ToolExecutor, tool_schemas};
 use crate::{
     AssistantContext, EngineState, VoiceCommand, VoiceEngineHandle, VoiceSettings, VoiceUiEvent,
@@ -23,16 +24,53 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LOOP_SLEEP: Duration = Duration::from_millis(10);
 const NARRATION_INTERVAL: Duration = Duration::from_secs(2);
 const MIC_LEVEL_INTERVAL: Duration = Duration::from_millis(100);
-const BARGE_IN_RMS: f32 = 0.05;
-const BARGE_IN_CHUNKS: u8 = 3;
-const BARGE_IN_PREROLL: usize = 6;
+const HALF_DUPLEX_RELEASE_DELAY: Duration = Duration::from_millis(500);
 const SESSION_ROLL_AGE: Duration = Duration::from_mins(50);
 const SESSION_ROLL_INPUT_TOKENS: u64 = 90_000;
 const MAX_TRANSCRIPT_TURNS: usize = 100;
 const SUMMARY_TURNS: usize = 15;
 const MAX_SUMMARY_CHARS: usize = 2_000;
 
-const BASE_INSTRUCTIONS: &str = "You are the Harness Harlot voice assistant — a hands-on project manager for a terminal workstation app. You manage workstations, tabs, git worktrees, and coding-agent CLIs (omp, hermes, codex, claude) on the user's behalf using your tools. Keep replies to one short sentence unless the user asks for detail; the only exception: before a long-running tool sequence, say a 3-6 word preamble like \"on it — creating that worktree\". Don't volunteer your capabilities unprompted and don't repeat yourself. Act, don't interrogate: when the user asks to open or create a terminal tab, call open_terminal_tab immediately with the current workstation id and never claim success without its tool result. When the user asks you to run a shell command in a tab you created, call send_input immediately; infer directories from working_dir and project_dir in list_workstations or use ~-relative paths the shell expands — do not ask for exact paths. You cannot guess filesystem paths: when the user names a project or directory whose exact path you have not seen in a tool result, call find_directory with the spoken name (or list_directory to browse from home) and use a returned path for open_project_tab, create_workstation, or create_worktree_tab. If a directory tool errors with a list of existing directories, pick the correct one from that list and retry instead of reporting failure. If a command fails, read_pane and report one short line. If a tool errors, report the error briefly and suggest the closest fix. Never invent tool results. When a tool returns status needs_approval, ask the user aloud exactly what you want to do and treat informal affirmatives (\"yeah\", \"sure\", \"go ahead\", \"mm-hm\") as yes for approve_action; anything ambiguous is not yes, and never tell the user to click buttons. Exception: when the result contains requires_ui_click, you cannot approve it — tell the user to click Approve in the pane if they really want it. Never try to close or delete your own assistant tab or workstation. If the user says stop or cancel, stop talking, start no new tool calls, and deny any pending approval via approve_action with approved false. Proactively report [event] messages about agents needing approval or input, naming the workstation and tab; ignore other events unless asked. When the user names a project, call attach_project before any other tool that needs that project — not on mere mentions. To start an agent on a task: create_worktree_tab (or open_project_tab), launch_agent, then send_input with the task text.";
+const BASE_INSTRUCTIONS: &str = concat!(
+    "You are the Harness Harlot voice assistant — a hands-on project manager for a terminal ",
+    "workstation app. You manage workstations, tabs, git worktrees, and coding-agent CLIs (omp, ",
+    "hermes, codex, claude) on the user's behalf using your tools. ",
+    "Keep replies to one short sentence unless the user asks for detail; the only exception: ",
+    "before a long-running tool sequence, say a 3-6 word preamble like \"on it — creating that ",
+    "worktree\". Don't volunteer your capabilities unprompted and don't repeat yourself. ",
+    "Act, don't interrogate: when the user asks to open or create a terminal tab and Where you ",
+    "live is a workstation, call open_terminal_tab immediately with that workstation id. From ",
+    "an assistant workspace, call list_workstations; choose the user-named kind=workstation ",
+    "target or the sole workstation, call attach_project, then call open_terminal_tab. If several ",
+    "workstations exist and none was named, ask one short question listing their titles; if none ",
+    "exists, call create_workstation. Never pass a kind=assistant id to terminal, project, or ",
+    "worktree tools, and never claim success without the tool result. When the user asks you to ",
+    "run a shell command in a tab you created, call send_input immediately; infer directories ",
+    "from working_dir and project_dir in list_workstations or use ~-relative paths the shell ",
+    "expands — do not ask for exact paths. ",
+    "You cannot guess filesystem paths: when the user names a project or directory whose exact ",
+    "path you have not seen in a tool result, call find_directory with the spoken name (or ",
+    "list_directory to browse from home) and use a returned path for open_project_tab, ",
+    "create_workstation, or create_worktree_tab. ",
+    "Earlier conversations are saved as threads: call list_threads to see them and read_thread ",
+    "to review one whenever the user references past work — never claim earlier conversations ",
+    "are unavailable without checking. ",
+    "If a directory tool errors with a list of existing directories, pick the correct one from ",
+    "that list and retry instead of reporting failure. If a command fails, read_pane and report ",
+    "one short line. If a tool errors, report the error briefly and suggest the closest fix. ",
+    "Never invent tool results. When a tool returns status needs_approval, ask the user aloud ",
+    "exactly what you want to do and treat informal affirmatives (\"yeah\", \"sure\", \"go ahead\", ",
+    "\"mm-hm\") as yes for approve_action; anything ambiguous is not yes, and never tell the user ",
+    "to click buttons. Exception: when the result contains requires_ui_click, you cannot approve ",
+    "it — tell the user to click Approve in the pane if they really want it. Never try to close ",
+    "or delete your own assistant tab or workstation. If the user says stop or cancel, stop ",
+    "talking, start no new tool calls, and deny any pending approval via approve_action with ",
+    "approved false. Proactively report [event] messages about agents needing approval or input, ",
+    "naming the workstation and tab; ignore other events unless asked. When the user names a ",
+    "project, call attach_project before any other tool that needs that project — not on mere ",
+    "mentions. To start an agent on a task: create_worktree_tab (or open_project_tab), ",
+    "launch_agent, then send_input with the task text.",
+);
 
 pub(crate) fn spawn(
     mut settings: VoiceSettings,
@@ -81,19 +119,20 @@ struct VoiceEngine {
     tools: ToolExecutor,
     memory: Box<dyn MemoryBackend>,
     transcripts: VecDeque<(Role, String)>,
+    thread_id: Option<uuid::Uuid>,
+    thread_has_title: bool,
     completed_input_transcriptions: VecDeque<String>,
     pending_user_content: VecDeque<InputContent>,
     narration: VecDeque<String>,
     response_active: bool,
     user_speaking: bool,
-    barge_streak: u8,
-    barge_preroll: VecDeque<Vec<i16>>,
     mic_enabled: bool,
     speaker_muted: bool,
     suspended: bool,
     connected_at: Option<Instant>,
     reconnect_roll: bool,
     last_activity: Instant,
+    last_output_audio: Option<Instant>,
     last_poll: Instant,
     last_narration: Option<Instant>,
     last_mic_level: Instant,
@@ -110,7 +149,9 @@ impl VoiceEngine {
     ) -> Result<Self> {
         let _ = ui.unbounded_send(VoiceUiEvent::State(EngineState::Connecting));
         let mut tools = ToolExecutor::connect()?;
-        if let Some(workspace_id) = context.workspace_id {
+        if context.workspace_kind == WorkspaceKind::Workstation
+            && let Some(workspace_id) = context.workspace_id
+        {
             tools.attach_workspace(workspace_id);
         }
         if let Some(pane_id) = context.pane_id {
@@ -121,6 +162,22 @@ impl VoiceEngine {
             .as_deref()
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned);
+        let thread_id = context.pane_id;
+        let mut thread_has_title = false;
+        if let Some(thread_id) = thread_id {
+            threads::prune_thread_files();
+            thread_has_title =
+                threads::read_thread(thread_id).is_some_and(|thread| thread.title.is_some());
+            threads::append_record(
+                thread_id,
+                &ThreadRecord::Meta {
+                    thread_id,
+                    workspace_id: context.workspace_id,
+                    workspace_title: context.workspace_title.clone(),
+                    at_ms: threads::now_ms(),
+                },
+            );
+        }
         let audio = AudioSystem::start()?;
         let memory: Box<dyn MemoryBackend> = match backend(settings.honcho.clone()) {
             Ok(memory) => memory,
@@ -150,20 +207,21 @@ impl VoiceEngine {
             audio,
             tools,
             memory,
+            thread_id,
+            thread_has_title,
             transcripts: VecDeque::with_capacity(MAX_TRANSCRIPT_TURNS),
             completed_input_transcriptions: VecDeque::with_capacity(MAX_TRANSCRIPT_TURNS),
             pending_user_content: VecDeque::new(),
             narration: VecDeque::new(),
             response_active: false,
             user_speaking: false,
-            barge_streak: 0,
-            barge_preroll: VecDeque::new(),
             mic_enabled: true,
             speaker_muted: false,
             suspended: false,
             connected_at: None,
             reconnect_roll: false,
             last_activity: now,
+            last_output_audio: None,
             last_poll: now,
             last_narration: None,
             last_mic_level: now.checked_sub(MIC_LEVEL_INTERVAL).unwrap_or(now),
@@ -209,6 +267,7 @@ impl VoiceEngine {
                     self.speaker_muted = muted;
                 }
                 Ok(VoiceCommand::SendUserText(text)) => {
+                    self.record_user_turn(&text);
                     self.pending_user_content
                         .push_back(InputContent::InputText { text });
                     self.last_activity = Instant::now();
@@ -257,29 +316,20 @@ impl VoiceEngine {
                         self.last_mic_level = now;
                         let _ = self.ui.unbounded_send(VoiceUiEvent::MicLevel(chunk.rms));
                     }
+                    let output_quiet = self.last_output_audio.is_none_or(|last_output| {
+                        now.saturating_duration_since(last_output) >= HALF_DUPLEX_RELEASE_DELAY
+                    });
                     let streaming = !self.suspended
                         && self.mic_enabled
                         && self.connected_at.is_some()
-                        && (self.settings.full_duplex || !self.audio.playback_active());
+                        && (self.settings.full_duplex
+                            || half_duplex_capture_allowed(
+                                self.response_active,
+                                self.audio.playback_active(),
+                                output_quiet,
+                            ));
                     if streaming {
-                        self.barge_streak = 0;
-                        self.barge_preroll.clear();
                         self.send_mic_chunk(&chunk.samples);
-                    } else if !self.suspended && self.mic_enabled && self.connected_at.is_some() {
-                        if self.barge_preroll.len() == BARGE_IN_PREROLL {
-                            self.barge_preroll.pop_front();
-                        }
-                        self.barge_preroll.push_back(chunk.samples);
-                        self.barge_streak = barge_in_streak(self.barge_streak, chunk.rms);
-                        if self.barge_streak >= BARGE_IN_CHUNKS {
-                            if let Err(error) = self.barge_in(true) {
-                                self.emit_error(&error);
-                            }
-                            for samples in std::mem::take(&mut self.barge_preroll) {
-                                self.send_mic_chunk(&samples);
-                            }
-                            self.barge_streak = 0;
-                        }
                     }
                 }
                 AudioInputEvent::Error(error) => {
@@ -393,8 +443,7 @@ impl VoiceEngine {
                 }
                 self.clear_user_speaking();
                 self.last_activity = Instant::now();
-                self.memory.record_turn(Role::User, &transcript);
-                self.push_transcript(Role::User, transcript.clone());
+                self.record_user_turn(&transcript);
                 let _ = self.ui.unbounded_send(VoiceUiEvent::UserTranscript {
                     text: transcript,
                     final_: true,
@@ -403,6 +452,9 @@ impl VoiceEngine {
             ServerEvent::ResponseCreated { .. } => {
                 self.last_activity = Instant::now();
                 self.response_active = true;
+                let _ = self
+                    .ui
+                    .unbounded_send(VoiceUiEvent::State(EngineState::Thinking));
             }
             ServerEvent::ResponseDone { response } => {
                 self.response_active = false;
@@ -424,7 +476,8 @@ impl VoiceEngine {
                 let _ = self.ui.unbounded_send(VoiceUiEvent::State(state));
             }
             ServerEvent::OutputAudioDelta { item_id, delta } => {
-                self.last_activity = Instant::now();
+                let now = Instant::now();
+                self.last_activity = now;
                 if self.speaker_muted {
                     // Speaker is muted: discard synthesized audio while the
                     // transcript keeps streaming.
@@ -436,6 +489,7 @@ impl VoiceEngine {
                     .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
                     .collect::<Vec<_>>();
                 self.audio.push_output(&item_id, &samples)?;
+                self.last_output_audio = Some(now);
                 let _ = self
                     .ui
                     .unbounded_send(VoiceUiEvent::State(EngineState::Speaking));
@@ -449,6 +503,16 @@ impl VoiceEngine {
             ServerEvent::OutputTranscriptDone { transcript, .. } => {
                 self.memory.record_turn(Role::Assistant, &transcript);
                 self.push_transcript(Role::Assistant, transcript.clone());
+                if let Some(thread_id) = self.thread_id {
+                    threads::append_record(
+                        thread_id,
+                        &ThreadRecord::Turn {
+                            role: ThreadRole::Assistant,
+                            text: transcript.clone(),
+                            at_ms: threads::now_ms(),
+                        },
+                    );
+                }
                 let _ = self.ui.unbounded_send(VoiceUiEvent::AssistantTranscript {
                     text: transcript,
                     final_: true,
@@ -461,16 +525,32 @@ impl VoiceEngine {
             } => {
                 let _ = self
                     .ui
+                    .unbounded_send(VoiceUiEvent::ToolCallStarted { name: name.clone() });
+                let _ = self
+                    .ui
                     .unbounded_send(VoiceUiEvent::State(EngineState::ToolRunning));
                 let output = self
                     .tools
                     .execute(&name, &arguments, self.memory.as_mut(), &self.ui);
+                if let Some(thread_id) = self.thread_id {
+                    threads::append_record(
+                        thread_id,
+                        &ThreadRecord::Tool {
+                            name: name.clone(),
+                            summary: output.chars().take(200).collect(),
+                            at_ms: threads::now_ms(),
+                        },
+                    );
+                }
                 self.send(ClientEvent::ConversationItemCreate {
                     item: ConversationItem::FunctionCallOutput { call_id, output },
                     previous_item_id: None,
                 })?;
                 self.send(ClientEvent::ResponseCreate { response: None })?;
                 self.response_active = true;
+                let _ = self
+                    .ui
+                    .unbounded_send(VoiceUiEvent::State(EngineState::Thinking));
             }
         }
         Ok(())
@@ -664,6 +744,15 @@ impl VoiceEngine {
         self.connected_at = None;
         let summary = self.build_summary();
         if !summary.is_empty() {
+            if let Some(thread_id) = self.thread_id {
+                threads::append_record(
+                    thread_id,
+                    &ThreadRecord::Summary {
+                        text: summary.clone(),
+                        at_ms: threads::now_ms(),
+                    },
+                );
+            }
             let _ = self
                 .ui
                 .unbounded_send(VoiceUiEvent::SessionSummary { text: summary });
@@ -701,7 +790,23 @@ impl VoiceEngine {
 
     fn roll_session(&mut self, reason: &str) -> Result<()> {
         let summary = self.build_summary();
-        self.pending_instructions = (!summary.is_empty()).then_some(summary);
+        if summary.is_empty() {
+            self.pending_instructions = None;
+        } else {
+            if let Some(thread_id) = self.thread_id {
+                threads::append_record(
+                    thread_id,
+                    &ThreadRecord::Summary {
+                        text: summary.clone(),
+                        at_ms: threads::now_ms(),
+                    },
+                );
+            }
+            let _ = self.ui.unbounded_send(VoiceUiEvent::SessionSummary {
+                text: summary.clone(),
+            });
+            self.pending_instructions = Some(summary);
+        }
         if let Some(realtime) = self.realtime.take() {
             realtime.shutdown();
         }
@@ -733,6 +838,32 @@ impl VoiceEngine {
             summary.push_str(text);
         }
         summary.chars().take(MAX_SUMMARY_CHARS).collect()
+    }
+
+    fn record_user_turn(&mut self, text: &str) {
+        self.memory.record_turn(Role::User, text);
+        self.push_transcript(Role::User, text.to_owned());
+        if let Some(thread_id) = self.thread_id {
+            let at_ms = threads::now_ms();
+            threads::append_record(
+                thread_id,
+                &ThreadRecord::Turn {
+                    role: ThreadRole::User,
+                    text: text.to_owned(),
+                    at_ms,
+                },
+            );
+            if !self.thread_has_title {
+                threads::append_record(
+                    thread_id,
+                    &ThreadRecord::Title {
+                        text: threads::thread_title(text),
+                        at_ms,
+                    },
+                );
+                self.thread_has_title = true;
+            }
+        }
     }
 
     fn push_transcript(&mut self, role: Role, text: String) {
@@ -768,6 +899,15 @@ impl VoiceEngine {
         let _ = self.audio.set_mic_enabled(false);
         let summary = self.build_summary();
         if !summary.is_empty() {
+            if let Some(thread_id) = self.thread_id {
+                threads::append_record(
+                    thread_id,
+                    &ThreadRecord::Summary {
+                        text: summary.clone(),
+                        at_ms: threads::now_ms(),
+                    },
+                );
+            }
             let _ = self
                 .ui
                 .unbounded_send(VoiceUiEvent::SessionSummary { text: summary });
@@ -806,12 +946,12 @@ fn accept_completed_transcription(
     true
 }
 
-pub(crate) fn barge_in_streak(streak: u8, rms: f32) -> u8 {
-    if rms >= BARGE_IN_RMS {
-        streak.saturating_add(1)
-    } else {
-        0
-    }
+fn half_duplex_capture_allowed(
+    response_active: bool,
+    playback_active: bool,
+    output_quiet: bool,
+) -> bool {
+    !response_active && !playback_active && output_quiet
 }
 
 pub(crate) fn effective_idle_timeout(configured_secs: u32) -> Option<Duration> {
@@ -836,6 +976,16 @@ fn instructions_with_context(context: &AssistantContext, prior: Option<&str>) ->
     let mut instructions = BASE_INSTRUCTIONS.to_owned();
     instructions.push_str("\n\n");
     instructions.push_str(&location_block(context));
+    if let Some(operator_instructions) = context
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|instructions| !instructions.is_empty())
+    {
+        instructions.push_str("\n\n## Operator instructions\n");
+        instructions.push_str(operator_instructions);
+    }
+    instructions.push_str(&earlier_threads_block(context));
     if let Some(prior) = prior {
         instructions.push_str("\n\n## Prior context\n");
         instructions.push_str(prior);
@@ -843,30 +993,66 @@ fn instructions_with_context(context: &AssistantContext, prior: Option<&str>) ->
     instructions
 }
 
+fn earlier_threads_block(context: &AssistantContext) -> String {
+    let Some(workspace_id) = context.workspace_id else {
+        return String::new();
+    };
+    let lines = threads::list_threads()
+        .into_iter()
+        .filter(|thread| thread.workspace_id == Some(workspace_id))
+        .filter(|thread| Some(thread.thread_id) != context.pane_id)
+        .take(5)
+        .map(|thread| {
+            let title = thread
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| "Untitled thread".to_owned());
+            format!("- {title} ({})", thread.thread_id)
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## Earlier threads (read with read_thread)\n{}",
+            lines.join("\n")
+        )
+    }
+}
+
 /// Formats the "where this assistant is planted" block injected into the
 /// session instructions.
 pub(crate) fn location_block(context: &AssistantContext) -> String {
-    let workstation = match context.workspace_id {
-        Some(id) => format!(
-            "'{}' (id {id})",
-            if context.workspace_title.is_empty() {
-                "untitled"
-            } else {
-                &context.workspace_title
-            }
-        ),
-        None => "'unattached'".to_owned(),
+    let title = if context.workspace_title.is_empty() {
+        "untitled"
+    } else {
+        &context.workspace_title
     };
     let working_dir = context
         .working_dir
         .as_deref()
         .filter(|dir| !dir.is_empty())
         .unwrap_or("not set");
-    format!(
-        "## Where you live\nWorkstation: {workstation}. Working directory: {working_dir}. \
-         This workstation is already attached; create tabs, worktrees, and agents there by \
-         default and pass its id/directory to tools without asking."
-    )
+    match (context.workspace_id, context.workspace_kind) {
+        (Some(id), WorkspaceKind::Workstation) => format!(
+            "## Where you live\nWorkstation: '{title}' (id {id}). Working directory: \
+             {working_dir}. This workstation is already attached; create tabs, worktrees, and \
+             agents there by default and pass its id/directory to tools without asking."
+        ),
+        (Some(id), WorkspaceKind::Assistant) => format!(
+            "## Where you live\nAssistant workspace: '{title}' (id {id}). Conversation working \
+             directory: {working_dir}. This workspace only holds assistant threads and cannot \
+             host terminal, project, or worktree tabs. Call list_workstations, choose a \
+             kind=workstation target, call attach_project, then pass that workstation id to \
+             terminal, project, and worktree tools."
+        ),
+        (None, _) => format!(
+            "## Where you live\nWorkspace: unattached. Conversation working directory: \
+             {working_dir}. Call list_workstations, choose a kind=workstation target, and call \
+             attach_project before terminal, project, or worktree tools; if none exists, call \
+             create_workstation."
+        ),
+    }
 }
 
 fn narration_text(notification: &SessionNotification) -> String {
@@ -928,15 +1114,11 @@ mod tests {
     }
 
     #[test]
-    fn talk_over_requires_three_consecutive_loud_chunks() {
-        let mut streak = barge_in_streak(0, BARGE_IN_RMS);
-        assert_eq!(streak, 1);
-        streak = barge_in_streak(streak, BARGE_IN_RMS - f32::EPSILON);
-        assert_eq!(streak, 0);
-        for expected in 1..=BARGE_IN_CHUNKS {
-            streak = barge_in_streak(streak, BARGE_IN_RMS);
-            assert_eq!(streak, expected);
-        }
+    fn half_duplex_blocks_response_gaps_and_speaker_echo_tail() {
+        assert!(half_duplex_capture_allowed(false, false, true));
+        assert!(!half_duplex_capture_allowed(true, false, true));
+        assert!(!half_duplex_capture_allowed(false, true, true));
+        assert!(!half_duplex_capture_allowed(false, false, false));
     }
 
     #[test]
@@ -979,14 +1161,21 @@ mod tests {
 
     #[test]
     fn prior_context_is_appended_without_replacing_base_policy() {
-        let context = AssistantContext::default();
+        let context = AssistantContext {
+            instructions: Some("answer tersely".to_owned()),
+            ..AssistantContext::default()
+        };
         let instructions =
             instructions_with_context(&context, Some("user prefers concise updates"));
         assert!(instructions.starts_with(BASE_INSTRUCTIONS));
         assert!(instructions.contains("## Prior context\nuser prefers concise updates"));
-        assert!(instructions.contains("call open_terminal_tab immediately"));
+        assert!(instructions.contains("kind=workstation"));
+        assert!(instructions.contains("call attach_project"));
+        assert!(instructions.contains("call open_terminal_tab"));
         assert!(instructions.contains("requires_ui_click"));
         assert!(instructions.contains("find_directory"));
+        assert!(instructions.contains("## Operator instructions\nanswer tersely"));
+        assert!(instructions.contains("list_threads"));
     }
 
     #[test]
@@ -995,7 +1184,9 @@ mod tests {
             workspace_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
             pane_id: None,
             workspace_title: "Growth".to_owned(),
+            workspace_kind: WorkspaceKind::Workstation,
             working_dir: Some("/Users/demo/Projects/growth".to_owned()),
+            instructions: None,
             prior_context: None,
         };
         let block = location_block(&context);
@@ -1005,8 +1196,29 @@ mod tests {
         assert!(block.contains("already attached"));
 
         let unattached = location_block(&AssistantContext::default());
-        assert!(unattached.contains("Workstation: 'unattached'."));
-        assert!(unattached.contains("Working directory: not set."));
+        assert!(unattached.contains("Workspace: unattached."));
+        assert!(unattached.contains("Conversation working directory: not set."));
+        assert!(!unattached.contains("already attached"));
+    }
+
+    #[test]
+    fn location_block_marks_assistant_workspace_thread_only() {
+        let context = AssistantContext {
+            workspace_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap()),
+            pane_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap()),
+            workspace_title: "Assistant 1".to_owned(),
+            workspace_kind: WorkspaceKind::Assistant,
+            working_dir: Some("/Users/demo/Projects/growth".to_owned()),
+            instructions: None,
+            prior_context: None,
+        };
+        let block = location_block(&context);
+        assert!(block.contains("Assistant workspace: 'Assistant 1'"));
+        assert!(block.contains("only holds assistant threads"));
+        assert!(block.contains("cannot host terminal, project, or worktree tabs"));
+        assert!(block.contains("list_workstations"));
+        assert!(block.contains("attach_project"));
+        assert!(!block.contains("already attached"));
     }
 
     #[test]
@@ -1015,7 +1227,9 @@ mod tests {
             workspace_id: None,
             pane_id: None,
             workspace_title: String::new(),
+            workspace_kind: WorkspaceKind::Workstation,
             working_dir: None,
+            instructions: None,
             prior_context: None,
         };
         let instructions = instructions_with_context(&context, Some("earlier talk"));

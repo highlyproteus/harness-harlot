@@ -177,6 +177,9 @@ impl HhApp {
         if let Modal::GroupMenu(menu) = &mut self.editor.modal {
             menu.icon_picker_open = false;
         }
+        if let Modal::WorkspaceMenu(menu) = &mut self.editor.modal {
+            menu.icon_picker_open = false;
+        }
         cx.notify();
     }
 

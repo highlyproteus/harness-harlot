@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 impl HhApp {
     pub(crate) fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let Some((workspace_id, scope, empty)) = self
+        let Some((workspace_id, assistant, scope, empty)) = self
             .session
             .snapshot
             .as_ref()
@@ -38,6 +38,7 @@ impl HhApp {
             .map(|workspace| {
                 (
                     workspace.id,
+                    workspace.is_assistant(),
                     workspace_tab_set(workspace, self.sidebar.workspace_tab_scope).scope,
                     workspace.tabs.is_empty(),
                 )
@@ -45,6 +46,10 @@ impl HhApp {
         else {
             return;
         };
+        if assistant {
+            self.new_assistant_tab(workspace_id, cx);
+            return;
+        }
         if empty {
             self.open_workspace_terminal(workspace_id, cx);
             return;
@@ -63,21 +68,6 @@ impl HhApp {
             Box::new(move |this, cx, result| match result {
                 Ok(ServiceResponse::PaneCreated { pane_id }) => {
                     this.focus_created_pane(workspace_id, pane_id, cx);
-                }
-                Ok(response) => this.report_unexpected(&response),
-                Err(error) => this.report(&error),
-            }),
-        );
-        self.layout.last_sizes.clear();
-        cx.notify();
-    }
-
-    pub(crate) fn create_group_assistant_at(&mut self, target_pane: Uuid, cx: &mut Context<Self>) {
-        self.dispatch_with(
-            ClientRequest::CreateGroupAssistant { target_pane },
-            Box::new(move |this, cx, result| match result {
-                Ok(ServiceResponse::PaneCreated { pane_id }) => {
-                    this.focus_pane_with_snapshot(pane_id, cx);
                 }
                 Ok(response) => this.report_unexpected(&response),
                 Err(error) => this.report(&error),
@@ -109,6 +99,10 @@ impl HhApp {
     }
 
     pub(crate) fn open_workspace_terminal(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        if self.workspace_is_assistant(workspace_id) {
+            self.new_assistant_tab(workspace_id, cx);
+            return;
+        }
         self.dispatch_with(
             ClientRequest::CreateWorkspaceTerminal { workspace_id },
             Box::new(move |this, cx, result| match result {
@@ -124,6 +118,10 @@ impl HhApp {
     }
 
     pub(crate) fn new_workspace_tab(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        if self.workspace_is_assistant(workspace_id) {
+            self.new_assistant_tab(workspace_id, cx);
+            return;
+        }
         self.dispatch_with(
             ClientRequest::CreateWorkspaceTab { workspace_id },
             Box::new(move |this, cx, result| match result {

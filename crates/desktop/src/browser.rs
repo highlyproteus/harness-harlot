@@ -359,20 +359,6 @@ impl HhApp {
         }
     }
 
-    pub(crate) fn add_assistant_to_context(
-        &mut self,
-        workspace_id: Uuid,
-        target_tab: Option<Uuid>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tab_id) = target_tab.filter(|tab_id| self.tab_is_navigation_container(*tab_id))
-        {
-            self.new_group_assistant(tab_id, cx);
-        } else {
-            self.new_assistant_tab(workspace_id, cx);
-        }
-    }
-
     pub(crate) fn add_group_to_context(
         &mut self,
         workspace_id: Uuid,

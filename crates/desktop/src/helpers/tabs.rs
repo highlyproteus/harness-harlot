@@ -884,6 +884,9 @@ mod tests {
             active_terminal_count: 2,
             connection: WorkspaceConnection::Local,
             working_dir: None,
+            kind: hh_protocol::WorkspaceKind::Workstation,
+            instructions: None,
+            custom_icon: None,
             tabs: vec![
                 hh_protocol::Tab {
                     id: Uuid::from_u128(10),

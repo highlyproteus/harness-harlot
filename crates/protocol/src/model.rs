@@ -102,6 +102,9 @@ impl SessionSnapshot {
                 active_terminal_count: 1,
                 connection: WorkspaceConnection::Local,
                 working_dir: None,
+                kind: WorkspaceKind::Workstation,
+                instructions: None,
+                custom_icon: None,
                 tabs: vec![tab],
             }],
         }
@@ -127,7 +130,19 @@ pub struct Workspace {
     pub connection: WorkspaceConnection,
     #[serde(default)]
     pub working_dir: Option<String>,
+    #[serde(default)]
+    pub kind: WorkspaceKind,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub custom_icon: Option<String>,
     pub tabs: Vec<Tab>,
+}
+
+impl Workspace {
+    pub fn is_assistant(&self) -> bool {
+        self.kind == WorkspaceKind::Assistant
+    }
 }
 
 const MAX_TMUX_ID_LEN: usize = 32;
@@ -207,6 +222,14 @@ pub struct TmuxSessionAttachIssue {
 pub enum TmuxScanScope {
     Local,
     SystemSsh { destination: String },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    #[default]
+    Workstation,
+    Assistant,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

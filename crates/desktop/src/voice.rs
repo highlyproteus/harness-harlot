@@ -8,9 +8,11 @@ use futures::StreamExt as _;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, ClipboardItem, Context, InteractiveElement, IntoElement, Keystroke, ParentElement,
-    PathPromptOptions, ScrollHandle, StatefulInteractiveElement, Styled, div, px, relative, rgb,
+    PathPromptOptions, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage, div, img, px,
+    relative, rgb,
 };
-use hh_protocol::Pane;
+use hh_protocol::{ClientRequest, Pane, ServiceResponse};
+use hh_voice::threads::{self, ThreadRecord, ThreadRole, ThreadSummary};
 use hh_voice::{
     AssistantContext, EngineState, HonchoSettings, VoiceCommand, VoiceEngineHandle, VoiceSettings,
     VoiceUiEvent, spawn_engine,
@@ -25,6 +27,35 @@ use gpui::AppContext as _;
 const ASSISTANT_SUMMARY_MAX_BYTES: u64 = 16 * 1024;
 const MAX_ASSISTANT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
+fn local_datetime(at_ms: u64) -> Option<time::OffsetDateTime> {
+    let datetime =
+        time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_ms) * 1_000_000).ok()?;
+    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    Some(datetime.to_offset(offset))
+}
+
+fn format_clock(at_ms: u64) -> String {
+    local_datetime(at_ms)
+        .and_then(|datetime| {
+            datetime
+                .format(&time::macros::format_description!("[hour]:[minute]"))
+                .ok()
+        })
+        .unwrap_or_else(|| "--:--".to_owned())
+}
+
+fn format_thread_activity(at_ms: u64) -> String {
+    local_datetime(at_ms)
+        .and_then(|datetime| {
+            datetime
+                .format(&time::macros::format_description!(
+                    "[year]-[month]-[day] [hour]:[minute]"
+                ))
+                .ok()
+        })
+        .unwrap_or_else(|| "Unknown time".to_owned())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VoiceTranscriptRole {
     User,
@@ -37,6 +68,7 @@ pub(crate) struct VoiceTranscriptEntry {
     pub text: String,
     pub final_: bool,
     pub timestamp: String,
+    pub image: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +127,7 @@ enum PersistedSummaryState {
 pub(crate) struct AssistantSession {
     pub engine: Option<VoiceEngineHandle>,
     pub engine_state: EngineState,
+    pub active_tool: Option<String>,
     pub transcript: Vec<VoiceTranscriptEntry>,
     pub ledger: Vec<VoiceLedgerEntry>,
     pub approvals: Vec<VoiceApproval>,
@@ -113,6 +146,7 @@ impl AssistantSession {
         Self {
             engine: None,
             engine_state: EngineState::Suspended,
+            active_tool: None,
             transcript: Vec::new(),
             ledger: Vec::new(),
             approvals: Vec::new(),
@@ -126,8 +160,32 @@ impl AssistantSession {
             persisted_summary: PersistedSummaryState::Absent,
         }
     }
+
     fn load(pane_id: Uuid) -> Self {
         let mut session = Self::new();
+        if let Some(thread) = threads::read_thread(pane_id) {
+            let mut transcript = thread
+                .entries
+                .into_iter()
+                .rev()
+                .filter_map(|record| match record {
+                    ThreadRecord::Turn { role, text, at_ms } => Some(VoiceTranscriptEntry {
+                        role: match role {
+                            ThreadRole::User => VoiceTranscriptRole::User,
+                            ThreadRole::Assistant => VoiceTranscriptRole::Assistant,
+                        },
+                        text,
+                        final_: true,
+                        timestamp: format_clock(at_ms),
+                        image: None,
+                    }),
+                    _ => None,
+                })
+                .take(50)
+                .collect::<Vec<_>>();
+            transcript.reverse();
+            session.transcript = transcript;
+        }
         session.persisted_summary = if load_assistant_summary(pane_id).is_some() {
             PersistedSummaryState::Present
         } else {
@@ -153,6 +211,7 @@ fn toggle_headphones_muted(session: &mut AssistantSession) -> bool {
 }
 
 pub(crate) struct VoiceUi {
+    pub thread_index: Vec<ThreadSummary>,
     pub sessions: HashMap<Uuid, AssistantSession>,
     pub settings_editor: VoiceSettingsEditor,
     pub quit_subscription: Option<gpui::Subscription>,
@@ -160,11 +219,18 @@ pub(crate) struct VoiceUi {
 
 impl VoiceUi {
     pub(crate) fn new() -> Self {
-        Self {
+        let mut voice = Self {
             sessions: HashMap::new(),
             settings_editor: VoiceSettingsEditor::load(),
             quit_subscription: None,
-        }
+            thread_index: Vec::new(),
+        };
+        voice.refresh_thread_index();
+        voice
+    }
+
+    pub(crate) fn refresh_thread_index(&mut self) {
+        self.thread_index = threads::list_threads();
     }
 }
 
@@ -232,9 +298,31 @@ impl HhApp {
         cx.notify();
     }
 
-    /// Resolves where an assistant pane is planted: its workstation, and the
-    /// working directory of its tab (falling back to the parent project tab,
-    /// then the workstation's own working directory).
+    fn reopen_thread(&mut self, workspace_id: Uuid, thread_id: Uuid, cx: &mut Context<Self>) {
+        self.dispatch_with(
+            ClientRequest::CreateAssistantTab { workspace_id },
+            Box::new(move |this, cx, result| match result {
+                Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                    if threads::adopt_thread(thread_id, pane_id) {
+                        this.voice
+                            .sessions
+                            .insert(pane_id, AssistantSession::load(pane_id));
+                    }
+                    this.voice.refresh_thread_index();
+                    this.focus_created_pane(workspace_id, pane_id, cx);
+                    this.start_assistant(pane_id, cx);
+                }
+                Ok(response) => this.report_unexpected(&response),
+                Err(error) => this.report(&error),
+            }),
+        );
+        self.layout.last_sizes.clear();
+        cx.notify();
+    }
+
+    /// Resolves the workspace containing an assistant pane and the working
+    /// directory of its tab (falling back to the parent project tab, then the
+    /// containing workspace's own working directory).
     pub(crate) fn assistant_context_for_pane(&self, pane_id: Uuid) -> AssistantContext {
         let Some(snapshot) = self.session.snapshot.as_ref() else {
             return AssistantContext::default();
@@ -259,8 +347,12 @@ impl HhApp {
                         workspace_id: Some(workspace.id),
                         pane_id: Some(pane_id),
                         workspace_title: workspace.title.clone(),
+                        workspace_kind: workspace.kind,
                         working_dir,
-                        prior_context: load_assistant_summary(pane_id),
+                        instructions: workspace.instructions.clone(),
+                        prior_context: load_assistant_summary(pane_id).or_else(|| {
+                            threads::read_thread(pane_id).and_then(|thread| thread.summary)
+                        }),
                     };
                 }
             }
@@ -302,13 +394,26 @@ impl HhApp {
         if !engine_running {
             self.start_assistant(pane_id, cx);
         }
-        if let Some(ComposerAttachment { filename, data_url }) = attachment {
+        if let Some(ComposerAttachment {
+            filename,
+            data_url,
+            path,
+        }) = attachment
+        {
             self.apply_transcript(
                 pane_id,
                 VoiceTranscriptRole::User,
                 format!("[image attached: {filename}]"),
                 true,
             );
+            if let Some(entry) = self
+                .voice
+                .sessions
+                .get_mut(&pane_id)
+                .and_then(|session| session.transcript.last_mut())
+            {
+                entry.image = Some(path);
+            }
             self.send_assistant_command(pane_id, VoiceCommand::SendUserImage { data_url });
         }
         if !text.is_empty() {
@@ -390,15 +495,20 @@ impl HhApp {
                     Ok::<_, anyhow::Error>((
                         filename,
                         format!("data:{mime};base64,{}", BASE64.encode(bytes)),
+                        path,
                     ))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| match result {
-                Ok((filename, data_url)) => {
+                Ok((filename, data_url, path)) => {
                     this.focus_pane_with_snapshot(pane_id, cx);
                     activate_assistant_composer(&mut this.editor.assistant_composer, pane_id);
                     if let Some(composer) = this.editor.assistant_composer.as_mut() {
-                        composer.attachment = Some(ComposerAttachment { filename, data_url });
+                        composer.attachment = Some(ComposerAttachment {
+                            filename,
+                            data_url,
+                            path,
+                        });
                     }
                     cx.notify();
                 }
@@ -485,6 +595,7 @@ impl HhApp {
             }
             delete_assistant_summary(pane_id);
         }
+        self.voice.refresh_thread_index();
     }
 
     pub(crate) fn shutdown_voice(&mut self) {
@@ -501,6 +612,9 @@ impl HhApp {
         };
         match event {
             VoiceUiEvent::State(state) => {
+                if !matches!(&state, EngineState::ToolRunning) {
+                    session.active_tool = None;
+                }
                 if let EngineState::Error(message) = &state {
                     session.ledger.push(VoiceLedgerEntry {
                         name: "engine.error".to_owned(),
@@ -542,7 +656,11 @@ impl HhApp {
                     session.assistant_reveal_chars = session.assistant_reveal_chars.max(target);
                 }
             }
+            VoiceUiEvent::ToolCallStarted { name } => {
+                session.active_tool = Some(name);
+            }
             VoiceUiEvent::ToolCall { name, summary } => {
+                session.active_tool = None;
                 session.ledger.push(VoiceLedgerEntry { name, summary });
                 if session.ledger.len() > 100 {
                     session.ledger.remove(0);
@@ -558,6 +676,7 @@ impl HhApp {
             VoiceUiEvent::MicLevel(level) => session.mic_level = level.clamp(0.0, 1.0),
             VoiceUiEvent::SessionSummary { text } => {
                 save_assistant_summary(pane_id, &text);
+                self.voice.refresh_thread_index();
             }
         }
     }
@@ -569,6 +688,18 @@ impl HhApp {
         text: String,
         final_: bool,
     ) {
+        if final_
+            && role == VoiceTranscriptRole::User
+            && !text.starts_with("[image attached:")
+            && self
+                .pane_metadata(pane_id)
+                .is_some_and(|pane| pane.kind.is_assistant() && pane.title == "Assistant")
+        {
+            let title = hh_voice::threads::thread_title(&text);
+            if !title.is_empty() {
+                self.dispatch(ClientRequest::RenamePane { pane_id, title });
+            }
+        }
         let Some(session) = self.voice.sessions.get_mut(&pane_id) else {
             return;
         };
@@ -596,6 +727,7 @@ impl HhApp {
                 text,
                 final_: true,
                 timestamp,
+                image: None,
             });
             if role == VoiceTranscriptRole::Assistant {
                 session.assistant_reveal_chars = 0;
@@ -612,6 +744,7 @@ impl HhApp {
                 text,
                 final_: false,
                 timestamp: current_timestamp(),
+                image: None,
             });
             if role == VoiceTranscriptRole::Assistant {
                 session.assistant_reveal_chars = 0;
@@ -693,6 +826,37 @@ fn activate_assistant_composer(composer: &mut Option<AssistantComposer>, pane_id
     }
 }
 
+fn assistant_activity_row(pane_id: Uuid, session: &AssistantSession) -> Option<AnyElement> {
+    let label = match &session.engine_state {
+        EngineState::Thinking => Some("thinking…".to_owned()),
+        EngineState::ToolRunning => Some(format!(
+            "running {}…",
+            session.active_tool.as_deref().unwrap_or("tool")
+        )),
+        _ => None,
+    }?;
+    Some(
+        div()
+            .id(("voice-activity", element_key(pane_id)))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .font_family("SF Mono")
+            .text_xs()
+            .text_color(rgb(THEME.dim))
+            .child(
+                div()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded_full()
+                    .bg(rgb(THEME.accent)),
+            )
+            .child(label)
+            .into_any_element(),
+    )
+}
+
 impl HhApp {
     pub(crate) fn render_assistant_workspace(
         &self,
@@ -729,6 +893,7 @@ impl HhApp {
         let (state_label, state_color) = match &session.engine_state {
             EngineState::Connecting => ("Connecting", THEME.accent_soft),
             EngineState::Listening => ("Listening", THEME.ansi[2]),
+            EngineState::Thinking => ("Thinking", THEME.accent),
             EngineState::Speaking => ("Speaking", THEME.accent),
             EngineState::ToolRunning => ("Running tool", THEME.dim),
             EngineState::Suspended => ("Suspended", THEME.dim),
@@ -785,6 +950,87 @@ impl HhApp {
             .into_any_element()
     }
 
+    fn render_previous_threads(&self, pane_id: Uuid, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let workspace_id = self.workspace_id_for_pane(pane_id)?;
+        let summaries = self
+            .voice
+            .thread_index
+            .iter()
+            .filter(|summary| summary.workspace_id == Some(workspace_id))
+            .filter(|summary| self.workspace_id_for_pane(summary.thread_id).is_none())
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>();
+        if summaries.is_empty() {
+            return None;
+        }
+        let rows = summaries.into_iter().map(|summary| {
+            let thread_id = summary.thread_id;
+            let title = summary
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| "Untitled thread".to_owned());
+            let turn_label = format!(
+                "{} turn{}",
+                summary.turns,
+                if summary.turns == 1 { "" } else { "s" }
+            );
+            let activity = format_thread_activity(summary.last_at_ms);
+            div()
+                .id(("assistant-previous-thread", element_key(thread_id)))
+                .w_full()
+                .min_w(px(0.0))
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(rgb(THEME.surface))
+                .hover(|element| element.bg(rgb(THEME.elevated)))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.foreground))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .font_family("SF Mono")
+                        .text_size(px(9.0))
+                        .text_color(rgb(THEME.dim))
+                        .child(format!("{turn_label} · {activity}")),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.reopen_thread(workspace_id, thread_id, cx);
+                    cx.stop_propagation();
+                }))
+                .into_any_element()
+        });
+        Some(
+            div()
+                .w_full()
+                .max_w(px(440.0))
+                .pt(px(10.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .text_xs()
+                        .text_color(rgb(THEME.muted))
+                        .child("Previous threads"),
+                )
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
     fn render_assistant_idle(
         &self,
         pane_id: Uuid,
@@ -801,6 +1047,7 @@ impl HhApp {
             EngineState::Error(message) => Some(message.clone()),
             _ => None,
         };
+        let previous_threads = self.render_previous_threads(pane_id, cx);
         div()
             .id(("assistant-idle", element_key(pane_id)))
             .min_h(px(0.0))
@@ -811,6 +1058,8 @@ impl HhApp {
             .justify_center()
             .gap(px(12.0))
             .px(px(24.0))
+            .py(px(24.0))
+            .overflow_y_scroll()
             .bg(rgb(THEME.terminal))
             .when_some(error_line, |element, message| {
                 element.child(
@@ -850,9 +1099,11 @@ impl HhApp {
                     .text_color(rgb(THEME.dim))
                     .child("Not connected — no microphone or API usage while idle."),
             )
+            .when_some(previous_threads, |element, history| element.child(history))
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_assistant_live(
         &self,
         pane_id: Uuid,
@@ -911,6 +1162,15 @@ impl HhApp {
                             .text_color(rgb(if user { THEME.muted } else { THEME.foreground }))
                             .flex()
                             .flex_col()
+                            .when_some(entry.image.clone(), |element, path| {
+                                element.child(
+                                    img(path)
+                                        .max_w(px(220.0))
+                                        .max_h(px(160.0))
+                                        .object_fit(gpui::ObjectFit::Contain)
+                                        .rounded(px(5.0)),
+                                )
+                            })
                             .children(text.split('\n').map(|line| {
                                 let line = if line.is_empty() { " " } else { line };
                                 div().child(line.to_owned())
@@ -1019,6 +1279,7 @@ impl HhApp {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
+        let activity = assistant_activity_row(pane_id, session);
         let approvals = session
             .approvals
             .iter()
@@ -1109,12 +1370,14 @@ impl HhApp {
                     .flex_col()
                     .gap(px(8.0))
                     .children(transcript)
-                    .children(ledger),
+                    .children(ledger)
+                    .when_some(activity, |element, activity| element.child(activity)),
             )
             .children(approvals)
             .child(self.render_assistant_composer_row(pane_id, session, cx))
             .into_any_element()
     }
+    #[allow(clippy::too_many_lines)]
     fn render_assistant_composer_row(
         &self,
         pane_id: Uuid,
@@ -1127,20 +1390,20 @@ impl HhApp {
             .is_some_and(|engine| !engine.is_finished());
         let voice_active =
             engine_present && !matches!(&session.engine_state, EngineState::Suspended);
-        let attachment_filename = self
+        let attachment_info = self
             .editor
             .assistant_composer
             .as_ref()
             .filter(|composer| composer.pane_id == pane_id)
             .and_then(|composer| composer.attachment.as_ref())
-            .map(|attachment| attachment.filename.clone());
+            .map(|attachment| (attachment.filename.clone(), attachment.path.clone()));
         div()
             .flex_none()
             .border_t_1()
             .border_color(rgb(THEME.border))
             .flex()
             .flex_col()
-            .when_some(attachment_filename, |element, filename| {
+            .when_some(attachment_info, |element, (filename, path)| {
                 element.child(
                     div()
                         .px(px(10.0))
@@ -1160,8 +1423,17 @@ impl HhApp {
                                 .text_xs()
                                 .text_color(rgb(THEME.foreground))
                                 .max_w(relative(0.7))
-                                .truncate()
-                                .child(format!("🖼 {filename}")),
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    img(path)
+                                        .h(px(48.0))
+                                        .max_w(px(160.0))
+                                        .object_fit(gpui::ObjectFit::Contain)
+                                        .rounded(px(4.0)),
+                                )
+                                .child(div().min_w(px(0.0)).truncate().child(filename)),
                         )
                         .child(
                             div()
@@ -1781,6 +2053,7 @@ mod tests {
             text: "keep this visible".to_owned(),
             final_: true,
             timestamp: "12:34".to_owned(),
+            image: None,
         });
         assert!(!assistant_workspace_shows_idle(&session));
         session.transcript.clear();
@@ -1821,6 +2094,7 @@ mod tests {
             attachment: Some(ComposerAttachment {
                 filename: "screenshot.png".to_owned(),
                 data_url: "data:image/png;base64,AA==".to_owned(),
+                path: PathBuf::from("/tmp/screenshot.png"),
             }),
         });
         activate_assistant_composer(&mut composer, pane_id);

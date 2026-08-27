@@ -21,6 +21,17 @@ pub(crate) fn abbreviate_home(path: &str) -> String {
         .map_or_else(|| path.to_owned(), |suffix| format!("~{suffix}"))
 }
 
+pub(crate) fn expand_home(path: &str) -> String {
+    let Ok(home) = std::env::var("HOME") else {
+        return path.to_owned();
+    };
+    if path == "~" {
+        return home;
+    }
+    path.strip_prefix("~/")
+        .map_or_else(|| path.to_owned(), |suffix| format!("{home}/{suffix}"))
+}
+
 pub(crate) fn element_key(id: Uuid) -> u64 {
     let (high, low) = id.as_u64_pair();
     high ^ low
@@ -114,7 +125,7 @@ pub(crate) fn append_rename_text(value: &mut String, replace_on_type: &mut bool,
 #[cfg(test)]
 #[cfg(test)]
 mod tests {
-    use super::append_rename_text;
+    use super::{append_rename_text, expand_home};
 
     #[test]
     fn terminal_rename_accepts_replacement_text_after_the_original_is_cleared() {
@@ -128,5 +139,15 @@ mod tests {
 
         append_rename_text(&mut value, &mut replace_on_type, "\n");
         assert_eq!(value, "Build shell");
+    }
+
+    #[test]
+    fn home_expansion_only_rewrites_home_shorthand() {
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(expand_home("~"), home);
+            assert_eq!(expand_home("~/Projects"), format!("{home}/Projects"));
+        }
+        assert_eq!(expand_home("~someone/Projects"), "~someone/Projects");
+        assert_eq!(expand_home("/tmp/project"), "/tmp/project");
     }
 }

@@ -17,12 +17,15 @@ use uuid::Uuid;
 use crate::VoiceUiEvent;
 use crate::harness::{Agent, launch_command};
 use crate::memory::MemoryBackend;
+use crate::threads::{self, ThreadRecord, ThreadRole};
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const DEFAULT_PANE_LINES: usize = 60;
 const MAX_PANE_LINES: usize = 200;
 const WORKTREE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DIRECTORY_MATCHES: usize = 20;
+const MAX_LISTED_THREADS: usize = 20;
+const MAX_READ_THREAD_TURNS: usize = 30;
 const MAX_SEARCH_DEPTH: usize = 4;
 const MAX_SEARCH_VISITS: usize = 20_000;
 const SEARCH_SKIP_DIRECTORIES: &[&str] = &[
@@ -163,6 +166,8 @@ impl ToolExecutor {
             "attach_project" => self.attach_project(arguments),
             "list_directory" => Self::list_directory(arguments),
             "find_directory" => Self::find_directory(arguments),
+            "list_threads" => Ok(Self::list_threads(arguments)),
+            "read_thread" => Self::read_thread(arguments),
             "recall_memory" => {
                 let query = required_str(arguments, "query")?;
                 memory
@@ -360,24 +365,15 @@ impl ToolExecutor {
 
     fn attach_project(&mut self, arguments: &Value) -> Result<Value> {
         let workspace_id = required_uuid(arguments, "workspace_id")?;
-        let snapshot = self.ensure_snapshot()?.clone();
-        if !snapshot
-            .workspaces
-            .iter()
-            .any(|workspace| workspace.id == workspace_id)
-        {
-            bail!("workstation {workspace_id} does not exist");
-        }
+        let (title, working_dir) = {
+            let workspace = terminal_workspace(self.ensure_snapshot()?, workspace_id)?;
+            (workspace.title.clone(), workspace.working_dir.clone())
+        };
         self.attached_workspaces.insert(workspace_id);
-        let workspace = snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .expect("workspace checked");
         Ok(json!({
-            "workspace_id": workspace.id,
-            "title": workspace.title,
-            "working_dir": workspace.working_dir,
+            "workspace_id": workspace_id,
+            "title": title,
+            "working_dir": working_dir,
             "attached": true,
         }))
     }
@@ -404,6 +400,54 @@ impl ToolExecutor {
             .map(|path| json!({ "path": path }))
             .collect::<Vec<_>>();
         Ok(json!({ "query": query, "matches": matches, "truncated": truncated }))
+    }
+
+    fn list_threads(_arguments: &Value) -> Value {
+        let threads = threads::list_threads();
+        let truncated = threads.len() > MAX_LISTED_THREADS;
+        let threads = threads
+            .into_iter()
+            .take(MAX_LISTED_THREADS)
+            .map(|thread| {
+                json!({
+                    "thread_id": thread.thread_id,
+                    "title": thread.title,
+                    "workspace": thread.workspace_title,
+                    "last_active_ms": thread.last_at_ms,
+                    "turns": thread.turns,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "threads": threads, "truncated": truncated })
+    }
+
+    fn read_thread(arguments: &Value) -> Result<Value> {
+        let thread_id = required_uuid(arguments, "thread_id")?;
+        let thread = threads::read_thread(thread_id)
+            .with_context(|| format!("thread {thread_id} not found"))?;
+        let mut turns = thread
+            .entries
+            .into_iter()
+            .rev()
+            .filter_map(|record| match record {
+                ThreadRecord::Turn { role, text, .. } => Some(json!({
+                    "role": match role {
+                        ThreadRole::User => "user",
+                        ThreadRole::Assistant => "assistant",
+                    },
+                    "text": text,
+                })),
+                _ => None,
+            })
+            .take(MAX_READ_THREAD_TURNS)
+            .collect::<Vec<_>>();
+        turns.reverse();
+        Ok(json!({
+            "thread_id": thread.thread_id,
+            "title": thread.title,
+            "summary": thread.summary,
+            "turns": turns,
+        }))
     }
 
     fn create_workstation(&mut self, arguments: &Value) -> Result<Value> {
@@ -443,7 +487,7 @@ impl ToolExecutor {
 
     fn open_terminal_tab(&mut self, arguments: &Value) -> Result<Value> {
         let workspace_id = required_uuid(arguments, "workspace_id")?;
-        self.require_attached(workspace_id)?;
+        self.require_attached_workstation(workspace_id)?;
         let response = self
             .client
             .call(&ClientRequest::CreateWorkspaceTab { workspace_id })?;
@@ -467,7 +511,7 @@ impl ToolExecutor {
 
     fn open_project_tab(&mut self, arguments: &Value) -> Result<Value> {
         let workspace_id = required_uuid(arguments, "workspace_id")?;
-        self.require_attached(workspace_id)?;
+        self.require_attached_workstation(workspace_id)?;
         let working_dir = canonical_existing_directory(required_str(arguments, "working_dir")?)?
             .to_string_lossy()
             .into_owned();
@@ -490,7 +534,7 @@ impl ToolExecutor {
 
     fn create_worktree_tab(&mut self, arguments: &Value) -> Result<Value> {
         let workspace_id = required_uuid(arguments, "workspace_id")?;
-        self.require_attached(workspace_id)?;
+        self.require_attached_workstation(workspace_id)?;
         let repo_dir = canonical_git_repository(required_str(arguments, "repo_dir")?)?;
         let branch = required_str(arguments, "branch")?;
         let base = arguments.get("base").and_then(Value::as_str);
@@ -627,9 +671,16 @@ impl ToolExecutor {
 
     fn require_attached(&self, workspace_id: Uuid) -> Result<()> {
         if !self.attached_workspaces.contains(&workspace_id) {
-            bail!("workspace not attached; ask the user, then call attach_project");
+            bail!("workstation {workspace_id} is not attached; call attach_project first");
         }
         Ok(())
+    }
+
+    fn require_attached_workstation(&mut self, workspace_id: Uuid) -> Result<()> {
+        {
+            terminal_workspace(self.ensure_snapshot()?, workspace_id)?;
+        }
+        self.require_attached(workspace_id)
     }
 
     fn tab_contains_own_pane(&mut self, tab_id: Uuid) -> Result<bool> {
@@ -683,7 +734,7 @@ pub(crate) fn classify_tool(
 ) -> Result<TrustTier> {
     match name {
         "list_workstations" | "read_pane" | "check_status" | "attach_project" | "recall_memory"
-        | "list_directory" | "find_directory" => Ok(TrustTier::T0),
+        | "list_directory" | "find_directory" | "list_threads" | "read_thread" => Ok(TrustTier::T0),
         "create_workstation"
         | "open_terminal_tab"
         | "rename_tab"
@@ -709,7 +760,7 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
     vec![
         tool(
             "list_workstations",
-            "List workstations, tabs, panes, profiles, and statuses",
+            "List all workspaces with kind, tabs, panes, profiles, and statuses",
             json!({}),
             &[],
         ),
@@ -729,7 +780,7 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             "attach_project",
-            "Attach Voice Mode to an existing workstation",
+            "Attach Voice Mode to an existing kind=workstation target from list_workstations",
             json!({"workspace_id": {"type":"string"}}),
             &["workspace_id"],
         ),
@@ -752,6 +803,18 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
             &["query"],
         ),
         tool(
+            "list_threads",
+            "List saved assistant conversation threads, newest first",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "read_thread",
+            "Read a saved conversation thread by thread_id from list_threads",
+            json!({"thread_id": {"type":"string"}}),
+            &["thread_id"],
+        ),
+        tool(
             "create_workstation",
             "Create and attach a workstation",
             json!({
@@ -761,7 +824,7 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             "open_terminal_tab",
-            "Open a terminal tab immediately when the user asks; returns pane_id for send_input",
+            "Open a terminal tab in an attached kind=workstation target; returns pane_id for send_input",
             json!({"workspace_id": {"type":"string"}}),
             &["workspace_id"],
         ),
@@ -1118,6 +1181,23 @@ fn key_bytes(key: &str) -> Result<&'static [u8]> {
     }
 }
 
+fn terminal_workspace(
+    snapshot: &SessionSnapshot,
+    workspace_id: Uuid,
+) -> Result<&hh_protocol::Workspace> {
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+    if workspace.is_assistant() {
+        bail!(
+            "workspace {workspace_id} is an assistant workspace; choose a kind=workstation target from list_workstations"
+        );
+    }
+    Ok(workspace)
+}
+
 fn snapshot_summary(snapshot: &SessionSnapshot, states: &HashMap<Uuid, PaneStreamState>) -> Value {
     let workspaces = snapshot
         .workspaces
@@ -1152,6 +1232,7 @@ fn snapshot_summary(snapshot: &SessionSnapshot, states: &HashMap<Uuid, PaneStrea
             json!({
                 "id": workspace.id,
                 "title": workspace.title,
+                "kind": workspace.kind,
                 "working_dir": workspace.working_dir,
                 "tabs": tabs,
             })
@@ -1352,6 +1433,38 @@ mod tests {
         assert_eq!(required("send_input"), json!(["pane_id", "text"]));
         assert_eq!(required("list_directory"), json!([]));
         assert_eq!(required("find_directory"), json!(["query"]));
+        assert_eq!(required("list_threads"), json!([]));
+        assert_eq!(required("read_thread"), json!(["thread_id"]));
+    }
+
+    #[test]
+    fn snapshot_summary_exposes_workspace_kind() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let summary = snapshot_summary(&snapshot, &HashMap::new());
+        assert_eq!(summary["workspaces"][0]["kind"], "workstation");
+
+        snapshot.workspaces[0].kind = hh_protocol::WorkspaceKind::Assistant;
+        let summary = snapshot_summary(&snapshot, &HashMap::new());
+        assert_eq!(summary["workspaces"][0]["kind"], "assistant");
+    }
+
+    #[test]
+    fn terminal_workspace_rejects_assistant_workspace() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let workspace_id = snapshot.workspaces[0].id;
+        assert_eq!(
+            terminal_workspace(&snapshot, workspace_id).unwrap().id,
+            workspace_id
+        );
+
+        snapshot.workspaces[0].kind = hh_protocol::WorkspaceKind::Assistant;
+        let error = terminal_workspace(&snapshot, workspace_id).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "workspace {workspace_id} is an assistant workspace; choose a kind=workstation target from list_workstations"
+            )
+        );
     }
 
     #[test]

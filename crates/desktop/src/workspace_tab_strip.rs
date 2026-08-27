@@ -35,6 +35,7 @@ impl HhApp {
             WorkspaceTabScope::Workstation => None,
             WorkspaceTabScope::Project(project_id) => Some(project_id),
         };
+        let assistant = workspace.is_assistant();
         let active_tab = workspace_strip_active_tab(workspace, scope, self.layout.focused_pane);
         let tabs = tab_set
             .tabs
@@ -343,21 +344,27 @@ impl HhApp {
                             .bg(rgb(THEME.elevated))
                             .text_color(rgb(THEME.foreground))
                     })
-                    .tooltip(|_, cx| {
-                        cx.new(|_| TooltipView {
-                            text: "Add project, terminal, browser, or group".to_owned(),
-                        })
-                        .into()
+                    .tooltip({
+                        let text = if assistant {
+                            "New thread".to_owned()
+                        } else {
+                            "Add project, terminal, browser, or group".to_owned()
+                        };
+                        move |_, cx| cx.new(|_| TooltipView { text: text.clone() }).into()
                     })
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.editor.modal = Modal::CreateMenu(CreateMenu {
-                            position: event.position(),
-                            target: CreateMenuTarget::TabStrip {
-                                workspace_id,
-                                target_tab,
-                            },
-                        });
-                        cx.notify();
+                        if assistant {
+                            this.new_assistant_tab(workspace_id, cx);
+                        } else {
+                            this.editor.modal = Modal::CreateMenu(CreateMenu {
+                                position: event.position(),
+                                target: CreateMenuTarget::TabStrip {
+                                    workspace_id,
+                                    target_tab,
+                                },
+                            });
+                            cx.notify();
+                        }
                     }))
                     .child("+"),
             )
