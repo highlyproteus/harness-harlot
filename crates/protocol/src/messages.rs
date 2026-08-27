@@ -8,8 +8,8 @@ use crate::history::{
     TerminalHistoryPage,
 };
 use crate::model::{
-    AppearanceColor, SessionSnapshot, SplitAxis, TmuxScanScope, TmuxSession,
-    TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
+    AppearanceColor, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport, TmuxScanScope,
+    TmuxSession, TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
 };
 use crate::profile::TerminalProfile;
 use crate::terminal::{
@@ -17,6 +17,17 @@ use crate::terminal::{
     TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen,
     TerminalSelectionKind,
 };
+
+/// Exact pane identity and transport approved by a trusted caller. The service
+/// compares this tuple while holding registry state through the read/write edge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PaneAuthority {
+    pub workspace_id: Uuid,
+    pub tab_id: Uuid,
+    pub pane_id: Uuid,
+    pub kind: PaneKind,
+    pub transport: TerminalTransport,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -40,6 +51,9 @@ pub enum ClientRequest {
     ClearNotifications,
     GetPaneSnapshot {
         pane_id: Uuid,
+    },
+    GetAuthorizedPaneSnapshot {
+        authority: PaneAuthority,
     },
     CreatePane {
         target_pane: Uuid,
@@ -81,6 +95,23 @@ pub enum ClientRequest {
         workspace_id: Uuid,
         working_dir: String,
         title: Option<String>,
+    },
+    /// Creates a project only after the service resolves the consumed path and
+    /// verifies canonical containment at the operation edge.
+    CreateAuthorizedWorkspaceProject {
+        workspace_id: Uuid,
+        working_dir: String,
+        authorized_root: String,
+        title: Option<String>,
+    },
+    /// Creates a Git worktree and project tab under the same service-side
+    /// canonical-root authority operation.
+    CreateAuthorizedWorktreeProject {
+        workspace_id: Uuid,
+        repo_dir: String,
+        authorized_root: String,
+        branch: String,
+        base: Option<String>,
     },
     SetTabWorkingDir {
         tab_id: Uuid,
@@ -207,6 +238,13 @@ pub enum ClientRequest {
     CreateWorkspace {
         title: Option<String>,
     },
+    /// Creates a workspace and applies its directory only after service-side
+    /// canonical-root containment succeeds at the mutation edge.
+    CreateAuthorizedWorkspace {
+        title: Option<String>,
+        working_dir: String,
+        authorized_root: String,
+    },
     CreateAssistantWorkspace {
         title: Option<String>,
         working_dir: Option<String>,
@@ -244,6 +282,10 @@ pub enum ClientRequest {
     },
     WriteInput {
         pane_id: Uuid,
+        bytes: Vec<u8>,
+    },
+    WriteAuthorizedInput {
+        authority: PaneAuthority,
         bytes: Vec<u8>,
     },
     BeginSelection {

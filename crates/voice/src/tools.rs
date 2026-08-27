@@ -10,9 +10,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use hh_protocol::TerminalTransport;
 use hh_protocol::{
     ClientRequest, Pane, PaneLayout, PaneStreamState, ServiceResponse, SessionNotification,
-    SessionSnapshot, TerminalLine, TerminalTransport,
+    SessionSnapshot, TerminalLine,
 };
 use hh_session_client::SessionClient;
 use serde_json::{Value, json};
@@ -26,7 +28,14 @@ use crate::{VoiceUiEvent, VoiceUiSender};
 mod authority;
 mod worktree;
 
-use authority::{MutationAuthority, PendingAction, key_bytes, pending_action};
+use authority::{
+    MutationAuthority, PendingAction, key_bytes, pane_service_authority, pending_action,
+    revalidate_mutation_authority, revalidate_pending_action, revalidate_provider_read,
+};
+#[cfg(test)]
+use authority::{
+    mutation_authority_for_pane, mutation_authority_for_tab, mutation_authority_for_workspace,
+};
 #[cfg(test)]
 use worktree::git_worktree_command;
 use worktree::{run_git_worktree, validate_worktree_base, validate_worktree_branch, worktree_path};
@@ -290,10 +299,17 @@ impl ToolExecutor {
         ))
     }
 
-    fn read_pane(&mut self, pane_id: Uuid, lines: usize) -> Result<Value> {
+    fn read_pane(
+        &mut self,
+        pane_id: Uuid,
+        lines: usize,
+        authority: &MutationAuthority,
+    ) -> Result<Value> {
         let response = self
             .client
-            .call(&ClientRequest::GetPaneSnapshot { pane_id })?;
+            .call(&ClientRequest::GetAuthorizedPaneSnapshot {
+                authority: pane_service_authority(authority)?,
+            })?;
         let ServiceResponse::PaneSnapshot { screen, .. } = response else {
             bail!("unexpected GetPaneSnapshot response: {response:?}");
         };
@@ -457,9 +473,19 @@ impl ToolExecutor {
             .get("working_dir")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let response = self.client.call(&ClientRequest::CreateWorkspace {
-            title: Some(title.clone()),
-        })?;
+        let response = match (&working_dir, self.authorized_root.as_deref()) {
+            (Some(working_dir), Some(authorized_root)) => {
+                self.client
+                    .call(&ClientRequest::CreateAuthorizedWorkspace {
+                        title: Some(title.clone()),
+                        working_dir: working_dir.clone(),
+                        authorized_root: authorized_root.to_string_lossy().into_owned(),
+                    })?
+            }
+            _ => self.client.call(&ClientRequest::CreateWorkspace {
+                title: Some(title.clone()),
+            })?,
+        };
         let ServiceResponse::WorkspaceCreated {
             workspace_id,
             pane_id,
@@ -467,7 +493,9 @@ impl ToolExecutor {
         else {
             bail!("unexpected CreateWorkspace response: {response:?}");
         };
-        if let Some(directory) = &working_dir {
+        if let Some(directory) = &working_dir
+            && self.authorized_root.is_none()
+        {
             let snapshot = self.refresh_snapshot()?;
             let workspace = terminal_workspace(&snapshot, workspace_id)?;
             let pane_exists = workspace.tabs.iter().any(|tab| {
@@ -531,11 +559,22 @@ impl ToolExecutor {
             .get("title")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let response = self.client.call(&ClientRequest::CreateWorkspaceProject {
-            workspace_id,
-            working_dir: working_dir.clone(),
-            title,
-        })?;
+        let response = match self.authorized_root.as_deref() {
+            Some(authorized_root) => {
+                self.client
+                    .call(&ClientRequest::CreateAuthorizedWorkspaceProject {
+                        workspace_id,
+                        working_dir: working_dir.clone(),
+                        authorized_root: authorized_root.to_string_lossy().into_owned(),
+                        title,
+                    })?
+            }
+            None => self.client.call(&ClientRequest::CreateWorkspaceProject {
+                workspace_id,
+                working_dir: working_dir.clone(),
+                title,
+            })?,
+        };
         let ServiceResponse::PaneCreated { pane_id } = response else {
             bail!("unexpected CreateWorkspaceProject response: {response:?}");
         };
@@ -558,24 +597,35 @@ impl ToolExecutor {
             validate_worktree_base(base)?;
         }
         let worktree_path = worktree_path(&repo_dir, branch)?;
-        let parent = worktree_path
-            .parent()
-            .context("worktree path has no parent")?;
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create worktree parent {}", parent.display()))?;
-        run_git_worktree(&repo_dir, &worktree_path, branch, base, cancelled)?;
-        let snapshot = self.refresh_snapshot()?;
-        revalidate_mutation_authority(
-            &snapshot,
-            &MutationAuthority::Workspace { workspace_id },
-            &self.authorized_workspaces,
-            self.authorized_root.as_deref(),
-        )?;
-        let response = self.client.call(&ClientRequest::CreateWorkspaceProject {
-            workspace_id,
-            working_dir: worktree_path.to_string_lossy().into_owned(),
-            title: Some(branch.to_owned()),
-        })?;
+        let response = if let Some(authorized_root) = self.authorized_root.as_deref() {
+            self.client
+                .call(&ClientRequest::CreateAuthorizedWorktreeProject {
+                    workspace_id,
+                    repo_dir: repo_dir.to_string_lossy().into_owned(),
+                    authorized_root: authorized_root.to_string_lossy().into_owned(),
+                    branch: branch.to_owned(),
+                    base: base.map(str::to_owned),
+                })?
+        } else {
+            let parent = worktree_path
+                .parent()
+                .context("worktree path has no parent")?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create worktree parent {}", parent.display()))?;
+            run_git_worktree(&repo_dir, &worktree_path, branch, base, cancelled)?;
+            let snapshot = self.refresh_snapshot()?;
+            revalidate_mutation_authority(
+                &snapshot,
+                &MutationAuthority::Workspace { workspace_id },
+                &self.authorized_workspaces,
+                self.authorized_root.as_deref(),
+            )?;
+            self.client.call(&ClientRequest::CreateWorkspaceProject {
+                workspace_id,
+                working_dir: worktree_path.to_string_lossy().into_owned(),
+                title: Some(branch.to_owned()),
+            })?
+        };
         let ServiceResponse::PaneCreated { pane_id } = response else {
             bail!("unexpected CreateWorkspaceProject response: {response:?}");
         };
@@ -588,7 +638,7 @@ impl ToolExecutor {
         }))
     }
 
-    fn launch_agent(&mut self, arguments: &Value) -> Result<Value> {
+    fn launch_agent(&mut self, arguments: &Value, authority: &MutationAuthority) -> Result<Value> {
         let pane_id = required_uuid(arguments, "pane_id")?;
         if !self.voice_created_panes.contains(&pane_id) {
             bail!("pane was not created by Voice Mode");
@@ -597,8 +647,8 @@ impl ToolExecutor {
         self.require_attached(workspace_id)?;
         let agent = Agent::parse(required_str(arguments, "agent")?)?;
         let command = launch_command(agent);
-        expect_ack(&self.client.call(&ClientRequest::WriteInput {
-            pane_id,
+        expect_ack(&self.client.call(&ClientRequest::WriteAuthorizedInput {
+            authority: pane_service_authority(authority)?,
             bytes: format!("{command}\r").into_bytes(),
         })?)?;
         Ok(json!({ "pane_id": pane_id, "launched": command }))
@@ -644,7 +694,11 @@ impl ToolExecutor {
             )?;
         }
         match action {
-            PendingAction::ReadPane { pane_id, lines, .. } => self.read_pane(pane_id, lines),
+            PendingAction::ReadPane {
+                pane_id,
+                lines,
+                authority,
+            } => self.read_pane(pane_id, lines, &authority),
             PendingAction::ReadThread {
                 thread_id,
                 workspace_id,
@@ -653,32 +707,42 @@ impl ToolExecutor {
                 .recall(&query)
                 .map(|content| json!({ "content": content })),
             PendingAction::ToolCall {
-                name, arguments, ..
+                name,
+                arguments,
+                authority,
             } => match name.as_str() {
                 "create_workstation" => self.create_workstation(&arguments),
                 "open_terminal_tab" => self.open_terminal_tab(&arguments),
                 "rename_tab" => self.rename_tab(&arguments),
                 "open_project_tab" => self.open_project_tab(&arguments),
                 "create_worktree_tab" => self.create_worktree_tab(&arguments, cancelled),
-                "launch_agent" => self.launch_agent(&arguments),
+                "launch_agent" => self.launch_agent(
+                    &arguments,
+                    authority
+                        .as_ref()
+                        .context("approved launch is missing pane authority")?,
+                ),
                 _ => bail!("unsupported pending voice tool {name}"),
             },
             PendingAction::SendInput {
                 pane_id,
                 text,
                 submit,
-                ..
-            } => self.write_input(pane_id, &text, submit),
-            PendingAction::SendKeys { pane_id, keys, .. } => {
+                authority,
+            } => self.write_input(pane_id, &text, submit, &authority),
+            PendingAction::SendKeys {
+                pane_id,
+                keys,
+                authority,
+            } => {
                 let mut bytes = Vec::new();
                 for key in &keys {
                     bytes.extend_from_slice(key_bytes(key)?);
                 }
-                expect_ack(
-                    &self
-                        .client
-                        .call(&ClientRequest::WriteInput { pane_id, bytes })?,
-                )?;
+                expect_ack(&self.client.call(&ClientRequest::WriteAuthorizedInput {
+                    authority: pane_service_authority(&authority)?,
+                    bytes,
+                })?)?;
                 Ok(json!({ "status": "executed", "pane_id": pane_id }))
             }
             PendingAction::CloseTab { tab_id, .. } => {
@@ -699,16 +763,21 @@ impl ToolExecutor {
         }
     }
 
-    fn write_input(&mut self, pane_id: Uuid, text: &str, submit: bool) -> Result<Value> {
+    fn write_input(
+        &mut self,
+        pane_id: Uuid,
+        text: &str,
+        submit: bool,
+        authority: &MutationAuthority,
+    ) -> Result<Value> {
         let mut bytes = text.as_bytes().to_vec();
         if submit {
             bytes.push(b'\r');
         }
-        expect_ack(
-            &self
-                .client
-                .call(&ClientRequest::WriteInput { pane_id, bytes })?,
-        )?;
+        expect_ack(&self.client.call(&ClientRequest::WriteAuthorizedInput {
+            authority: pane_service_authority(authority)?,
+            bytes,
+        })?)?;
         Ok(json!({ "status": "executed", "pane_id": pane_id }))
     }
 
@@ -1236,176 +1305,6 @@ fn run_child_with_stderr_timeout(
     }
     captured.truncate(MAX_SUBPROCESS_STDERR_BYTES);
     Ok((status, String::from_utf8_lossy(&captured).into_owned()))
-}
-
-fn mutation_authority_for_workspace(
-    snapshot: &SessionSnapshot,
-    workspace_id: Uuid,
-) -> Result<MutationAuthority> {
-    terminal_workspace(snapshot, workspace_id)?;
-    Ok(MutationAuthority::Workspace { workspace_id })
-}
-
-fn mutation_authority_for_tab(
-    snapshot: &SessionSnapshot,
-    tab_id: Uuid,
-) -> Result<MutationAuthority> {
-    snapshot
-        .workspaces
-        .iter()
-        .find_map(|workspace| {
-            workspace
-                .tabs
-                .iter()
-                .any(|tab| tab.id == tab_id)
-                .then_some(MutationAuthority::Tab {
-                    workspace_id: workspace.id,
-                    tab_id,
-                })
-        })
-        .with_context(|| format!("tab {tab_id} does not exist"))
-}
-
-fn mutation_authority_for_pane(
-    snapshot: &SessionSnapshot,
-    pane_id: Uuid,
-) -> Result<MutationAuthority> {
-    for workspace in &snapshot.workspaces {
-        for tab in &workspace.tabs {
-            let mut panes = Vec::new();
-            collect_panes(&tab.layout, &mut panes);
-            if let Some(pane) = panes.into_iter().find(|pane| pane.id == pane_id) {
-                if !pane.kind.is_terminal() {
-                    bail!("pane {pane_id} is not a terminal pane");
-                }
-                let transport = snapshot
-                    .terminal_transports
-                    .get(&pane_id)
-                    .filter(|transport| !matches!(transport, TerminalTransport::Unknown))
-                    .cloned()
-                    .with_context(|| format!("pane {pane_id} has no authoritative transport"))?;
-                return Ok(MutationAuthority::Pane {
-                    workspace_id: workspace.id,
-                    tab_id: tab.id,
-                    pane_id,
-                    transport,
-                });
-            }
-        }
-    }
-    bail!("pane {pane_id} does not exist")
-}
-
-fn revalidate_provider_read(
-    snapshot: &SessionSnapshot,
-    action: &PendingAction,
-    authorized_workspaces: &HashSet<Uuid>,
-    authorized_root: Option<&Path>,
-) -> Result<()> {
-    let PendingAction::ReadPane { authority, .. } = action else {
-        bail!("provider read does not carry pane authority");
-    };
-    revalidate_mutation_authority(snapshot, authority, authorized_workspaces, authorized_root)
-}
-
-fn revalidate_pending_action(
-    snapshot: &SessionSnapshot,
-    action: &PendingAction,
-    authorized_workspaces: &HashSet<Uuid>,
-    authorized_root: Option<&Path>,
-) -> Result<()> {
-    let authority = match action {
-        PendingAction::ReadThread { .. } | PendingAction::RecallMemory { .. } => None,
-        PendingAction::ToolCall { authority, .. } => authority.as_ref(),
-        PendingAction::ReadPane { authority, .. }
-        | PendingAction::SendInput { authority, .. }
-        | PendingAction::SendKeys { authority, .. }
-        | PendingAction::CloseTab { authority, .. }
-        | PendingAction::CloseWorkstation { authority, .. } => Some(authority),
-    };
-    if let Some(authority) = authority {
-        revalidate_mutation_authority(snapshot, authority, authorized_workspaces, authorized_root)?;
-    }
-    if let PendingAction::ToolCall {
-        name, arguments, ..
-    } = action
-    {
-        match name.as_str() {
-            "create_workstation" if arguments.get("working_dir").is_some() => {
-                revalidate_approved_tool_path(action, "working_dir", authorized_root)?;
-            }
-            "open_project_tab" => {
-                revalidate_approved_tool_path(action, "working_dir", authorized_root)?;
-            }
-            "create_worktree_tab" => {
-                revalidate_approved_tool_path(action, "repo_dir", authorized_root)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn revalidate_mutation_authority(
-    snapshot: &SessionSnapshot,
-    authority: &MutationAuthority,
-    authorized_workspaces: &HashSet<Uuid>,
-    authorized_root: Option<&Path>,
-) -> Result<()> {
-    let workspace_id = match authority {
-        MutationAuthority::Workspace { workspace_id }
-        | MutationAuthority::Tab { workspace_id, .. }
-        | MutationAuthority::Pane { workspace_id, .. } => *workspace_id,
-    };
-    if !authorized_workspaces.contains(&workspace_id) {
-        bail!("workspace {workspace_id} is outside the authorized workspace boundary");
-    }
-    let workspace = terminal_workspace(snapshot, workspace_id)?;
-    if let Some(root) = authorized_root
-        && !workspace_directory_is_within(workspace, root)
-    {
-        bail!("workspace {workspace_id} is outside the canonical authorized root");
-    }
-
-    match authority {
-        MutationAuthority::Workspace { .. } => Ok(()),
-        MutationAuthority::Tab { tab_id, .. } => workspace
-            .tabs
-            .iter()
-            .any(|tab| tab.id == *tab_id)
-            .then_some(())
-            .with_context(|| format!("tab {tab_id} changed workspace or no longer exists")),
-        MutationAuthority::Pane {
-            tab_id,
-            pane_id,
-            transport,
-            ..
-        } => {
-            let tab = workspace
-                .tabs
-                .iter()
-                .find(|tab| tab.id == *tab_id)
-                .with_context(|| format!("pane {pane_id} changed workspace or tab"))?;
-            let mut panes = Vec::new();
-            collect_panes(&tab.layout, &mut panes);
-            let pane = panes
-                .into_iter()
-                .find(|pane| pane.id == *pane_id)
-                .with_context(|| format!("pane {pane_id} changed workspace or tab"))?;
-            if !pane.kind.is_terminal() {
-                bail!("pane {pane_id} is no longer a terminal pane");
-            }
-            let current_transport = snapshot
-                .terminal_transports
-                .get(pane_id)
-                .filter(|current| !matches!(current, TerminalTransport::Unknown))
-                .with_context(|| format!("pane {pane_id} has no authoritative transport"))?;
-            if current_transport != transport {
-                bail!("pane {pane_id} terminal transport changed");
-            }
-            Ok(())
-        }
-    }
 }
 
 fn terminal_workspace(
