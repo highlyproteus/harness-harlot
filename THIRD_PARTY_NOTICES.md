@@ -69,7 +69,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [cfg_aliases 0.1.1](https://github.com/katharostech/cfg_aliases) — MIT
 - [cfg_aliases 0.2.2](https://github.com/katharostech/cfg_aliases) — MIT
 - [cgl 0.3.2](https://github.com/servo/cgl-rs) — MIT  OR  Apache-2.0
-- [chacha20 0.10.1](https://github.com/RustCrypto/stream-ciphers) — MIT OR Apache-2.0
+- [chacha20 0.10.2](https://github.com/RustCrypto/stream-ciphers) — MIT OR Apache-2.0
 - [clang-sys 1.9.1](https://github.com/KyleMayes/clang-sys) — Apache-2.0
 - [cocoa 0.26.0](https://github.com/servo/core-foundation-rs) — MIT OR Apache-2.0
 - [cocoa-foundation 0.2.0](https://github.com/servo/core-foundation-rs) — MIT OR Apache-2.0
