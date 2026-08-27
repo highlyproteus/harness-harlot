@@ -899,7 +899,19 @@ impl SessionRegistry {
     }
 
     pub fn write_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<()> {
-        self.pane(pane_id)?.write_input(bytes)?;
+        self.write_input_with_delivery(pane_id, bytes)
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn write_input_with_delivery(
+        &self,
+        pane_id: Uuid,
+        bytes: &[u8],
+    ) -> std::result::Result<(), crate::pty::InputDeliveryError> {
+        let pane = self.pane(pane_id).map_err(|error| {
+            crate::pty::InputDeliveryError::definitely_unsent(format!("{error:#}"))
+        })?;
+        pane.write_input(bytes)?;
         let mut state = self.state.write();
         if find_pane_in_snapshot(&state.snapshot, pane_id).is_some_and(|pane| {
             matches!(

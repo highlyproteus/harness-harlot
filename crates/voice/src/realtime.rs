@@ -296,6 +296,42 @@ pub(crate) enum RealtimeInbound {
     Disconnected(String),
 }
 
+impl RealtimeInbound {
+    const fn droppable_delta(&self) -> bool {
+        matches!(
+            self,
+            Self::Event(
+                ServerEvent::InputTranscriptionDelta { .. }
+                    | ServerEvent::OutputAudioDelta { .. }
+                    | ServerEvent::OutputTranscriptDelta { .. }
+            )
+        )
+    }
+}
+
+fn forward_inbound(
+    inbound: &SyncSender<RealtimeInbound>,
+    mut event: RealtimeInbound,
+    shutdown_requested: &AtomicBool,
+) -> bool {
+    loop {
+        match inbound.try_send(event) {
+            Ok(()) => return true,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                if returned.droppable_delta() {
+                    return false;
+                }
+                if shutdown_requested.load(Ordering::Acquire) {
+                    return false;
+                }
+                event = returned;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
 pub(crate) type RecoverableSendResult =
     std::result::Result<(), (anyhow::Error, Option<ClientEvent>)>;
 
@@ -495,9 +531,11 @@ pub(crate) fn spawn(
                     worker_shutdown_wake,
                 )),
                 Err(error) => {
-                    let _ = inbound.try_send(RealtimeInbound::Disconnected(format!(
-                        "build Realtime runtime: {error}"
-                    )));
+                    let _ = forward_inbound(
+                        &inbound,
+                        RealtimeInbound::Disconnected(format!("build Realtime runtime: {error}")),
+                        &worker_shutdown_requested,
+                    );
                 }
             }
         })
@@ -577,6 +615,10 @@ impl ReconnectBudget {
     }
 }
 
+fn retain_after_send_failure(delivery: &DeliveryState) -> bool {
+    delivery.definitely_unsent()
+}
+
 async fn run_socket(
     api_key: String,
     model: String,
@@ -596,18 +638,22 @@ async fn run_socket(
             match format!("wss://api.openai.com/v1/realtime?model={model}").into_client_request() {
                 Ok(request) => request,
                 Err(error) => {
-                    let _ = inbound.try_send(RealtimeInbound::Disconnected(format!(
-                        "build Realtime request: {error}"
-                    )));
+                    let _ = forward_inbound(
+                        &inbound,
+                        RealtimeInbound::Disconnected(format!("build Realtime request: {error}")),
+                        &shutdown_requested,
+                    );
                     return;
                 }
             };
         let authorization = match format!("Bearer {api_key}").parse() {
             Ok(value) => value,
             Err(error) => {
-                let _ = inbound.try_send(RealtimeInbound::Disconnected(format!(
-                    "invalid API key header: {error}"
-                )));
+                let _ = forward_inbound(
+                    &inbound,
+                    RealtimeInbound::Disconnected(format!("invalid API key header: {error}")),
+                    &shutdown_requested,
+                );
                 return;
             }
         };
@@ -634,7 +680,7 @@ async fn run_socket(
         match connect_result {
             Ok(Ok((socket, _))) => {
                 let connected_at = std::time::Instant::now();
-                let _ = inbound.try_send(RealtimeInbound::Connected);
+                let _ = forward_inbound(&inbound, RealtimeInbound::Connected, &shutdown_requested);
                 let (mut sink, mut stream) = socket.split();
                 loop {
                     if shutdown_requested.load(Ordering::Acquire) {
@@ -657,12 +703,22 @@ async fn run_socket(
                             continue;
                         }
                         if let Err(error) = send_event(&mut sink, &event).await {
-                            pending = Some(WsCommand::Event {
-                                event,
-                                ack,
-                                delivery,
-                            });
-                            let _ = inbound.try_send(RealtimeInbound::Disconnected(error));
+                            if retain_after_send_failure(&delivery) {
+                                pending = Some(WsCommand::Event {
+                                    event,
+                                    ack,
+                                    delivery,
+                                });
+                            } else {
+                                let _ = ack.send(Err(format!(
+                                    "{error}; delivery is indeterminate and will not be retried"
+                                )));
+                            }
+                            let _ = forward_inbound(
+                                &inbound,
+                                RealtimeInbound::Disconnected(error),
+                                &shutdown_requested,
+                            );
                             break;
                         }
                         delivery.mark_delivered();
@@ -685,11 +741,11 @@ async fn run_socket(
                         }
                         message = stream.next() => match message {
                             Some(Ok(Message::Text(text))) => match decode_server_event(&text) {
-                                Ok(event) => { let _ = inbound.try_send(RealtimeInbound::Event(event)); }
-                                Err(error) => { let _ = inbound.try_send(RealtimeInbound::Warning(error)); }
+                                Ok(event) => { let _ = forward_inbound(&inbound, RealtimeInbound::Event(event), &shutdown_requested); }
+                                Err(error) => { let _ = forward_inbound(&inbound, RealtimeInbound::Warning(error), &shutdown_requested); }
                             },
                             Some(Ok(Message::Close(frame))) => {
-                                let _ = inbound.try_send(RealtimeInbound::Disconnected(format!("Realtime socket closed: {frame:?}")));
+                                let _ = forward_inbound(&inbound, RealtimeInbound::Disconnected(format!("Realtime socket closed: {frame:?}")), &shutdown_requested);
                                 break;
                             }
                             Some(Ok(Message::Ping(payload))) => {
@@ -699,11 +755,11 @@ async fn run_socket(
                             }
                             Some(Ok(_)) => {}
                             Some(Err(error)) => {
-                                let _ = inbound.try_send(RealtimeInbound::Disconnected(format!("read Realtime socket: {error}")));
+                                let _ = forward_inbound(&inbound, RealtimeInbound::Disconnected(format!("read Realtime socket: {error}")), &shutdown_requested);
                                 break;
                             }
                             None => {
-                                let _ = inbound.try_send(RealtimeInbound::Disconnected("Realtime socket ended".to_owned()));
+                                let _ = forward_inbound(&inbound, RealtimeInbound::Disconnected("Realtime socket ended".to_owned()), &shutdown_requested);
                                 break;
                             }
                         }
@@ -730,7 +786,11 @@ async fn run_socket(
                     _ => None,
                 };
                 let message = format!("connect Realtime socket: {error}");
-                let _ = inbound.try_send(RealtimeInbound::Disconnected(message.clone()));
+                let _ = forward_inbound(
+                    &inbound,
+                    RealtimeInbound::Disconnected(message.clone()),
+                    &shutdown_requested,
+                );
                 if !reconnect_budget.retryable(status) {
                     if let Some(WsCommand::Event { ack, delivery, .. }) = pending.take() {
                         delivery.mark_unsent_if_queued();
@@ -743,7 +803,11 @@ async fn run_socket(
                 reconnect_budget.record_failure();
                 let message =
                     format!("connect Realtime socket timed out after {CONNECT_TIMEOUT:?}");
-                let _ = inbound.try_send(RealtimeInbound::Disconnected(message.clone()));
+                let _ = forward_inbound(
+                    &inbound,
+                    RealtimeInbound::Disconnected(message.clone()),
+                    &shutdown_requested,
+                );
                 if !reconnect_budget.retryable(None) {
                     if let Some(WsCommand::Event { ack, delivery, .. }) = pending.take() {
                         delivery.mark_unsent_if_queued();
@@ -824,6 +888,39 @@ mod tests {
             .expect_err("a full realtime queue must apply backpressure");
         assert!(error.to_string().contains("queue is full"));
         assert_eq!(recovered, Some(event));
+    }
+
+    #[test]
+    fn critical_provider_events_wait_for_bounded_capacity_instead_of_dropping() {
+        let (inbound, receiver) = std::sync::mpsc::sync_channel(1);
+        inbound.send(RealtimeInbound::Connected).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = std::thread::spawn(move || {
+            forward_inbound(
+                &inbound,
+                RealtimeInbound::Disconnected("critical".to_owned()),
+                &worker_shutdown,
+            )
+        });
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            RealtimeInbound::Connected
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)).unwrap(),
+            RealtimeInbound::Disconnected(message) if message == "critical"
+        ));
+        assert!(worker.join().unwrap());
+    }
+
+    #[test]
+    fn websocket_send_failure_after_delivery_begins_is_not_retained_for_retry() {
+        let delivery = DeliveryState::queued();
+        assert!(delivery.begin_delivery());
+
+        assert!(!retain_after_send_failure(&delivery));
     }
 
     #[test]

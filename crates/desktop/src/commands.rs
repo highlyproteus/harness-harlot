@@ -26,13 +26,14 @@ pub enum AppCommand {
     TogglePaneZoom,
     EqualizePanes,
     ReattachPane,
+    RetryTerminalInput,
     ShowNotifications,
     ToggleVoiceMic,
     ShowSettings,
 }
 
 impl AppCommand {
-    const COUNT: usize = 19;
+    const COUNT: usize = 20;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +161,13 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         default_bindings: &["cmd-shift-r"],
     },
     CommandDescriptor {
+        command: AppCommand::RetryTerminalInput,
+        id: "terminal.retry-undelivered-input",
+        title: "Retry Undelivered Terminal Input",
+        category: "Terminal",
+        default_bindings: &[],
+    },
+    CommandDescriptor {
         command: AppCommand::ShowNotifications,
         id: "app.session.notifications",
         title: "Show Notifications",
@@ -211,6 +219,7 @@ const fn check_registry() {
                 || matches!(
                     descriptor.command,
                     AppCommand::NewBrowserTab
+                        | AppCommand::RetryTerminalInput
                         | AppCommand::ShowNotifications
                         | AppCommand::ShowSettings
                 )

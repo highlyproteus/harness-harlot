@@ -24,6 +24,7 @@ use crate::{
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LOOP_SLEEP: Duration = Duration::from_millis(10);
+const MAX_CRITICAL_UI_EVENTS_PER_REALTIME_INBOUND: usize = 8;
 const NARRATION_INTERVAL: Duration = Duration::from_secs(2);
 const MIC_LEVEL_INTERVAL: Duration = Duration::from_millis(100);
 const HALF_DUPLEX_RELEASE_DELAY: Duration = Duration::from_millis(500);
@@ -180,6 +181,36 @@ struct PendingUserSend {
     result: Receiver<crate::realtime::RecoverableSendResult>,
     user_text: Vec<String>,
     user_item_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserSendFailureDisposition {
+    DefinitelyUnsent,
+    Indeterminate,
+}
+
+impl UserSendFailureDisposition {
+    const fn retires_admission(self) -> bool {
+        matches!(self, Self::Indeterminate)
+    }
+
+    #[cfg(test)]
+    const fn restores_content(self) -> bool {
+        matches!(self, Self::DefinitelyUnsent)
+    }
+
+    #[cfg(test)]
+    const fn creates_response() -> bool {
+        false
+    }
+}
+
+const fn user_send_failure_disposition(has_unsent_event: bool) -> UserSendFailureDisposition {
+    if has_unsent_event {
+        UserSendFailureDisposition::DefinitelyUnsent
+    } else {
+        UserSendFailureDisposition::Indeterminate
+    }
 }
 
 struct ActiveTool {
@@ -382,7 +413,9 @@ impl VoiceEngine {
     }
 
     fn drain_realtime(&mut self) {
-        while let Ok(event) = self.realtime_rx.try_recv() {
+        while self.ui.critical_capacity() >= MAX_CRITICAL_UI_EVENTS_PER_REALTIME_INBOUND
+            && let Ok(event) = self.realtime_rx.try_recv()
+        {
             if let Err(error) = self.handle_realtime(event) {
                 self.emit_error(&error);
             }
@@ -751,8 +784,17 @@ impl VoiceEngine {
                 }
             }
             Ok(Err((error, unsent))) => {
+                let disposition = user_send_failure_disposition(unsent.is_some());
                 if let Some(unsent) = unsent {
                     restore_pending_user_content(&mut self.pending_user_content, unsent);
+                }
+                if disposition.retires_admission() {
+                    self.accepted_user_items
+                        .fetch_sub(pending.user_item_count, Ordering::AcqRel);
+                    let _ = self.ui.emit(VoiceUiEvent::ToolCall {
+                        name: "realtime.indeterminate".to_owned(),
+                        summary: "Your turn may have reached the provider, but delivery could not be confirmed. It was not replayed and no response was requested; resend explicitly if needed.".to_owned(),
+                    });
                 }
                 self.emit_error(&error);
             }
@@ -760,6 +802,12 @@ impl VoiceEngine {
                 self.pending_user_send = Some(pending);
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.accepted_user_items
+                    .fetch_sub(pending.user_item_count, Ordering::AcqRel);
+                let _ = self.ui.emit(VoiceUiEvent::ToolCall {
+                    name: "realtime.indeterminate".to_owned(),
+                    summary: "Your turn's delivery result is indeterminate. It was not replayed and no response was requested; resend explicitly if needed.".to_owned(),
+                });
                 self.emit_error(&anyhow::anyhow!("Realtime acknowledgement waiter stopped"));
             }
         }

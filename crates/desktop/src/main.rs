@@ -110,6 +110,7 @@ actions!(
         ShowNotifications,
         EqualizePanes,
         ReattachPane,
+        RetryTerminalInput,
         ToggleVoiceMic,
         ShowSettings,
         ConsumeChordPrefix,

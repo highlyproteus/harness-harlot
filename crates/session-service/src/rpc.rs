@@ -160,8 +160,16 @@ pub(crate) fn handle_request(
         | ClientRequest::DisconnectWorkspace { .. }
         | ClientRequest::ReconnectWorkspace { .. }
         | ClientRequest::DeleteWorkspace { .. } => handle_workspaces_request(sessions, request),
-        ClientRequest::WriteInput { .. }
-        | ClientRequest::BeginSelection { .. }
+        ClientRequest::WriteInput { pane_id, bytes } => {
+            Ok(match sessions.write_input_with_delivery(pane_id, &bytes) {
+                Ok(()) => ServiceResponse::Ack,
+                Err(error) => ServiceResponse::DeliveryError {
+                    message: error.to_string(),
+                    disposition: error.disposition(),
+                },
+            })
+        }
+        ClientRequest::BeginSelection { .. }
         | ClientRequest::UpdateSelection { .. }
         | ClientRequest::ClearSelection { .. }
         | ClientRequest::CopySelection { .. }
@@ -512,10 +520,6 @@ fn handle_terminal_request(
     request: ClientRequest,
 ) -> Result<ServiceResponse> {
     match request {
-        ClientRequest::WriteInput { pane_id, bytes } => {
-            sessions.write_input(pane_id, &bytes)?;
-            Ok(ServiceResponse::Ack)
-        }
         ClientRequest::BeginSelection {
             pane_id,
             point,
@@ -739,18 +743,21 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        let error = handle_request(
+        let response = handle_request(
             &registry,
             ClientRequest::WriteInput {
                 pane_id,
                 bytes: b"must fail".to_vec(),
             },
         )
-        .expect_err("RPC must not acknowledge input that the PTY writer failed to flush");
+        .unwrap();
 
-        assert!(
-            error.to_string().contains("write terminal input"),
-            "unexpected error: {error:#}"
-        );
+        assert!(matches!(
+            response,
+            ServiceResponse::DeliveryError {
+                message,
+                disposition: hh_protocol::DeliveryDisposition::Indeterminate,
+            } if message.contains("write terminal input")
+        ));
     }
 }
