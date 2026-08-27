@@ -20,6 +20,10 @@ use crate::harness::{Agent, launch_command};
 use crate::memory::MemoryBackend;
 use crate::threads::{self, ThreadRecord, ThreadRole};
 
+mod authority;
+
+use authority::{MutationAuthority, PendingAction, key_bytes, pending_action};
+
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const DEFAULT_PANE_LINES: usize = 60;
 const MAX_PANE_LINES: usize = 200;
@@ -49,71 +53,6 @@ const SEARCH_SKIP_DIRECTORIES: &[&str] = &[
 pub(crate) enum TrustTier {
     T0,
     T2,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PendingAction {
-    ToolCall {
-        name: String,
-        arguments: Value,
-        authority: Option<MutationAuthority>,
-    },
-    SendInput {
-        pane_id: Uuid,
-        text: String,
-        submit: bool,
-        authority: MutationAuthority,
-    },
-    SendKeys {
-        pane_id: Uuid,
-        keys: Vec<String>,
-        authority: MutationAuthority,
-    },
-    CloseTab {
-        tab_id: Uuid,
-        authority: MutationAuthority,
-    },
-    CloseWorkstation {
-        workspace_id: Uuid,
-        authority: MutationAuthority,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum MutationAuthority {
-    Workspace {
-        workspace_id: Uuid,
-    },
-    Tab {
-        workspace_id: Uuid,
-        tab_id: Uuid,
-    },
-    Pane {
-        workspace_id: Uuid,
-        tab_id: Uuid,
-        pane_id: Uuid,
-        transport: TerminalTransport,
-    },
-}
-
-impl PendingAction {
-    fn description(&self) -> String {
-        match self {
-            Self::ToolCall {
-                name, arguments, ..
-            } => format!("run {name} with {arguments}"),
-            Self::SendInput { pane_id, text, .. } => {
-                format!("send potentially destructive input to pane {pane_id}: {text}")
-            }
-            Self::SendKeys { pane_id, keys, .. } => {
-                format!("send keys {} to pane {pane_id}", keys.join(", "))
-            }
-            Self::CloseTab { tab_id, .. } => format!("close tab {tab_id}"),
-            Self::CloseWorkstation { workspace_id, .. } => {
-                format!("close workstation {workspace_id}")
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1212,61 +1151,6 @@ fn run_git_worktree(
     Ok(())
 }
 
-fn pending_action(
-    name: &str,
-    arguments: &Value,
-    snapshot: &SessionSnapshot,
-) -> Result<PendingAction> {
-    match name {
-        "send_input" => pending_send_input(arguments, snapshot),
-        "send_keys" => pending_send_keys(arguments, snapshot),
-        "close_tab" => {
-            let tab_id = required_uuid(arguments, "tab_id")?;
-            Ok(PendingAction::CloseTab {
-                tab_id,
-                authority: mutation_authority_for_tab(snapshot, tab_id)?,
-            })
-        }
-        "close_workstation" => {
-            let workspace_id = required_uuid(arguments, "workspace_id")?;
-            Ok(PendingAction::CloseWorkstation {
-                workspace_id,
-                authority: mutation_authority_for_workspace(snapshot, workspace_id)?,
-            })
-        }
-        "create_workstation" => Ok(PendingAction::ToolCall {
-            name: name.to_owned(),
-            arguments: arguments.clone(),
-            authority: None,
-        }),
-        "open_terminal_tab" | "open_project_tab" | "create_worktree_tab" => {
-            let workspace_id = required_uuid(arguments, "workspace_id")?;
-            Ok(PendingAction::ToolCall {
-                name: name.to_owned(),
-                arguments: arguments.clone(),
-                authority: Some(mutation_authority_for_workspace(snapshot, workspace_id)?),
-            })
-        }
-        "rename_tab" => {
-            let tab_id = required_uuid(arguments, "tab_id")?;
-            Ok(PendingAction::ToolCall {
-                name: name.to_owned(),
-                arguments: arguments.clone(),
-                authority: Some(mutation_authority_for_tab(snapshot, tab_id)?),
-            })
-        }
-        "launch_agent" => {
-            let pane_id = required_uuid(arguments, "pane_id")?;
-            Ok(PendingAction::ToolCall {
-                name: name.to_owned(),
-                arguments: arguments.clone(),
-                authority: Some(mutation_authority_for_pane(snapshot, pane_id)?),
-            })
-        }
-        _ => bail!("tool {name} cannot be approved"),
-    }
-}
-
 fn run_child_with_stderr_timeout(
     command: &mut Command,
     timeout: Duration,
@@ -1342,54 +1226,6 @@ fn run_child_with_stderr_timeout(
     }
     captured.truncate(MAX_SUBPROCESS_STDERR_BYTES);
     Ok((status, String::from_utf8_lossy(&captured).into_owned()))
-}
-
-fn pending_send_input(arguments: &Value, snapshot: &SessionSnapshot) -> Result<PendingAction> {
-    let pane_id = required_uuid(arguments, "pane_id")?;
-    Ok(PendingAction::SendInput {
-        pane_id,
-        text: required_str(arguments, "text")?.to_owned(),
-        submit: arguments
-            .get("submit")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        authority: mutation_authority_for_pane(snapshot, pane_id)?,
-    })
-}
-
-fn pending_send_keys(arguments: &Value, snapshot: &SessionSnapshot) -> Result<PendingAction> {
-    let keys = arguments
-        .get("keys")
-        .and_then(Value::as_array)
-        .context("keys must be an array")?
-        .iter()
-        .map(|key| {
-            key.as_str()
-                .context("each key must be a string")
-                .map(str::to_owned)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for key in &keys {
-        let _ = key_bytes(key)?;
-    }
-    let pane_id = required_uuid(arguments, "pane_id")?;
-    Ok(PendingAction::SendKeys {
-        pane_id,
-        keys,
-        authority: mutation_authority_for_pane(snapshot, pane_id)?,
-    })
-}
-
-fn key_bytes(key: &str) -> Result<&'static [u8]> {
-    match key {
-        "enter" => Ok(b"\r"),
-        "esc" => Ok(b"\x1b"),
-        "up" => Ok(b"\x1b[A"),
-        "down" => Ok(b"\x1b[B"),
-        "tab" => Ok(b"\t"),
-        "ctrl-c" => Ok(b"\x03"),
-        _ => bail!("unsupported key {key}"),
-    }
 }
 
 fn mutation_authority_for_workspace(
