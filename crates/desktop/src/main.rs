@@ -234,9 +234,9 @@ struct SessionState {
     /// Everything else, including terminal input and selection updates.
     control_client: SharedSessionClient,
     /// Enqueue side of the stream lane's serialized request pipeline.
-    stream_tx: futures::channel::mpsc::UnboundedSender<pipeline::PipelineJob>,
+    stream_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
     /// Enqueue side of the control lane's serialized request pipeline.
-    control_tx: futures::channel::mpsc::UnboundedSender<pipeline::PipelineJob>,
+    control_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
     /// Interrupts an idle screen poll when input is queued. Capacity one
     /// coalesces a burst of keystrokes instead of scheduling a poll per byte.
     poll_wake_tx: futures::channel::mpsc::Sender<()>,
@@ -258,8 +258,8 @@ impl SessionState {
     fn new(
         stream_client: SharedSessionClient,
         control_client: SharedSessionClient,
-        stream_tx: futures::channel::mpsc::UnboundedSender<pipeline::PipelineJob>,
-        control_tx: futures::channel::mpsc::UnboundedSender<pipeline::PipelineJob>,
+        stream_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
+        control_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
         poll_wake_tx: futures::channel::mpsc::Sender<()>,
         window_active: bool,
         connection_error: Option<String>,
@@ -525,8 +525,9 @@ impl HhApp {
             Err(error) => (Arc::new(Mutex::new(None)), Some(format!("{error:#}"))),
         };
         let startup_connection_error = startup_connection_error.or(second_error);
-        let (stream_tx, stream_rx) = futures::channel::mpsc::unbounded();
-        let (control_tx, control_rx) = futures::channel::mpsc::unbounded();
+        let (stream_tx, stream_lane) = pipeline::bounded_lane(pipeline::STREAM_PIPELINE_CAPACITY);
+        let (control_tx, control_lane) =
+            pipeline::bounded_lane(pipeline::CONTROL_PIPELINE_CAPACITY);
         let (poll_wake_tx, mut poll_wake_rx) = futures::channel::mpsc::channel(1);
         #[cfg(all(target_os = "macos", feature = "browser"))]
         let browser_parent_view = native_nsview(window);
@@ -566,16 +567,8 @@ impl HhApp {
         if app.layout.focused_pane.is_some() && app.session.screens.is_empty() {
             app.initial_state_fetch(cx);
         }
-        pipeline::spawn_lane(
-            cx,
-            pipeline::PipelineLane::from_receiver(stream_rx),
-            |app: &HhApp| &app.session.stream_client,
-        );
-        pipeline::spawn_lane(
-            cx,
-            pipeline::PipelineLane::from_receiver(control_rx),
-            |app: &HhApp| &app.session.control_client,
-        );
+        pipeline::spawn_lane(cx, stream_lane, |app: &HhApp| &app.session.stream_client);
+        pipeline::spawn_lane(cx, control_lane, |app: &HhApp| &app.session.control_client);
         #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         {
             app.browser.cef_shutdown_subscription = Some(cx.on_app_quit(|this, _| {

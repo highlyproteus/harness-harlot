@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -33,6 +35,7 @@ const MAX_USER_TEXT_CHARS: usize = 32 * 1024;
 const MAX_PENDING_USER_ITEMS: usize = 16;
 const MAX_NARRATION_ITEMS: usize = 64;
 const MAX_NARRATION_CHARS: usize = 2 * 1024;
+const REALTIME_INBOUND_CAPACITY: usize = 256;
 const SUMMARY_TURNS: usize = 15;
 const MAX_SUMMARY_CHARS: usize = 2_000;
 
@@ -130,17 +133,20 @@ struct VoiceEngine {
     context: AssistantContext,
     ui: UnboundedSender<VoiceUiEvent>,
     command_rx: Receiver<VoiceCommand>,
-    realtime_tx: Sender<RealtimeInbound>,
+    realtime_tx: SyncSender<RealtimeInbound>,
     realtime_rx: Receiver<RealtimeInbound>,
     realtime: Option<RealtimeHandle>,
     audio: AudioSystem,
-    tools: ToolExecutor,
-    memory: Box<dyn MemoryBackend>,
+    tools: Option<ToolExecutor>,
+    memory: Option<Box<dyn MemoryBackend>>,
+    active_tool: Option<ActiveTool>,
+    pending_memory_turns: VecDeque<(Role, String)>,
     transcripts: VecDeque<(Role, String)>,
     thread_id: Option<uuid::Uuid>,
     thread_has_title: bool,
     completed_input_transcriptions: VecDeque<String>,
     pending_user_content: VecDeque<InputContent>,
+    pending_user_send: Option<PendingUserSend>,
     narration: VecDeque<ClientEvent>,
     response_active: bool,
     user_speaking: bool,
@@ -156,6 +162,36 @@ struct VoiceEngine {
     last_mic_level: Instant,
     last_playback_progress: Instant,
     pending_instructions: Option<String>,
+}
+
+struct PendingUserSend {
+    result: Receiver<crate::realtime::RecoverableSendResult>,
+    user_text: Vec<String>,
+}
+
+struct ActiveTool {
+    cancelled: Arc<AtomicBool>,
+    result: Receiver<ToolJobResult>,
+}
+
+struct ToolJobResult {
+    tools: ToolExecutor,
+    memory: Box<dyn MemoryBackend>,
+    completion: ToolCompletion,
+}
+
+enum ToolCompletion {
+    Function {
+        call_id: String,
+        name: String,
+        output: String,
+    },
+    Approval {
+        approval_id: u64,
+        approved: bool,
+        result: Result<serde_json::Value>,
+    },
+    Cancelled,
 }
 
 impl VoiceEngine {
@@ -205,7 +241,7 @@ impl VoiceEngine {
                 Box::<NullBackend>::default()
             }
         };
-        let (realtime_tx, realtime_rx) = std::sync::mpsc::channel();
+        let (realtime_tx, realtime_rx) = std::sync::mpsc::sync_channel(REALTIME_INBOUND_CAPACITY);
         let realtime = Some(crate::realtime::spawn(
             settings.api_key.clone(),
             settings.model.clone(),
@@ -221,13 +257,16 @@ impl VoiceEngine {
             realtime_rx,
             realtime,
             audio,
-            tools,
-            memory,
+            tools: Some(tools),
+            memory: Some(memory),
+            active_tool: None,
+            pending_memory_turns: VecDeque::new(),
             thread_id,
             thread_has_title,
             transcripts: VecDeque::with_capacity(MAX_TRANSCRIPT_TURNS),
             completed_input_transcriptions: VecDeque::with_capacity(MAX_TRANSCRIPT_TURNS),
             pending_user_content: VecDeque::new(),
+            pending_user_send: None,
             narration: VecDeque::new(),
             response_active: false,
             user_speaking: false,
@@ -253,6 +292,7 @@ impl VoiceEngine {
                 Ok(false) => {}
                 Err(error) => self.emit_error(&error),
             }
+            self.finish_active_tool();
             self.drain_realtime();
             self.drain_audio();
             self.tick();
@@ -264,7 +304,10 @@ impl VoiceEngine {
     fn drain_commands(&mut self) -> Result<bool> {
         loop {
             match self.command_rx.try_recv() {
-                Ok(VoiceCommand::Shutdown) | Err(TryRecvError::Disconnected) => return Ok(true),
+                Ok(VoiceCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
+                    self.cancel_active_tool();
+                    return Ok(true);
+                }
                 Ok(VoiceCommand::SetMicEnabled(enabled)) => {
                     self.mic_consent.apply_command(enabled);
                     self.audio.set_mic_enabled(enabled && !self.suspended)?;
@@ -306,10 +349,10 @@ impl VoiceEngine {
                 }
                 Ok(VoiceCommand::BargeIn) => self.barge_in(true)?,
                 Ok(VoiceCommand::Approve { approval_id }) => {
-                    self.resolve_ui_approval(approval_id, true)?;
+                    self.start_approval_tool(approval_id, true)?;
                 }
                 Ok(VoiceCommand::Deny { approval_id }) => {
-                    self.resolve_ui_approval(approval_id, false)?;
+                    self.start_approval_tool(approval_id, false)?;
                 }
                 Ok(VoiceCommand::Suspend) => self.suspend()?,
                 Ok(VoiceCommand::Resume) => self.resume()?,
@@ -371,7 +414,9 @@ impl VoiceEngine {
                         let summary = self.build_summary();
                         (!summary.is_empty()).then_some(summary)
                     } else {
-                        self.memory.session_preamble()
+                        self.memory
+                            .as_mut()
+                            .and_then(|memory| memory.session_preamble())
                     }
                 });
                 let instructions = instructions_with_context(&self.context, prior.as_deref())?;
@@ -532,7 +577,7 @@ impl VoiceEngine {
                 });
             }
             ServerEvent::OutputTranscriptDone { transcript, .. } => {
-                self.memory.record_turn(Role::Assistant, &transcript);
+                self.record_memory_turn(Role::Assistant, &transcript);
                 self.push_transcript(Role::Assistant, transcript.clone());
                 if let Some(thread_id) = self.thread_id {
                     threads::append_record(
@@ -560,28 +605,7 @@ impl VoiceEngine {
                 let _ = self
                     .ui
                     .unbounded_send(VoiceUiEvent::State(EngineState::ToolRunning));
-                let output = self
-                    .tools
-                    .execute(&name, &arguments, self.memory.as_mut(), &self.ui);
-                if let Some(thread_id) = self.thread_id {
-                    threads::append_record(
-                        thread_id,
-                        &ThreadRecord::Tool {
-                            name: name.clone(),
-                            summary: output.chars().take(200).collect(),
-                            at_ms: threads::now_ms(),
-                        },
-                    )?;
-                }
-                self.send(ClientEvent::ConversationItemCreate {
-                    item: ConversationItem::FunctionCallOutput { call_id, output },
-                    previous_item_id: None,
-                })?;
-                self.send(ClientEvent::ResponseCreate { response: None })?;
-                self.response_active = true;
-                let _ = self
-                    .ui
-                    .unbounded_send(VoiceUiEvent::State(EngineState::Thinking));
+                self.start_function_tool(call_id, name, arguments)?;
             }
         }
         Ok(())
@@ -594,6 +618,7 @@ impl VoiceEngine {
             return;
         }
         let now = Instant::now();
+        self.finish_pending_user_send(now);
         if now.saturating_duration_since(self.last_playback_progress) >= MIC_LEVEL_INTERVAL {
             self.last_playback_progress = now;
             if let Some((played_ms, total_ms)) = self.audio.playback_progress() {
@@ -605,22 +630,24 @@ impl VoiceEngine {
         }
         if now.saturating_duration_since(self.last_poll) >= POLL_INTERVAL {
             self.last_poll = now;
-            match self.tools.poll_updates() {
-                Ok(notifications) => {
-                    for notification in notifications {
-                        if self.tools.notification_is_attached(&notification) {
-                            queue_narration(
-                                &mut self.narration,
-                                notification_context_event(&notification),
-                            );
+            if let Some(tools) = self.tools.as_mut() {
+                match tools.poll_updates() {
+                    Ok(notifications) => {
+                        for notification in notifications {
+                            if tools.notification_is_attached(&notification) {
+                                queue_narration(
+                                    &mut self.narration,
+                                    notification_context_event(&notification),
+                                );
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
-                        name: "status.poll".to_owned(),
-                        summary: format!("{error:#}"),
-                    });
+                    Err(error) => {
+                        let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+                            name: "status.poll".to_owned(),
+                            summary: format!("{error:#}"),
+                        });
+                    }
                 }
             }
         }
@@ -644,6 +671,7 @@ impl VoiceEngine {
             && !self.response_active
             && !self.user_speaking
             && !self.pending_user_content.is_empty()
+            && self.pending_user_send.is_none()
             && let Some(realtime) = self.realtime.as_ref()
         {
             let content = std::mem::take(&mut self.pending_user_content)
@@ -663,22 +691,12 @@ impl VoiceEngine {
                 },
                 previous_item_id: None,
             };
-            match realtime.send_recoverable(event) {
-                Ok(()) => {
-                    for text in user_text {
-                        if let Err(error) = self.record_user_turn(&text) {
-                            self.emit_error(&error);
-                        }
-                    }
-                    if let Err(error) = self.send(ClientEvent::ResponseCreate { response: None }) {
-                        self.emit_error(&error);
-                    } else {
-                        self.response_active = true;
-                        self.last_activity = now;
-                    }
+            match realtime.send_recoverable_async(event.clone()) {
+                Ok(result) => {
+                    self.pending_user_send = Some(PendingUserSend { result, user_text });
                 }
-                Err((error, unsent)) => {
-                    restore_pending_user_content(&mut self.pending_user_content, unsent);
+                Err(error) => {
+                    restore_pending_user_content(&mut self.pending_user_content, event);
                     self.emit_error(&error);
                 }
             }
@@ -693,7 +711,11 @@ impl VoiceEngine {
             && !self.response_active
             && !self.user_speaking
             && !self.audio.playback_active()
-            && !self.tools.has_pending_approvals()
+            && !self
+                .tools
+                .as_ref()
+                .is_some_and(ToolExecutor::has_pending_approvals)
+            && self.active_tool.is_none()
             && now.saturating_duration_since(self.last_activity) >= timeout
             && let Err(error) = self.suspend()
         {
@@ -701,17 +723,37 @@ impl VoiceEngine {
         }
     }
 
-    fn resolve_ui_approval(&mut self, approval_id: u64, approved: bool) -> Result<()> {
-        let result = self
-            .tools
-            .resolve_ui_approval(approval_id, approved, &self.ui)?;
-        self.last_activity = Instant::now();
-        self.send(approval_context_event(approval_id, approved, &result))?;
-        if !self.response_active {
-            self.send(ClientEvent::ResponseCreate { response: None })?;
-            self.response_active = true;
+    fn finish_pending_user_send(&mut self, now: Instant) {
+        let Some(pending) = self.pending_user_send.take() else {
+            return;
+        };
+        match pending.result.try_recv() {
+            Ok(Ok(())) => {
+                for text in pending.user_text {
+                    if let Err(error) = self.record_user_turn(&text) {
+                        self.emit_error(&error);
+                    }
+                }
+                if let Err(error) = self.send(ClientEvent::ResponseCreate { response: None }) {
+                    self.emit_error(&error);
+                } else {
+                    self.response_active = true;
+                    self.last_activity = now;
+                }
+            }
+            Ok(Err((error, unsent))) => {
+                if let Some(unsent) = unsent {
+                    restore_pending_user_content(&mut self.pending_user_content, unsent);
+                }
+                self.emit_error(&error);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.pending_user_send = Some(pending);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.emit_error(&anyhow::anyhow!("Realtime acknowledgement waiter stopped"));
+            }
         }
-        Ok(())
     }
 
     fn send_mic_chunk(&mut self, samples: &[i16]) {
@@ -734,6 +776,7 @@ impl VoiceEngine {
     }
 
     fn barge_in(&mut self, cancel_response: bool) -> Result<()> {
+        self.cancel_active_tool();
         let (item_id, played_ms) = self.audio.stop_and_clear();
         if let Some(item_id) = item_id {
             self.send(ClientEvent::ConversationItemTruncate {
@@ -756,6 +799,7 @@ impl VoiceEngine {
         if self.suspended {
             return Ok(());
         }
+        self.cancel_active_tool();
         if let Some(realtime) = self.realtime.take() {
             realtime.shutdown();
         }
@@ -845,9 +889,196 @@ impl VoiceEngine {
         Ok(())
     }
 
+    fn start_function_tool(
+        &mut self,
+        call_id: String,
+        name: String,
+        arguments: String,
+    ) -> Result<()> {
+        if self.active_tool.is_some() {
+            anyhow::bail!("tool execution is already in progress");
+        }
+        let mut tools = self.tools.take().context("tool executor is unavailable")?;
+        let mut memory = self
+            .memory
+            .take()
+            .context("memory backend is unavailable")?;
+        let ui = self.ui.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (result_tx, result) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let output = tools.execute(&name, &arguments, memory.as_mut(), &ui, &worker_cancelled);
+            let completion = if worker_cancelled.load(Ordering::Acquire) {
+                ToolCompletion::Cancelled
+            } else {
+                ToolCompletion::Function {
+                    call_id,
+                    name,
+                    output,
+                }
+            };
+            let _ = result_tx.send(ToolJobResult {
+                tools,
+                memory,
+                completion,
+            });
+        });
+        self.active_tool = Some(ActiveTool { cancelled, result });
+        Ok(())
+    }
+
+    fn start_approval_tool(&mut self, approval_id: u64, approved: bool) -> Result<()> {
+        if self.active_tool.is_some() {
+            anyhow::bail!("tool execution is already in progress");
+        }
+        let mut tools = self.tools.take().context("tool executor is unavailable")?;
+        let memory = self
+            .memory
+            .take()
+            .context("memory backend is unavailable")?;
+        let ui = self.ui.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (result_tx, result) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = tools.resolve_ui_approval(approval_id, approved, &ui, &worker_cancelled);
+            let completion = if worker_cancelled.load(Ordering::Acquire) {
+                ToolCompletion::Cancelled
+            } else {
+                ToolCompletion::Approval {
+                    approval_id,
+                    approved,
+                    result,
+                }
+            };
+            let _ = result_tx.send(ToolJobResult {
+                tools,
+                memory,
+                completion,
+            });
+        });
+        self.active_tool = Some(ActiveTool { cancelled, result });
+        Ok(())
+    }
+
+    fn finish_active_tool(&mut self) {
+        let Some(active) = self.active_tool.take() else {
+            return;
+        };
+        let result = match active.result.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.active_tool = Some(active);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.emit_error(&anyhow::anyhow!("tool worker stopped unexpectedly"));
+                return;
+            }
+        };
+        self.tools = Some(result.tools);
+        self.memory = Some(result.memory);
+        self.flush_pending_memory_turns();
+
+        match result.completion {
+            ToolCompletion::Function {
+                call_id,
+                name,
+                output,
+            } => {
+                if let Some(thread_id) = self.thread_id
+                    && let Err(error) = threads::append_record(
+                        thread_id,
+                        &ThreadRecord::Tool {
+                            name,
+                            summary: output.chars().take(200).collect(),
+                            at_ms: threads::now_ms(),
+                        },
+                    )
+                {
+                    self.emit_error(&error);
+                }
+                if let Err(error) = self
+                    .send(ClientEvent::ConversationItemCreate {
+                        item: ConversationItem::FunctionCallOutput { call_id, output },
+                        previous_item_id: None,
+                    })
+                    .and_then(|()| self.send(ClientEvent::ResponseCreate { response: None }))
+                {
+                    self.emit_error(&error);
+                } else {
+                    self.response_active = true;
+                    let _ = self
+                        .ui
+                        .unbounded_send(VoiceUiEvent::State(EngineState::Thinking));
+                }
+            }
+            ToolCompletion::Approval {
+                approval_id,
+                approved,
+                result,
+            } => match result {
+                Ok(result) => {
+                    self.last_activity = Instant::now();
+                    if let Err(error) = self
+                        .send(approval_context_event(approval_id, approved, &result))
+                        .and_then(|()| {
+                            if !self.response_active {
+                                self.send(ClientEvent::ResponseCreate { response: None })?;
+                                self.response_active = true;
+                            }
+                            Ok(())
+                        })
+                    {
+                        self.emit_error(&error);
+                    }
+                }
+                Err(error) => self.emit_error(&error),
+            },
+            ToolCompletion::Cancelled => {
+                let _ = self
+                    .ui
+                    .unbounded_send(VoiceUiEvent::State(EngineState::Listening));
+            }
+        }
+    }
+
+    fn cancel_active_tool(&self) {
+        if let Some(active) = &self.active_tool {
+            active.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    fn record_memory_turn(&mut self, role: Role, text: &str) {
+        if let Some(memory) = self.memory.as_mut() {
+            memory.record_turn(role, text);
+            return;
+        }
+        if self.pending_memory_turns.len() == MAX_TRANSCRIPT_TURNS {
+            self.pending_memory_turns.pop_front();
+        }
+        self.pending_memory_turns.push_back((role, text.to_owned()));
+    }
+
+    fn flush_pending_memory_turns(&mut self) {
+        let Some(memory) = self.memory.as_mut() else {
+            return;
+        };
+        while let Some((role, text)) = self.pending_memory_turns.pop_front() {
+            memory.record_turn(role, &text);
+        }
+    }
+
     fn build_summary(&mut self) -> String {
-        self.memory.flush();
-        let mut summary = self.memory.session_preamble().unwrap_or_default();
+        let mut summary = self
+            .memory
+            .as_mut()
+            .map(|memory| {
+                memory.flush();
+                memory.session_preamble().unwrap_or_default()
+            })
+            .unwrap_or_default();
         for (role, text) in self.transcripts.iter().rev().take(SUMMARY_TURNS).rev() {
             if !summary.is_empty() {
                 summary.push('\n');
@@ -862,7 +1093,7 @@ impl VoiceEngine {
     }
 
     fn record_user_turn(&mut self, text: &str) -> Result<()> {
-        self.memory.record_turn(Role::User, text);
+        self.record_memory_turn(Role::User, text);
         self.push_transcript(Role::User, text.to_owned());
         if let Some(thread_id) = self.thread_id {
             let at_ms = threads::now_ms();
@@ -913,6 +1144,7 @@ impl VoiceEngine {
     }
 
     fn shutdown_resources(&mut self) {
+        self.cancel_active_tool();
         self.pending_user_content.clear();
         if let Some(realtime) = self.realtime.take() {
             realtime.shutdown();
@@ -937,7 +1169,9 @@ impl VoiceEngine {
                 .ui
                 .unbounded_send(VoiceUiEvent::SessionSummary { text: summary });
         }
-        self.memory.flush();
+        if let Some(memory) = self.memory.as_mut() {
+            memory.flush();
+        }
     }
 }
 fn restore_pending_user_content(pending: &mut VecDeque<InputContent>, unsent: ClientEvent) {

@@ -709,3 +709,48 @@ pub(crate) async fn read_message<T: DeserializeOwned>(
         })??;
     hh_protocol::decode_frame(&payload)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use crate::layout::first_pane_id;
+
+    #[test]
+    fn write_input_reports_writer_failure_instead_of_acknowledging_delivery() {
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        registry.write_input(pane_id, b"exit\r").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while registry
+            .pane(pane_id)
+            .unwrap()
+            .exit_status()
+            .unwrap()
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "configured shell did not exit before the regression deadline"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let error = handle_request(
+            &registry,
+            ClientRequest::WriteInput {
+                pane_id,
+                bytes: b"must fail".to_vec(),
+            },
+        )
+        .expect_err("RPC must not acknowledge input that the PTY writer failed to flush");
+
+        assert!(
+            error.to_string().contains("write terminal input"),
+            "unexpected error: {error:#}"
+        );
+    }
+}

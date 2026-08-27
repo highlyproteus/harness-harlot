@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -15,8 +15,10 @@ use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 const OUTBOUND_CAPACITY: usize = 256;
 const SEND_ACK_TIMEOUT: Duration = Duration::from_secs(6);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONNECT_RETRIES: u32 = 8;
+const STABLE_CONNECTION_RESET_AFTER: Duration = Duration::from_secs(30);
 const MAX_PROVIDER_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -294,63 +296,128 @@ pub(crate) enum RealtimeInbound {
     Disconnected(String),
 }
 
+pub(crate) type RecoverableSendResult =
+    std::result::Result<(), (anyhow::Error, Option<ClientEvent>)>;
+
 #[derive(Debug)]
 enum WsCommand {
     Event {
         event: Box<ClientEvent>,
         ack: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
-        cancelled: Arc<AtomicBool>,
+        delivery: Arc<DeliveryState>,
     },
     Shutdown,
+}
+
+const DELIVERY_QUEUED: u8 = 0;
+const DELIVERY_SENDING: u8 = 1;
+const DELIVERY_DELIVERED: u8 = 2;
+const DELIVERY_CANCELLED: u8 = 3;
+const DELIVERY_UNSENT: u8 = 4;
+
+#[derive(Debug)]
+struct DeliveryState(AtomicU8);
+
+impl DeliveryState {
+    fn queued() -> Self {
+        Self(AtomicU8::new(DELIVERY_QUEUED))
+    }
+
+    fn begin_delivery(&self) -> bool {
+        match self.0.compare_exchange(
+            DELIVERY_QUEUED,
+            DELIVERY_SENDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(DELIVERY_SENDING) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn mark_delivered(&self) {
+        self.0.store(DELIVERY_DELIVERED, Ordering::Release);
+    }
+
+    fn cancel_before_delivery(&self) -> bool {
+        self.0
+            .compare_exchange(
+                DELIVERY_QUEUED,
+                DELIVERY_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn mark_unsent_if_queued(&self) {
+        let _ = self.0.compare_exchange(
+            DELIVERY_QUEUED,
+            DELIVERY_UNSENT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn definitely_unsent(&self) -> bool {
+        matches!(
+            self.0.load(Ordering::Acquire),
+            DELIVERY_CANCELLED | DELIVERY_UNSENT
+        )
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct RealtimeHandle {
     outbound: tokio::sync::mpsc::Sender<WsCommand>,
+    shutdown_requested: Arc<AtomicBool>,
+    shutdown_wake: Arc<tokio::sync::Notify>,
     join: Option<JoinHandle<()>>,
 }
 
 impl RealtimeHandle {
     pub(crate) fn send(&self, event: ClientEvent) -> Result<()> {
-        self.send_recoverable(event).map_err(|(error, _)| error)
-    }
-
-    pub(crate) fn send_recoverable(
-        &self,
-        event: ClientEvent,
-    ) -> std::result::Result<(), (anyhow::Error, ClientEvent)> {
-        let (ack, result) = std::sync::mpsc::sync_channel(1);
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let (ack, _result) = std::sync::mpsc::sync_channel(1);
         let command = WsCommand::Event {
-            event: Box::new(event.clone()),
+            event: Box::new(event),
             ack,
-            cancelled: Arc::clone(&cancelled),
+            delivery: Arc::new(DeliveryState::queued()),
         };
-        if let Err(error) = self.outbound.try_send(command) {
-            let message = match error {
+        self.outbound
+            .try_send(command)
+            .map_err(|error| match error {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    "Realtime outbound queue is full"
+                    anyhow::anyhow!("Realtime outbound queue is full")
                 }
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    "Realtime websocket task stopped"
+                    anyhow::anyhow!("Realtime websocket task stopped")
                 }
-            };
-            return Err((anyhow::anyhow!(message), event));
-        }
-        match result.recv_timeout(SEND_ACK_TIMEOUT) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err((anyhow::anyhow!(error), event)),
-            Err(error) => {
-                cancelled.store(true, Ordering::Release);
-                Err((
-                    anyhow::anyhow!("Realtime send acknowledgement failed: {error}"),
-                    event,
-                ))
-            }
-        }
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_recoverable(&self, event: ClientEvent) -> RecoverableSendResult {
+        send_recoverable_with_outbound(&self.outbound, event)
+    }
+
+    pub(crate) fn send_recoverable_async(
+        &self,
+        event: ClientEvent,
+    ) -> Result<Receiver<RecoverableSendResult>> {
+        let outbound = self.outbound.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("hh-realtime-send".to_owned())
+            .spawn(move || {
+                let _ = result_tx.send(send_recoverable_with_outbound(&outbound, event));
+            })
+            .context("spawn Realtime acknowledgement waiter")?;
+        Ok(result_rx)
     }
 
     pub(crate) fn shutdown(mut self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.shutdown_wake.notify_one();
         let _ = self.outbound.try_send(WsCommand::Shutdown);
         if let Some(join) = self.join.take() {
             let deadline = std::time::Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
@@ -364,15 +431,53 @@ impl RealtimeHandle {
     }
 }
 
+fn send_recoverable_with_outbound(
+    outbound: &tokio::sync::mpsc::Sender<WsCommand>,
+    event: ClientEvent,
+) -> RecoverableSendResult {
+    let (ack, result) = std::sync::mpsc::sync_channel(1);
+    let delivery = Arc::new(DeliveryState::queued());
+    let command = WsCommand::Event {
+        event: Box::new(event.clone()),
+        ack,
+        delivery: Arc::clone(&delivery),
+    };
+    if let Err(error) = outbound.try_send(command) {
+        let message = match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => "Realtime outbound queue is full",
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => "Realtime websocket task stopped",
+        };
+        return Err((anyhow::anyhow!(message), Some(event)));
+    }
+    match result.recv_timeout(SEND_ACK_TIMEOUT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err((
+            anyhow::anyhow!(error),
+            delivery.definitely_unsent().then_some(event),
+        )),
+        Err(error) => {
+            let unsent = delivery.cancel_before_delivery().then_some(event);
+            Err((
+                anyhow::anyhow!("Realtime send acknowledgement failed: {error}"),
+                unsent,
+            ))
+        }
+    }
+}
+
 pub(crate) fn spawn(
     api_key: String,
     model: String,
-    inbound: Sender<RealtimeInbound>,
+    inbound: SyncSender<RealtimeInbound>,
 ) -> Result<RealtimeHandle> {
     if api_key.trim().is_empty() {
         anyhow::bail!("OpenAI API key is empty");
     }
     let (outbound, receiver) = tokio::sync::mpsc::channel(OUTBOUND_CAPACITY);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_wake = Arc::new(tokio::sync::Notify::new());
+    let worker_shutdown_requested = Arc::clone(&shutdown_requested);
+    let worker_shutdown_wake = Arc::clone(&shutdown_wake);
     let join = std::thread::Builder::new()
         .name("hh-realtime".to_owned())
         .spawn(move || {
@@ -381,9 +486,16 @@ pub(crate) fn spawn(
                 .enable_time()
                 .build();
             match runtime {
-                Ok(runtime) => runtime.block_on(run_socket(api_key, model, receiver, inbound)),
+                Ok(runtime) => runtime.block_on(run_socket(
+                    api_key,
+                    model,
+                    receiver,
+                    inbound,
+                    worker_shutdown_requested,
+                    worker_shutdown_wake,
+                )),
                 Err(error) => {
-                    let _ = inbound.send(RealtimeInbound::Disconnected(format!(
+                    let _ = inbound.try_send(RealtimeInbound::Disconnected(format!(
                         "build Realtime runtime: {error}"
                     )));
                 }
@@ -392,6 +504,8 @@ pub(crate) fn spawn(
         .context("spawn Realtime websocket thread")?;
     Ok(RealtimeHandle {
         outbound,
+        shutdown_requested,
+        shutdown_wake,
         join: Some(join),
     })
 }
@@ -402,8 +516,17 @@ where
     S::Error: std::fmt::Display,
 {
     let json = encode_event(event)?;
-    sink.send(Message::Text(Utf8Bytes::from(json)))
+    send_message(sink, Message::Text(Utf8Bytes::from(json))).await
+}
+
+async fn send_message<S>(sink: &mut S, message: Message) -> std::result::Result<(), String>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    tokio::time::timeout(SOCKET_IO_TIMEOUT, sink.send(message))
         .await
+        .map_err(|_| format!("Realtime socket send timed out after {SOCKET_IO_TIMEOUT:?}"))?
         .map_err(|error| format!("send Realtime event: {error}"))
 }
 
@@ -432,21 +555,48 @@ fn provider_failure_retryable(status: Option<u16>, retries: u32) -> bool {
         && !matches!(status, Some(400..=499) if status != Some(408) && status != Some(429))
 }
 
+#[derive(Default)]
+struct ReconnectBudget {
+    failures: u32,
+}
+
+impl ReconnectBudget {
+    fn record_failure(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    fn record_disconnect(&mut self, connected_for: Duration) {
+        if connected_for >= STABLE_CONNECTION_RESET_AFTER {
+            self.failures = 0;
+        }
+        self.record_failure();
+    }
+
+    fn retryable(&self, status: Option<u16>) -> bool {
+        provider_failure_retryable(status, self.failures)
+    }
+}
+
 async fn run_socket(
     api_key: String,
     model: String,
     mut outbound: tokio::sync::mpsc::Receiver<WsCommand>,
-    inbound: Sender<RealtimeInbound>,
+    inbound: SyncSender<RealtimeInbound>,
+    shutdown_requested: Arc<AtomicBool>,
+    shutdown_wake: Arc<tokio::sync::Notify>,
 ) {
     let mut backoff_secs = 1_u64;
-    let mut retries = 0_u32;
+    let mut reconnect_budget = ReconnectBudget::default();
     let mut pending = None;
     loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
         let mut request =
             match format!("wss://api.openai.com/v1/realtime?model={model}").into_client_request() {
                 Ok(request) => request,
                 Err(error) => {
-                    let _ = inbound.send(RealtimeInbound::Disconnected(format!(
+                    let _ = inbound.try_send(RealtimeInbound::Disconnected(format!(
                         "build Realtime request: {error}"
                     )));
                     return;
@@ -455,7 +605,7 @@ async fn run_socket(
         let authorization = match format!("Bearer {api_key}").parse() {
             Ok(value) => value,
             Err(error) => {
-                let _ = inbound.send(RealtimeInbound::Disconnected(format!(
+                let _ = inbound.try_send(RealtimeInbound::Disconnected(format!(
                     "invalid API key header: {error}"
                 )));
                 return;
@@ -467,28 +617,40 @@ async fn run_socket(
             .max_message_size(Some(MAX_PROVIDER_EVENT_BYTES))
             .max_frame_size(Some(MAX_PROVIDER_EVENT_BYTES))
             .max_write_buffer_size(MAX_PROVIDER_EVENT_BYTES * 2);
-        match tokio::time::timeout(
+        let connect = tokio::time::timeout(
             CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async_with_config(request, Some(socket_config), false),
-        )
-        .await
-        {
+        );
+        tokio::pin!(connect);
+        let connect_result = tokio::select! {
+            result = &mut connect => result,
+            () = shutdown_wake.notified() => {
+                if shutdown_requested.load(Ordering::Acquire) {
+                    return;
+                }
+                continue;
+            }
+        };
+        match connect_result {
             Ok(Ok((socket, _))) => {
-                backoff_secs = 1;
-                retries = 0;
-                let _ = inbound.send(RealtimeInbound::Connected);
+                let connected_at = std::time::Instant::now();
+                let _ = inbound.try_send(RealtimeInbound::Connected);
                 let (mut sink, mut stream) = socket.split();
                 loop {
+                    if shutdown_requested.load(Ordering::Acquire) {
+                        let _ = send_message(&mut sink, Message::Close(None)).await;
+                        return;
+                    }
                     if let Some(command) = pending.take() {
                         let WsCommand::Event {
                             event,
                             ack,
-                            cancelled,
+                            delivery,
                         } = command
                         else {
                             return;
                         };
-                        if cancelled.load(Ordering::Acquire) {
+                        if !delivery.begin_delivery() {
                             let _ = ack.send(Err(
                                 "Realtime send was cancelled before delivery".to_owned()
                             ));
@@ -498,11 +660,12 @@ async fn run_socket(
                             pending = Some(WsCommand::Event {
                                 event,
                                 ack,
-                                cancelled,
+                                delivery,
                             });
-                            let _ = inbound.send(RealtimeInbound::Disconnected(error));
+                            let _ = inbound.try_send(RealtimeInbound::Disconnected(error));
                             break;
                         }
+                        delivery.mark_delivered();
                         let _ = ack.send(Ok(()));
                         continue;
                     }
@@ -510,39 +673,56 @@ async fn run_socket(
                         command = outbound.recv() => match command {
                             Some(command @ WsCommand::Event { .. }) => pending = Some(command),
                             Some(WsCommand::Shutdown) | None => {
-                                let _ = sink.send(Message::Close(None)).await;
+                                let _ = send_message(&mut sink, Message::Close(None)).await;
                                 return;
                             }
                         },
+                        () = shutdown_wake.notified() => {
+                            if shutdown_requested.load(Ordering::Acquire) {
+                                let _ = send_message(&mut sink, Message::Close(None)).await;
+                                return;
+                            }
+                        }
                         message = stream.next() => match message {
                             Some(Ok(Message::Text(text))) => match decode_server_event(&text) {
-                                Ok(event) => { let _ = inbound.send(RealtimeInbound::Event(event)); }
-                                Err(error) => { let _ = inbound.send(RealtimeInbound::Warning(error)); }
+                                Ok(event) => { let _ = inbound.try_send(RealtimeInbound::Event(event)); }
+                                Err(error) => { let _ = inbound.try_send(RealtimeInbound::Warning(error)); }
                             },
                             Some(Ok(Message::Close(frame))) => {
-                                let _ = inbound.send(RealtimeInbound::Disconnected(format!("Realtime socket closed: {frame:?}")));
+                                let _ = inbound.try_send(RealtimeInbound::Disconnected(format!("Realtime socket closed: {frame:?}")));
                                 break;
                             }
                             Some(Ok(Message::Ping(payload))) => {
-                                if sink.send(Message::Pong(payload)).await.is_err() {
+                                if send_message(&mut sink, Message::Pong(payload)).await.is_err() {
                                     break;
                                 }
                             }
                             Some(Ok(_)) => {}
                             Some(Err(error)) => {
-                                let _ = inbound.send(RealtimeInbound::Disconnected(format!("read Realtime socket: {error}")));
+                                let _ = inbound.try_send(RealtimeInbound::Disconnected(format!("read Realtime socket: {error}")));
                                 break;
                             }
                             None => {
-                                let _ = inbound.send(RealtimeInbound::Disconnected("Realtime socket ended".to_owned()));
+                                let _ = inbound.try_send(RealtimeInbound::Disconnected("Realtime socket ended".to_owned()));
                                 break;
                             }
                         }
                     }
                 }
+                let connected_for = connected_at.elapsed();
+                reconnect_budget.record_disconnect(connected_for);
+                if connected_for >= STABLE_CONNECTION_RESET_AFTER {
+                    backoff_secs = 1;
+                }
+                if !reconnect_budget.retryable(None) {
+                    if let Some(WsCommand::Event { ack, .. }) = pending.take() {
+                        let _ = ack.send(Err("Realtime reconnect limit reached".to_owned()));
+                    }
+                    return;
+                }
             }
             Ok(Err(error)) => {
-                retries = retries.saturating_add(1);
+                reconnect_budget.record_failure();
                 let status = match &error {
                     tokio_tungstenite::tungstenite::Error::Http(response) => {
                         Some(response.status().as_u16())
@@ -550,21 +730,23 @@ async fn run_socket(
                     _ => None,
                 };
                 let message = format!("connect Realtime socket: {error}");
-                let _ = inbound.send(RealtimeInbound::Disconnected(message.clone()));
-                if !provider_failure_retryable(status, retries) {
-                    if let Some(WsCommand::Event { ack, .. }) = pending.take() {
+                let _ = inbound.try_send(RealtimeInbound::Disconnected(message.clone()));
+                if !reconnect_budget.retryable(status) {
+                    if let Some(WsCommand::Event { ack, delivery, .. }) = pending.take() {
+                        delivery.mark_unsent_if_queued();
                         let _ = ack.send(Err(message));
                     }
                     return;
                 }
             }
             Err(_) => {
-                retries = retries.saturating_add(1);
+                reconnect_budget.record_failure();
                 let message =
                     format!("connect Realtime socket timed out after {CONNECT_TIMEOUT:?}");
-                let _ = inbound.send(RealtimeInbound::Disconnected(message.clone()));
-                if !provider_failure_retryable(None, retries) {
-                    if let Some(WsCommand::Event { ack, .. }) = pending.take() {
+                let _ = inbound.try_send(RealtimeInbound::Disconnected(message.clone()));
+                if !reconnect_budget.retryable(None) {
+                    if let Some(WsCommand::Event { ack, delivery, .. }) = pending.take() {
+                        delivery.mark_unsent_if_queued();
                         let _ = ack.send(Err(message));
                     }
                     return;
@@ -576,6 +758,11 @@ async fn run_socket(
         tokio::pin!(sleep);
         tokio::select! {
             () = &mut sleep => {}
+            () = shutdown_wake.notified() => {
+                if shutdown_requested.load(Ordering::Acquire) {
+                    return;
+                }
+            }
             command = outbound.recv(), if pending.is_none() => match command {
                 Some(WsCommand::Shutdown) | None => return,
                 Some(command @ WsCommand::Event { .. }) => pending = Some(command),
@@ -588,7 +775,20 @@ async fn run_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::Sink;
     use serde_json::json;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context as TaskContext, Poll};
+
+    fn test_handle(outbound: tokio::sync::mpsc::Sender<WsCommand>) -> RealtimeHandle {
+        RealtimeHandle {
+            outbound,
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_wake: Arc::new(tokio::sync::Notify::new()),
+            join: None,
+        }
+    }
     #[test]
     #[ignore = "writes the live session.update payload for manual debugging"]
     fn dump_session_update_payload() {
@@ -614,19 +814,65 @@ mod tests {
             .try_send(WsCommand::Event {
                 event: Box::new(ClientEvent::ResponseCreate { response: None }),
                 ack: ack_tx,
-                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                delivery: Arc::new(DeliveryState::queued()),
             })
             .unwrap();
-        let handle = RealtimeHandle {
-            outbound,
-            join: None,
-        };
+        let handle = test_handle(outbound);
         let event = ClientEvent::ResponseCancel;
         let (error, recovered) = handle
             .send_recoverable(event.clone())
             .expect_err("a full realtime queue must apply backpressure");
         assert!(error.to_string().contains("queue is full"));
-        assert_eq!(recovered, event);
+        assert_eq!(recovered, Some(event));
+    }
+
+    #[test]
+    fn ack_timeout_never_returns_an_event_that_is_delivered_late() {
+        let (outbound, mut receiver) = tokio::sync::mpsc::channel(1);
+        let delivered = Arc::new(AtomicBool::new(false));
+        let worker_delivered = Arc::clone(&delivered);
+        let worker = std::thread::spawn(move || {
+            let WsCommand::Event { ack, delivery, .. } = receiver.blocking_recv().unwrap() else {
+                panic!("expected event command");
+            };
+            assert!(delivery.begin_delivery());
+            std::thread::sleep(SEND_ACK_TIMEOUT + Duration::from_millis(50));
+            worker_delivered.store(true, Ordering::Release);
+            delivery.mark_delivered();
+            let _ = ack.send(Ok(()));
+        });
+        let handle = test_handle(outbound);
+
+        let recovered = handle
+            .send_recoverable(ClientEvent::ResponseCancel)
+            .expect_err("the delayed acknowledgement must exceed the caller bound")
+            .1;
+        worker.join().unwrap();
+
+        assert!(
+            recovered.is_none() || !delivered.load(Ordering::Acquire),
+            "event {recovered:?} was returned as unsent and also delivered"
+        );
+    }
+
+    #[test]
+    fn control_send_does_not_wait_for_a_provider_acknowledgement() {
+        let (outbound, mut receiver) = tokio::sync::mpsc::channel(1);
+        let worker = std::thread::spawn(move || {
+            let _command = receiver.blocking_recv().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let handle = test_handle(outbound);
+
+        let started = std::time::Instant::now();
+        handle.send(ClientEvent::ResponseCancel).unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "engine control send blocked for {:?}",
+            started.elapsed()
+        );
+        worker.join().unwrap();
     }
 
     #[test]
@@ -636,6 +882,92 @@ mod tests {
         assert!(provider_failure_retryable(Some(429), 0));
         assert!(provider_failure_retryable(Some(500), 0));
         assert!(!provider_failure_retryable(Some(500), MAX_CONNECT_RETRIES));
+    }
+
+    #[test]
+    fn successful_handshakes_do_not_reset_a_flapping_reconnect_budget() {
+        let mut budget = ReconnectBudget::default();
+        for _ in 0..MAX_CONNECT_RETRIES {
+            budget.record_disconnect(Duration::from_millis(10));
+        }
+
+        assert!(!budget.retryable(None));
+    }
+
+    #[test]
+    fn shutdown_is_out_of_band_when_the_outbound_queue_is_full() {
+        let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
+        let (ack, _result) = std::sync::mpsc::sync_channel(1);
+        outbound
+            .try_send(WsCommand::Event {
+                event: Box::new(ClientEvent::ResponseCancel),
+                ack,
+                delivery: Arc::new(DeliveryState::queued()),
+            })
+            .unwrap();
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown_requested);
+        let join = std::thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let handle = RealtimeHandle {
+            outbound,
+            shutdown_requested,
+            shutdown_wake: Arc::new(tokio::sync::Notify::new()),
+            join: Some(join),
+        };
+
+        let started = std::time::Instant::now();
+        handle.shutdown();
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    struct StalledSink;
+
+    impl Sink<Message> for StalledSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_socket_send_returns_within_the_io_bound() {
+        let started = std::time::Instant::now();
+        let error = send_event(&mut StalledSink, &ClientEvent::ResponseCancel)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+        assert!(started.elapsed() < SOCKET_IO_TIMEOUT + Duration::from_millis(250));
     }
 
     #[test]

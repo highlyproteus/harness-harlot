@@ -63,12 +63,20 @@ impl HhApp {
     /// visible state refreshes without waiting for the next poll tick.
     pub(crate) fn dispatch(&mut self, request: ClientRequest) {
         let one_way = PipelineJob::is_one_way(&request);
-        let _ = self.session.control_tx.unbounded_send(PipelineJob {
-            request,
-            one_way,
-            followup_refresh: true,
-            apply: None,
-        });
+        if self
+            .session
+            .control_tx
+            .try_send(PipelineJob {
+                request,
+                one_way,
+                followup_refresh: true,
+                apply: None,
+            })
+            .is_err()
+        {
+            self.session.connection_error =
+                Some("control pipeline overloaded; newest request was not queued".to_owned());
+        }
     }
 
     /// Enqueues a control-lane request with no follow-up refresh. Terminal
@@ -76,18 +84,21 @@ impl HhApp {
     pub(crate) fn dispatch_control(&mut self, request: ClientRequest) {
         let wake_poll = terminal_poll_wake_requested(&request);
         let one_way = PipelineJob::is_one_way(&request);
-        if self
+        let queued = self
             .session
             .control_tx
-            .unbounded_send(PipelineJob {
+            .try_send(PipelineJob {
                 request,
                 one_way,
                 followup_refresh: false,
                 apply: None,
             })
-            .is_ok()
-            && wake_poll
-        {
+            .is_ok();
+        if !queued {
+            self.session.connection_error = Some(
+                "control pipeline overloaded; newest terminal input was not queued".to_owned(),
+            );
+        } else if wake_poll {
             let _ = self.session.poll_wake_tx.try_send(());
         }
     }
@@ -96,23 +107,39 @@ impl HhApp {
     /// with the response on the UI thread, followed by one poll cycle.
     pub(crate) fn dispatch_with(&mut self, request: ClientRequest, apply: ApplyFn) {
         let one_way = PipelineJob::is_one_way(&request);
-        let _ = self.session.control_tx.unbounded_send(PipelineJob {
-            request,
-            one_way,
-            followup_refresh: true,
-            apply: Some(apply),
-        });
+        if self
+            .session
+            .control_tx
+            .try_send(PipelineJob {
+                request,
+                one_way,
+                followup_refresh: true,
+                apply: Some(apply),
+            })
+            .is_err()
+        {
+            self.session.connection_error =
+                Some("control pipeline overloaded; newest request was not queued".to_owned());
+        }
     }
 
     /// Enqueues a stream-lane request (screen traffic) with a typed
     /// continuation; no follow-up refresh.
     pub(crate) fn dispatch_stream_with(&mut self, request: ClientRequest, apply: ApplyFn) {
-        let _ = self.session.stream_tx.unbounded_send(PipelineJob {
-            request,
-            one_way: false,
-            followup_refresh: false,
-            apply: Some(apply),
-        });
+        if self
+            .session
+            .stream_tx
+            .try_send(PipelineJob {
+                request,
+                one_way: false,
+                followup_refresh: false,
+                apply: Some(apply),
+            })
+            .is_err()
+        {
+            self.session.connection_error =
+                Some("stream pipeline overloaded; newest request was not queued".to_owned());
+        }
     }
 
     pub(crate) fn pane_update_request(&self) -> ClientRequest {

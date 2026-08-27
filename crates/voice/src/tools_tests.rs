@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn notification(id: u64) -> SessionNotification {
     SessionNotification {
@@ -178,12 +180,50 @@ fn subprocess_stderr_is_drained_without_deadlock_and_bounded() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let started = Instant::now();
-    let (status, stderr) =
-        run_child_with_stderr_timeout(&mut command, Duration::from_secs(2), "stderr stress test")
-            .unwrap();
+    let cancelled = AtomicBool::new(false);
+    let (status, stderr) = run_child_with_stderr_timeout(
+        &mut command,
+        Duration::from_secs(2),
+        "stderr stress test",
+        &cancelled,
+    )
+    .unwrap();
     assert_eq!(status.code(), Some(7));
     assert!(stderr.len() <= MAX_SUBPROCESS_STDERR_BYTES);
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn long_subprocess_is_killed_promptly_when_tool_work_is_cancelled() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 5")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let result = run_child_with_stderr_timeout(
+            &mut command,
+            Duration::from_secs(30),
+            "cancelled tool",
+            &worker_cancelled,
+        );
+        let _ = done_tx.send(result);
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    cancelled.store(true, Ordering::Release);
+    let error = done_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("cancelled tool did not stop within the responsiveness bound")
+        .unwrap_err();
+
+    assert!(error.to_string().contains("cancelled"));
+    assert!(started.elapsed() < Duration::from_millis(500));
 }
 
 #[test]
