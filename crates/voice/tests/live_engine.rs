@@ -1,5 +1,6 @@
 //! Manual live probe: runs the real engine against the local service and the
-//! Realtime API using the operator's saved settings, printing every UI event.
+//! Realtime API using saved non-secret settings and `HH_OPENAI_API_KEY`,
+//! printing every UI event.
 use std::time::{Duration, Instant};
 
 use hh_protocol::{ClientRequest, ServiceResponse};
@@ -10,12 +11,12 @@ use hh_voice::{
 };
 
 #[test]
-#[ignore = "requires saved voice settings, a running hh-service, and network access"]
+#[ignore = "requires HH_OPENAI_API_KEY, a running hh-service, and network access"]
 fn live_engine_reports_state_transitions() {
-    let settings = VoiceSettings::load().expect("load saved voice settings");
+    let settings = VoiceSettings::load().expect("load voice settings and environment overrides");
     assert!(
         !settings.api_key.trim().is_empty(),
-        "no API key in saved voice settings"
+        "HH_OPENAI_API_KEY is missing or empty"
     );
     let (ui_tx, mut ui_rx) = voice_ui_channel();
     let engine = spawn_engine(settings, AssistantContext::default(), ui_tx).expect("spawn engine");
@@ -100,12 +101,12 @@ fn live_engine_reports_state_transitions() {
 }
 
 #[test]
-#[ignore = "creates a real terminal tab and requires saved settings, hh-service, and network"]
+#[ignore = "creates a real terminal tab and requires HH_OPENAI_API_KEY, hh-service, and network"]
 fn live_engine_opens_requested_terminal_tab() {
-    let settings = VoiceSettings::load().expect("load saved voice settings");
+    let settings = VoiceSettings::load().expect("load voice settings and environment overrides");
     assert!(
         !settings.api_key.trim().is_empty(),
-        "no API key in saved voice settings"
+        "HH_OPENAI_API_KEY is missing or empty"
     );
     let mut client = SessionClient::connect().expect("connect session service");
     let ServiceResponse::Snapshot { snapshot } = client
@@ -178,12 +179,12 @@ fn live_engine_opens_requested_terminal_tab() {
 }
 
 #[test]
-#[ignore = "creates a real terminal tab and requires saved settings, hh-service, and network"]
+#[ignore = "creates a real terminal tab and requires HH_OPENAI_API_KEY, hh-service, and network"]
 fn live_engine_from_assistant_workspace_opens_workstation_terminal_tab() {
-    let settings = VoiceSettings::load().expect("load saved voice settings");
+    let settings = VoiceSettings::load().expect("load voice settings and environment overrides");
     assert!(
         !settings.api_key.trim().is_empty(),
-        "no API key in saved voice settings"
+        "HH_OPENAI_API_KEY is missing or empty"
     );
     let mut client = SessionClient::connect().expect("connect session service");
     let ServiceResponse::Snapshot { snapshot } = client

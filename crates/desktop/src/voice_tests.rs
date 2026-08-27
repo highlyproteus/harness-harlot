@@ -61,6 +61,17 @@ fn clearing_saved_history_updates_summary_only_session_ui() {
 }
 
 #[test]
+fn delayed_summary_event_does_not_restore_cleared_ui_state() {
+    let pane_id = Uuid::new_v4();
+    let mut session = AssistantSession::new();
+    session.persisted_summary = PersistedSummaryState::Present;
+
+    reconcile_persisted_summary(&mut session, pane_id, &[]);
+
+    assert_eq!(session.persisted_summary, PersistedSummaryState::Absent);
+}
+
+#[test]
 fn suspended_assistant_keeps_the_live_surface_when_history_exists() {
     let mut session = AssistantSession::new();
     assert!(assistant_workspace_shows_idle(&session));

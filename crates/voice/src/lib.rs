@@ -21,8 +21,8 @@ pub const VOICE_UI_EVENT_CAPACITY: usize = 64;
 
 pub use settings::{HonchoSettings, VoiceSettings};
 pub use threads::{
-    Thread, ThreadRecord, ThreadRole, ThreadSummary, adopt_thread, append_record, list_threads,
-    read_summary, read_thread,
+    Thread, ThreadGeneration, ThreadRecord, ThreadRole, ThreadSummary, adopt_thread, append_record,
+    list_threads, read_summary, read_thread,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
