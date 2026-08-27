@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::{
+    io::Read as _,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -21,15 +24,21 @@ use crate::memory::MemoryBackend;
 use crate::threads::{self, ThreadRecord, ThreadRole};
 
 mod authority;
+mod worktree;
 
 use authority::{MutationAuthority, PendingAction, key_bytes, pending_action};
+#[cfg(test)]
+use worktree::git_worktree_command;
+use worktree::{run_git_worktree, validate_worktree_base, validate_worktree_branch, worktree_path};
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const DEFAULT_PANE_LINES: usize = 60;
 const MAX_PANE_LINES: usize = 200;
-const WORKTREE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const SUBPROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(test)]
 const STDERR_COMPLETION_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(test)]
 const MAX_SUBPROCESS_STDERR_BYTES: usize = 16 * 1024;
 const MAX_DIRECTORY_MATCHES: usize = 20;
 const MAX_LISTED_THREADS: usize = 20;
@@ -135,7 +144,7 @@ impl ToolExecutor {
         &mut self,
         name: &str,
         arguments: &Value,
-        memory: &mut dyn MemoryBackend,
+        _memory: &mut dyn MemoryBackend,
         ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
         cancelled: &AtomicBool,
     ) -> Result<Value> {
@@ -145,7 +154,9 @@ impl ToolExecutor {
         let tier = classify_tool(name)?;
         if tier == TrustTier::T2 {
             let snapshot = self.refresh_snapshot()?;
-            let result = self.request_approval(pending_action(name, arguments, &snapshot)?, ui);
+            let mut action = pending_action(name, arguments, &snapshot)?;
+            bind_pending_canonical_paths(&mut action, self.authorized_root.as_deref())?;
+            let result = self.request_approval(action, ui);
             let _ = ui.unbounded_send(VoiceUiEvent::ToolCall {
                 name: name.to_owned(),
                 summary: summarize_output(&result),
@@ -154,19 +165,11 @@ impl ToolExecutor {
         }
         let result = match name {
             "list_workstations" => self.list_workstations(),
-            "read_pane" => self.read_pane(arguments),
             "check_status" => self.check_status(),
             "attach_project" => self.attach_project(arguments),
             "list_directory" => self.list_directory(arguments),
             "find_directory" => self.find_directory(arguments),
             "list_threads" => self.list_threads(arguments),
-            "read_thread" => self.read_thread(arguments),
-            "recall_memory" => {
-                let query = required_str(arguments, "query")?;
-                memory
-                    .recall(query)
-                    .map(|content| json!({ "content": content }))
-            }
             _ => bail!("unknown voice tool {name}"),
         }?;
         let _ = ui.unbounded_send(VoiceUiEvent::ToolCall {
@@ -180,6 +183,7 @@ impl ToolExecutor {
         &mut self,
         approval_id: u64,
         approved: bool,
+        memory: &mut dyn MemoryBackend,
         ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
         cancelled: &AtomicBool,
     ) -> Result<Value> {
@@ -188,7 +192,7 @@ impl ToolExecutor {
             .remove(&approval_id)
             .with_context(|| format!("approval {approval_id} is not pending"))?;
         let result = if approved {
-            self.execute_pending(action, cancelled)?
+            self.execute_pending(action, memory, cancelled)?
         } else {
             json!({ "status": "denied", "approval_id": approval_id })
         };
@@ -286,16 +290,7 @@ impl ToolExecutor {
         ))
     }
 
-    fn read_pane(&mut self, arguments: &Value) -> Result<Value> {
-        let pane_id = required_uuid(arguments, "pane_id")?;
-        let workspace_id = self.workspace_for_pane(pane_id)?;
-        self.require_authorized(workspace_id)?;
-        let lines = arguments
-            .get("lines")
-            .and_then(Value::as_u64)
-            .and_then(|lines| usize::try_from(lines).ok())
-            .unwrap_or(DEFAULT_PANE_LINES)
-            .clamp(1, MAX_PANE_LINES);
+    fn read_pane(&mut self, pane_id: Uuid, lines: usize) -> Result<Value> {
         let response = self
             .client
             .call(&ClientRequest::GetPaneSnapshot { pane_id })?;
@@ -422,10 +417,12 @@ impl ToolExecutor {
         Ok(json!({ "threads": threads, "truncated": truncated }))
     }
 
-    fn read_thread(&self, arguments: &Value) -> Result<Value> {
-        let thread_id = required_uuid(arguments, "thread_id")?;
+    fn read_thread(&self, thread_id: Uuid, approved_workspace_id: Uuid) -> Result<Value> {
         let thread = threads::read_thread(thread_id)?
             .with_context(|| format!("thread {thread_id} not found"))?;
+        if thread.workspace_id != Some(approved_workspace_id) {
+            bail!("thread {thread_id} changed workspace authority");
+        }
         if !thread_workspace_is_authorized(thread.workspace_id, &self.authorized_workspaces) {
             bail!("thread {thread_id} is outside the authorized workspace boundary");
         }
@@ -459,9 +456,7 @@ impl ToolExecutor {
         let working_dir = arguments
             .get("working_dir")
             .and_then(Value::as_str)
-            .map(canonical_existing_directory)
-            .transpose()?
-            .map(|directory| directory.to_string_lossy().into_owned());
+            .map(str::to_owned);
         let response = self.client.call(&ClientRequest::CreateWorkspace {
             title: Some(title.clone()),
         })?;
@@ -531,9 +526,7 @@ impl ToolExecutor {
     fn open_project_tab(&mut self, arguments: &Value) -> Result<Value> {
         let workspace_id = required_uuid(arguments, "workspace_id")?;
         self.require_attached_workstation(workspace_id)?;
-        let working_dir = canonical_existing_directory(required_str(arguments, "working_dir")?)?
-            .to_string_lossy()
-            .into_owned();
+        let working_dir = required_str(arguments, "working_dir")?.to_owned();
         let title = arguments
             .get("title")
             .and_then(Value::as_str)
@@ -554,10 +547,16 @@ impl ToolExecutor {
     fn create_worktree_tab(&mut self, arguments: &Value, cancelled: &AtomicBool) -> Result<Value> {
         let workspace_id = required_uuid(arguments, "workspace_id")?;
         self.require_attached_workstation(workspace_id)?;
-        let repo_dir = canonical_git_repository(required_str(arguments, "repo_dir")?)?;
+        let repo_dir = PathBuf::from(required_str(arguments, "repo_dir")?);
+        if !repo_dir.join(".git").exists() {
+            bail!("repository directory must contain .git");
+        }
         let branch = required_str(arguments, "branch")?;
         let base = arguments.get("base").and_then(Value::as_str);
         validate_worktree_branch(branch)?;
+        if let Some(base) = base {
+            validate_worktree_base(base)?;
+        }
         let worktree_path = worktree_path(&repo_dir, branch)?;
         let parent = worktree_path
             .parent()
@@ -614,31 +613,49 @@ impl ToolExecutor {
         self.next_approval_id = self.next_approval_id.saturating_add(1);
         let description = action.description();
         self.pending_approvals.insert(id, action);
-        let _ = ui.unbounded_send(VoiceUiEvent::ApprovalRequested {
+        let _ = ui.unbounded_send(VoiceUiEvent::ApprovalRequested { id, description });
+        approval_required_output(
             id,
-            description: description.clone(),
-        });
-        json!({
-            "status": "needs_approval",
-            "approval_id": id,
-            "action": description,
-            "requires_ui_click": true,
-            "note": "the user must click Approve or Deny in the pane; spoken confirmation is not authorization",
-        })
+            self.pending_approvals
+                .get(&id)
+                .expect("pending action inserted"),
+        )
     }
 
-    fn execute_pending(&mut self, action: PendingAction, cancelled: &AtomicBool) -> Result<Value> {
+    fn execute_pending(
+        &mut self,
+        action: PendingAction,
+        memory: &mut dyn MemoryBackend,
+        cancelled: &AtomicBool,
+    ) -> Result<Value> {
         if cancelled.load(Ordering::Acquire) {
             bail!("tool execution cancelled");
         }
         let snapshot = self.refresh_snapshot()?;
-        revalidate_pending_action(
-            &snapshot,
-            &action,
-            &self.authorized_workspaces,
-            self.authorized_root.as_deref(),
-        )?;
+        if matches!(action, PendingAction::ReadPane { .. }) {
+            revalidate_provider_read(
+                &snapshot,
+                &action,
+                &self.authorized_workspaces,
+                self.authorized_root.as_deref(),
+            )?;
+        } else {
+            revalidate_pending_action(
+                &snapshot,
+                &action,
+                &self.authorized_workspaces,
+                self.authorized_root.as_deref(),
+            )?;
+        }
         match action {
+            PendingAction::ReadPane { pane_id, lines, .. } => self.read_pane(pane_id, lines),
+            PendingAction::ReadThread {
+                thread_id,
+                workspace_id,
+            } => self.read_thread(thread_id, workspace_id),
+            PendingAction::RecallMemory { query } => memory
+                .recall(&query)
+                .map(|content| json!({ "content": content })),
             PendingAction::ToolCall {
                 name, arguments, ..
             } => match name.as_str() {
@@ -747,9 +764,12 @@ impl ToolExecutor {
 
 pub(crate) fn classify_tool(name: &str) -> Result<TrustTier> {
     match name {
-        "list_workstations" | "read_pane" | "check_status" | "attach_project" | "recall_memory"
-        | "list_directory" | "find_directory" | "list_threads" | "read_thread" => Ok(TrustTier::T0),
-        "create_workstation"
+        "list_workstations" | "check_status" | "attach_project" | "list_directory"
+        | "find_directory" | "list_threads" => Ok(TrustTier::T0),
+        "read_pane"
+        | "read_thread"
+        | "recall_memory"
+        | "create_workstation"
         | "open_terminal_tab"
         | "rename_tab"
         | "open_project_tab"
@@ -761,6 +781,16 @@ pub(crate) fn classify_tool(name: &str) -> Result<TrustTier> {
         | "close_workstation" => Ok(TrustTier::T2),
         _ => bail!("unknown voice tool {name}"),
     }
+}
+
+fn approval_required_output(id: u64, action: &PendingAction) -> Value {
+    json!({
+        "status": "needs_approval",
+        "approval_id": id,
+        "action": action.description(),
+        "requires_ui_click": true,
+        "note": "the user must click Approve or Deny in the pane; spoken confirmation is not authorization",
+    })
 }
 
 pub(crate) fn tool_schemas() -> Vec<Value> {
@@ -933,36 +963,6 @@ fn initial_notification_cursor(items: &[SessionNotification]) -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn validate_worktree_branch(branch: &str) -> Result<()> {
-    if branch.is_empty()
-        || branch.len() > 100
-        || !branch
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
-    {
-        bail!("branch must match [A-Za-z0-9._/-]{{1,100}}");
-    }
-    Ok(())
-}
-
-pub(crate) fn worktree_path(repo_dir: &Path, branch: &str) -> Result<PathBuf> {
-    validate_worktree_branch(branch)?;
-    let repo_name = repo_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("repository directory has no UTF-8 name")?;
-    let parent = repo_dir
-        .parent()
-        .context("repository directory has no parent")?;
-    let path_name = branch.replace('/', "-");
-    if matches!(path_name.as_str(), "." | "..") {
-        bail!("branch does not produce a safe worktree directory name");
-    }
-    Ok(parent
-        .join(format!("{repo_name}-worktrees"))
-        .join(path_name))
-}
-
 fn thread_workspace_is_authorized(
     workspace_id: Option<Uuid>,
     authorized_workspaces: &HashSet<Uuid>,
@@ -975,6 +975,60 @@ fn workspace_directory_is_within(workspace: &hh_protocol::Workspace, root: &Path
         .working_dir
         .as_deref()
         .is_some_and(|working_dir| canonical_directory_within(working_dir, root).is_ok())
+}
+
+fn bind_pending_canonical_paths(
+    action: &mut PendingAction,
+    authorized_root: Option<&Path>,
+) -> Result<()> {
+    let PendingAction::ToolCall {
+        name, arguments, ..
+    } = action
+    else {
+        return Ok(());
+    };
+    let field = match name.as_str() {
+        "create_workstation" if arguments.get("working_dir").is_some() => Some("working_dir"),
+        "open_project_tab" => Some("working_dir"),
+        "create_worktree_tab" => Some("repo_dir"),
+        _ => None,
+    };
+    let Some(field) = field else {
+        return Ok(());
+    };
+    let raw = required_str(arguments, field)?;
+    let canonical = match authorized_root {
+        Some(root) => canonical_directory_within(raw, root)?,
+        None => canonical_existing_directory(raw)?,
+    };
+    arguments[field] = Value::String(canonical.to_string_lossy().into_owned());
+    Ok(())
+}
+
+fn approved_tool_path(action: &PendingAction, field: &str) -> Result<PathBuf> {
+    let PendingAction::ToolCall { arguments, .. } = action else {
+        bail!("approved action does not contain tool arguments");
+    };
+    Ok(PathBuf::from(required_str(arguments, field)?))
+}
+
+fn revalidate_approved_tool_path(
+    action: &PendingAction,
+    field: &str,
+    authorized_root: Option<&Path>,
+) -> Result<PathBuf> {
+    let approved = approved_tool_path(action, field)?;
+    let approved_text = approved
+        .to_str()
+        .context("approved canonical path is not valid UTF-8")?;
+    let current = match authorized_root {
+        Some(root) => canonical_directory_within(approved_text, root)?,
+        None => canonical_existing_directory(approved_text)?,
+    };
+    if current != approved {
+        bail!("approved canonical path changed before execution");
+    }
+    Ok(approved)
 }
 
 fn canonical_directory_within(path: &str, root: &Path) -> Result<PathBuf> {
@@ -1110,47 +1164,7 @@ fn find_directories(root: &Path, query: &str) -> Vec<PathBuf> {
     scored.into_iter().map(|(_, _, path)| path).collect()
 }
 
-fn canonical_git_repository(path: &str) -> Result<PathBuf> {
-    let canonical = canonical_existing_directory(path)?;
-    if !canonical.join(".git").exists() {
-        bail!("repository directory must contain .git");
-    }
-    Ok(canonical)
-}
-
-fn run_git_worktree(
-    repo: &Path,
-    target: &Path,
-    branch: &str,
-    base: Option<&str>,
-    cancelled: &AtomicBool,
-) -> Result<()> {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(repo)
-        .arg("worktree")
-        .arg("add")
-        .arg(target)
-        .arg("-b")
-        .arg(branch)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    if let Some(base) = base {
-        command.arg(base);
-    }
-    let (status, stderr) = run_child_with_stderr_timeout(
-        &mut command,
-        WORKTREE_TIMEOUT,
-        "git worktree add",
-        cancelled,
-    )?;
-    if !status.success() {
-        bail!("git worktree add failed: {}", stderr.trim());
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn run_child_with_stderr_timeout(
     command: &mut Command,
     timeout: Duration,
@@ -1286,6 +1300,18 @@ fn mutation_authority_for_pane(
     bail!("pane {pane_id} does not exist")
 }
 
+fn revalidate_provider_read(
+    snapshot: &SessionSnapshot,
+    action: &PendingAction,
+    authorized_workspaces: &HashSet<Uuid>,
+    authorized_root: Option<&Path>,
+) -> Result<()> {
+    let PendingAction::ReadPane { authority, .. } = action else {
+        bail!("provider read does not carry pane authority");
+    };
+    revalidate_mutation_authority(snapshot, authority, authorized_workspaces, authorized_root)
+}
+
 fn revalidate_pending_action(
     snapshot: &SessionSnapshot,
     action: &PendingAction,
@@ -1293,8 +1319,10 @@ fn revalidate_pending_action(
     authorized_root: Option<&Path>,
 ) -> Result<()> {
     let authority = match action {
+        PendingAction::ReadThread { .. } | PendingAction::RecallMemory { .. } => None,
         PendingAction::ToolCall { authority, .. } => authority.as_ref(),
-        PendingAction::SendInput { authority, .. }
+        PendingAction::ReadPane { authority, .. }
+        | PendingAction::SendInput { authority, .. }
         | PendingAction::SendKeys { authority, .. }
         | PendingAction::CloseTab { authority, .. }
         | PendingAction::CloseWorkstation { authority, .. } => Some(authority),
@@ -1305,21 +1333,16 @@ fn revalidate_pending_action(
     if let PendingAction::ToolCall {
         name, arguments, ..
     } = action
-        && let Some(root) = authorized_root
     {
         match name.as_str() {
-            "create_workstation" => {
-                let working_dir = arguments
-                    .get("working_dir")
-                    .and_then(Value::as_str)
-                    .context("working_dir is required within an authorized root")?;
-                canonical_directory_within(working_dir, root)?;
+            "create_workstation" if arguments.get("working_dir").is_some() => {
+                revalidate_approved_tool_path(action, "working_dir", authorized_root)?;
             }
             "open_project_tab" => {
-                canonical_directory_within(required_str(arguments, "working_dir")?, root)?;
+                revalidate_approved_tool_path(action, "working_dir", authorized_root)?;
             }
             "create_worktree_tab" => {
-                canonical_directory_within(required_str(arguments, "repo_dir")?, root)?;
+                revalidate_approved_tool_path(action, "repo_dir", authorized_root)?;
             }
             _ => {}
         }
