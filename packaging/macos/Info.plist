@@ -27,7 +27,7 @@
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Harness Harlot uses the microphone for Voice Mode.</string>
+  <string>Harness Harlot captures microphone audio only after you explicitly start Voice Mode.</string>
   <key>NSDesktopFolderUsageDescription</key>
   <string>Terminal commands may access files in your Desktop folder when you request it.</string>
   <key>NSDocumentsFolderUsageDescription</key>

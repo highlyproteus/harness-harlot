@@ -1168,7 +1168,7 @@ impl HhApp {
                     .font_family(".SystemUIFont")
                     .text_xs()
                     .text_color(rgb(THEME.dim))
-                    .child("Select the API key field, then paste. The key is stored in the owner-only state file."),
+                    .child("Used for this process only; it is not saved. Set HH_OPENAI_API_KEY for future launches. Honcho bearer tokens use HH_HONCHO_BEARER."),
             )
             .child(
                 div()

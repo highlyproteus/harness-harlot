@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-08-27
+
 ### Added
 
 - Added Voice Mode with OpenAI Realtime audio and transcripts, Assistant panes,
@@ -28,6 +30,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   feedback, and prevented idle suspension during active voice exchanges.
 - Made Assistant tab rename, color, and custom-icon controls behave consistently
   with other pane types.
+- Made terminal input use acknowledged RPC responses, invalidated timed-out
+  client connections, retained Realtime events across bounded reconnects, and
+  surfaced failed, cancelled, or incomplete provider responses.
+- Added spoken barge-in, bounded playback and provider queues, persistence
+  rollback, composer draft preservation, and bounded subprocess shutdown.
+
+### Security
+
+- Removed model-controlled approval resolution. Terminal mutations, terminal and
+  workstation creation or closure, tab changes, worktree creation, and agent
+  launches now require independent approval in the Harness Harlot UI.
+- Scoped pane, thread, project, and directory reads to the Assistant's authorized
+  workspace and canonical directory boundary.
+- Treated terminal OSC notifications and approval results as bounded, explicitly
+  untrusted user data instead of system instructions.
+- Started Assistant microphone capture only after the visible start-voice action;
+  typed messages, image attachments, and reopened threads remain microphone-muted.
+- Restricted remote Honcho memory to HTTPS while allowing plaintext only for
+  validated loopback hosts, and no longer serializes OpenAI or Honcho credentials.
+- Hardened saved threads and image attachments with owner-only descriptor checks,
+  no-follow file access, format and size validation, bounded retention, and local
+  delete-one or clear-all controls.
+
+### Documentation
+
+- Added a public Voice Mode privacy and data-handling disclosure, corrected the
+  in-app credential-storage description, and clarified Linux Voice dependencies
+  and the macOS microphone permission prompt.
 
 ## [0.1.13] - 2026-08-23
 
