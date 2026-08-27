@@ -51,7 +51,8 @@ pub(crate) use tabs::{
     workspace_tab_standalone_pane,
 };
 pub(crate) use terminal_io::{
-    TerminalPointerAction, plain_history_line, prepare_paste, selection_span,
-    terminal_grid_for_pane, terminal_input_bytes, terminal_modifiers, terminal_mouse_button,
-    terminal_point_at, terminal_pointer_action, terminal_run_display_text, url_at_column,
+    TerminalPointerAction, TerminalUrlOpenTarget, plain_history_line, prepare_paste,
+    selection_span, terminal_grid_for_pane, terminal_input_bytes, terminal_modifiers,
+    terminal_mouse_button, terminal_point_at, terminal_pointer_action, terminal_run_display_text,
+    terminal_url_open_target, url_at_column,
 };

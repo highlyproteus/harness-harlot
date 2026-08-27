@@ -42,6 +42,7 @@ mod dialogs;
 mod elements;
 mod helpers;
 mod history_settings;
+mod image_transfer;
 mod input;
 mod menus;
 mod notifications;
@@ -459,6 +460,9 @@ impl HhApp {
     fn new(window: &mut Window, keymap: ResolvedKeymap, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
+        if let Err(error) = image_transfer::cleanup_clipboard_image_cache() {
+            eprintln!("Harness Harlot clipboard image cleanup unavailable: {error:#}");
+        }
         let workspace_input_focus = [
             cx.focus_handle(),
             cx.focus_handle(),
