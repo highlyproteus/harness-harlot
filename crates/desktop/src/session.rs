@@ -53,6 +53,10 @@ pub(crate) fn with_session_client<T>(
 }
 
 impl HhApp {
+    pub(crate) fn control_client_handle(&self) -> SharedSessionClient {
+        Arc::clone(&self.session.control_client)
+    }
+
     /// One synchronous startup fetch. All later refreshes flow through the
     /// async pipelines and the shared poll cycle.
     pub(crate) fn initial_state_fetch(&mut self, cx: &mut Context<Self>) -> bool {

@@ -3,7 +3,8 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{AppContext as _, Context, Image, ImageFormat};
 use hh_protocol::{
-    ClientRequest, SessionSnapshot, TerminalModes, ensure_private_directory, validate_ssh_host,
+    ClientRequest, ServiceResponse, SessionSnapshot, TerminalModes, ensure_private_directory,
+    validate_ssh_host,
 };
 use std::fs::{self, OpenOptions};
 use std::io::Read;
@@ -16,6 +17,7 @@ use uuid::Uuid;
 
 use crate::HhApp;
 use crate::helpers::{find_pane, prepare_paste};
+use crate::session::session_call;
 
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 16;
@@ -29,6 +31,14 @@ const STDERR_COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 enum FileTransferTarget {
     Local,
     SystemSsh(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileTransferAuthority {
+    workspace_id: Uuid,
+    tab_id: Uuid,
+    pane_id: Uuid,
+    target: FileTransferTarget,
 }
 
 enum FilePasteSource {
@@ -477,25 +487,67 @@ fn run_remote_cleanup(command: Command) -> Result<()> {
     run_scp_upload(command).context("remove partial remote uploads")
 }
 
+fn transfer_authority_for_pane(
+    snapshot: &SessionSnapshot,
+    pane_id: Uuid,
+) -> Result<FileTransferAuthority> {
+    for workspace in &snapshot.workspaces {
+        for tab in &workspace.tabs {
+            let Some(pane) = find_pane(&tab.layout, pane_id) else {
+                continue;
+            };
+            ensure!(pane.kind.is_terminal(), "pane {pane_id} is not terminal");
+            let target = match snapshot.terminal_transports.get(&pane_id) {
+                Some(hh_protocol::TerminalTransport::Local) => FileTransferTarget::Local,
+                Some(hh_protocol::TerminalTransport::SystemSsh { destination }) => {
+                    FileTransferTarget::SystemSsh(destination.clone())
+                }
+                Some(hh_protocol::TerminalTransport::Unknown) | None => {
+                    bail!("pane {pane_id} has no authoritative terminal transport")
+                }
+            };
+            return Ok(FileTransferAuthority {
+                workspace_id: workspace.id,
+                tab_id: tab.id,
+                pane_id,
+                target,
+            });
+        }
+    }
+    bail!("pane {pane_id} does not exist")
+}
+
+fn revalidate_transfer_authority(
+    snapshot: &SessionSnapshot,
+    expected: &FileTransferAuthority,
+) -> Result<()> {
+    let current = transfer_authority_for_pane(snapshot, expected.pane_id)?;
+    ensure!(
+        current.workspace_id == expected.workspace_id,
+        "pane {} changed workspace",
+        expected.pane_id
+    );
+    ensure!(
+        current.tab_id == expected.tab_id,
+        "pane {} changed tab",
+        expected.pane_id
+    );
+    ensure!(
+        current.target == expected.target,
+        "pane {} terminal transport or destination changed",
+        expected.pane_id
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 fn transfer_target_for_pane(
     snapshot: &SessionSnapshot,
     pane_id: Uuid,
 ) -> Option<FileTransferTarget> {
-    let pane = snapshot
-        .workspaces
-        .iter()
-        .flat_map(|workspace| &workspace.tabs)
-        .find_map(|tab| find_pane(&tab.layout, pane_id))?;
-    if !pane.kind.is_terminal() {
-        return None;
-    }
-    match snapshot.terminal_transports.get(&pane_id)? {
-        hh_protocol::TerminalTransport::Local => Some(FileTransferTarget::Local),
-        hh_protocol::TerminalTransport::SystemSsh { destination } => {
-            Some(FileTransferTarget::SystemSsh(destination.clone()))
-        }
-        hh_protocol::TerminalTransport::Unknown => None,
-    }
+    transfer_authority_for_pane(snapshot, pane_id)
+        .ok()
+        .map(|authority| authority.target)
 }
 
 fn validate_transfer_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -653,6 +705,21 @@ fn transfer_paths(paths: Vec<PathBuf>, target: FileTransferTarget) -> Result<Vec
     }
 }
 
+fn cleanup_aborted_transfer(
+    authority: &FileTransferAuthority,
+    paths: &[PathBuf],
+    owned_local_path: Option<&Path>,
+) -> Result<()> {
+    match &authority.target {
+        FileTransferTarget::SystemSsh(destination) => rollback_remote_paths(destination, paths),
+        FileTransferTarget::Local => match owned_local_path {
+            Some(path) => fs::remove_file(path)
+                .with_context(|| format!("remove aborted clipboard image {}", path.display())),
+            None => Ok(()),
+        },
+    }
+}
+
 impl HhApp {
     pub(crate) fn paste_image_to_terminal(
         &mut self,
@@ -679,12 +746,14 @@ impl HhApp {
         let Some(snapshot) = self.session.snapshot.as_ref() else {
             return;
         };
-        let Some(target) = transfer_target_for_pane(snapshot, pane_id) else {
+        let Ok(authority) = transfer_authority_for_pane(snapshot, pane_id) else {
             return;
         };
         let bracketed = screen.modes.contains(TerminalModes::BRACKETED_PASTE);
+        let control_client = self.control_client_handle();
 
         cx.spawn(async move |this, cx| {
+            let transfer_target = authority.target.clone();
             let result = cx
                 .background_spawn(async move {
                     let (paths, owned_clipboard_image) = match source {
@@ -694,15 +763,15 @@ impl HhApp {
                         }
                         FilePasteSource::Paths(paths) => (paths, None),
                     };
-                    let remote_destination = match &target {
+                    let remote_destination = match &transfer_target {
                         FileTransferTarget::SystemSsh(destination) => Some(destination.clone()),
                         FileTransferTarget::Local => None,
                     };
-                    let result = transfer_paths(paths, target);
+                    let result = transfer_paths(paths, transfer_target);
                     if let (Some(destination), Some(path)) =
-                        (remote_destination, owned_clipboard_image)
+                        (remote_destination, owned_clipboard_image.as_ref())
                     {
-                        let cleanup = fs::remove_file(&path).with_context(|| {
+                        let cleanup = fs::remove_file(path).with_context(|| {
                             format!("remove uploaded clipboard image {}", path.display())
                         });
                         return reconcile_remote_source_cleanup(
@@ -710,13 +779,33 @@ impl HhApp {
                             result,
                             cleanup,
                             rollback_remote_paths,
-                        );
+                        )
+                        .map(|paths| (paths, None));
                     }
-                    result
+                    result.map(|paths| (paths, owned_clipboard_image))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                match result.and_then(|paths| {
+                match result.and_then(|(paths, owned_local_path)| {
+                    let response = session_call(&control_client, &ClientRequest::GetSnapshot)
+                        .context("refresh transfer authority before terminal path insertion")?;
+                    let ServiceResponse::Snapshot { snapshot } = response else {
+                        bail!("unexpected GetSnapshot response before terminal path insertion: {response:?}");
+                    };
+                    if let Err(authority_error) =
+                        revalidate_transfer_authority(&snapshot, &authority)
+                    {
+                        return match cleanup_aborted_transfer(
+                            &authority,
+                            &paths,
+                            owned_local_path.as_deref(),
+                        ) {
+                            Ok(()) => Err(authority_error),
+                            Err(cleanup_error) => Err(authority_error.context(format!(
+                                "aborted transfer cleanup also failed: {cleanup_error:#}"
+                            ))),
+                        };
+                    }
                     prepare_paste(&shell_join_paths(&paths), bracketed).map_err(anyhow::Error::msg)
                 }) {
                     Ok(bytes) => {
@@ -737,10 +826,10 @@ mod tests {
     use super::{
         CLIPBOARD_IMAGE_RETENTION, FileTransferTarget, cleanup_stale_clipboard_images,
         materialize_clipboard_image, read_bounded_stderr, receive_stderr_with_timeout,
-        reconcile_remote_source_cleanup, remote_paste_path, scp_upload_command_with,
-        shell_join_paths, ssh_cleanup_command_with, ssh_private_directory_command_with,
-        ssh_private_files_command_with, stage_remote_source, transfer_target_for_pane,
-        validate_transfer_paths,
+        reconcile_remote_source_cleanup, remote_paste_path, revalidate_transfer_authority,
+        scp_upload_command_with, shell_join_paths, ssh_cleanup_command_with,
+        ssh_private_directory_command_with, ssh_private_files_command_with, stage_remote_source,
+        transfer_authority_for_pane, transfer_target_for_pane, validate_transfer_paths,
     };
     use gpui::{Image, ImageFormat};
     use hh_protocol::{
@@ -751,6 +840,44 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+
+    #[test]
+    fn transferred_path_insertion_rejects_transport_or_pane_change() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
+            PaneLayout::Leaf { pane } => pane.id,
+            _ => unreachable!(),
+        };
+        snapshot.terminal_transports.insert(
+            pane_id,
+            TerminalTransport::SystemSsh {
+                destination: "developer@build-node".to_owned(),
+            },
+        );
+        let authority = transfer_authority_for_pane(&snapshot, pane_id).unwrap();
+
+        snapshot.terminal_transports.insert(
+            pane_id,
+            TerminalTransport::SystemSsh {
+                destination: "developer@other-node".to_owned(),
+            },
+        );
+        assert!(revalidate_transfer_authority(&snapshot, &authority).is_err());
+
+        snapshot.terminal_transports.insert(
+            pane_id,
+            TerminalTransport::SystemSsh {
+                destination: "developer@build-node".to_owned(),
+            },
+        );
+        let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[0].tabs[0].layout else {
+            unreachable!()
+        };
+        pane.kind = PaneKind::Browser {
+            url: "https://example.com".to_owned(),
+        };
+        assert!(revalidate_transfer_authority(&snapshot, &authority).is_err());
+    }
 
     #[test]
     fn managed_ssh_workstation_routes_pane_files_to_its_remote_host() {
