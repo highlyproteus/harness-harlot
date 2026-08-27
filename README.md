@@ -71,7 +71,8 @@ The bootstrap requires `curl`, `python3`, GNU `sha256sum`, and `tar`; these are
 present by default on supported Ubuntu installations or available from the
 standard package repositories.
 
-Browser tabs require the matching distribution packages:
+The desktop package uses the matching distribution runtime libraries. Browser tabs
+need GTK, NSS, and GBM; Voice Mode needs ALSA:
 
 ```text
 Ubuntu 22.04:  libgtk-3-0 libnss3 libasound2 libgbm1
