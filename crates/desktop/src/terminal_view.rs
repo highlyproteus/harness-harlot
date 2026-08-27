@@ -1,8 +1,9 @@
 //! Terminal pane rendering: headers, lines, search, and drops.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    Point, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, px, relative, rgb, rgba,
+    AnyElement, Context, CursorStyle, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, Point, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, px,
+    relative, rgb, rgba,
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled};
 use hh_protocol::{
@@ -505,6 +506,12 @@ impl HhApp {
             }))
             .on_drop(cx.listener(move |this, info: &PaneDrag, _, cx| {
                 this.swap_panes(info.pane_id, active, cx);
+            }))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                this.focus_pane_with_snapshot(active, cx);
+                this.focus_handle.focus(window);
+                this.paste_paths_to_terminal(active, paths.paths().to_vec(), cx);
+                cx.stop_propagation();
             }))
             .on_drag_move::<PaneDrag>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<PaneDrag>, _, cx| {

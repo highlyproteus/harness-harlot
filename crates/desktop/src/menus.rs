@@ -16,6 +16,13 @@ use gpui::{ParentElement, StatefulInteractiveElement, Styled};
 use hh_protocol::{ClientRequest, ServiceResponse, WorkspaceConnection, WorkspaceConnectionStatus};
 use uuid::Uuid;
 
+fn tmux_scan_available(connection: &WorkspaceConnection) -> bool {
+    matches!(
+        connection,
+        WorkspaceConnection::Local | WorkspaceConnection::SystemSsh { .. }
+    )
+}
+
 impl HhApp {
     pub(crate) fn open_tab_menu(
         &mut self,
@@ -589,16 +596,7 @@ impl HhApp {
         let pinned = workspace.is_some_and(|workspace| workspace.pinned);
         let connection = workspace.map(|workspace| workspace.connection.clone());
         let has_working_dir = workspace.is_some_and(|workspace| workspace.working_dir.is_some());
-        let tmux_scan_available = matches!(
-            connection.as_ref(),
-            Some(
-                WorkspaceConnection::Local
-                    | WorkspaceConnection::SystemSsh {
-                        status: WorkspaceConnectionStatus::Connected,
-                        ..
-                    }
-            )
-        );
+        let tmux_scan_available = connection.as_ref().is_some_and(tmux_scan_available);
         let inline_color_picker = self
             .editor
             .color_picker
@@ -972,5 +970,19 @@ impl HhApp {
                     })),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tmux_scan_available;
+    use hh_protocol::{WorkspaceConnection, WorkspaceConnectionStatus};
+
+    #[test]
+    fn saved_ssh_workstation_can_scan_tmux_while_offline() {
+        assert!(tmux_scan_available(&WorkspaceConnection::SystemSsh {
+            destination: "developer@build-node".to_owned(),
+            status: WorkspaceConnectionStatus::Offline,
+        }));
     }
 }

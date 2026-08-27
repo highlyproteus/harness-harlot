@@ -1,5 +1,5 @@
 //! Pane streaming, notifications, and diagnostics sampling.
-use super::{PaneUpdateBatch, SessionRegistry, serialized_len};
+use super::{PaneUpdateBatch, SessionRegistry, serialized_len, snapshot_with_runtime_transports};
 use crate::registry::identity::refresh_runtime_metadata;
 use anyhow::{Result, bail};
 use hh_protocol::{
@@ -83,7 +83,7 @@ pub(crate) fn cpu_milli_percent(percent: f32) -> u32 {
 impl SessionRegistry {
     pub fn state(&self) -> Result<(SessionSnapshot, Vec<TerminalScreen>)> {
         let state = self.state.read();
-        let snapshot = state.snapshot.clone();
+        let snapshot = snapshot_with_runtime_transports(&state);
         let screens = state
             .panes
             .iter()
@@ -149,8 +149,8 @@ impl SessionRegistry {
         let state = self.state.read();
 
         let session_revision = state.snapshot.revision;
-        let snapshot =
-            (snapshot_revision != Some(session_revision)).then(|| state.snapshot.clone());
+        let snapshot = (snapshot_revision != Some(session_revision))
+            .then(|| snapshot_with_runtime_transports(&state));
         let mut screens = Vec::new();
         let mut pane_states = Vec::with_capacity(state.panes.len());
         let mut coalesced_revisions = 0_u64;

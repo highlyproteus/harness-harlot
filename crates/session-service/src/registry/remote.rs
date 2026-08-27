@@ -18,6 +18,7 @@ use hh_protocol::{
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -29,6 +30,18 @@ pub(crate) const REMOTE_LS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) const REMOTE_LS_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub(crate) const MAX_REMOTE_DIRECTORY_ENTRIES: usize = 200;
+
+fn tmux_probe_for_connection(connection: &WorkspaceConnection) -> Result<(TmuxScanScope, Command)> {
+    match connection {
+        WorkspaceConnection::Local => Ok((TmuxScanScope::Local, tmux_local_probe_command()?)),
+        WorkspaceConnection::SystemSsh { destination, .. } => Ok((
+            TmuxScanScope::SystemSsh {
+                destination: destination.clone(),
+            },
+            tmux_ssh_probe_command(destination)?,
+        )),
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct TmuxAttachmentResult {
@@ -178,22 +191,7 @@ impl SessionRegistry {
     pub fn scan_tmux_sessions(&self, workspace_id: Uuid) -> Result<TmuxScanResult> {
         let _scan_permit = self.begin_tmux_scan(workspace_id)?;
         let connection = self.workspace_connection(workspace_id)?;
-        let (scope, probe) = match connection {
-            WorkspaceConnection::Local => (TmuxScanScope::Local, tmux_local_probe_command()?),
-            WorkspaceConnection::SystemSsh {
-                destination,
-                status: WorkspaceConnectionStatus::Connected,
-            } => (
-                TmuxScanScope::SystemSsh {
-                    destination: destination.clone(),
-                },
-                tmux_ssh_probe_command(&destination)?,
-            ),
-            WorkspaceConnection::SystemSsh {
-                status: WorkspaceConnectionStatus::Offline,
-                ..
-            } => bail!("reconnect this SSH workstation before scanning tmux sessions"),
-        };
+        let (scope, probe) = tmux_probe_for_connection(&connection)?;
         let open_session_ids = self.open_tmux_session_ids(workspace_id)?;
         let output = run_tmux_probe(probe)?;
         if !output.success {
@@ -239,26 +237,7 @@ impl SessionRegistry {
                 .map(|workspace| workspace.connection.clone())
                 .with_context(|| format!("workstation {workspace_id} does not exist"))?
         };
-        if matches!(
-            connection,
-            WorkspaceConnection::SystemSsh {
-                status: WorkspaceConnectionStatus::Offline,
-                ..
-            }
-        ) {
-            bail!("reconnect this SSH workstation before opening tmux");
-        }
-        let probe = match &connection {
-            WorkspaceConnection::Local => tmux_local_probe_command()?,
-            WorkspaceConnection::SystemSsh {
-                destination,
-                status: WorkspaceConnectionStatus::Connected,
-            } => tmux_ssh_probe_command(destination)?,
-            WorkspaceConnection::SystemSsh {
-                status: WorkspaceConnectionStatus::Offline,
-                ..
-            } => unreachable!("offline connection rejected above"),
-        };
+        let (_, probe) = tmux_probe_for_connection(&connection)?;
         let output = run_tmux_probe(probe)?;
         if !output.success {
             bail!("tmux scan failed: {}", probe_error_summary(&output.stderr));
@@ -327,10 +306,7 @@ impl SessionRegistry {
                     session_id: tmux_session.id.clone(),
                 },
             ),
-            WorkspaceConnection::SystemSsh {
-                destination,
-                status: WorkspaceConnectionStatus::Connected,
-            } => (
+            WorkspaceConnection::SystemSsh { destination, .. } => (
                 PtySession::spawn_tmux_ssh(
                     pane_id,
                     workspace_id,
@@ -343,10 +319,6 @@ impl SessionRegistry {
                     session_id: tmux_session.id.clone(),
                 },
             ),
-            WorkspaceConnection::SystemSsh {
-                status: WorkspaceConnectionStatus::Offline,
-                ..
-            } => bail!("reconnect this SSH workstation before opening tmux"),
         };
         self.register_live_tmux_tab(workspace_id, pane_id, tmux_session, &session, kind)
     }
@@ -389,16 +361,18 @@ impl SessionRegistry {
                 .iter_mut()
                 .find(|workspace| workspace.id == workspace_id)
                 .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-            let still_connected = matches!(
-                workspace.connection,
-                WorkspaceConnection::Local
-                    | WorkspaceConnection::SystemSsh {
-                        status: WorkspaceConnectionStatus::Connected,
-                        ..
-                    }
-            );
-            if !still_connected {
-                bail!("workstation went offline before opening tmux");
+            match (&mut workspace.connection, &kind) {
+                (WorkspaceConnection::Local, RuntimePaneKind::TmuxLocal { .. }) => {}
+                (
+                    WorkspaceConnection::SystemSsh {
+                        destination,
+                        status,
+                    },
+                    RuntimePaneKind::TmuxSystemSsh { host, .. },
+                ) if destination == host => {
+                    *status = WorkspaceConnectionStatus::Connected;
+                }
+                _ => bail!("tmux transport no longer matches its workstation"),
             }
             workspace.tabs.push(Tab {
                 id: Uuid::new_v4(),
@@ -467,6 +441,69 @@ mod tests {
     use portable_pty::CommandBuilder;
     use std::ffi::OsString;
     use uuid::Uuid;
+
+    #[test]
+    fn offline_ssh_workstations_still_plan_remote_tmux_scans() {
+        let connection = WorkspaceConnection::SystemSsh {
+            destination: "developer@build-node".to_owned(),
+            status: WorkspaceConnectionStatus::Offline,
+        };
+
+        let (scope, command) = tmux_probe_for_connection(&connection).unwrap();
+
+        assert_eq!(
+            scope,
+            TmuxScanScope::SystemSsh {
+                destination: "developer@build-node".to_owned(),
+            }
+        );
+        assert_eq!(command.get_program(), "/usr/bin/ssh");
+    }
+
+    #[test]
+    fn a_live_remote_tmux_attach_connects_an_offline_workstation() {
+        let registry = SessionRegistry::new().unwrap();
+        let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+        registry.state.write().snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
+            destination: "build-node".to_owned(),
+            status: WorkspaceConnectionStatus::Offline,
+        };
+        let pane_id = Uuid::new_v4();
+        let session = PtySession::spawn_command(
+            pane_id,
+            workspace_id,
+            CommandBuilder::from_argv(vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("printf fixture; sleep 1"),
+            ]),
+            "live remote tmux fixture",
+            &registry.history,
+        )
+        .unwrap();
+        let tmux_session = tmux_session("$12", "remote-editor");
+
+        registry
+            .register_live_tmux_tab(
+                workspace_id,
+                pane_id,
+                &tmux_session,
+                &session,
+                RuntimePaneKind::TmuxSystemSsh {
+                    host: "build-node".to_owned(),
+                    session_id: tmux_session.id.clone(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.snapshot().unwrap().workspaces[0].connection,
+            WorkspaceConnection::SystemSsh {
+                destination: "build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Connected,
+            }
+        );
+    }
 
     #[test]
     fn live_tmux_runtime_tab_is_registered_and_selectable() {

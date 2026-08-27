@@ -432,6 +432,7 @@ impl DesiredState {
             snapshot: SessionSnapshot {
                 revision: self.revision.saturating_add(1),
                 appearance,
+                terminal_transports: std::collections::HashMap::new(),
                 workspaces,
             },
             cwd_by_pane,

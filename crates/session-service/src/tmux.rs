@@ -163,7 +163,17 @@ pub(crate) fn tmux_ssh_probe_command(destination: &str) -> Result<Command> {
     // Pin the locale inside the fixed remote command: a local process
     // environment is not guaranteed to pass through sshd AcceptEnv.
     command
-        .arg("--")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=3",
+            "-o",
+            "ServerAliveInterval=2",
+            "-o",
+            "ServerAliveCountMax=1",
+            "--",
+        ])
         .arg(destination)
         .arg(TMUX_REMOTE_LIST_COMMAND)
         .stdin(Stdio::null())
@@ -423,9 +433,22 @@ mod tests {
     fn remote_tmux_probe_is_a_fixed_command_not_a_user_command() {
         let command = tmux_ssh_probe_command("admin@build-node").unwrap();
         let args = command.get_args().collect::<Vec<_>>();
-        assert_eq!(args[0], OsStr::new("--"));
-        assert_eq!(args[1], OsStr::new("admin@build-node"));
-        assert_eq!(args[2], OsStr::new(TMUX_REMOTE_LIST_COMMAND));
+        assert_eq!(
+            args,
+            vec![
+                OsStr::new("-o"),
+                OsStr::new("BatchMode=yes"),
+                OsStr::new("-o"),
+                OsStr::new("ConnectTimeout=3"),
+                OsStr::new("-o"),
+                OsStr::new("ServerAliveInterval=2"),
+                OsStr::new("-o"),
+                OsStr::new("ServerAliveCountMax=1"),
+                OsStr::new("--"),
+                OsStr::new("admin@build-node"),
+                OsStr::new(TMUX_REMOTE_LIST_COMMAND),
+            ]
+        );
         assert!(tmux_ssh_probe_command("build;whoami").is_err());
     }
 

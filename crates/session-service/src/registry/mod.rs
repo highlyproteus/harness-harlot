@@ -18,7 +18,7 @@ use hh_protocol::{
     HistoryArchiveStatus, HistoryClearScope, HistoryCursor, HistoryPageDirection, HistorySettings,
     NotificationKind, Pane, PaneKind, PaneStreamState, SessionNotification, SessionSnapshot,
     StreamDiagnostics, TerminalHistoryPage, TerminalIdentity, TerminalProfile, TerminalScreen,
-    TmuxSessionId, WorkspaceConnection,
+    TerminalTransport, TmuxSessionId, WorkspaceConnection,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -386,6 +386,7 @@ pub(crate) fn serialized_len(value: &impl Serialize) -> Result<u64> {
 )]
 pub(crate) fn encode_desired_state(state: &RegistryState) -> Result<Vec<u8>> {
     let mut snapshot = state.snapshot.clone();
+    snapshot.terminal_transports.clear();
     let runtime_only_panes = state
         .panes
         .iter()
@@ -439,6 +440,26 @@ pub(crate) fn encode_desired_state(state: &RegistryState) -> Result<Vec<u8>> {
         }
     }
     SnapshotStore::encode_with_offline(&snapshot, &cwd_by_pane, &offline_panes)
+}
+
+pub(crate) fn snapshot_with_runtime_transports(state: &RegistryState) -> SessionSnapshot {
+    let mut snapshot = state.snapshot.clone();
+    snapshot.terminal_transports.clear();
+    for (pane_id, runtime) in &state.panes {
+        let Some(terminal) = runtime.terminal() else {
+            continue;
+        };
+        let transport = match &terminal.kind {
+            RuntimePaneKind::Local | RuntimePaneKind::TmuxLocal { .. } => TerminalTransport::Local,
+            RuntimePaneKind::SystemSsh { host } | RuntimePaneKind::TmuxSystemSsh { host, .. } => {
+                TerminalTransport::SystemSsh {
+                    destination: host.clone(),
+                }
+            }
+        };
+        snapshot.terminal_transports.insert(*pane_id, transport);
+    }
+    snapshot
 }
 
 pub(crate) fn terminate_runtime_panes(panes: &HashMap<Uuid, RuntimePane>) {
@@ -601,7 +622,7 @@ impl SessionRegistry {
         })
     }
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
-        Ok(self.state.read().snapshot.clone())
+        Ok(snapshot_with_runtime_transports(&self.state.read()))
     }
 
     pub fn request_shutdown(&self) -> Result<()> {
@@ -752,6 +773,7 @@ pub(crate) fn create_owner_only_directory(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hh_protocol::{DropPlacement, WorkspaceConnectionStatus};
 
     #[test]
     fn service_shutdown_requires_zero_live_terminals() {
@@ -763,5 +785,29 @@ mod tests {
         registry.close_pane(pane_id).unwrap();
         registry.request_shutdown().unwrap();
         assert!(registry.shutdown_requested());
+    }
+
+    #[test]
+    fn local_runtime_replacement_inside_ssh_workstation_projects_local_transport() {
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        {
+            let mut state = registry.state.write();
+            state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
+                destination: "developer@build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Connected,
+            };
+        }
+
+        registry
+            .move_pane_to_split(pane_id, pane_id, DropPlacement::Right)
+            .unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let pane_ids = pane_ids_in_snapshot(&snapshot);
+
+        assert_eq!(pane_ids.len(), 2);
+        assert!(pane_ids.iter().all(|pane_id| {
+            snapshot.terminal_transports.get(pane_id) == Some(&TerminalTransport::Local)
+        }));
     }
 }

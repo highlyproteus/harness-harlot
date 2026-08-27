@@ -1,5 +1,6 @@
 //! Desired-state model: snapshots, workspaces, tabs, panes, and tmux types.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,22 @@ pub struct SessionSnapshot {
     pub revision: u64,
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    /// Ephemeral transport authority projected by the local session service.
+    /// Missing entries are intentionally treated as unknown and fail closed.
+    #[serde(default)]
+    pub terminal_transports: HashMap<Uuid, TerminalTransport>,
     pub workspaces: Vec<Workspace>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TerminalTransport {
+    #[default]
+    Unknown,
+    Local,
+    SystemSsh {
+        destination: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -90,6 +106,7 @@ impl SessionSnapshot {
         Self {
             revision: 0,
             appearance: AppearanceSettings::default(),
+            terminal_transports: HashMap::new(),
             workspaces: vec![Workspace {
                 id: Uuid::new_v4(),
                 title: "Workstation 1".to_owned(),
