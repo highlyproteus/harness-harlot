@@ -37,10 +37,7 @@ pub(crate) struct PipelineJob {
 impl PipelineJob {
     /// Whether the request is answered on the wire at all.
     pub(crate) fn is_one_way(request: &ClientRequest) -> bool {
-        matches!(
-            request,
-            ClientRequest::WriteInput { .. } | ClientRequest::UpdateSelection { .. }
-        )
+        matches!(request, ClientRequest::UpdateSelection { .. })
     }
 }
 /// The consumer side of one lane.

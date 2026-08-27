@@ -8,6 +8,7 @@ pub mod threads;
 mod tools;
 
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedSender;
 
@@ -87,13 +88,19 @@ pub enum VoiceUiEvent {
 
 #[derive(Debug)]
 pub struct VoiceEngineHandle {
-    pub(crate) command_tx: std::sync::mpsc::Sender<VoiceCommand>,
+    pub(crate) command_tx: std::sync::mpsc::SyncSender<VoiceCommand>,
     pub(crate) join: Option<JoinHandle<()>>,
 }
 
 impl VoiceEngineHandle {
     pub fn send(&self, command: VoiceCommand) {
-        let _ = self.command_tx.send(command);
+        let _ = self.try_send(command);
+    }
+
+    /// Queues a command without blocking the caller.
+    #[must_use]
+    pub fn try_send(&self, command: VoiceCommand) -> bool {
+        self.command_tx.try_send(command).is_ok()
     }
 
     /// Whether the engine thread has already exited (startup failure or
@@ -105,9 +112,15 @@ impl VoiceEngineHandle {
     }
 
     pub fn shutdown(mut self) {
-        let _ = self.command_tx.send(VoiceCommand::Shutdown);
+        let _ = self.command_tx.try_send(VoiceCommand::Shutdown);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !join.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+            }
         }
     }
 }

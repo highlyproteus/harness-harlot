@@ -93,10 +93,7 @@ pub async fn serve_connection(mut stream: UnixStream, sessions: &SessionRegistry
 /// for them, and a queued response nobody reads would eventually block this
 /// connection's writer.
 pub(crate) fn request_is_one_way(request: &ClientRequest) -> bool {
-    matches!(
-        request,
-        ClientRequest::WriteInput { .. } | ClientRequest::UpdateSelection { .. }
-    )
+    matches!(request, ClientRequest::UpdateSelection { .. })
 }
 
 pub(crate) fn handle_request(

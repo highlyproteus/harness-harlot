@@ -235,7 +235,7 @@ impl VoiceUi {
 }
 
 impl HhApp {
-    pub(crate) fn start_assistant(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+    pub(crate) fn start_assistant(&mut self, pane_id: Uuid, cx: &mut Context<Self>) -> bool {
         if self
             .voice
             .sessions
@@ -243,7 +243,7 @@ impl HhApp {
             .and_then(|session| session.engine.as_ref())
             .is_some_and(|engine| !engine.is_finished())
         {
-            return;
+            return true;
         }
         // A finished thread (startup failure or shutdown) never recovers;
         // replace it with a fresh engine.
@@ -251,7 +251,7 @@ impl HhApp {
         if settings.api_key.trim().is_empty() && std::env::var("HH_OPENAI_API_KEY").is_err() {
             self.voice.settings_editor = VoiceSettingsEditor::load();
             self.open_appearance_settings(cx);
-            return;
+            return false;
         }
         let context = self.assistant_context_for_pane(pane_id);
         let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded();
@@ -281,7 +281,7 @@ impl HhApp {
                     .or_insert_with(|| AssistantSession::load(pane_id));
                 session.engine_state = EngineState::Error(format!("{error:#}"));
                 cx.notify();
-                return;
+                return false;
             }
         }
         cx.spawn(async move |this, cx| {
@@ -296,6 +296,7 @@ impl HhApp {
         })
         .detach();
         cx.notify();
+        true
     }
 
     fn reopen_thread(&mut self, workspace_id: Uuid, thread_id: Uuid, cx: &mut Context<Self>) {
@@ -360,18 +361,15 @@ impl HhApp {
         AssistantContext::default()
     }
 
-    pub(crate) fn send_assistant_command(&self, pane_id: Uuid, command: VoiceCommand) {
-        if let Some(engine) = self
-            .voice
+    pub(crate) fn send_assistant_command(&self, pane_id: Uuid, command: VoiceCommand) -> bool {
+        self.voice
             .sessions
             .get(&pane_id)
             .and_then(|session| session.engine.as_ref())
-        {
-            engine.send(command);
-        }
+            .is_some_and(|engine| engine.try_send(command))
     }
     pub(crate) fn submit_assistant_composer(&mut self, cx: &mut Context<Self>) {
-        let Some(composer) = self.editor.assistant_composer.take() else {
+        let Some(composer) = self.editor.assistant_composer.clone() else {
             return;
         };
         let pane_id = composer.pane_id;
@@ -391,8 +389,8 @@ impl HhApp {
             .get(&pane_id)
             .and_then(|session| session.engine.as_ref())
             .is_some_and(|engine| !engine.is_finished());
-        if !engine_running {
-            self.start_assistant(pane_id, cx);
+        if !engine_running && !self.start_assistant(pane_id, cx) {
+            return;
         }
         if let Some(ComposerAttachment {
             filename,
@@ -400,6 +398,9 @@ impl HhApp {
             path,
         }) = attachment
         {
+            if !self.send_assistant_command(pane_id, VoiceCommand::SendUserImage { data_url }) {
+                return;
+            }
             self.apply_transcript(
                 pane_id,
                 VoiceTranscriptRole::User,
@@ -414,18 +415,20 @@ impl HhApp {
             {
                 entry.image = Some(path);
             }
-            self.send_assistant_command(pane_id, VoiceCommand::SendUserImage { data_url });
+            if let Some(active) = self.editor.assistant_composer.as_mut() {
+                active.attachment = None;
+            }
         }
         if !text.is_empty() {
+            if !self.send_assistant_command(pane_id, VoiceCommand::SendUserText(text.clone())) {
+                return;
+            }
             self.apply_transcript(pane_id, VoiceTranscriptRole::User, text.clone(), true);
-            self.send_assistant_command(pane_id, VoiceCommand::SendUserText(text));
+            if let Some(active) = self.editor.assistant_composer.as_mut() {
+                active.text.clear();
+                active.selection = None;
+            }
         }
-        self.editor.assistant_composer = Some(AssistantComposer {
-            pane_id,
-            text: String::new(),
-            selection: None,
-            attachment: None,
-        });
         cx.notify();
     }
 

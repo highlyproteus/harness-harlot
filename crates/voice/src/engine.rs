@@ -28,6 +28,11 @@ const HALF_DUPLEX_RELEASE_DELAY: Duration = Duration::from_millis(500);
 const SESSION_ROLL_AGE: Duration = Duration::from_mins(50);
 const SESSION_ROLL_INPUT_TOKENS: u64 = 90_000;
 const MAX_TRANSCRIPT_TURNS: usize = 100;
+const MAX_TRANSCRIPT_CHARS: usize = 32 * 1024;
+const MAX_USER_TEXT_CHARS: usize = 32 * 1024;
+const MAX_PENDING_USER_ITEMS: usize = 16;
+const MAX_NARRATION_ITEMS: usize = 64;
+const MAX_NARRATION_CHARS: usize = 2 * 1024;
 const SUMMARY_TURNS: usize = 15;
 const MAX_SUMMARY_CHARS: usize = 2_000;
 
@@ -85,7 +90,7 @@ pub(crate) fn spawn(
     if settings.api_key.trim().is_empty() {
         anyhow::bail!("OpenAI API key is empty");
     }
-    let (command_tx, command_rx) = std::sync::mpsc::channel();
+    let (command_tx, command_rx) = std::sync::mpsc::sync_channel(64);
     let join = std::thread::Builder::new()
         .name("hh-voice-engine".to_owned())
         .spawn(
@@ -267,19 +272,22 @@ impl VoiceEngine {
                     self.speaker_muted = muted;
                 }
                 Ok(VoiceCommand::SendUserText(text)) => {
-                    self.record_user_turn(&text);
-                    self.pending_user_content
-                        .push_back(InputContent::InputText { text });
+                    queue_pending_user_content(
+                        &mut self.pending_user_content,
+                        InputContent::InputText { text },
+                    );
                     self.last_activity = Instant::now();
                     if self.suspended {
                         self.resume()?;
                     }
                 }
                 Ok(VoiceCommand::SendUserImage { data_url }) => {
-                    self.pending_user_content
-                        .push_back(InputContent::InputImage {
+                    queue_pending_user_content(
+                        &mut self.pending_user_content,
+                        InputContent::InputImage {
                             image_url: data_url,
-                        });
+                        },
+                    );
                     self.last_activity = Instant::now();
                     if self.suspended {
                         self.resume()?;
@@ -322,12 +330,14 @@ impl VoiceEngine {
                     let streaming = !self.suspended
                         && self.mic_enabled
                         && self.connected_at.is_some()
-                        && (self.settings.full_duplex
-                            || half_duplex_capture_allowed(
-                                self.response_active,
-                                self.audio.playback_active(),
+                        && microphone_streaming_allowed(
+                            self.settings.full_duplex,
+                            MicrophoneActivity {
+                                response_active: self.response_active,
                                 output_quiet,
-                            ));
+                                playback_active: self.audio.playback_active(),
+                            },
+                        );
                     if streaming {
                         self.send_mic_chunk(&chunk.samples);
                     }
@@ -413,9 +423,10 @@ impl VoiceEngine {
                     .ui
                     .unbounded_send(VoiceUiEvent::UserSpeech { active: true });
                 self.last_activity = Instant::now();
-                if self.settings.full_duplex {
-                    self.barge_in(false)?;
-                }
+                // Server VAD is configured to interrupt the response. Always
+                // clear local playback too, including in the default mode, so
+                // a spoken "stop" takes effect immediately.
+                self.barge_in(false)?;
             }
             ServerEvent::SpeechStopped { .. } => self.clear_user_speaking(),
             ServerEvent::InputTranscriptionDelta { delta, item_id } => {
@@ -458,7 +469,16 @@ impl VoiceEngine {
             }
             ServerEvent::ResponseDone { response } => {
                 self.response_active = false;
-                self.audio.finish_output()?;
+                if response_done_successful(response.status.as_deref()) {
+                    self.audio.finish_output()?;
+                } else {
+                    let _ = self.audio.stop_and_clear();
+                    let status = response.status.as_deref().unwrap_or("unknown");
+                    let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+                        name: "realtime.response".to_owned(),
+                        summary: format!("response ended with status {status}"),
+                    });
+                }
                 if let Some(usage) = response.usage {
                     let _ = self.ui.unbounded_send(VoiceUiEvent::Usage {
                         input_tokens: usage.input_tokens,
@@ -578,7 +598,7 @@ impl VoiceEngine {
                 Ok(notifications) => {
                     for notification in notifications {
                         if self.tools.notification_is_attached(&notification) {
-                            self.narration.push_back(narration_text(&notification));
+                            queue_narration(&mut self.narration, narration_text(&notification));
                         }
                     }
                 }
@@ -628,8 +648,7 @@ impl VoiceEngine {
             match realtime.send_recoverable(event) {
                 Ok(()) => {
                     for text in user_text {
-                        self.memory.record_turn(Role::User, &text);
-                        self.push_transcript(Role::User, text);
+                        self.record_user_turn(&text);
                     }
                     if let Err(error) = self.send(ClientEvent::ResponseCreate { response: None }) {
                         self.emit_error(&error);
@@ -870,7 +889,8 @@ impl VoiceEngine {
         if self.transcripts.len() == MAX_TRANSCRIPT_TURNS {
             self.transcripts.pop_front();
         }
-        self.transcripts.push_back((role, text));
+        self.transcripts
+            .push_back((role, truncate_chars(text, MAX_TRANSCRIPT_CHARS)));
     }
 
     fn send(&self, event: ClientEvent) -> Result<()> {
@@ -921,8 +941,38 @@ fn restore_pending_user_content(pending: &mut VecDeque<InputContent>, unsent: Cl
         ..
     } = unsent
     {
-        pending.extend(content);
+        for item in content.into_iter().rev() {
+            pending.push_front(item);
+        }
     }
+}
+
+fn truncate_chars(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text
+    } else {
+        text.chars().take(max_chars).collect()
+    }
+}
+
+fn queue_pending_user_content(pending: &mut VecDeque<InputContent>, content: InputContent) {
+    let content = match content {
+        InputContent::InputText { text } => InputContent::InputText {
+            text: truncate_chars(text, MAX_USER_TEXT_CHARS),
+        },
+        image @ InputContent::InputImage { .. } => image,
+    };
+    if pending.len() == MAX_PENDING_USER_ITEMS {
+        pending.pop_front();
+    }
+    pending.push_back(content);
+}
+
+fn queue_narration(narration: &mut VecDeque<String>, text: String) {
+    if narration.len() == MAX_NARRATION_ITEMS {
+        narration.pop_front();
+    }
+    narration.push_back(truncate_chars(text, MAX_NARRATION_CHARS));
 }
 
 fn transcription_already_completed(completed: &VecDeque<String>, item_id: Option<&str>) -> bool {
@@ -946,12 +996,19 @@ fn accept_completed_transcription(
     true
 }
 
-fn half_duplex_capture_allowed(
+#[derive(Clone, Copy)]
+struct MicrophoneActivity {
     response_active: bool,
-    playback_active: bool,
     output_quiet: bool,
-) -> bool {
-    !response_active && !playback_active && output_quiet
+    playback_active: bool,
+}
+
+fn microphone_streaming_allowed(full_duplex: bool, activity: MicrophoneActivity) -> bool {
+    full_duplex || activity.response_active || (!activity.playback_active && activity.output_quiet)
+}
+
+fn response_done_successful(status: Option<&str>) -> bool {
+    status.is_none_or(|status| status == "completed")
 }
 
 pub(crate) fn effective_idle_timeout(configured_secs: u32) -> Option<Duration> {
@@ -1095,6 +1152,103 @@ mod tests {
         restore_pending_user_content(&mut pending, event);
         assert_eq!(pending.into_iter().collect::<Vec<_>>(), content);
     }
+
+    #[test]
+    fn restored_user_content_precedes_content_queued_during_send() {
+        let event = ClientEvent::ConversationItemCreate {
+            item: ConversationItem::Message {
+                role: ConversationRole::User,
+                content: vec![InputContent::InputText {
+                    text: "first".to_owned(),
+                }],
+            },
+            previous_item_id: None,
+        };
+        let mut pending = VecDeque::from([InputContent::InputText {
+            text: "second".to_owned(),
+        }]);
+        restore_pending_user_content(&mut pending, event);
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec![
+                InputContent::InputText {
+                    text: "first".to_owned()
+                },
+                InputContent::InputText {
+                    text: "second".to_owned()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_user_content_and_narration_are_bounded() {
+        let mut pending = VecDeque::new();
+        for index in 0..(MAX_PENDING_USER_ITEMS + 5) {
+            queue_pending_user_content(
+                &mut pending,
+                InputContent::InputText {
+                    text: format!("{index}:{}", "x".repeat(MAX_USER_TEXT_CHARS + 10)),
+                },
+            );
+        }
+        assert_eq!(pending.len(), MAX_PENDING_USER_ITEMS);
+        assert!(pending.iter().all(|item| match item {
+            InputContent::InputText { text } => text.chars().count() <= MAX_USER_TEXT_CHARS,
+            InputContent::InputImage { .. } => true,
+        }));
+
+        let mut narration = VecDeque::new();
+        for index in 0..(MAX_NARRATION_ITEMS + 5) {
+            queue_narration(
+                &mut narration,
+                format!("{index}:{}", "x".repeat(MAX_NARRATION_CHARS)),
+            );
+        }
+        assert_eq!(narration.len(), MAX_NARRATION_ITEMS);
+        assert!(
+            narration
+                .iter()
+                .all(|item| item.chars().count() <= MAX_NARRATION_CHARS)
+        );
+    }
+
+    #[test]
+    fn default_mode_streams_during_a_response_for_spoken_barge_in() {
+        assert!(microphone_streaming_allowed(
+            false,
+            MicrophoneActivity {
+                response_active: true,
+                output_quiet: true,
+                playback_active: true,
+            }
+        ));
+        assert!(!microphone_streaming_allowed(
+            false,
+            MicrophoneActivity {
+                response_active: false,
+                output_quiet: false,
+                playback_active: false,
+            }
+        ));
+        assert!(microphone_streaming_allowed(
+            true,
+            MicrophoneActivity {
+                response_active: true,
+                output_quiet: true,
+                playback_active: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn only_completed_response_done_is_successful() {
+        for status in ["failed", "cancelled", "incomplete"] {
+            assert!(!response_done_successful(Some(status)), "status: {status}");
+        }
+        assert!(response_done_successful(Some("completed")));
+        assert!(response_done_successful(None));
+    }
     #[test]
     fn repeated_transcription_item_is_emitted_once() {
         let mut completed = VecDeque::new();
@@ -1114,11 +1268,39 @@ mod tests {
     }
 
     #[test]
-    fn half_duplex_blocks_response_gaps_and_speaker_echo_tail() {
-        assert!(half_duplex_capture_allowed(false, false, true));
-        assert!(!half_duplex_capture_allowed(true, false, true));
-        assert!(!half_duplex_capture_allowed(false, true, true));
-        assert!(!half_duplex_capture_allowed(false, false, false));
+    fn default_capture_blocks_only_idle_playback_and_speaker_echo_tail() {
+        assert!(microphone_streaming_allowed(
+            false,
+            MicrophoneActivity {
+                response_active: false,
+                output_quiet: true,
+                playback_active: false,
+            }
+        ));
+        assert!(microphone_streaming_allowed(
+            false,
+            MicrophoneActivity {
+                response_active: true,
+                output_quiet: false,
+                playback_active: true,
+            }
+        ));
+        assert!(!microphone_streaming_allowed(
+            false,
+            MicrophoneActivity {
+                response_active: false,
+                output_quiet: true,
+                playback_active: true,
+            }
+        ));
+        assert!(!microphone_streaming_allowed(
+            false,
+            MicrophoneActivity {
+                response_active: false,
+                output_quiet: false,
+                playback_active: false,
+            }
+        ));
     }
 
     #[test]

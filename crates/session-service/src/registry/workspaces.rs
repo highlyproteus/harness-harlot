@@ -404,10 +404,18 @@ impl SessionRegistry {
                 backend: RuntimePaneBackend::Assistant,
             },
         );
+        let previous_revision = state.snapshot.revision;
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
-        drop(state);
-        self.write_snapshot(&bytes)?;
+        if let Err(error) = self.write_snapshot(&bytes) {
+            state
+                .snapshot
+                .workspaces
+                .retain(|workspace| workspace.id != workspace_id);
+            state.panes.remove(&pane_id);
+            state.snapshot.revision = previous_revision;
+            return Err(error);
+        }
         Ok((workspace_id, pane_id))
     }
 
@@ -1021,6 +1029,28 @@ mod tests {
             runtime_kind_for_workspace(&WorkspaceConnection::Local),
             RuntimePaneKind::Local
         );
+    }
+
+    #[test]
+    fn failed_assistant_persistence_does_not_publish_live_state() {
+        let directory =
+            std::env::temp_dir().join(format!("hh-assistant-persistence-test-{}", Uuid::new_v4()));
+        create_owner_only_directory(&directory);
+        let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
+        let before = registry.snapshot().unwrap();
+        registry
+            .store
+            .as_ref()
+            .unwrap()
+            .inject_failure_before_replace(true);
+
+        assert!(
+            registry
+                .create_assistant_workspace(Some("Must rollback"), None, None)
+                .is_err()
+        );
+        assert_eq!(registry.snapshot().unwrap(), before);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

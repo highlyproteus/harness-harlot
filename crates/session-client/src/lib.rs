@@ -20,6 +20,7 @@ use hh_protocol::{
 pub struct SessionClient {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    valid: bool,
 }
 
 fn validate_socket_path(path: &Path, allow_legacy_temp_parent: bool) -> Result<()> {
@@ -111,7 +112,11 @@ impl SessionClient {
             response => bail!("unexpected handshake response: {response:?}"),
         }
 
-        Ok(Self { stream, reader })
+        Ok(Self {
+            stream,
+            reader,
+            valid: true,
+        })
     }
 
     /// Reports whether the previous socket location still has a listening
@@ -148,11 +153,26 @@ impl SessionClient {
     /// Returns an error after a failed response read, a failed reconnect or
     /// retry, or a service-side request rejection.
     pub fn call(&mut self, request: &ClientRequest) -> Result<ServiceResponse> {
+        if !self.valid {
+            *self = Self::connect()?;
+        }
         let response = match write_message(&mut self.stream, request) {
-            Ok(()) => read_message(&mut self.reader)?,
+            Ok(()) => match read_message(&mut self.reader) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.invalidate();
+                    return Err(error.into());
+                }
+            },
             Err(WireError::Io(_)) => {
                 *self = Self::connect()?;
-                self.exchange(request)?
+                match self.exchange(request) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.invalidate();
+                        return Err(error.into());
+                    }
+                }
             }
             Err(error) => return Err(error.into()),
         };
@@ -169,6 +189,9 @@ impl SessionClient {
     /// Returns an error when both the initial write and the single reconnect
     /// retry fail.
     pub fn notify(&mut self, request: &ClientRequest) -> Result<()> {
+        if !self.valid {
+            *self = Self::connect()?;
+        }
         if write_message(&mut self.stream, request).is_err() {
             *self = Self::connect()?;
             write_message(&mut self.stream, request)?;
@@ -179,6 +202,11 @@ impl SessionClient {
     fn exchange(&mut self, request: &ClientRequest) -> Result<ServiceResponse, WireError> {
         write_message(&mut self.stream, request)?;
         read_message(&mut self.reader)
+    }
+
+    fn invalidate(&mut self) {
+        self.valid = false;
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -194,6 +222,33 @@ mod tests {
     #[test]
     fn protocol_keeps_individual_input_frames_bounded() {
         assert_eq!(MAX_FRAME_SIZE, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn response_timeout_invalidates_connection_before_any_later_request() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let reader = BufReader::new(client_stream.try_clone().unwrap());
+        let mut client = SessionClient {
+            stream: client_stream,
+            reader,
+            valid: true,
+        };
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            assert_eq!(
+                read_message::<ClientRequest>(&mut reader).unwrap(),
+                ClientRequest::GetSnapshot
+            );
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let _ = write_message(&mut server_stream, &ServiceResponse::Ack);
+        });
+
+        assert!(client.call(&ClientRequest::GetSnapshot).is_err());
+        assert!(!client.valid, "a timed-out stream must never be reused");
+        server.join().unwrap();
     }
 
     #[test]
