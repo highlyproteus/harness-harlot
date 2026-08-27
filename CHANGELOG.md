@@ -8,8 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Added typed text and image attachments to Assistant panes, including focused
-  keyboard and clipboard routing.
+- Added Voice Mode with OpenAI Realtime audio and transcripts, Assistant panes,
+  typed text and image attachments, persistent conversation threads, and
+  optional Honcho-backed memory.
+- Added service-projected agent status badges for workspace tabs and pane tabs,
+  including stable OSC status events and omp/Codex heuristics.
+- Added persistent Voice settings and dock state, coding-agent launch adapters,
+  and reusable session-client support for the desktop and voice engine.
+- Added clipboard-image paste and file/image drop transfer for focused local and
+  SSH terminal panes with private staging, bounded transfer, and rollback.
+- Added native modifier-arrow terminal navigation and URL click routing, including
+  macOS Command-click embedded browser splits.
+- Added bounded, noninteractive tmux discovery for saved SSH workstations that
+  are not currently connected.
 
 ### Fixed
 
@@ -19,15 +30,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with other pane types.
 
 ## [0.1.13] - 2026-08-23
-
-### Added
-
-- Added Voice Mode with OpenAI Realtime audio, transcript and approval controls,
-  trust-tiered workstation tools, and optional Honcho-backed memory.
-- Added service-projected agent status badges for workspace tabs and pane tabs,
-  including stable OSC 777 status events and omp/Codex heuristics.
-- Added persistent Voice settings and dock state, coding-agent launch adapters,
-  and reusable session-client support for the desktop and voice engine.
 
 ### Fixed
 
