@@ -31,6 +31,21 @@ const MAX_TRANSCRIPT_TURNS: usize = 100;
 const SUMMARY_TURNS: usize = 15;
 const MAX_SUMMARY_CHARS: usize = 2_000;
 
+#[derive(Debug, Default)]
+struct MicrophoneConsent {
+    explicitly_enabled: bool,
+}
+
+impl MicrophoneConsent {
+    const fn capture_enabled(&self) -> bool {
+        self.explicitly_enabled
+    }
+
+    fn apply_command(&mut self, enabled: bool) {
+        self.explicitly_enabled = enabled;
+    }
+}
+
 const BASE_INSTRUCTIONS: &str = concat!(
     "You are the Harness Harlot voice assistant — a hands-on project manager for a terminal ",
     "workstation app. You manage workstations, tabs, git worktrees, and coding-agent CLIs (omp, ",
@@ -126,7 +141,7 @@ struct VoiceEngine {
     narration: VecDeque<String>,
     response_active: bool,
     user_speaking: bool,
-    mic_enabled: bool,
+    mic_consent: MicrophoneConsent,
     speaker_muted: bool,
     suspended: bool,
     connected_at: Option<Instant>,
@@ -165,9 +180,9 @@ impl VoiceEngine {
         let thread_id = context.pane_id;
         let mut thread_has_title = false;
         if let Some(thread_id) = thread_id {
-            threads::prune_thread_files();
+            threads::prune_thread_files(threads::ThreadRetention::default())?;
             thread_has_title =
-                threads::read_thread(thread_id).is_some_and(|thread| thread.title.is_some());
+                threads::read_thread(thread_id)?.is_some_and(|thread| thread.title.is_some());
             threads::append_record(
                 thread_id,
                 &ThreadRecord::Meta {
@@ -176,9 +191,9 @@ impl VoiceEngine {
                     workspace_title: context.workspace_title.clone(),
                     at_ms: threads::now_ms(),
                 },
-            );
+            )?;
         }
-        let audio = AudioSystem::start()?;
+        let audio = AudioSystem::start(false)?;
         let memory: Box<dyn MemoryBackend> = match backend(settings.honcho.clone()) {
             Ok(memory) => memory,
             Err(error) => {
@@ -215,7 +230,7 @@ impl VoiceEngine {
             narration: VecDeque::new(),
             response_active: false,
             user_speaking: false,
-            mic_enabled: true,
+            mic_consent: MicrophoneConsent::default(),
             speaker_muted: false,
             suspended: false,
             connected_at: None,
@@ -250,7 +265,7 @@ impl VoiceEngine {
             match self.command_rx.try_recv() {
                 Ok(VoiceCommand::Shutdown) | Err(TryRecvError::Disconnected) => return Ok(true),
                 Ok(VoiceCommand::SetMicEnabled(enabled)) => {
-                    self.mic_enabled = enabled;
+                    self.mic_consent.apply_command(enabled);
                     self.audio.set_mic_enabled(enabled && !self.suspended)?;
                 }
                 Ok(VoiceCommand::SetSpeakerMuted(muted)) => {
@@ -267,7 +282,7 @@ impl VoiceEngine {
                     self.speaker_muted = muted;
                 }
                 Ok(VoiceCommand::SendUserText(text)) => {
-                    self.record_user_turn(&text);
+                    self.record_user_turn(&text)?;
                     self.pending_user_content
                         .push_back(InputContent::InputText { text });
                     self.last_activity = Instant::now();
@@ -320,7 +335,7 @@ impl VoiceEngine {
                         now.saturating_duration_since(last_output) >= HALF_DUPLEX_RELEASE_DELAY
                     });
                     let streaming = !self.suspended
-                        && self.mic_enabled
+                        && self.mic_consent.capture_enabled()
                         && self.connected_at.is_some()
                         && (self.settings.full_duplex
                             || half_duplex_capture_allowed(
@@ -353,7 +368,7 @@ impl VoiceEngine {
                         self.memory.session_preamble()
                     }
                 });
-                let instructions = instructions_with_context(&self.context, prior.as_deref());
+                let instructions = instructions_with_context(&self.context, prior.as_deref())?;
                 self.send(ClientEvent::SessionUpdate {
                     session: Box::new(SessionConfig::new(
                         instructions,
@@ -443,7 +458,7 @@ impl VoiceEngine {
                 }
                 self.clear_user_speaking();
                 self.last_activity = Instant::now();
-                self.record_user_turn(&transcript);
+                self.record_user_turn(&transcript)?;
                 let _ = self.ui.unbounded_send(VoiceUiEvent::UserTranscript {
                     text: transcript,
                     final_: true,
@@ -511,7 +526,7 @@ impl VoiceEngine {
                             text: transcript.clone(),
                             at_ms: threads::now_ms(),
                         },
-                    );
+                    )?;
                 }
                 let _ = self.ui.unbounded_send(VoiceUiEvent::AssistantTranscript {
                     text: transcript,
@@ -540,7 +555,7 @@ impl VoiceEngine {
                             summary: output.chars().take(200).collect(),
                             at_ms: threads::now_ms(),
                         },
-                    );
+                    )?;
                 }
                 self.send(ClientEvent::ConversationItemCreate {
                     item: ConversationItem::FunctionCallOutput { call_id, output },
@@ -751,7 +766,7 @@ impl VoiceEngine {
                         text: summary.clone(),
                         at_ms: threads::now_ms(),
                     },
-                );
+                )?;
             }
             let _ = self
                 .ui
@@ -779,7 +794,8 @@ impl VoiceEngine {
             self.settings.model.clone(),
             self.realtime_tx.clone(),
         )?);
-        self.audio.set_mic_enabled(self.mic_enabled)?;
+        self.audio
+            .set_mic_enabled(self.mic_consent.capture_enabled())?;
         self.suspended = false;
         self.last_activity = Instant::now();
         let _ = self
@@ -800,7 +816,7 @@ impl VoiceEngine {
                         text: summary.clone(),
                         at_ms: threads::now_ms(),
                     },
-                );
+                )?;
             }
             let _ = self.ui.unbounded_send(VoiceUiEvent::SessionSummary {
                 text: summary.clone(),
@@ -840,7 +856,7 @@ impl VoiceEngine {
         summary.chars().take(MAX_SUMMARY_CHARS).collect()
     }
 
-    fn record_user_turn(&mut self, text: &str) {
+    fn record_user_turn(&mut self, text: &str) -> Result<()> {
         self.memory.record_turn(Role::User, text);
         self.push_transcript(Role::User, text.to_owned());
         if let Some(thread_id) = self.thread_id {
@@ -852,7 +868,7 @@ impl VoiceEngine {
                     text: text.to_owned(),
                     at_ms,
                 },
-            );
+            )?;
             if !self.thread_has_title {
                 threads::append_record(
                     thread_id,
@@ -860,10 +876,11 @@ impl VoiceEngine {
                         text: threads::thread_title(text),
                         at_ms,
                     },
-                );
+                )?;
                 self.thread_has_title = true;
             }
         }
+        Ok(())
     }
 
     fn push_transcript(&mut self, role: Role, text: String) {
@@ -899,14 +916,16 @@ impl VoiceEngine {
         let _ = self.audio.set_mic_enabled(false);
         let summary = self.build_summary();
         if !summary.is_empty() {
-            if let Some(thread_id) = self.thread_id {
-                threads::append_record(
+            if let Some(thread_id) = self.thread_id
+                && let Err(error) = threads::append_record(
                     thread_id,
                     &ThreadRecord::Summary {
                         text: summary.clone(),
                         at_ms: threads::now_ms(),
                     },
-                );
+                )
+            {
+                self.emit_error(&error);
             }
             let _ = self
                 .ui
@@ -972,7 +991,7 @@ pub(crate) fn narration_ready(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= NARRATION_INTERVAL)
 }
 
-fn instructions_with_context(context: &AssistantContext, prior: Option<&str>) -> String {
+fn instructions_with_context(context: &AssistantContext, prior: Option<&str>) -> Result<String> {
     let mut instructions = BASE_INSTRUCTIONS.to_owned();
     instructions.push_str("\n\n");
     instructions.push_str(&location_block(context));
@@ -985,19 +1004,19 @@ fn instructions_with_context(context: &AssistantContext, prior: Option<&str>) ->
         instructions.push_str("\n\n## Operator instructions\n");
         instructions.push_str(operator_instructions);
     }
-    instructions.push_str(&earlier_threads_block(context));
+    instructions.push_str(&earlier_threads_block(context)?);
     if let Some(prior) = prior {
         instructions.push_str("\n\n## Prior context\n");
         instructions.push_str(prior);
     }
-    instructions
+    Ok(instructions)
 }
 
-fn earlier_threads_block(context: &AssistantContext) -> String {
+fn earlier_threads_block(context: &AssistantContext) -> Result<String> {
     let Some(workspace_id) = context.workspace_id else {
-        return String::new();
+        return Ok(String::new());
     };
-    let lines = threads::list_threads()
+    let lines = threads::list_threads()?
         .into_iter()
         .filter(|thread| thread.workspace_id == Some(workspace_id))
         .filter(|thread| Some(thread.thread_id) != context.pane_id)
@@ -1011,12 +1030,12 @@ fn earlier_threads_block(context: &AssistantContext) -> String {
         })
         .collect::<Vec<_>>();
     if lines.is_empty() {
-        String::new()
+        Ok(String::new())
     } else {
-        format!(
+        Ok(format!(
             "\n\n## Earlier threads (read with read_thread)\n{}",
             lines.join("\n")
-        )
+        ))
     }
 }
 
@@ -1166,7 +1185,7 @@ mod tests {
             ..AssistantContext::default()
         };
         let instructions =
-            instructions_with_context(&context, Some("user prefers concise updates"));
+            instructions_with_context(&context, Some("user prefers concise updates")).unwrap();
         assert!(instructions.starts_with(BASE_INSTRUCTIONS));
         assert!(instructions.contains("## Prior context\nuser prefers concise updates"));
         assert!(instructions.contains("kind=workstation"));
@@ -1232,7 +1251,7 @@ mod tests {
             instructions: None,
             prior_context: None,
         };
-        let instructions = instructions_with_context(&context, Some("earlier talk"));
+        let instructions = instructions_with_context(&context, Some("earlier talk")).unwrap();
         let location_index = instructions
             .find("## Where you live")
             .expect("location block");
@@ -1240,5 +1259,15 @@ mod tests {
             .find("## Prior context")
             .expect("prior context");
         assert!(location_index < prior_index);
+    }
+
+    #[test]
+    fn microphone_capture_starts_without_consent_and_only_explicit_enable_grants_it() {
+        let mut consent = MicrophoneConsent::default();
+        assert!(!consent.capture_enabled());
+        consent.apply_command(false);
+        assert!(!consent.capture_enabled());
+        consent.apply_command(true);
+        assert!(consent.capture_enabled());
     }
 }

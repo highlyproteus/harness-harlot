@@ -2,6 +2,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use url::{Host, Url};
 
 use crate::settings::HonchoSettings;
 
@@ -66,10 +67,7 @@ pub(crate) struct HonchoBackend {
 
 impl HonchoBackend {
     pub(crate) fn new(settings: HonchoSettings) -> Result<Self> {
-        let base_url = settings.base_url.trim_end_matches('/').to_owned();
-        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-            bail!("Honcho base URL must start with http:// or https://");
-        }
+        let base_url = validate_honcho_base_url(&settings.base_url)?;
         let workspace = encode_path_segment(&settings.workspace);
         let unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -168,6 +166,34 @@ impl HonchoBackend {
     }
 }
 
+fn validate_honcho_base_url(value: &str) -> Result<String> {
+    let parsed = Url::parse(value).context("parse Honcho base URL")?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("Honcho base URL must not contain credentials, a path, query, or fragment");
+    }
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            let loopback = match parsed.host() {
+                Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                Some(Host::Ipv4(address)) => address.is_loopback(),
+                Some(Host::Ipv6(address)) => address.is_loopback(),
+                None => false,
+            };
+            if !loopback {
+                bail!("plaintext Honcho transport is allowed only for a loopback destination");
+            }
+        }
+        _ => bail!("Honcho base URL must use https, or http to a loopback destination"),
+    }
+    Ok(value.trim_end_matches('/').to_owned())
+}
+
 impl MemoryBackend for HonchoBackend {
     fn record_turn(&mut self, role: Role, text: &str) {
         if text.trim().is_empty() {
@@ -251,6 +277,29 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn honcho_plaintext_transport_is_limited_to_rigorous_loopback_hosts() {
+        for accepted in [
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "http://[::1]:8000",
+            "https://honcho.example.com",
+        ] {
+            assert!(validate_honcho_base_url(accepted).is_ok(), "{accepted}");
+        }
+        for rejected in [
+            "http://honcho.example.com",
+            "http://127.0.0.1.evil.example:8000",
+            "http://0.0.0.0:8000",
+            "http://192.168.1.2:8000",
+            "http://user@127.0.0.1:8000",
+            "http://localhost:8000/path",
+            "http://localhost:8000?token=secret",
+        ] {
+            assert!(validate_honcho_base_url(rejected).is_err(), "{rejected}");
+        }
+    }
 
     #[test]
     fn honcho_path_segments_are_percent_encoded() {

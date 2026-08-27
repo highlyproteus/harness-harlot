@@ -208,7 +208,10 @@ impl HhApp {
         self.editor.color_picker = None;
         self.editor.history_editor = None;
         self.editor.history_clear_confirmation = None;
-        self.voice.settings_editor = crate::voice::VoiceSettingsEditor::load();
+        match crate::voice::VoiceSettingsEditor::load() {
+            Ok(editor) => self.voice.settings_editor = editor,
+            Err(error) => self.report(&error),
+        }
         self.refresh_history_status();
         cx.notify();
     }

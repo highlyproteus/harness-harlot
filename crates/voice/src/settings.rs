@@ -11,6 +11,7 @@ const SETTINGS_FILE: &str = "voice-settings.json";
 #[serde(default, deny_unknown_fields)]
 pub struct VoiceSettings {
     pub schema_version: u32,
+    #[serde(default, skip_serializing)]
     pub api_key: String,
     pub model: String,
     pub voice: String,
@@ -24,6 +25,7 @@ pub struct VoiceSettings {
 pub struct HonchoSettings {
     pub base_url: String,
     pub workspace: String,
+    #[serde(default, skip_serializing)]
     pub bearer: Option<String>,
 }
 
@@ -52,12 +54,34 @@ impl Default for HonchoSettings {
 }
 
 impl VoiceSettings {
-    #[must_use]
-    pub fn load() -> Self {
-        settings_path()
-            .ok()
-            .and_then(|path| load_from(&path).ok())
-            .unwrap_or_default()
+    /// Loads non-secret settings and overlays process-environment secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unreadable, malformed, or unsupported settings
+    /// file instead of silently replacing it with defaults.
+    pub fn load() -> Result<Self> {
+        let path = settings_path()?;
+        let mut settings = match load_from(&path) {
+            Ok(settings) => settings,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Self::default()
+            }
+            Err(error) => return Err(error),
+        };
+        if let Ok(api_key) = std::env::var("HH_OPENAI_API_KEY") {
+            settings.api_key = api_key;
+        }
+        if let Some(honcho) = settings.honcho.as_mut()
+            && let Ok(bearer) = std::env::var("HH_HONCHO_BEARER")
+        {
+            honcho.bearer = Some(bearer);
+        }
+        Ok(settings)
     }
 
     /// Persists settings in the application's owner-only state directory.
@@ -83,7 +107,15 @@ fn settings_path() -> Result<PathBuf> {
 fn load_from(path: &Path) -> Result<VoiceSettings> {
     let bytes = hh_protocol::read_private_file(path, MAX_SETTINGS_BYTES)
         .with_context(|| format!("read voice settings {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("decode voice settings")
+    let settings: VoiceSettings =
+        serde_json::from_slice(&bytes).context("decode voice settings")?;
+    if settings.schema_version != SETTINGS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported voice settings schema version {}; expected {SETTINGS_SCHEMA_VERSION}",
+            settings.schema_version
+        );
+    }
+    Ok(settings)
 }
 
 #[cfg(test)]
@@ -108,20 +140,37 @@ mod tests {
     }
 
     #[test]
-    fn settings_round_trip_without_exposing_implicit_fields() {
+    fn persisted_settings_omit_openai_and_honcho_secrets() {
         let settings = VoiceSettings {
             api_key: "secret".to_owned(),
             model: "gpt-realtime-2.1-mini".to_owned(),
             voice: "cedar".to_owned(),
             full_duplex: true,
             idle_timeout_secs: 0,
-            honcho: Some(HonchoSettings::default()),
+            honcho: Some(HonchoSettings {
+                bearer: Some("honcho-secret".to_owned()),
+                ..HonchoSettings::default()
+            }),
             ..VoiceSettings::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
-        assert_eq!(
-            serde_json::from_str::<VoiceSettings>(&json).unwrap(),
-            settings
-        );
+        assert!(!json.contains("secret"));
+        let loaded = serde_json::from_str::<VoiceSettings>(&json).unwrap();
+        assert!(loaded.api_key.is_empty());
+        assert_eq!(loaded.honcho.unwrap().bearer, None);
+    }
+
+    #[test]
+    fn unsupported_settings_schema_is_an_error() {
+        let path =
+            std::env::temp_dir().join(format!("hh-voice-settings-{}.json", uuid::Uuid::new_v4()));
+        hh_protocol::atomic_write_private(
+            &path,
+            br#"{"schema_version":999,"model":"m","voice":"v","full_duplex":false,"idle_timeout_secs":1,"honcho":null}"#,
+        )
+        .unwrap();
+        let error = load_from(&path).unwrap_err();
+        assert!(error.to_string().contains("schema version"));
+        std::fs::remove_file(path).unwrap();
     }
 }

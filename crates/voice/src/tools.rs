@@ -166,7 +166,7 @@ impl ToolExecutor {
             "attach_project" => self.attach_project(arguments),
             "list_directory" => Self::list_directory(arguments),
             "find_directory" => Self::find_directory(arguments),
-            "list_threads" => Ok(Self::list_threads(arguments)),
+            "list_threads" => Self::list_threads(arguments),
             "read_thread" => Self::read_thread(arguments),
             "recall_memory" => {
                 let query = required_str(arguments, "query")?;
@@ -402,8 +402,8 @@ impl ToolExecutor {
         Ok(json!({ "query": query, "matches": matches, "truncated": truncated }))
     }
 
-    fn list_threads(_arguments: &Value) -> Value {
-        let threads = threads::list_threads();
+    fn list_threads(_arguments: &Value) -> Result<Value> {
+        let threads = threads::list_threads()?;
         let truncated = threads.len() > MAX_LISTED_THREADS;
         let threads = threads
             .into_iter()
@@ -418,12 +418,12 @@ impl ToolExecutor {
                 })
             })
             .collect::<Vec<_>>();
-        json!({ "threads": threads, "truncated": truncated })
+        Ok(json!({ "threads": threads, "truncated": truncated }))
     }
 
     fn read_thread(arguments: &Value) -> Result<Value> {
         let thread_id = required_uuid(arguments, "thread_id")?;
-        let thread = threads::read_thread(thread_id)
+        let thread = threads::read_thread(thread_id)?
             .with_context(|| format!("thread {thread_id} not found"))?;
         let mut turns = thread
             .entries

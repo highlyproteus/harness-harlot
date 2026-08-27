@@ -3056,6 +3056,7 @@ dependencies = [
  "futures",
  "hh-protocol",
  "hh-session-client",
+ "libc",
  "parking_lot",
  "rubato",
  "serde",
@@ -3063,6 +3064,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "ureq 2.12.1",
+ "url",
  "uuid",
 ]
 
