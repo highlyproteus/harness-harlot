@@ -182,6 +182,7 @@ fi
 install -m 0644 "$repository_root/packaging/linux/com.harnessharlot.desktop.desktop" "$root/share/applications/com.harnessharlot.desktop.desktop"
 install -m 0644 "$repository_root/packaging/linux/com.harnessharlot.desktop.png" "$root/share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png"
 install -m 0644 "$repository_root/LICENSE" "$root/share/licenses/harness-harlot/LICENSE"
+install -m 0644 "$repository_root/PRIVACY.md" "$root/share/licenses/harness-harlot/PRIVACY.md"
 install -m 0644 "$repository_root/THIRD_PARTY_NOTICES.md" "$root/share/licenses/harness-harlot/THIRD_PARTY_NOTICES.md"
 install -m 0644 "$repository_root/ASSET_NOTICES.md" "$root/share/licenses/harness-harlot/ASSET_NOTICES.md"
 printf 'com.harnessharlot.desktop\n' > "$root/share/harness-harlot/install-id"

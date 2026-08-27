@@ -295,15 +295,81 @@ fn enqueue_playback_chunk(playback: &mut PlaybackState, mut chunk: PlaybackChunk
     playback.queue.push_back(chunk);
 }
 
-pub(crate) struct AudioSystem {
-    input_stream: Stream,
-    _output_stream: Stream,
+trait MicrophoneCapture {
+    fn play(&self) -> Result<()>;
+    fn pause(&self) -> Result<()>;
+    fn try_input(&self) -> Option<AudioInputEvent>;
+}
+
+struct CpalMicrophoneCapture {
+    stream: Stream,
     input: Receiver<AudioInputEvent>,
+}
+
+impl MicrophoneCapture for CpalMicrophoneCapture {
+    fn play(&self) -> Result<()> {
+        self.stream.play().context("start microphone stream")
+    }
+
+    fn pause(&self) -> Result<()> {
+        self.stream.pause().context("pause microphone stream")
+    }
+
+    fn try_input(&self) -> Option<AudioInputEvent> {
+        self.input.try_recv().ok()
+    }
+}
+
+type MicrophoneFactory = Box<dyn FnMut() -> Result<Box<dyn MicrophoneCapture>>>;
+
+struct LazyMicrophone {
+    capture: Option<Box<dyn MicrophoneCapture>>,
+    factory: MicrophoneFactory,
+    enabled: bool,
+}
+
+impl LazyMicrophone {
+    fn new(factory: MicrophoneFactory) -> Self {
+        Self {
+            capture: None,
+            factory,
+            enabled: false,
+        }
+    }
+
+    fn try_input(&self) -> Option<AudioInputEvent> {
+        self.capture
+            .as_ref()
+            .and_then(|capture| capture.try_input())
+    }
+
+    fn set_enabled(&mut self, enabled: bool) -> Result<()> {
+        if self.enabled == enabled {
+            return Ok(());
+        }
+        if enabled {
+            if self.capture.is_none() {
+                self.capture = Some((self.factory)()?);
+            }
+            self.capture
+                .as_ref()
+                .expect("microphone capture was initialized")
+                .play()?;
+        } else if let Some(capture) = self.capture.as_ref() {
+            capture.pause()?;
+        }
+        self.enabled = enabled;
+        Ok(())
+    }
+}
+
+pub(crate) struct AudioSystem {
+    microphone: LazyMicrophone,
+    _output_stream: Stream,
     playback: Arc<Mutex<PlaybackState>>,
     playback_active: Arc<AtomicBool>,
     output_resampler: Mutex<OutputResampler>,
     output_rate: u32,
-    input_enabled: bool,
 }
 
 impl std::fmt::Debug for AudioSystem {
@@ -312,40 +378,22 @@ impl std::fmt::Debug for AudioSystem {
             .debug_struct("AudioSystem")
             .field("playback_active", &self.playback_active())
             .field("output_rate", &self.output_rate)
-            .field("input_enabled", &self.input_enabled)
+            .field("input_enabled", &self.microphone.enabled)
             .finish_non_exhaustive()
     }
 }
 
 impl AudioSystem {
-    pub(crate) fn start(microphone_enabled: bool) -> Result<Self> {
+    pub(crate) fn start() -> Result<Self> {
         let host = cpal::default_host();
-        let input_device = host
-            .default_input_device()
-            .context("no default microphone")?;
         let output_device = host
             .default_output_device()
             .context("no default audio output")?;
-        let input_supported = input_device
-            .default_input_config()
-            .context("read default microphone configuration")?;
         let output_supported = output_device
             .default_output_config()
             .context("read default output configuration")?;
-        let input_format = input_supported.sample_format();
         let output_format = output_supported.sample_format();
-        let input_config: StreamConfig = input_supported.into();
         let output_config: StreamConfig = output_supported.into();
-        let (sender, input) = std::sync::mpsc::sync_channel(AUDIO_CHANNEL_CAPACITY);
-        let processor =
-            InputProcessor::new(input_config.sample_rate, usize::from(input_config.channels))?;
-        let input_stream = build_input_stream(
-            &input_device,
-            &input_config,
-            input_format,
-            processor,
-            sender,
-        )?;
 
         let playback = Arc::new(Mutex::new(PlaybackState::default()));
         let playback_active = Arc::new(AtomicBool::new(false));
@@ -356,44 +404,24 @@ impl AudioSystem {
             Arc::clone(&playback),
             Arc::clone(&playback_active),
         )?;
-        if microphone_enabled {
-            input_stream.play().context("start microphone stream")?;
-        } else {
-            input_stream.pause().context("pause microphone stream")?;
-        }
         output_stream.play().context("start audio output stream")?;
         let output_rate = output_config.sample_rate;
         Ok(Self {
-            input_stream,
+            microphone: LazyMicrophone::new(Box::new(build_default_microphone)),
             _output_stream: output_stream,
-            input,
             playback,
             playback_active,
             output_resampler: Mutex::new(OutputResampler::new(output_rate)?),
             output_rate,
-            input_enabled: microphone_enabled,
         })
     }
 
     pub(crate) fn try_input(&self) -> Option<AudioInputEvent> {
-        self.input.try_recv().ok()
+        self.microphone.try_input()
     }
 
     pub(crate) fn set_mic_enabled(&mut self, enabled: bool) -> Result<()> {
-        if self.input_enabled == enabled {
-            return Ok(());
-        }
-        if enabled {
-            self.input_stream
-                .play()
-                .context("resume microphone stream")?;
-        } else {
-            self.input_stream
-                .pause()
-                .context("pause microphone stream")?;
-        }
-        self.input_enabled = enabled;
-        Ok(())
+        self.microphone.set_enabled(enabled)
     }
 
     pub(crate) fn push_output(&self, item_id: &str, samples: &[i16]) -> Result<()> {
@@ -450,6 +478,28 @@ impl AudioSystem {
         self.playback_active.store(false, Ordering::Release);
         (item_id, played_ms)
     }
+}
+
+fn build_default_microphone() -> Result<Box<dyn MicrophoneCapture>> {
+    let input_device = cpal::default_host()
+        .default_input_device()
+        .context("no default microphone")?;
+    let input_supported = input_device
+        .default_input_config()
+        .context("read default microphone configuration")?;
+    let input_format = input_supported.sample_format();
+    let input_config: StreamConfig = input_supported.into();
+    let (sender, input) = std::sync::mpsc::sync_channel(AUDIO_CHANNEL_CAPACITY);
+    let processor =
+        InputProcessor::new(input_config.sample_rate, usize::from(input_config.channels))?;
+    let stream = build_input_stream(
+        &input_device,
+        &input_config,
+        input_format,
+        processor,
+        sender,
+    )?;
+    Ok(Box::new(CpalMicrophoneCapture { stream, input }))
 }
 
 fn build_input_stream(
@@ -571,6 +621,50 @@ fn output_stream<T: SizedSample + Copy + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_factory_is_lazy_until_explicit_enable() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct FakeCapture {
+            plays: Arc<AtomicUsize>,
+        }
+
+        impl MicrophoneCapture for FakeCapture {
+            fn play(&self) -> Result<()> {
+                self.plays.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn pause(&self) -> Result<()> {
+                Ok(())
+            }
+
+            fn try_input(&self) -> Option<AudioInputEvent> {
+                None
+            }
+        }
+
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let plays = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&factory_calls);
+        let played = Arc::clone(&plays);
+        let mut microphone = LazyMicrophone::new(Box::new(move || {
+            called.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeCapture {
+                plays: Arc::clone(&played),
+            }))
+        }));
+
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        microphone.set_enabled(false).unwrap();
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+
+        microphone.set_enabled(true).unwrap();
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(plays.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn playback_queue_drops_oldest_audio_at_the_memory_bound() {

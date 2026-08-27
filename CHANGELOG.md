@@ -43,21 +43,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   launches now require independent approval in the Harness Harlot UI.
 - Scoped pane, thread, project, and directory reads to the Assistant's authorized
   workspace and canonical directory boundary.
-- Treated terminal OSC notifications and approval results as bounded, explicitly
-  untrusted user data instead of system instructions.
-- Started Assistant microphone capture only after the visible start-voice action;
-  typed messages, image attachments, and reopened threads remain microphone-muted.
-- Restricted remote Honcho memory to HTTPS while allowing plaintext only for
-  validated loopback hosts, and no longer serializes OpenAI or Honcho credentials.
+- Removed terminal-controlled OSC payloads from model context and reduced
+  notifications to fixed-vocabulary local cues.
+- Deferred microphone device discovery and stream creation until the visible
+  start-voice action; text, image, and history paths remain microphone-free.
+- Restricted remote Honcho memory and redirects to HTTPS while allowing plaintext
+  only for validated loopback hosts, and no longer serializes provider credentials.
 - Hardened saved threads and image attachments with owner-only descriptor checks,
   no-follow file access, format and size validation, bounded retention, and local
-  delete-one or clear-all controls.
+  delete-one or clear-all controls that include retained session summaries.
+- Required tagged release publication to pass exact-commit tests, strict Clippy,
+  audit, deny, notice-drift, ShellCheck, and secret-scanning gates.
 
 ### Documentation
 
 - Added a public Voice Mode privacy and data-handling disclosure, corrected the
   in-app credential-storage description, and clarified Linux Voice dependencies
-  and the macOS microphone permission prompt.
+  and the macOS microphone permission prompt. The disclosure ships in macOS and
+  Linux artifacts and is linked from Voice settings.
 
 ## [0.1.13] - 2026-08-23
 

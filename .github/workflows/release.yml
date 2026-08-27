@@ -12,6 +12,63 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify-release-quality:
+    name: Verify tagged release quality
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Assert checkout is the tagged commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.96"
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-quality-macos-arm64
+          cache-targets: true
+      - run: scripts/check-structure.sh
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-targets --all-features
+
+  verify-release-security:
+    name: Verify tagged release security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Assert checkout is the tagged commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.96"
+      - name: Install security tools
+        run: |
+          cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2
+          cargo install --locked cargo-about@0.9.1 --features cli
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - run: cargo audit
+      - run: cargo deny check
+      - name: Verify generated dependency notices
+        run: |
+          cargo about generate --locked --workspace --fail about.hbs -o THIRD_PARTY_NOTICES.generated.md
+          diff -u THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES.generated.md
+      - run: shellcheck scripts/*.sh install*.sh packaging/**/*.sh
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   package:
     name: Package macOS ${{ matrix.release_mode }} ${{ matrix.architecture }}
     environment: release
@@ -351,7 +408,12 @@ jobs:
 
   publish:
     name: Publish immutable release assets
-    needs: [package, package-linux, sbom]
+    needs:
+      - verify-release-quality
+      - verify-release-security
+      - package
+      - package-linux
+      - sbom
     environment: release
     runs-on: ubuntu-latest
     permissions:

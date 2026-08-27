@@ -45,6 +45,22 @@ fn assistant_attachment_accepts_a_bounded_decodable_image() {
 }
 
 #[test]
+fn clearing_saved_history_updates_summary_only_session_ui() {
+    let pane_id = Uuid::new_v4();
+    let mut sessions = HashMap::from([(pane_id, AssistantSession::new())]);
+    sessions.get_mut(&pane_id).unwrap().persisted_summary = PersistedSummaryState::Present;
+    assert!(!assistant_workspace_shows_idle(
+        sessions.get(&pane_id).unwrap()
+    ));
+
+    mark_persisted_summaries_cleared(&mut sessions);
+
+    assert!(assistant_workspace_shows_idle(
+        sessions.get(&pane_id).unwrap()
+    ));
+}
+
+#[test]
 fn suspended_assistant_keeps_the_live_surface_when_history_exists() {
     let mut session = AssistantSession::new();
     assert!(assistant_workspace_shows_idle(&session));

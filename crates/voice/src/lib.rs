@@ -15,7 +15,7 @@ use futures::channel::mpsc::UnboundedSender;
 pub use settings::{HonchoSettings, VoiceSettings};
 pub use threads::{
     Thread, ThreadRecord, ThreadRole, ThreadSummary, adopt_thread, append_record, list_threads,
-    read_thread,
+    read_summary, read_thread,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
