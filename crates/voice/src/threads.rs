@@ -15,13 +15,17 @@ const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RECORDS: usize = 10_000;
 const MAX_TEXT_CHARS: usize = 32 * 1024;
 const GENERATION_FILE: &str = ".generation";
+const AUTHORITY_FILE_SUFFIX: &str = "authority";
 pub const MAX_THREAD_TITLE_CHARS: usize = 60;
 
 static STORAGE_LOCK: LazyLock<parking_lot::Mutex<()>> =
     LazyLock::new(|| parking_lot::Mutex::new(()));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ThreadGeneration(u64);
+pub struct ThreadGeneration {
+    storage: u64,
+    authority: Uuid,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -94,18 +98,61 @@ fn generation_path(dir: &Path) -> PathBuf {
     dir.join(GENERATION_FILE)
 }
 
-fn current_generation_in(dir: &Path) -> Result<ThreadGeneration> {
+fn authority_path(dir: &Path, thread_id: Uuid) -> PathBuf {
+    dir.join(format!(".{thread_id}.{AUTHORITY_FILE_SUFFIX}"))
+}
+
+fn authority_thread_id(path: &Path) -> Option<Uuid> {
+    let name = path.file_name()?.to_str()?;
+    let thread_id = name
+        .strip_prefix('.')?
+        .strip_suffix(AUTHORITY_FILE_SUFFIX)?
+        .strip_suffix('.')?;
+    Uuid::parse_str(thread_id).ok()
+}
+
+fn current_storage_generation_in(dir: &Path) -> Result<u64> {
     let bytes = match hh_protocol::read_private_file(&generation_path(dir), 32) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ThreadGeneration(0));
+            return Ok(0);
         }
         Err(error) => return Err(error).context("read assistant thread generation"),
     };
     let text = std::str::from_utf8(&bytes).context("decode assistant thread generation")?;
-    Ok(ThreadGeneration(
-        text.parse().context("parse assistant thread generation")?,
+    text.parse().context("parse assistant thread generation")
+}
+
+fn read_thread_authority_in(dir: &Path, thread_id: Uuid) -> Result<Option<Uuid>> {
+    let bytes = match hh_protocol::read_private_file(&authority_path(dir, thread_id), 36) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read assistant thread authority"),
+    };
+    let text = std::str::from_utf8(&bytes).context("decode assistant thread authority")?;
+    Ok(Some(
+        Uuid::parse_str(text).context("parse assistant thread authority")?,
     ))
+}
+
+fn current_generation_in(dir: &Path, thread_id: Uuid) -> Result<ThreadGeneration> {
+    hh_protocol::ensure_private_directory(dir)
+        .with_context(|| format!("prepare assistant thread directory {}", dir.display()))?;
+    let authority = if let Some(authority) = read_thread_authority_in(dir, thread_id)? {
+        authority
+    } else {
+        let authority = Uuid::new_v4();
+        hh_protocol::atomic_write_private(
+            &authority_path(dir, thread_id),
+            authority.to_string().as_bytes(),
+        )
+        .context("create assistant thread authority")?;
+        authority
+    };
+    Ok(ThreadGeneration {
+        storage: current_storage_generation_in(dir)?,
+        authority,
+    })
 }
 
 fn record_at_ms(record: &ThreadRecord) -> u64 {
@@ -176,7 +223,9 @@ fn append_record_for_generation_in(
     thread_id: Uuid,
     record: &ThreadRecord,
 ) -> Result<bool> {
-    if current_generation_in(dir)? != generation {
+    if current_storage_generation_in(dir)? != generation.storage
+        || read_thread_authority_in(dir, thread_id)? != Some(generation.authority)
+    {
         return Ok(false);
     }
     append_record_in(dir, thread_id, record)?;
@@ -309,10 +358,23 @@ fn adopt_thread_in(dir: &Path, old: Uuid, new: Uuid) -> Result<bool> {
         return Ok(false);
     }
     let new_path = thread_path(dir, new);
-    if fs::symlink_metadata(&new_path).is_ok() {
+    let new_authority_path = authority_path(dir, new);
+    if fs::symlink_metadata(&new_path).is_ok() || fs::symlink_metadata(&new_authority_path).is_ok()
+    {
         return Ok(false);
     }
-    fs::rename(thread_path(dir, old), new_path).context("adopt assistant thread")?;
+    let old_authority_path = authority_path(dir, old);
+    let moved_authority = read_thread_authority_in(dir, old)?.is_some();
+    if moved_authority {
+        fs::rename(&old_authority_path, &new_authority_path)
+            .context("adopt assistant thread authority")?;
+    }
+    if let Err(error) = fs::rename(thread_path(dir, old), new_path) {
+        if moved_authority {
+            let _ = fs::rename(new_authority_path, old_authority_path);
+        }
+        return Err(error).context("adopt assistant thread");
+    }
     Ok(true)
 }
 
@@ -345,15 +407,24 @@ fn prune_thread_files_in(dir: &Path, policy: ThreadRetention, current_ms: u64) -
             || thread.last_at_ms < cutoff
             || kept_bytes.saturating_add(size) > policy.max_total_bytes;
         if exceeds {
-            fs::remove_file(&path).with_context(|| {
+            removed += usize::from(delete_thread_in(dir, thread.thread_id).with_context(|| {
                 format!("delete retained assistant thread {}", thread.thread_id)
-            })?;
-            removed += 1;
+            })?);
         } else {
             kept_bytes = kept_bytes.saturating_add(size);
         }
     }
     Ok(removed)
+}
+
+fn prepare_writer_in(
+    dir: &Path,
+    thread_id: Uuid,
+    policy: ThreadRetention,
+    current_ms: u64,
+) -> Result<ThreadGeneration> {
+    prune_thread_files_in(dir, policy, current_ms)?;
+    current_generation_in(dir, thread_id)
 }
 
 fn required_thread_directory() -> Result<PathBuf> {
@@ -364,9 +435,23 @@ fn required_thread_directory() -> Result<PathBuf> {
 ///
 /// # Errors
 /// Returns an error when the generation file is unsafe or malformed.
-pub fn current_generation() -> Result<ThreadGeneration> {
+pub fn current_generation(thread_id: Uuid) -> Result<ThreadGeneration> {
     let _guard = STORAGE_LOCK.lock();
-    current_generation_in(&required_thread_directory()?)
+    current_generation_in(&required_thread_directory()?, thread_id)
+}
+
+/// Applies retention and captures authority for a newly started thread writer atomically.
+///
+/// # Errors
+/// Returns an error when retention or writer authority cannot be updated safely.
+pub fn prepare_writer(thread_id: Uuid) -> Result<ThreadGeneration> {
+    let _guard = STORAGE_LOCK.lock();
+    prepare_writer_in(
+        &required_thread_directory()?,
+        thread_id,
+        ThreadRetention::default(),
+        now_ms(),
+    )
 }
 
 /// Appends a record only while the writer's captured storage generation is current.
@@ -416,11 +501,17 @@ pub fn list_threads() -> Result<Vec<ThreadSummary>> {
 /// Returns an error when either path is unsafe or the rename cannot be
 /// completed.
 pub fn adopt_thread(old: Uuid, new: Uuid) -> Result<bool> {
+    let _guard = STORAGE_LOCK.lock();
     adopt_thread_in(&required_thread_directory()?, old, new)
 }
 
 fn delete_thread_in(dir: &Path, thread_id: Uuid) -> Result<bool> {
     let path = thread_path(dir, thread_id);
+    match fs::remove_file(authority_path(dir, thread_id)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("revoke assistant thread writer"),
+    }
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             anyhow::bail!("assistant thread delete target is not a regular file")
@@ -439,8 +530,7 @@ fn delete_thread_in(dir: &Path, thread_id: Uuid) -> Result<bool> {
 fn clear_all_threads_in(dir: &Path) -> Result<usize> {
     hh_protocol::ensure_private_directory(dir)
         .with_context(|| format!("prepare assistant thread directory {}", dir.display()))?;
-    let next_generation = current_generation_in(dir)?
-        .0
+    let next_generation = current_storage_generation_in(dir)?
         .checked_add(1)
         .context("assistant thread generation exhausted")?;
     hh_protocol::atomic_write_private(
@@ -454,6 +544,14 @@ fn clear_all_threads_in(dir: &Path) -> Result<usize> {
         let path = entry
             .context("read assistant thread directory entry")?
             .path();
+        if authority_thread_id(&path).is_some() {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("remove assistant thread authority"),
+            }
+            continue;
+        }
         let Some(thread_id) = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -475,6 +573,7 @@ fn clear_all_threads_in(dir: &Path) -> Result<usize> {
 /// Returns an error when the target is unsafe, foreign-owned, or cannot be
 /// removed.
 pub fn delete_thread(thread_id: Uuid) -> Result<bool> {
+    let _guard = STORAGE_LOCK.lock();
     delete_thread_in(&required_thread_directory()?, thread_id)
 }
 
@@ -494,6 +593,7 @@ pub fn clear_all_threads() -> Result<usize> {
 /// Returns an error when thread metadata cannot be validated or an expired
 /// thread cannot be removed safely.
 pub fn prune_thread_files(policy: ThreadRetention) -> Result<usize> {
+    let _guard = STORAGE_LOCK.lock();
     prune_thread_files_in(&required_thread_directory()?, policy, now_ms())
 }
 
@@ -646,6 +746,49 @@ mod tests {
     }
 
     #[test]
+    fn adopt_moves_writer_authority_away_from_old_thread_id() {
+        let dir = test_dir();
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        let old_generation = current_generation_in(&dir, old).unwrap();
+        assert!(
+            append_record_for_generation_in(&dir, old_generation, old, &meta(old, 10)).unwrap()
+        );
+
+        assert!(adopt_thread_in(&dir, old, new).unwrap());
+        assert!(
+            !append_record_for_generation_in(
+                &dir,
+                old_generation,
+                old,
+                &ThreadRecord::Summary {
+                    text: "delayed old summary".to_owned(),
+                    at_ms: 20,
+                },
+            )
+            .unwrap()
+        );
+        let new_generation = current_generation_in(&dir, new).unwrap();
+        assert_eq!(new_generation.authority, old_generation.authority);
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                new_generation,
+                new,
+                &ThreadRecord::Turn {
+                    role: ThreadRole::User,
+                    text: "continued thread".to_owned(),
+                    at_ms: 30,
+                },
+            )
+            .unwrap()
+        );
+        assert!(read_thread_in(&dir, old).unwrap().is_none());
+        assert!(read_thread_in(&dir, new).unwrap().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn retention_enforces_age_count_and_total_bytes() {
         let dir = test_dir();
         let old = Uuid::new_v4();
@@ -671,6 +814,89 @@ mod tests {
         assert!(read_thread_in(&dir, newest).unwrap().is_some());
         assert!(read_thread_in(&dir, over_count).unwrap().is_none());
         assert!(read_thread_in(&dir, old).unwrap().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retention_revokes_active_writer_for_pruned_thread() {
+        let dir = test_dir();
+        let thread_id = Uuid::new_v4();
+        let active_generation = current_generation_in(&dir, thread_id).unwrap();
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                active_generation,
+                thread_id,
+                &meta(thread_id, 10),
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            prune_thread_files_in(
+                &dir,
+                ThreadRetention {
+                    max_count: 0,
+                    max_age_ms: u64::MAX,
+                    max_total_bytes: u64::MAX,
+                },
+                10,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            !append_record_for_generation_in(
+                &dir,
+                active_generation,
+                thread_id,
+                &ThreadRecord::Summary {
+                    text: "delayed retention summary".to_owned(),
+                    at_ms: 20,
+                },
+            )
+            .unwrap()
+        );
+        assert!(read_thread_in(&dir, thread_id).unwrap().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preparing_writer_after_retention_returns_fresh_authority() {
+        let dir = test_dir();
+        let thread_id = Uuid::new_v4();
+        let stale_generation = current_generation_in(&dir, thread_id).unwrap();
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                stale_generation,
+                thread_id,
+                &meta(thread_id, 10),
+            )
+            .unwrap()
+        );
+
+        let fresh_generation = prepare_writer_in(
+            &dir,
+            thread_id,
+            ThreadRetention {
+                max_count: 0,
+                max_age_ms: u64::MAX,
+                max_total_bytes: u64::MAX,
+            },
+            10,
+        )
+        .unwrap();
+        assert_ne!(fresh_generation.authority, stale_generation.authority);
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                fresh_generation,
+                thread_id,
+                &meta(thread_id, 20),
+            )
+            .unwrap()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -732,7 +958,7 @@ mod tests {
         let dir = test_dir();
         let stale_thread = Uuid::new_v4();
         let fresh_thread = Uuid::new_v4();
-        let active_generation = current_generation_in(&dir).unwrap();
+        let active_generation = current_generation_in(&dir, stale_thread).unwrap();
         assert!(
             append_record_for_generation_in(
                 &dir,
@@ -772,8 +998,8 @@ mod tests {
         );
         assert!(list_threads_in(&dir).unwrap().is_empty());
 
-        let fresh_generation = current_generation_in(&dir).unwrap();
-        assert_ne!(fresh_generation, active_generation);
+        let fresh_generation = current_generation_in(&dir, fresh_thread).unwrap();
+        assert_ne!(fresh_generation.storage, active_generation.storage);
         assert!(
             append_record_for_generation_in(
                 &dir,
@@ -784,6 +1010,124 @@ mod tests {
             .unwrap()
         );
         assert_eq!(list_threads_in(&dir).unwrap()[0].thread_id, fresh_thread);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn single_delete_revokes_active_writer_and_allows_new_writer() {
+        let dir = test_dir();
+        let deleted_thread = Uuid::new_v4();
+        let active_generation = current_generation_in(&dir, deleted_thread).unwrap();
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                active_generation,
+                deleted_thread,
+                &meta(deleted_thread, 10),
+            )
+            .unwrap()
+        );
+
+        assert!(delete_thread_in(&dir, deleted_thread).unwrap());
+        for delayed_record in [
+            ThreadRecord::Turn {
+                role: ThreadRole::Assistant,
+                text: "delayed reply".to_owned(),
+                at_ms: 20,
+            },
+            ThreadRecord::Tool {
+                name: "delayed.tool".to_owned(),
+                summary: "delayed result".to_owned(),
+                at_ms: 30,
+            },
+            ThreadRecord::Title {
+                text: "Delayed title".to_owned(),
+                at_ms: 40,
+            },
+            ThreadRecord::Summary {
+                text: "shutdown summary".to_owned(),
+                at_ms: 50,
+            },
+            meta(deleted_thread, 60),
+        ] {
+            assert!(
+                !append_record_for_generation_in(
+                    &dir,
+                    active_generation,
+                    deleted_thread,
+                    &delayed_record,
+                )
+                .unwrap()
+            );
+        }
+        assert!(read_thread_in(&dir, deleted_thread).unwrap().is_none());
+
+        let fresh_generation = current_generation_in(&dir, deleted_thread).unwrap();
+        assert_ne!(fresh_generation.authority, active_generation.authority);
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                fresh_generation,
+                deleted_thread,
+                &meta(deleted_thread, 70),
+            )
+            .unwrap()
+        );
+        assert_eq!(list_threads_in(&dir).unwrap()[0].thread_id, deleted_thread);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delete_revokes_writer_even_before_thread_file_exists() {
+        let dir = test_dir();
+        let thread_id = Uuid::new_v4();
+        let active_generation = current_generation_in(&dir, thread_id).unwrap();
+
+        assert!(!delete_thread_in(&dir, thread_id).unwrap());
+        assert!(
+            !append_record_for_generation_in(
+                &dir,
+                active_generation,
+                thread_id,
+                &meta(thread_id, 10),
+            )
+            .unwrap()
+        );
+        assert!(read_thread_in(&dir, thread_id).unwrap().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_all_removes_pre_file_writer_authorities_without_blocking_new_writers() {
+        let dir = test_dir();
+        let thread_id = Uuid::new_v4();
+        let stale_generation = current_generation_in(&dir, thread_id).unwrap();
+        let authority = authority_path(&dir, thread_id);
+        assert!(authority.is_file());
+
+        assert_eq!(clear_all_threads_in(&dir).unwrap(), 0);
+        assert!(!authority.exists());
+        assert!(
+            !append_record_for_generation_in(
+                &dir,
+                stale_generation,
+                thread_id,
+                &meta(thread_id, 10),
+            )
+            .unwrap()
+        );
+
+        let fresh_generation = current_generation_in(&dir, thread_id).unwrap();
+        assert_ne!(fresh_generation, stale_generation);
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                fresh_generation,
+                thread_id,
+                &meta(thread_id, 20),
+            )
+            .unwrap()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
