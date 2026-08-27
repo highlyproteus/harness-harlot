@@ -19,9 +19,9 @@ use crate::helpers::{
 };
 use crate::typography::{TerminalCellMetrics, adjusted_terminal_zoom_level};
 use crate::view_models::{
-    ArchivedView, CloseConfirmation, GroupRenameEditor, LayoutControlMutation, Modal, PixelRect,
-    RenameEditor, SearchEditor, SelectionDrag, SidebarResizeMove, TabCloseConfirmation,
-    WorkspaceCreationStep, route_workspace_creation_paste,
+    ArchivedView, AssistantComposer, CloseConfirmation, GroupRenameEditor, LayoutControlMutation,
+    Modal, PixelRect, RenameEditor, SearchEditor, SelectionDrag, SidebarResizeMove,
+    TabCloseConfirmation, WorkspaceCreationStep, route_workspace_creation_paste,
 };
 use crate::{
     APP_CHROME_HEIGHT, CopyTerminal, FindNextTerminal, FindTerminal, HhApp, PasteTerminal,
@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 impl HhApp {
     pub(crate) fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let Some((workspace_id, scope, empty)) = self
+        let Some((workspace_id, assistant, scope, empty)) = self
             .session
             .snapshot
             .as_ref()
@@ -38,6 +38,7 @@ impl HhApp {
             .map(|workspace| {
                 (
                     workspace.id,
+                    workspace.is_assistant(),
                     workspace_tab_set(workspace, self.sidebar.workspace_tab_scope).scope,
                     workspace.tabs.is_empty(),
                 )
@@ -45,6 +46,10 @@ impl HhApp {
         else {
             return;
         };
+        if assistant {
+            self.new_assistant_tab(workspace_id, cx);
+            return;
+        }
         if empty {
             self.open_workspace_terminal(workspace_id, cx);
             return;
@@ -55,6 +60,21 @@ impl HhApp {
                 self.new_project_group(workspace_id, project_id, cx);
             }
         }
+    }
+
+    pub(crate) fn new_assistant_tab(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        self.dispatch_with(
+            ClientRequest::CreateAssistantTab { workspace_id },
+            Box::new(move |this, cx, result| match result {
+                Ok(ServiceResponse::PaneCreated { pane_id }) => {
+                    this.focus_created_pane(workspace_id, pane_id, cx);
+                }
+                Ok(response) => this.report_unexpected(&response),
+                Err(error) => this.report(&error),
+            }),
+        );
+        self.layout.last_sizes.clear();
+        cx.notify();
     }
 
     pub(crate) fn focus_created_pane(
@@ -79,6 +99,10 @@ impl HhApp {
     }
 
     pub(crate) fn open_workspace_terminal(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        if self.workspace_is_assistant(workspace_id) {
+            self.new_assistant_tab(workspace_id, cx);
+            return;
+        }
         self.dispatch_with(
             ClientRequest::CreateWorkspaceTerminal { workspace_id },
             Box::new(move |this, cx, result| match result {
@@ -94,6 +118,10 @@ impl HhApp {
     }
 
     pub(crate) fn new_workspace_tab(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        if self.workspace_is_assistant(workspace_id) {
+            self.new_assistant_tab(workspace_id, cx);
+            return;
+        }
         self.dispatch_with(
             ClientRequest::CreateWorkspaceTab { workspace_id },
             Box::new(move |this, cx, result| match result {
@@ -583,6 +611,28 @@ impl HhApp {
         let Some(pane_id) = self.layout.focused_pane else {
             return;
         };
+        if let Some(text) = self
+            .voice
+            .sessions
+            .get(&pane_id)
+            .and_then(|session| session.selected_transcript)
+            .and_then(|index| {
+                self.voice
+                    .sessions
+                    .get(&pane_id)
+                    .and_then(|session| session.transcript.get(index))
+            })
+            .map(|entry| entry.text.clone())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
+        if self
+            .pane_metadata(pane_id)
+            .is_some_and(|pane| pane.kind.is_assistant())
+        {
+            return;
+        }
         self.dispatch_with(
             ClientRequest::CopySelection { pane_id },
             Box::new(|this, cx, result| {
@@ -615,8 +665,36 @@ impl HhApp {
             cx.notify();
             return;
         }
+        if self.paste_voice_setting(&text, cx) {
+            return;
+        }
         if self.editor.browser_url_editor.is_some() {
             self.append_browser_url_text(&text);
+            cx.notify();
+            return;
+        }
+        if let Some(pane_id) = self.layout.focused_pane.filter(|pane_id| {
+            self.pane_metadata(*pane_id)
+                .is_some_and(|pane| pane.kind.is_assistant())
+        }) {
+            let composer =
+                self.editor
+                    .assistant_composer
+                    .get_or_insert_with(|| AssistantComposer {
+                        pane_id,
+                        text: String::new(),
+                        selection: None,
+                        attachment: None,
+                    });
+            if composer.pane_id != pane_id {
+                *composer = AssistantComposer {
+                    pane_id,
+                    text: String::new(),
+                    selection: None,
+                    attachment: None,
+                };
+            }
+            composer.insert(&text);
             cx.notify();
             return;
         }

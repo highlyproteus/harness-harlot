@@ -184,10 +184,54 @@ impl SessionClient {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    use std::os::unix::net::UnixListener;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use hh_protocol::MAX_FRAME_SIZE;
 
     #[test]
     fn protocol_keeps_individual_input_frames_bounded() {
         assert_eq!(MAX_FRAME_SIZE, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stale_service_handshake_fails_cleanly_without_hanging() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let directory =
+            Path::new("/tmp").join(format!("hhc-mismatch-{}-{suffix}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let path = directory.join("service.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert_eq!(
+                read_message::<ClientRequest>(&mut reader).unwrap(),
+                ClientRequest::Hello {
+                    protocol_version: PROTOCOL_VERSION
+                }
+            );
+            write_message(
+                &mut stream,
+                &ServiceResponse::Hello {
+                    protocol_version: PROTOCOL_VERSION - 1,
+                },
+            )
+            .unwrap();
+        });
+
+        let error = SessionClient::connect_path(&path, false).unwrap_err();
+        assert!(error.to_string().contains("unexpected handshake response"));
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

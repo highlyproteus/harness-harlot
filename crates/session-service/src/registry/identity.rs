@@ -3,8 +3,9 @@ use super::{RegistryState, RuntimePane};
 use crate::history;
 use crate::layout::{find_pane_in_snapshot, find_pane_mut_in_snapshot, pane_ids_for_workspace};
 use crate::process::valid_local_cwd;
+use crate::registry::status::omp_title_status;
 use hh_protocol::{
-    NotificationKind, Pane, SessionSnapshot, TerminalIdentity, TerminalIdentitySource,
+    NotificationKind, Pane, PaneStatus, SessionSnapshot, TerminalIdentity, TerminalIdentitySource,
     TerminalProfile, WorkspaceConnection, WorkspaceConnectionStatus, terminal_profile_for_command,
     terminal_profile_for_executable, terminal_profile_for_title,
 };
@@ -150,6 +151,7 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
                     None,
                     history::now_ms(),
                 );
+                state.set_pane_status(pane_id, PaneStatus::Done);
             }
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
@@ -171,13 +173,45 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
         .collect::<Vec<_>>();
     let mut identity_changed = false;
     for (pane_id, title_signal, command_profile, cwd) in identity_inputs {
-        if let Some(pane) = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id) {
-            identity_changed |= resolve_pane_identity(
-                pane,
-                title_signal.as_deref(),
-                command_profile,
-                Some(cwd.as_path()),
-            );
+        let resolved_profile =
+            if let Some(pane) = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id) {
+                identity_changed |= resolve_pane_identity(
+                    pane,
+                    title_signal.as_deref(),
+                    command_profile,
+                    Some(cwd.as_path()),
+                );
+                Some(pane.identity.profile)
+            } else {
+                None
+            };
+        let status_update = state
+            .panes
+            .get_mut(&pane_id)
+            .and_then(RuntimePane::terminal_mut)
+            .and_then(|runtime| {
+                if resolved_profile != Some(TerminalProfile::Omp) {
+                    runtime.omp_title_status = None;
+                    return None;
+                }
+                let Some(next) = title_signal.as_deref().and_then(omp_title_status) else {
+                    runtime.omp_title_status = None;
+                    return None;
+                };
+                if runtime.omp_title_status == Some(next) {
+                    return None;
+                }
+                let previous = runtime.omp_title_status.replace(next);
+                Some(
+                    if previous == Some(PaneStatus::Working) && next == PaneStatus::Idle {
+                        PaneStatus::Done
+                    } else {
+                        next
+                    },
+                )
+            });
+        if let Some(status) = status_update {
+            state.set_pane_status(pane_id, status);
         }
     }
     if identity_changed {

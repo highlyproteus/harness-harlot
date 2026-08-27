@@ -159,7 +159,7 @@ const fn png(path: &'static str, sha256: &'static str) -> AgentIconAsset {
 
 /// Desktop-only icon registry. Assets are compiled into the executable and
 /// are never fetched or resolved from the user's environment at runtime.
-pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 12] = [
+pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 13] = [
     AgentIconDefinition {
         profile: TerminalProfile::Terminal,
         accessible_name: "Terminal",
@@ -174,6 +174,12 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 12] = [
             "0cad9cd8f57639ffd60fe1ff2e6cb722bca4fc1bf8e9137068dba4b2f3abc989",
         )),
         notice_key: "hermes-agent",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::Omp,
+        accessible_name: "omp",
+        asset: None,
+        notice_key: "omp",
     },
     AgentIconDefinition {
         profile: TerminalProfile::Codex,

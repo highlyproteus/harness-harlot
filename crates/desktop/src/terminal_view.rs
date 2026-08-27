@@ -6,7 +6,7 @@ use gpui::{
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled};
 use hh_protocol::{
-    ClientRequest, DropPlacement, HistoryPageFlags, Pane, PaneLayout, SplitAxis,
+    ClientRequest, DropPlacement, HistoryPageFlags, Pane, PaneLayout, PaneStatus, SplitAxis,
     TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, WorkspaceConnection,
 };
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -19,17 +19,18 @@ use crate::elements::{TerminalGridElement, TerminalPointerElement};
 use crate::helpers::visible_panes;
 use crate::helpers::{
     IDENTITY_MARK_SIZE, effective_split_ratio, element_key, find_pane, plain_history_line,
-    selection_span, split_child_dimensions, split_control_id, split_element_key,
-    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
-    tab_identity_presentation, terminal_run_display_text, terminal_tab_secondary_label,
-    workspace_layout_for_focused_pane, workspace_tab_standalone_pane, zoom_projection,
+    render_headphones_icon, render_microphone_icon, selection_span, split_child_dimensions,
+    split_control_id, split_element_key, split_placement_at, split_target_for_drag,
+    split_target_for_drag_ids, tab_identity_presentation, terminal_run_display_text,
+    terminal_tab_secondary_label, workspace_layout_for_focused_pane, workspace_tab_standalone_pane,
+    zoom_projection,
 };
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{
     DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag, SearchEditor, SplitControlId,
     TabDrag, TerminalLineRender, TooltipView, WorkspaceDrag,
 };
-use crate::{HhApp, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, THEME};
+use crate::{HhApp, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, THEME, pane_status_color};
 use uuid::Uuid;
 
 impl HhApp {
@@ -139,6 +140,27 @@ impl HhApp {
             .into_any_element()
     }
 
+    /// Wraps the assistant surface with the shared pane-header tab strip.
+    pub(crate) fn render_assistant_pane(
+        &mut self,
+        pane: &Pane,
+        panes: Vec<Pane>,
+        show_pane_header: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .when(show_pane_header, |element| {
+                element.child(self.render_pane_header(panes, pane.id, cx))
+            })
+            .child(self.render_assistant_workspace(pane, cx))
+            .into_any_element()
+    }
+
     fn render_pane_header_controls(
         &self,
         panes: Vec<Pane>,
@@ -153,6 +175,8 @@ impl HhApp {
                 let identity_detail = identity.detail.clone();
                 let secondary_label = terminal_tab_secondary_label(&pane).map(str::to_owned);
                 let selected = pane_id == active;
+                let status = pane.status;
+                let status_color = pane_status_color(status);
                 let pane_accent = pane
                     .color
                     .unwrap_or_else(|| self.terminal_accent(pane_id))
@@ -258,6 +282,16 @@ impl HhApp {
                                 .child(label),
                         )
                     })
+                    .when(status != PaneStatus::Idle, |element| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .rounded_full()
+                                .bg(rgb(status_color.expect("non-idle status has a color"))),
+                        )
+                    })
                     .child(
                         div()
                             .id(("close-tab", element_key(pane_id)))
@@ -295,6 +329,94 @@ impl HhApp {
                             }))
                             .child("×"),
                     )
+                    .when(pane.kind.is_assistant(), |element| {
+                        let (mic_muted, speaker_muted) = self
+                            .voice
+                            .sessions
+                            .get(&pane_id)
+                            .map_or((false, false), |session| {
+                                (session.mic_muted, session.speaker_muted)
+                            });
+                        element
+                            .child(
+                                div()
+                                    .id(("assistant-mic-header", element_key(pane_id)))
+                                    .ml(px(1.0))
+                                    .flex_none()
+                                    .w(px(18.0))
+                                    .h(px(18.0))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .font_family("SF Mono")
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(if mic_muted {
+                                        THEME.danger
+                                    } else {
+                                        THEME.accent
+                                    }))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: if mic_muted {
+                                                "Unmute microphone".to_owned()
+                                            } else {
+                                                "Mute microphone".to_owned()
+                                            },
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_assistant_mic(pane_id, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(render_microphone_icon(if mic_muted {
+                                        THEME.danger
+                                    } else {
+                                        THEME.accent
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("assistant-speaker-header", element_key(pane_id)))
+                                    .ml(px(1.0))
+                                    .flex_none()
+                                    .w(px(18.0))
+                                    .h(px(18.0))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .font_family("SF Mono")
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(if speaker_muted {
+                                        THEME.danger
+                                    } else {
+                                        THEME.accent
+                                    }))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| TooltipView {
+                                            text: if speaker_muted {
+                                                "Unmute headphones".to_owned()
+                                            } else {
+                                                "Mute headphones".to_owned()
+                                            },
+                                        })
+                                        .into()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_assistant_speaker(pane_id, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(render_headphones_icon(if speaker_muted {
+                                        THEME.danger
+                                    } else {
+                                        THEME.accent
+                                    })),
+                            )
+                    })
                     .into_any_element()
             })
             .collect()
@@ -1032,6 +1154,8 @@ impl HhApp {
                         show_pane_header,
                         cx,
                     )
+                } else if pane.kind.is_assistant() {
+                    self.render_assistant_pane(pane, vec![pane.clone()], show_pane_header, cx)
                 } else {
                     let active = pane.id;
                     self.render_terminal(vec![pane.clone()], active, show_pane_header, cx)
@@ -1051,6 +1175,12 @@ impl HhApp {
                         show_pane_header,
                         cx,
                     )
+                } else if let Some(pane) = panes
+                    .iter()
+                    .find(|pane| pane.id == *active)
+                    .filter(|pane| pane.kind.is_assistant())
+                {
+                    self.render_assistant_pane(pane, panes.clone(), show_pane_header, cx)
                 } else {
                     self.render_terminal(panes.clone(), *active, show_pane_header, cx)
                 }
@@ -1291,17 +1421,17 @@ impl HhApp {
                 )
                 .into_any_element()
         };
-        let showing_appearance_settings = matches!(self.editor.modal, Modal::AppearanceSettings);
         #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-        if showing_appearance_settings {
+        let showing_settings = matches!(self.editor.modal, Modal::AppearanceSettings);
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+        if showing_settings {
             visible_browsers.clear();
         }
         #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         self.sync_browser_view_presentation(&visible_browsers);
-        let workspace_content = if showing_appearance_settings {
-            self.render_appearance_settings(cx)
-        } else {
-            workspace_content
+        let workspace_content = match self.editor.modal {
+            Modal::AppearanceSettings => self.render_appearance_settings(cx),
+            _ => workspace_content,
         };
         div()
             .min_w(px(0.0))

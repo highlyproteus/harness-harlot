@@ -5,6 +5,19 @@ use uuid::Uuid;
 
 use crate::profile::TerminalProfile;
 
+/// Ephemeral activity state projected by the local session service.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneStatus {
+    #[default]
+    Idle,
+    Working,
+    NeedsApproval,
+    NeedsInput,
+    Attention,
+    Done,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalScreen {
     pub pane_id: Uuid,

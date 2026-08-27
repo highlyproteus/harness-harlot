@@ -1,4 +1,7 @@
-use hh_protocol::{ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, ServiceResponse, WireError};
+use hh_protocol::{
+    AppearanceColor, ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, PaneKind, PaneLayout,
+    ServiceResponse, WireError,
+};
 use hh_session_service::{SessionRegistry, serve_connection};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -83,6 +86,96 @@ async fn client_can_handshake_and_fetch_snapshot() {
         }
         other => panic!("unexpected response: {other:?}"),
     }
+
+    drop(client);
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn assistant_identity_requests_round_trip_over_the_service_socket() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let registry = SessionRegistry::new().expect("start seeded configured-shell PTY");
+    let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+    let server_task = tokio::spawn(async move {
+        serve_connection(server, &registry).await.unwrap();
+    });
+
+    write_message(
+        &mut client,
+        &ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_message::<ServiceResponse>(&mut client).await.unwrap(),
+        ServiceResponse::Hello {
+            protocol_version: PROTOCOL_VERSION
+        }
+    ));
+
+    write_message(
+        &mut client,
+        &ClientRequest::CreateAssistantTab { workspace_id },
+    )
+    .await
+    .unwrap();
+    let ServiceResponse::PaneCreated { pane_id } =
+        read_message::<ServiceResponse>(&mut client).await.unwrap()
+    else {
+        panic!("assistant creation did not return its pane id");
+    };
+
+    let color = AppearanceColor::new(0x12, 0x34, 0x56);
+    let requests = [
+        ClientRequest::RenamePane {
+            pane_id,
+            title: "Helper".to_owned(),
+        },
+        ClientRequest::SetPaneColor {
+            pane_id,
+            color: Some(color),
+        },
+        ClientRequest::SetPaneCustomIcon {
+            pane_id,
+            icon: None,
+        },
+        ClientRequest::SetPaneProfile {
+            pane_id,
+            profile: None,
+        },
+        ClientRequest::ResetPaneIdentity { pane_id },
+    ];
+    for request in requests {
+        write_message(&mut client, &request).await.unwrap();
+        assert!(matches!(
+            read_message::<ServiceResponse>(&mut client).await.unwrap(),
+            ServiceResponse::Ack
+        ));
+    }
+
+    write_message(&mut client, &ClientRequest::GetSnapshot)
+        .await
+        .unwrap();
+    let ServiceResponse::Snapshot { snapshot } =
+        read_message::<ServiceResponse>(&mut client).await.unwrap()
+    else {
+        panic!("snapshot request returned an unexpected response");
+    };
+    let pane = snapshot.workspaces[0]
+        .tabs
+        .iter()
+        .find_map(|tab| match &tab.layout {
+            PaneLayout::Leaf { pane } if pane.id == pane_id => Some(pane),
+            _ => None,
+        })
+        .expect("assistant pane in service snapshot");
+    assert_eq!(pane.kind, PaneKind::Assistant);
+    assert_eq!(pane.title, "Helper");
+    assert_eq!(pane.color, Some(color));
+    assert_eq!(pane.custom_title, None);
+    assert_eq!(pane.custom_icon, None);
 
     drop(client);
     server_task.await.unwrap();

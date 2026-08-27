@@ -18,6 +18,13 @@ pub(crate) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation 
             detail: "Chromium browser tab".to_owned(),
         };
     }
+    if pane.kind.is_assistant() {
+        return TabIdentityPresentation {
+            label: pane.title.clone(),
+            profile: TerminalProfile::Terminal,
+            detail: "Voice assistant".to_owned(),
+        };
+    }
     let detection_detail = match pane.identity.source {
         hh_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
         hh_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",
@@ -161,6 +168,95 @@ pub(crate) fn render_bell_icon(color: u32) -> AnyElement {
         )
         .into_any_element()
 }
+pub(crate) fn render_microphone_icon(color: u32) -> AnyElement {
+    div()
+        .relative()
+        .w(px(14.0))
+        .h(px(14.0))
+        .child(
+            div()
+                .absolute()
+                .left(px(4.0))
+                .top(px(0.0))
+                .w(px(6.0))
+                .h(px(9.0))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(color)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(2.0))
+                .top(px(5.0))
+                .w(px(10.0))
+                .h(px(6.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(rgb(color)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(6.5))
+                .top(px(10.0))
+                .w(px(1.0))
+                .h(px(3.0))
+                .bg(rgb(color)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(4.0))
+                .top(px(13.0))
+                .w(px(6.0))
+                .h(px(1.0))
+                .bg(rgb(color)),
+        )
+        .into_any_element()
+}
+
+pub(crate) fn render_headphones_icon(color: u32) -> AnyElement {
+    div()
+        .relative()
+        .w(px(14.0))
+        .h(px(14.0))
+        .child(
+            div()
+                .absolute()
+                .left(px(2.0))
+                .top(px(1.0))
+                .w(px(10.0))
+                .h(px(10.0))
+                .rounded_tl(px(5.0))
+                .rounded_tr(px(5.0))
+                .border_t_1()
+                .border_l_1()
+                .border_r_1()
+                .border_color(rgb(color)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(7.0))
+                .w(px(4.0))
+                .h(px(6.0))
+                .rounded(px(2.0))
+                .bg(rgb(color)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(10.0))
+                .top(px(7.0))
+                .w(px(4.0))
+                .h(px(6.0))
+                .rounded(px(2.0))
+                .bg(rgb(color)),
+        )
+        .into_any_element()
+}
 
 pub(crate) fn render_terminal_profile_icon(
     profile: TerminalProfile,
@@ -292,6 +388,7 @@ mod tests {
                         hh_protocol::TerminalIdentitySource::Command
                     },
                 },
+                status: hh_protocol::PaneStatus::default(),
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
@@ -327,6 +424,7 @@ mod tests {
             shell: "ssh release@long-production-host.example.com".to_owned(),
             color: None,
             identity: hh_protocol::TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,

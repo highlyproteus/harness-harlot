@@ -10,6 +10,7 @@ pub enum TerminalProfile {
     #[default]
     Terminal,
     Hermes,
+    Omp,
     Codex,
     Claude,
     Droid,
@@ -23,9 +24,10 @@ pub enum TerminalProfile {
 }
 
 impl TerminalProfile {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Terminal,
         Self::Hermes,
+        Self::Omp,
         Self::Codex,
         Self::Claude,
         Self::Droid,
@@ -42,6 +44,7 @@ impl TerminalProfile {
         match self {
             Self::Terminal => "Terminal",
             Self::Hermes => "Hermes Agent",
+            Self::Omp => "omp",
             Self::Codex => "Codex CLI",
             Self::Claude => "Claude Code",
             Self::Droid => "Droid",
@@ -88,10 +91,15 @@ pub struct TerminalProfileDefinition {
 
 /// Local, compile-time registry used for explicit profiles and bounded exact
 /// detection. It performs no network access and contains no third-party art.
-pub const TERMINAL_PROFILE_REGISTRY: [TerminalProfileDefinition; 11] = [
+pub const TERMINAL_PROFILE_REGISTRY: [TerminalProfileDefinition; 12] = [
     TerminalProfileDefinition {
         profile: TerminalProfile::Hermes,
         commands: &["hermes", "hermes-agent"],
+        terminal_titles: &[],
+    },
+    TerminalProfileDefinition {
+        profile: TerminalProfile::Omp,
+        commands: &["omp"],
         terminal_titles: &[],
     },
     TerminalProfileDefinition {
@@ -213,6 +221,10 @@ mod tests {
         assert_eq!(
             terminal_profile_for_command("/opt/homebrew/bin/hermes"),
             Some(TerminalProfile::Hermes)
+        );
+        assert_eq!(
+            terminal_profile_for_command("/opt/homebrew/bin/omp"),
+            Some(TerminalProfile::Omp)
         );
         assert_eq!(
             terminal_profile_for_command("CODEX.EXE"),

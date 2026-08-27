@@ -1,16 +1,17 @@
 use gpui::{IntoElement, ParentElement, Pixels, Point, Render, Styled, Window, div, px, rgb};
 use hh_protocol::{
-    ClientRequest, DropPlacement, MAX_SSH_INPUT_LEN, Pane, SplitAxis, TerminalHistoryPage,
-    TerminalPoint, TerminalProfile, TerminalSelection, TerminalSelectionKind, TmuxScanScope,
-    TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
+    ClientRequest, DropPlacement, MAX_SSH_INPUT_LEN, MAX_WORKSPACE_DIR_BYTES, Pane, SplitAxis,
+    TerminalHistoryPage, TerminalPoint, TerminalProfile, TerminalSelection, TerminalSelectionKind,
+    TmuxScanScope, TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
 };
 use std::collections::HashSet;
 use std::ops::Range;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use gpui::{Context, MouseButton};
 
-use crate::THEME;
+use crate::{THEME, helpers::expand_home};
 
 #[derive(Clone, Debug)]
 pub(super) struct PaneDrag {
@@ -107,6 +108,62 @@ fn drag_ghost(title: &str, position: gpui::Point<Pixels>, terminal: bool) -> imp
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct ComposerAttachment {
+    pub(super) filename: String,
+    pub(super) data_url: String,
+    pub(super) path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct AssistantComposer {
+    pub(super) pane_id: Uuid,
+    pub(super) text: String,
+    pub(super) selection: Option<Range<usize>>,
+    pub(super) attachment: Option<ComposerAttachment>,
+}
+
+impl AssistantComposer {
+    pub(super) fn insert(&mut self, text: &str) {
+        if let Some(selection) = self.selection.take() {
+            self.text.replace_range(selection, text);
+        } else {
+            self.text.push_str(text);
+        }
+    }
+
+    pub(super) fn backspace(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            self.text.replace_range(selection, "");
+        } else {
+            self.text.pop();
+        }
+    }
+
+    pub(super) fn select_all(&mut self) {
+        self.selection = (!self.text.is_empty()).then_some(0..self.text.len());
+    }
+
+    pub(super) fn selected_text(&self) -> Option<&str> {
+        self.selection
+            .as_ref()
+            .and_then(|selection| self.text.get(selection.clone()))
+    }
+
+    pub(super) fn cut_selection(&mut self) -> Option<String> {
+        let selection = self.selection.take()?;
+        let selected = self.text.get(selection.clone())?.to_owned();
+        self.text.replace_range(selection, "");
+        Some(selected)
+    }
+
+    pub(super) fn all_selected(&self) -> bool {
+        self.selection
+            .as_ref()
+            .is_some_and(|selection| selection.start == 0 && selection.end == self.text.len())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct TooltipView {
     pub(super) text: String,
 }
@@ -138,6 +195,7 @@ pub(super) struct TabMenu {
 pub(super) struct WorkspaceMenu {
     pub(super) workspace_id: Uuid,
     pub(super) position: Point<Pixels>,
+    pub(super) icon_picker_open: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -269,7 +327,15 @@ pub(super) struct CloseConfirmation {
     pub(super) pane_id: Uuid,
     pub(super) title: String,
     pub(super) leaves_workspace_empty: bool,
-    pub(super) is_browser: bool,
+    pub(super) kind: CloseConfirmationKind,
+}
+
+/// Drives the close-dialog copy for the pane kind being closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CloseConfirmationKind {
+    Terminal,
+    Browser,
+    Assistant,
 }
 #[derive(Clone, Debug)]
 pub(super) struct TabCloseConfirmation {
@@ -363,10 +429,13 @@ pub(super) enum TmuxSelectionChange {
     None,
 }
 
+const MAX_ASSISTANT_INSTRUCTIONS_CHARS: usize = 4_096;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WorkspaceCreationKind {
     Local,
     SystemSsh,
+    Assistant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +448,8 @@ pub(super) enum WorkspaceCreationStep {
 pub(super) enum WorkspaceCreationField {
     Name,
     Destination,
+    WorkingDir,
+    Instructions,
 }
 
 impl WorkspaceCreationField {
@@ -386,6 +457,8 @@ impl WorkspaceCreationField {
         match self {
             Self::Name => 0,
             Self::Destination => 1,
+            Self::WorkingDir => 2,
+            Self::Instructions => 3,
         }
     }
 }
@@ -680,6 +753,8 @@ pub(super) struct WorkspaceCreationDialog {
     pub(super) kind: WorkspaceCreationKind,
     pub(super) name: DialogTextEditor,
     pub(super) destination: DialogTextEditor,
+    pub(super) working_dir: DialogTextEditor,
+    pub(super) instructions: DialogTextEditor,
     pub(super) field: WorkspaceCreationField,
     pub(super) step: WorkspaceCreationStep,
     pub(super) error: Option<String>,
@@ -691,6 +766,8 @@ impl WorkspaceCreationDialog {
             kind: WorkspaceCreationKind::Local,
             name: DialogTextEditor::default(),
             destination: DialogTextEditor::default(),
+            working_dir: DialogTextEditor::default(),
+            instructions: DialogTextEditor::default(),
             field: WorkspaceCreationField::Name,
             step: WorkspaceCreationStep::Details,
             error: None,
@@ -712,6 +789,8 @@ impl WorkspaceCreationDialog {
         match self.field {
             WorkspaceCreationField::Name => &self.name,
             WorkspaceCreationField::Destination => &self.destination,
+            WorkspaceCreationField::WorkingDir => &self.working_dir,
+            WorkspaceCreationField::Instructions => &self.instructions,
         }
     }
 
@@ -719,6 +798,8 @@ impl WorkspaceCreationDialog {
         match self.field {
             WorkspaceCreationField::Name => &mut self.name,
             WorkspaceCreationField::Destination => &mut self.destination,
+            WorkspaceCreationField::WorkingDir => &mut self.working_dir,
+            WorkspaceCreationField::Instructions => &mut self.instructions,
         }
     }
 
@@ -732,6 +813,8 @@ impl WorkspaceCreationDialog {
         let (maximum, limit_is_bytes) = match self.field {
             WorkspaceCreationField::Name => (80, false),
             WorkspaceCreationField::Destination => (MAX_SSH_INPUT_LEN, true),
+            WorkspaceCreationField::WorkingDir => (MAX_WORKSPACE_DIR_BYTES, true),
+            WorkspaceCreationField::Instructions => (MAX_ASSISTANT_INSTRUCTIONS_CHARS, false),
         };
         self.active_editor_mut().replace(
             range_utf16,
@@ -764,6 +847,17 @@ impl WorkspaceCreationDialog {
             WorkspaceCreationKind::Local if self.step == WorkspaceCreationStep::Details => {
                 Some(ClientRequest::CreateWorkspace { title })
             }
+            WorkspaceCreationKind::Assistant if self.step == WorkspaceCreationStep::Details => {
+                let working_dir = (!self.working_dir.text.trim().is_empty())
+                    .then(|| expand_home(self.working_dir.text.trim()));
+                let instructions = (!self.instructions.text.trim().is_empty())
+                    .then(|| self.instructions.text.trim().to_owned());
+                Some(ClientRequest::CreateAssistantWorkspace {
+                    title,
+                    working_dir,
+                    instructions,
+                })
+            }
             WorkspaceCreationKind::SystemSsh
                 if self.step == WorkspaceCreationStep::ConfirmSsh
                     && validate_ssh_host(&self.destination.text).is_ok() =>
@@ -773,7 +867,9 @@ impl WorkspaceCreationDialog {
                     destination: self.destination.text.clone(),
                 })
             }
-            WorkspaceCreationKind::Local | WorkspaceCreationKind::SystemSsh => None,
+            WorkspaceCreationKind::Local
+            | WorkspaceCreationKind::SystemSsh
+            | WorkspaceCreationKind::Assistant => None,
         }
     }
 }
@@ -793,11 +889,18 @@ pub(super) fn route_workspace_creation_paste(
 
 impl CloseConfirmation {
     pub(super) fn for_pane(pane: &Pane, leaves_workspace_empty: bool) -> Self {
+        let kind = if pane.kind.is_browser() {
+            CloseConfirmationKind::Browser
+        } else if pane.kind.is_assistant() {
+            CloseConfirmationKind::Assistant
+        } else {
+            CloseConfirmationKind::Terminal
+        };
         Self {
             pane_id: pane.id,
             title: pane.title.clone(),
-            is_browser: pane.kind.is_browser(),
             leaves_workspace_empty,
+            kind,
         }
     }
 
@@ -1107,8 +1210,9 @@ impl DragHoverState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientRequest, CloseConfirmation, DialogTextEditor, DragDestination, DragHoverState,
-        DropPlacement, HashSet, MAX_SSH_INPUT_LEN, MouseButton, Pane, SidebarResizeLifecycle,
+        ClientRequest, CloseConfirmation, CloseConfirmationKind, DialogTextEditor, DragDestination,
+        DragHoverState, DropPlacement, HashSet, MAX_ASSISTANT_INSTRUCTIONS_CHARS,
+        MAX_SSH_INPUT_LEN, MAX_WORKSPACE_DIR_BYTES, MouseButton, Pane, SidebarResizeLifecycle,
         SidebarResizeMove, TmuxScanScope, TmuxSession, TmuxSessionId, TmuxSessionPicker, Uuid,
         WorkspaceCreationDialog, WorkspaceCreationField, WorkspaceCreationKind,
         WorkspaceCreationStep, route_workspace_creation_paste,
@@ -1123,6 +1227,7 @@ mod tests {
             shell: "zsh".to_owned(),
             color: None,
             identity: hh_protocol::TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: Some("build".to_owned()),
             profile_override: None,
             custom_icon: None,
@@ -1132,7 +1237,7 @@ mod tests {
 
         assert_eq!(confirmation.pane_id, pane.id);
         assert_eq!(confirmation.title, "build");
-        assert!(!confirmation.is_browser);
+        assert_eq!(confirmation.kind, CloseConfirmationKind::Terminal);
         assert!(confirmation.leaves_workspace_empty);
         assert_eq!(
             confirmation.request(),
@@ -1158,6 +1263,49 @@ mod tests {
             })
         );
     }
+    #[test]
+    fn assistant_workspace_request_trims_fields_and_expands_home() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.kind = WorkspaceCreationKind::Assistant;
+        dialog.name = DialogTextEditor::with_text("  Research  ");
+        dialog.working_dir = DialogTextEditor::with_text("  ~/Projects  ");
+        dialog.instructions = DialogTextEditor::with_text("  answer in one sentence  ");
+        let expected_working_dir = std::env::var("HOME").map_or_else(
+            |_| "~/Projects".to_owned(),
+            |home| format!("{home}/Projects"),
+        );
+
+        assert_eq!(
+            dialog.approved_request(),
+            Some(ClientRequest::CreateAssistantWorkspace {
+                title: Some("Research".to_owned()),
+                working_dir: Some(expected_working_dir),
+                instructions: Some("answer in one sentence".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_workspace_fields_enforce_wire_limits() {
+        let mut dialog = WorkspaceCreationDialog::new();
+        dialog.kind = WorkspaceCreationKind::Assistant;
+        dialog.field = WorkspaceCreationField::WorkingDir;
+        dialog.replace_text(None, &"x".repeat(MAX_WORKSPACE_DIR_BYTES + 1), false, None);
+        assert_eq!(dialog.working_dir.text.len(), MAX_WORKSPACE_DIR_BYTES);
+
+        dialog.field = WorkspaceCreationField::Instructions;
+        dialog.replace_text(
+            None,
+            &"😀".repeat(MAX_ASSISTANT_INSTRUCTIONS_CHARS + 1),
+            false,
+            None,
+        );
+        assert_eq!(
+            dialog.instructions.text.chars().count(),
+            MAX_ASSISTANT_INSTRUCTIONS_CHARS
+        );
+    }
+
     #[test]
     fn workspace_dialog_editor_inserts_and_deletes_at_the_visible_caret() {
         let mut editor = DialogTextEditor::with_text("Terminal App");

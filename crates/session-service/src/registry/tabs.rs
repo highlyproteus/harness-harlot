@@ -45,6 +45,7 @@ impl SessionRegistry {
     /// every request adds a tab, which is what the workstation menu's "New Tab"
     /// means.
     pub fn create_workspace_tab(&self, workspace_id: Uuid) -> Result<Uuid> {
+        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
         self.append_workspace_tab(workspace_id, None, None, None)
     }
 
@@ -55,6 +56,7 @@ impl SessionRegistry {
         workspace_id: Uuid,
         parent_tab: Option<Uuid>,
     ) -> Result<Uuid> {
+        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
         let number = {
             let mut state = self.state.write();
             let number = state.next_group_number;
@@ -75,6 +77,7 @@ impl SessionRegistry {
         working_dir: &str,
         title: Option<&str>,
     ) -> Result<Uuid> {
+        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
         validate_workspace_dir(working_dir).map_err(anyhow::Error::from)?;
         let title = title.map_or_else(
             || {
@@ -216,6 +219,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );
@@ -353,6 +357,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );

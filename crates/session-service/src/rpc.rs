@@ -121,6 +121,8 @@ pub(crate) fn handle_request(
         | ClientRequest::CreateWorkspaceTab { .. }
         | ClientRequest::CreateBrowserTab { .. }
         | ClientRequest::CreateGroupBrowser { .. }
+        | ClientRequest::CreateAssistantTab { .. }
+        | ClientRequest::CreateGroupAssistant { .. }
         | ClientRequest::CreateWorkspaceGroup { .. }
         | ClientRequest::ConnectSsh { .. }
         | ClientRequest::RenamePane { .. }
@@ -149,8 +151,10 @@ pub(crate) fn handle_request(
         ClientRequest::SetDefaultTerminalAccent { .. }
         | ClientRequest::SetDefaultWorkspaceColor { .. }
         | ClientRequest::SetWorkspaceColor { .. }
+        | ClientRequest::SetWorkspaceCustomIcon { .. }
         | ClientRequest::SetWorkspaceWorkingDir { .. }
         | ClientRequest::CreateWorkspace { .. }
+        | ClientRequest::CreateAssistantWorkspace { .. }
         | ClientRequest::CreateSshWorkspace { .. }
         | ClientRequest::RenameWorkspace { .. }
         | ClientRequest::SetWorkspacePinned { .. }
@@ -245,6 +249,12 @@ fn handle_panes_request(
                 pane_id: sessions.create_group_browser(target_pane, url.as_deref())?,
             })
         }
+        ClientRequest::CreateAssistantTab { workspace_id } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_assistant_tab(workspace_id)?,
+        }),
+        ClientRequest::CreateGroupAssistant { target_pane } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_group_assistant(target_pane)?,
+        }),
         ClientRequest::CreateWorkspaceGroup {
             workspace_id,
             parent_tab,
@@ -425,8 +435,24 @@ fn handle_workspaces_request(
             sessions.set_workspace_working_dir(workspace_id, working_dir)?;
             Ok(ServiceResponse::Ack)
         }
+        ClientRequest::SetWorkspaceCustomIcon { workspace_id, icon } => {
+            sessions.set_workspace_custom_icon(workspace_id, icon)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::CreateWorkspace { title } => {
             let (workspace_id, pane_id) = sessions.create_workspace(title.as_deref())?;
+            Ok(ServiceResponse::WorkspaceCreated {
+                workspace_id,
+                pane_id,
+            })
+        }
+        ClientRequest::CreateAssistantWorkspace {
+            title,
+            working_dir,
+            instructions,
+        } => {
+            let (workspace_id, pane_id) =
+                sessions.create_assistant_workspace(title.as_deref(), working_dir, instructions)?;
             Ok(ServiceResponse::WorkspaceCreated {
                 workspace_id,
                 pane_id,

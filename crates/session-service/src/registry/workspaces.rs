@@ -5,15 +5,17 @@ use super::{
 };
 use crate::history::HistoryArchive;
 use crate::layout::{find_pane_mut, pane_ids_for_workspace};
-use crate::persistence::{MAX_RECENT_COLORS, MAX_WORKSPACES, validate_title};
+use crate::persistence::{
+    MAX_INSTRUCTIONS_CHARS, MAX_RECENT_COLORS, MAX_WORKSPACES, validate_title,
+};
 use crate::process::fallback_cwd;
 use crate::pty::PtySession;
 use crate::registry::identity::set_pane_runtime_label;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     AppearanceColor, MAX_PANES, Pane, PaneLayout, SessionSnapshot, Tab, TerminalIdentity,
-    Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspacePinMove, validate_ssh_host,
-    validate_workspace_dir,
+    Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspaceKind, WorkspacePinMove,
+    validate_ssh_host, validate_workspace_dir,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,6 +77,19 @@ pub(crate) fn normalize_workspace_title(title: Option<&str>) -> Result<Option<St
     Ok(Some(title.to_owned()))
 }
 
+fn normalize_assistant_instructions(instructions: Option<String>) -> Result<Option<String>> {
+    let instructions = instructions
+        .map(|instructions| instructions.trim().to_owned())
+        .filter(|instructions| !instructions.is_empty());
+    if instructions
+        .as_deref()
+        .is_some_and(|instructions| instructions.chars().count() > MAX_INSTRUCTIONS_CHARS)
+    {
+        bail!("assistant instructions too long");
+    }
+    Ok(instructions)
+}
+
 pub(crate) fn next_workspace_order(workspaces: &[Workspace], pinned: bool) -> u32 {
     workspaces
         .iter()
@@ -114,6 +129,23 @@ pub(crate) fn normalize_workspace_orders(workspaces: &mut [Workspace]) {
 }
 
 impl SessionRegistry {
+    pub(crate) fn ensure_workspace_accepts_non_assistant_tabs(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<()> {
+        let state = self.state.read();
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+        if workspace.is_assistant() {
+            bail!("assistant workspaces only hold assistant threads");
+        }
+        Ok(())
+    }
+
     pub fn set_default_terminal_accent(&self, color: AppearanceColor) -> Result<()> {
         let mut state = self.state.write();
         state.snapshot.appearance.default_terminal_accent = color;
@@ -187,6 +219,31 @@ impl SessionRegistry {
         self.write_snapshot(&bytes)
     }
 
+    pub fn set_workspace_custom_icon(
+        &self,
+        workspace_id: Uuid,
+        icon: Option<String>,
+    ) -> Result<()> {
+        if let Some(icon) = icon.as_deref() {
+            crate::persistence::validate_custom_icon_id(icon)?;
+        }
+        let mut state = self.state.write();
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+        if workspace.custom_icon == icon {
+            return Ok(());
+        }
+        workspace.custom_icon = icon;
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)
+    }
+
     pub fn create_workspace(&self, title: Option<&str>) -> Result<(Uuid, Uuid)> {
         let title = normalize_workspace_title(title)?;
         {
@@ -224,6 +281,9 @@ impl SessionRegistry {
                 active_terminal_count: 1,
                 connection: WorkspaceConnection::Local,
                 working_dir: None,
+                kind: WorkspaceKind::Workstation,
+                instructions: None,
+                custom_icon: None,
                 tabs: vec![Tab {
                     id: tab_id,
                     title: "Terminals".to_owned(),
@@ -246,6 +306,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );
@@ -259,6 +320,95 @@ impl SessionRegistry {
             let _ = session.terminate_and_wait();
         }
         result
+    }
+    pub fn create_assistant_workspace(
+        &self,
+        title: Option<&str>,
+        working_dir: Option<String>,
+        instructions: Option<String>,
+    ) -> Result<(Uuid, Uuid)> {
+        let title = normalize_workspace_title(title)?;
+        if let Some(working_dir) = working_dir.as_deref() {
+            validate_workspace_dir(working_dir).map_err(anyhow::Error::from)?;
+        }
+        let instructions = normalize_assistant_instructions(instructions)?;
+        {
+            let state = self.state.read();
+            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+                bail!("workstation limit of {MAX_WORKSPACES} reached");
+            }
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
+        }
+
+        let workspace_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut state = self.state.write();
+        if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+            bail!("workstation limit of {MAX_WORKSPACES} reached");
+        }
+        if state.panes.len() >= MAX_PANES {
+            bail!("pane limit of {MAX_PANES} reached");
+        }
+        let number = state
+            .snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.is_assistant())
+            .count()
+            + 1;
+        let order = next_workspace_order(&state.snapshot.workspaces, false);
+        state.snapshot.workspaces.push(Workspace {
+            id: workspace_id,
+            title: title.unwrap_or_else(|| format!("Assistant {number}")),
+            color: None,
+            pinned: false,
+            pin_order: 0,
+            order,
+            active_terminal_count: 0,
+            connection: WorkspaceConnection::Local,
+            working_dir,
+            kind: WorkspaceKind::Assistant,
+            instructions,
+            custom_icon: None,
+            tabs: vec![Tab {
+                id: tab_id,
+                title: "Thread 1".to_owned(),
+                custom_title: None,
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
+                layout: PaneLayout::Leaf {
+                    pane: Pane {
+                        id: pane_id,
+                        title: "Assistant".to_owned(),
+                        shell: String::new(),
+                        kind: hh_protocol::PaneKind::Assistant,
+                        color: None,
+                        identity: TerminalIdentity::default(),
+                        status: hh_protocol::PaneStatus::default(),
+                        custom_title: None,
+                        profile_override: None,
+                        custom_icon: None,
+                    },
+                },
+            }],
+        });
+        state.panes.insert(
+            pane_id,
+            RuntimePane {
+                backend: RuntimePaneBackend::Assistant,
+            },
+        );
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)?;
+        Ok((workspace_id, pane_id))
     }
 
     pub fn create_ssh_workspace(
@@ -306,6 +456,7 @@ impl SessionRegistry {
             shell: "ssh".to_owned(),
             color: None,
             identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -323,6 +474,9 @@ impl SessionRegistry {
                 status: WorkspaceConnectionStatus::Offline,
             },
             working_dir: None,
+            kind: WorkspaceKind::Workstation,
+            instructions: None,
+            custom_icon: None,
             tabs: vec![Tab {
                 id: ids.tab,
                 title: "Remote".to_owned(),
@@ -377,6 +531,7 @@ impl SessionRegistry {
                     recovered: false,
                     exit_status: None,
                     detected_command_profile: None,
+                    omp_title_status: None,
                 }),
             },
         );
@@ -729,6 +884,7 @@ impl SessionRegistry {
                 shell: "ssh".to_owned(),
                 color: None,
                 identity: TerminalIdentity::default(),
+                status: hh_protocol::PaneStatus::default(),
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
@@ -774,6 +930,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );

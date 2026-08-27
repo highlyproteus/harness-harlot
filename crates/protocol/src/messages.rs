@@ -62,6 +62,12 @@ pub enum ClientRequest {
         target_pane: Uuid,
         url: Option<String>,
     },
+    CreateAssistantTab {
+        workspace_id: Uuid,
+    },
+    CreateGroupAssistant {
+        target_pane: Uuid,
+    },
     CreateWorkspaceGroup {
         workspace_id: Uuid,
         #[serde(default)]
@@ -194,8 +200,17 @@ pub enum ClientRequest {
         workspace_id: Uuid,
         color: Option<AppearanceColor>,
     },
+    SetWorkspaceCustomIcon {
+        workspace_id: Uuid,
+        icon: Option<String>,
+    },
     CreateWorkspace {
         title: Option<String>,
+    },
+    CreateAssistantWorkspace {
+        title: Option<String>,
+        working_dir: Option<String>,
+        instructions: Option<String>,
     },
     CreateSshWorkspace {
         title: Option<String>,
@@ -389,6 +404,35 @@ mod tests {
                 }),
             ),
             (
+                ClientRequest::CreateAssistantTab { workspace_id },
+                serde_json::json!({
+                    "type": "create_assistant_tab",
+                    "workspace_id": workspace_id,
+                }),
+            ),
+            (
+                ClientRequest::CreateAssistantWorkspace {
+                    title: Some("Research".to_owned()),
+                    working_dir: Some("/srv/projects".to_owned()),
+                    instructions: Some("Answer tersely".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "create_assistant_workspace",
+                    "title": "Research",
+                    "working_dir": "/srv/projects",
+                    "instructions": "Answer tersely",
+                }),
+            ),
+            (
+                ClientRequest::CreateGroupAssistant {
+                    target_pane: pane_id,
+                },
+                serde_json::json!({
+                    "type": "create_group_assistant",
+                    "target_pane": pane_id,
+                }),
+            ),
+            (
                 ClientRequest::SetBrowserState {
                     pane_id,
                     url: "https://example.com/next".to_owned(),
@@ -520,6 +564,17 @@ mod tests {
                 serde_json::json!({
                     "type": "set_tab_custom_icon",
                     "tab_id": tab_id,
+                    "icon": "00000000-0000-4000-8000-000000000004.png",
+                }),
+            ),
+            (
+                ClientRequest::SetWorkspaceCustomIcon {
+                    workspace_id,
+                    icon: Some("00000000-0000-4000-8000-000000000004.png".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "set_workspace_custom_icon",
+                    "workspace_id": workspace_id,
                     "icon": "00000000-0000-4000-8000-000000000004.png",
                 }),
             ),

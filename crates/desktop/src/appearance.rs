@@ -177,6 +177,9 @@ impl HhApp {
         if let Modal::GroupMenu(menu) = &mut self.editor.modal {
             menu.icon_picker_open = false;
         }
+        if let Modal::WorkspaceMenu(menu) = &mut self.editor.modal {
+            menu.icon_picker_open = false;
+        }
         cx.notify();
     }
 
@@ -205,6 +208,7 @@ impl HhApp {
         self.editor.color_picker = None;
         self.editor.history_editor = None;
         self.editor.history_clear_confirmation = None;
+        self.voice.settings_editor = crate::voice::VoiceSettingsEditor::load();
         self.refresh_history_status();
         cx.notify();
     }
@@ -881,7 +885,8 @@ impl HhApp {
                             .child("Saved locally with session layout · no network or telemetry"),
                     )
                     .child(self.render_update_settings(cx))
-                    .child(self.render_history_settings(cx)),
+                    .child(self.render_history_settings(cx))
+                    .child(self.render_voice_settings_section(cx)),
                     ),
             )
             .into_any_element()

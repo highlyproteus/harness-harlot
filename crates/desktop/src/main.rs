@@ -13,12 +13,12 @@ use gpui::{
     Pixels, ScrollHandle, ShapedLine, TitlebarOptions, Window, WindowBounds, WindowOptions,
     actions, point, px, size,
 };
-use hh_desktop::SessionClient;
 use hh_protocol::{
     AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, HistoryArchiveStatus, HistoryClearScope,
-    PaneStreamState, ServiceResponse, SessionNotification, SessionSnapshot, StreamDiagnostics,
-    TerminalScreen,
+    PaneStatus, PaneStreamState, ServiceResponse, SessionNotification, SessionSnapshot,
+    StreamDiagnostics, TerminalScreen,
 };
+use hh_session_client::SessionClient;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -54,6 +54,7 @@ mod session;
 mod sidebar;
 mod terminal_view;
 mod theme;
+mod voice;
 mod workspace_tab_strip;
 mod workspaces;
 
@@ -83,8 +84,9 @@ use typography::TerminalFontProfile;
 use ui_state::UiStateStore;
 use updates::{UpdateCheckState, automatic_update_check_interval, automatic_update_checks_enabled};
 use view_models::{
-    ArchivedView, ColorPickerState, DragHoverState, HistoryEditor, Modal, PaneDrag, ResizeDrag,
-    SelectionDrag, SidebarResizeLifecycle, SplitControlId, TabDropPreview, WorkspaceDropPreview,
+    ArchivedView, AssistantComposer, ColorPickerState, DragHoverState, HistoryEditor, Modal,
+    PaneDrag, ResizeDrag, SelectionDrag, SidebarResizeLifecycle, SplitControlId, TabDropPreview,
+    WorkspaceDropPreview,
 };
 
 actions!(
@@ -107,6 +109,8 @@ actions!(
         ShowNotifications,
         EqualizePanes,
         ReattachPane,
+        ToggleVoiceMic,
+        ShowSettings,
         ConsumeChordPrefix,
         CopyTerminal,
         PasteTerminal,
@@ -157,6 +161,35 @@ const TAB_COLOR_ALPHA: u8 = 0xd0;
 const STABLE_PRODUCT_NAME: &str = "Harness Harlot";
 const DEVELOPMENT_PRODUCT_NAME: &str = "Harness Harlot Dev";
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
+
+const fn pane_status_severity(status: PaneStatus) -> u8 {
+    match status {
+        PaneStatus::Idle => 0,
+        PaneStatus::Done => 1,
+        PaneStatus::Working => 2,
+        PaneStatus::Attention => 3,
+        PaneStatus::NeedsInput => 4,
+        PaneStatus::NeedsApproval => 5,
+    }
+}
+
+fn max_pane_status(statuses: impl IntoIterator<Item = PaneStatus>) -> PaneStatus {
+    statuses
+        .into_iter()
+        .max_by_key(|status| pane_status_severity(*status))
+        .unwrap_or_default()
+}
+
+const fn pane_status_color(status: PaneStatus) -> Option<u32> {
+    match status {
+        PaneStatus::Idle => None,
+        PaneStatus::Working => Some(THEME.dim),
+        PaneStatus::NeedsApproval => Some(THEME.danger),
+        PaneStatus::NeedsInput => Some(THEME.accent),
+        PaneStatus::Attention => Some(THEME.accent_soft),
+        PaneStatus::Done => Some(THEME.ansi[2]),
+    }
+}
 const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
     AppearanceColor::new(0x62, 0xad, 0xff),
     AppearanceColor::new(0x67, 0xc8, 0xc6),
@@ -340,10 +373,11 @@ struct EditorUi {
     history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
     browser_url_editor: Option<BrowserUrlEditor>,
+    assistant_composer: Option<AssistantComposer>,
     ime_preedit: String,
-    workspace_input_focus: [FocusHandle; 2],
-    workspace_input_layouts: [Option<ShapedLine>; 2],
-    workspace_input_bounds: [Option<Bounds<Pixels>>; 2],
+    workspace_input_focus: [FocusHandle; 4],
+    workspace_input_layouts: [Option<ShapedLine>; 4],
+    workspace_input_bounds: [Option<Bounds<Pixels>>; 4],
     /// Archived-history views per pane; belongs with editing UI state.
     archived_views: HashMap<Uuid, ArchivedView>,
     update_available: Option<AvailableUpdateBanner>,
@@ -351,17 +385,18 @@ struct EditorUi {
 }
 
 impl EditorUi {
-    fn new(workspace_input_focus: [FocusHandle; 2]) -> Self {
+    fn new(workspace_input_focus: [FocusHandle; 4]) -> Self {
         Self {
             modal: Modal::None,
             history_editor: None,
             history_clear_confirmation: None,
             color_picker: None,
             browser_url_editor: None,
+            assistant_composer: None,
             ime_preedit: String::new(),
             workspace_input_focus,
-            workspace_input_layouts: [None, None],
-            workspace_input_bounds: [None, None],
+            workspace_input_layouts: [None, None, None, None],
+            workspace_input_bounds: [None, None, None, None],
             archived_views: HashMap::new(),
             update_available: None,
             update_check: UpdateCheckState::default(),
@@ -415,6 +450,7 @@ struct HhApp {
     sidebar: SidebarUi,
     layout: LayoutUi,
     editor: EditorUi,
+    voice: voice::VoiceUi,
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     browser: BrowserUi,
 }
@@ -423,7 +459,12 @@ impl HhApp {
     fn new(window: &mut Window, keymap: ResolvedKeymap, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        let workspace_input_focus = [cx.focus_handle(), cx.focus_handle()];
+        let workspace_input_focus = [
+            cx.focus_handle(),
+            cx.focus_handle(),
+            cx.focus_handle(),
+            cx.focus_handle(),
+        ];
         let terminal_font = TerminalFontProfile::resolve(cx.text_system());
         let ui_state_store = match UiStateStore::from_default_path() {
             Ok(store) => Some(store),
@@ -509,6 +550,7 @@ impl HhApp {
             ),
             layout: LayoutUi::new(),
             editor: EditorUi::new(workspace_input_focus),
+            voice: voice::VoiceUi::new(),
             #[cfg(all(target_os = "macos", feature = "browser"))]
             browser: BrowserUi::new(browser_parent_view),
             #[cfg(all(target_os = "linux", feature = "browser"))]
@@ -520,8 +562,6 @@ impl HhApp {
         if app.layout.focused_pane.is_some() && app.session.screens.is_empty() {
             app.initial_state_fetch(cx);
         }
-
-        // Serialized request pipelines: one consumer task per latency lane.
         pipeline::spawn_lane(
             cx,
             pipeline::PipelineLane::from_receiver(stream_rx),
@@ -541,6 +581,10 @@ impl HhApp {
                 }
             }));
         }
+        app.voice.quit_subscription = Some(cx.on_app_quit(|this, _| {
+            this.shutdown_voice();
+            async {}
+        }));
 
         cx.observe_window_bounds(window, |this, window, cx| {
             if this.update_window_geometry(window) {
@@ -892,8 +936,9 @@ fn main() {
 mod tests {
     use super::{
         AvailableUpdateBanner, BUNDLED_BANNER_PIXEL_HEIGHT, BUNDLED_BANNER_PIXEL_WIDTH,
-        workstation_banner_path,
+        max_pane_status, pane_status_color, workstation_banner_path,
     };
+    use hh_protocol::PaneStatus;
 
     #[test]
     fn update_banner_reflects_install_capability() {
@@ -912,6 +957,31 @@ mod tests {
         };
         assert_eq!(manual.label(), "0.2.0 available — install manually");
         assert!(!manual.can_install());
+    }
+
+    #[test]
+    fn pane_status_badges_use_declared_severity_and_colors() {
+        assert_eq!(
+            max_pane_status([
+                PaneStatus::Done,
+                PaneStatus::Working,
+                PaneStatus::Attention,
+                PaneStatus::NeedsInput,
+                PaneStatus::NeedsApproval,
+            ]),
+            PaneStatus::NeedsApproval
+        );
+        assert_eq!(max_pane_status([]), PaneStatus::Idle);
+        assert_eq!(pane_status_color(PaneStatus::Idle), None);
+        for status in [
+            PaneStatus::Done,
+            PaneStatus::Working,
+            PaneStatus::Attention,
+            PaneStatus::NeedsInput,
+            PaneStatus::NeedsApproval,
+        ] {
+            assert!(pane_status_color(status).is_some(), "status: {status:?}");
+        }
     }
 
     #[test]

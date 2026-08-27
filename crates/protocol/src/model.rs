@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::profile::{TerminalIdentity, TerminalProfile};
+use crate::terminal::PaneStatus;
 use crate::validation::ValidationError;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -71,6 +72,7 @@ impl SessionSnapshot {
             kind: PaneKind::Terminal,
             color: None,
             identity: TerminalIdentity::default(),
+            status: PaneStatus::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -100,6 +102,9 @@ impl SessionSnapshot {
                 active_terminal_count: 1,
                 connection: WorkspaceConnection::Local,
                 working_dir: None,
+                kind: WorkspaceKind::Workstation,
+                instructions: None,
+                custom_icon: None,
                 tabs: vec![tab],
             }],
         }
@@ -125,7 +130,19 @@ pub struct Workspace {
     pub connection: WorkspaceConnection,
     #[serde(default)]
     pub working_dir: Option<String>,
+    #[serde(default)]
+    pub kind: WorkspaceKind,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub custom_icon: Option<String>,
     pub tabs: Vec<Tab>,
+}
+
+impl Workspace {
+    pub fn is_assistant(&self) -> bool {
+        self.kind == WorkspaceKind::Assistant
+    }
 }
 
 const MAX_TMUX_ID_LEN: usize = 32;
@@ -207,6 +224,14 @@ pub enum TmuxScanScope {
     SystemSsh { destination: String },
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    #[default]
+    Workstation,
+    Assistant,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceConnection {
@@ -285,24 +310,34 @@ pub enum PaneKind {
     Browser {
         url: String,
     },
+    Assistant,
 }
 
 impl PaneKind {
     /// Whether this pane renders a browser view. Exhaustive by design so a
-    /// future third variant fails compilation exactly here.
+    /// future variant fails compilation exactly here.
     pub fn is_browser(&self) -> bool {
         match self {
-            Self::Terminal => false,
             Self::Browser { .. } => true,
+            Self::Terminal | Self::Assistant => false,
         }
     }
 
     /// Whether this pane renders a terminal view. Exhaustive by design so a
-    /// future third variant fails compilation exactly here.
+    /// future variant fails compilation exactly here.
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::Terminal => true,
-            Self::Browser { .. } => false,
+            Self::Browser { .. } | Self::Assistant => false,
+        }
+    }
+
+    /// Whether this pane renders a voice assistant view. Exhaustive by design
+    /// so a future variant fails compilation exactly here.
+    pub fn is_assistant(&self) -> bool {
+        match self {
+            Self::Assistant => true,
+            Self::Terminal | Self::Browser { .. } => false,
         }
     }
 }
@@ -320,6 +355,10 @@ pub struct Pane {
     /// Only explicit overrides below are included in desired-state recovery.
     #[serde(default)]
     pub identity: TerminalIdentity,
+    /// Ephemeral activity state projected by the local session service.
+    /// It is intentionally reset during desired-state recovery.
+    #[serde(default)]
+    pub status: PaneStatus,
     #[serde(default)]
     pub custom_title: Option<String>,
     #[serde(default)]
@@ -358,6 +397,16 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<PaneKind>(serde_json::to_value(&browser).unwrap()).unwrap(),
             browser
+        );
+
+        let assistant = PaneKind::Assistant;
+        assert_eq!(
+            serde_json::to_value(&assistant).unwrap(),
+            serde_json::json!({ "type": "assistant" })
+        );
+        assert_eq!(
+            serde_json::from_value::<PaneKind>(serde_json::to_value(&assistant).unwrap()).unwrap(),
+            assistant
         );
     }
 
