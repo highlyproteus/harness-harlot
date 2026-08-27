@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -9,6 +11,13 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
+
+const OUTBOUND_CAPACITY: usize = 256;
+const SEND_ACK_TIMEOUT: Duration = Duration::from_secs(6);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CONNECT_RETRIES: u32 = 8;
+const MAX_PROVIDER_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -287,13 +296,17 @@ pub(crate) enum RealtimeInbound {
 
 #[derive(Debug)]
 enum WsCommand {
-    Event(Box<ClientEvent>),
+    Event {
+        event: Box<ClientEvent>,
+        ack: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+        cancelled: Arc<AtomicBool>,
+    },
     Shutdown,
 }
 
 #[derive(Debug)]
 pub(crate) struct RealtimeHandle {
-    outbound: tokio::sync::mpsc::UnboundedSender<WsCommand>,
+    outbound: tokio::sync::mpsc::Sender<WsCommand>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -306,20 +319,47 @@ impl RealtimeHandle {
         &self,
         event: ClientEvent,
     ) -> std::result::Result<(), (anyhow::Error, ClientEvent)> {
-        self.outbound
-            .send(WsCommand::Event(Box::new(event)))
-            .map_err(|error| {
-                let WsCommand::Event(event) = error.0 else {
-                    unreachable!("only event commands use recoverable send")
-                };
-                (anyhow::anyhow!("Realtime websocket task stopped"), *event)
-            })
+        let (ack, result) = std::sync::mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let command = WsCommand::Event {
+            event: Box::new(event.clone()),
+            ack,
+            cancelled: Arc::clone(&cancelled),
+        };
+        if let Err(error) = self.outbound.try_send(command) {
+            let message = match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    "Realtime outbound queue is full"
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    "Realtime websocket task stopped"
+                }
+            };
+            return Err((anyhow::anyhow!(message), event));
+        }
+        match result.recv_timeout(SEND_ACK_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err((anyhow::anyhow!(error), event)),
+            Err(error) => {
+                cancelled.store(true, Ordering::Release);
+                Err((
+                    anyhow::anyhow!("Realtime send acknowledgement failed: {error}"),
+                    event,
+                ))
+            }
+        }
     }
 
     pub(crate) fn shutdown(mut self) {
-        let _ = self.outbound.send(WsCommand::Shutdown);
+        let _ = self.outbound.try_send(WsCommand::Shutdown);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            let deadline = std::time::Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
+            while !join.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+            }
         }
     }
 }
@@ -332,7 +372,7 @@ pub(crate) fn spawn(
     if api_key.trim().is_empty() {
         anyhow::bail!("OpenAI API key is empty");
     }
-    let (outbound, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (outbound, receiver) = tokio::sync::mpsc::channel(OUTBOUND_CAPACITY);
     let join = std::thread::Builder::new()
         .name("hh-realtime".to_owned())
         .spawn(move || {
@@ -356,13 +396,51 @@ pub(crate) fn spawn(
     })
 }
 
+async fn send_event<S>(sink: &mut S, event: &ClientEvent) -> std::result::Result<(), String>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let json = encode_event(event)?;
+    sink.send(Message::Text(Utf8Bytes::from(json)))
+        .await
+        .map_err(|error| format!("send Realtime event: {error}"))
+}
+
+fn encode_event(event: &ClientEvent) -> std::result::Result<String, String> {
+    let json =
+        serde_json::to_string(event).map_err(|error| format!("encode Realtime event: {error}"))?;
+    if json.len() > MAX_PROVIDER_EVENT_BYTES {
+        return Err(format!(
+            "Realtime event exceeds {MAX_PROVIDER_EVENT_BYTES} byte limit"
+        ));
+    }
+    Ok(json)
+}
+
+fn decode_server_event(text: &str) -> std::result::Result<ServerEvent, String> {
+    if text.len() > MAX_PROVIDER_EVENT_BYTES {
+        return Err(format!(
+            "Realtime event exceeds {MAX_PROVIDER_EVENT_BYTES} byte limit"
+        ));
+    }
+    serde_json::from_str(text).map_err(|error| format!("decode Realtime event: {error}"))
+}
+
+fn provider_failure_retryable(status: Option<u16>, retries: u32) -> bool {
+    retries < MAX_CONNECT_RETRIES
+        && !matches!(status, Some(400..=499) if status != Some(408) && status != Some(429))
+}
+
 async fn run_socket(
     api_key: String,
     model: String,
-    mut outbound: tokio::sync::mpsc::UnboundedReceiver<WsCommand>,
+    mut outbound: tokio::sync::mpsc::Receiver<WsCommand>,
     inbound: Sender<RealtimeInbound>,
 ) {
     let mut backoff_secs = 1_u64;
+    let mut retries = 0_u32;
+    let mut pending = None;
     loop {
         let mut request =
             match format!("wss://api.openai.com/v1/realtime?model={model}").into_client_request() {
@@ -385,36 +463,61 @@ async fn run_socket(
         };
         request.headers_mut().insert(AUTHORIZATION, authorization);
 
-        match tokio_tungstenite::connect_async(request).await {
-            Ok((socket, _)) => {
+        let socket_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_PROVIDER_EVENT_BYTES))
+            .max_frame_size(Some(MAX_PROVIDER_EVENT_BYTES))
+            .max_write_buffer_size(MAX_PROVIDER_EVENT_BYTES * 2);
+        match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async_with_config(request, Some(socket_config), false),
+        )
+        .await
+        {
+            Ok(Ok((socket, _))) => {
                 backoff_secs = 1;
+                retries = 0;
                 let _ = inbound.send(RealtimeInbound::Connected);
                 let (mut sink, mut stream) = socket.split();
                 loop {
+                    if let Some(command) = pending.take() {
+                        let WsCommand::Event {
+                            event,
+                            ack,
+                            cancelled,
+                        } = command
+                        else {
+                            return;
+                        };
+                        if cancelled.load(Ordering::Acquire) {
+                            let _ = ack.send(Err(
+                                "Realtime send was cancelled before delivery".to_owned()
+                            ));
+                            continue;
+                        }
+                        if let Err(error) = send_event(&mut sink, &event).await {
+                            pending = Some(WsCommand::Event {
+                                event,
+                                ack,
+                                cancelled,
+                            });
+                            let _ = inbound.send(RealtimeInbound::Disconnected(error));
+                            break;
+                        }
+                        let _ = ack.send(Ok(()));
+                        continue;
+                    }
                     tokio::select! {
                         command = outbound.recv() => match command {
-                            Some(WsCommand::Event(event)) => {
-                                match serde_json::to_string(&event) {
-                                    Ok(json) => {
-                                        if let Err(error) = sink.send(Message::Text(Utf8Bytes::from(json))).await {
-                                            let _ = inbound.send(RealtimeInbound::Disconnected(format!("send Realtime event: {error}")));
-                                            break;
-                                        }
-                                    }
-                                    Err(error) => {
-                                        let _ = inbound.send(RealtimeInbound::Warning(format!("encode Realtime event: {error}")));
-                                    }
-                                }
-                            }
+                            Some(command @ WsCommand::Event { .. }) => pending = Some(command),
                             Some(WsCommand::Shutdown) | None => {
                                 let _ = sink.send(Message::Close(None)).await;
                                 return;
                             }
                         },
                         message = stream.next() => match message {
-                            Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServerEvent>(&text) {
+                            Some(Ok(Message::Text(text))) => match decode_server_event(&text) {
                                 Ok(event) => { let _ = inbound.send(RealtimeInbound::Event(event)); }
-                                Err(error) => { let _ = inbound.send(RealtimeInbound::Warning(format!("decode Realtime event: {error}"))); }
+                                Err(error) => { let _ = inbound.send(RealtimeInbound::Warning(error)); }
                             },
                             Some(Ok(Message::Close(frame))) => {
                                 let _ = inbound.send(RealtimeInbound::Disconnected(format!("Realtime socket closed: {frame:?}")));
@@ -438,10 +541,34 @@ async fn run_socket(
                     }
                 }
             }
-            Err(error) => {
-                let _ = inbound.send(RealtimeInbound::Disconnected(format!(
-                    "connect Realtime socket: {error}"
-                )));
+            Ok(Err(error)) => {
+                retries = retries.saturating_add(1);
+                let status = match &error {
+                    tokio_tungstenite::tungstenite::Error::Http(response) => {
+                        Some(response.status().as_u16())
+                    }
+                    _ => None,
+                };
+                let message = format!("connect Realtime socket: {error}");
+                let _ = inbound.send(RealtimeInbound::Disconnected(message.clone()));
+                if !provider_failure_retryable(status, retries) {
+                    if let Some(WsCommand::Event { ack, .. }) = pending.take() {
+                        let _ = ack.send(Err(message));
+                    }
+                    return;
+                }
+            }
+            Err(_) => {
+                retries = retries.saturating_add(1);
+                let message =
+                    format!("connect Realtime socket timed out after {CONNECT_TIMEOUT:?}");
+                let _ = inbound.send(RealtimeInbound::Disconnected(message.clone()));
+                if !provider_failure_retryable(None, retries) {
+                    if let Some(WsCommand::Event { ack, .. }) = pending.take() {
+                        let _ = ack.send(Err(message));
+                    }
+                    return;
+                }
             }
         }
 
@@ -449,12 +576,9 @@ async fn run_socket(
         tokio::pin!(sleep);
         tokio::select! {
             () = &mut sleep => {}
-            command = outbound.recv() => match command {
+            command = outbound.recv(), if pending.is_none() => match command {
                 Some(WsCommand::Shutdown) | None => return,
-                Some(WsCommand::Event(_)) => {
-                    // The session is not connected yet; the engine will resend
-                    // its session state after the next Connected event.
-                }
+                Some(command @ WsCommand::Event { .. }) => pending = Some(command),
             }
         }
         backoff_secs = (backoff_secs.saturating_mul(2)).min(30);
@@ -483,18 +607,59 @@ mod tests {
     }
 
     #[test]
-    fn failed_outbound_send_returns_the_unsent_event() {
-        let (outbound, receiver) = tokio::sync::mpsc::unbounded_channel();
-        drop(receiver);
+    fn bounded_outbound_rejects_when_full_and_returns_unsent_event() {
+        let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, _ack_rx) = std::sync::mpsc::sync_channel(1);
+        outbound
+            .try_send(WsCommand::Event {
+                event: Box::new(ClientEvent::ResponseCreate { response: None }),
+                ack: ack_tx,
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            })
+            .unwrap();
         let handle = RealtimeHandle {
             outbound,
             join: None,
         };
-        let event = ClientEvent::ResponseCreate { response: None };
-        let (_, recovered) = handle
+        let event = ClientEvent::ResponseCancel;
+        let (error, recovered) = handle
             .send_recoverable(event.clone())
-            .expect_err("closed channel must reject the event");
+            .expect_err("a full realtime queue must apply backpressure");
+        assert!(error.to_string().contains("queue is full"));
         assert_eq!(recovered, event);
+    }
+
+    #[test]
+    fn permanent_provider_failures_are_not_retried_and_transient_failures_are_capped() {
+        assert!(!provider_failure_retryable(Some(401), 0));
+        assert!(!provider_failure_retryable(Some(403), 0));
+        assert!(provider_failure_retryable(Some(429), 0));
+        assert!(provider_failure_retryable(Some(500), 0));
+        assert!(!provider_failure_retryable(Some(500), MAX_CONNECT_RETRIES));
+    }
+
+    #[test]
+    fn provider_payloads_are_bounded_in_both_directions() {
+        let oversized = ClientEvent::ConversationItemCreate {
+            item: ConversationItem::Message {
+                role: ConversationRole::User,
+                content: vec![InputContent::InputText {
+                    text: "x".repeat(MAX_PROVIDER_EVENT_BYTES),
+                }],
+            },
+            previous_item_id: None,
+        };
+        assert!(encode_event(&oversized).unwrap_err().contains("exceeds"));
+
+        let oversized_inbound = format!(
+            "{{\"type\":\"response.output_audio_transcript.delta\",\"delta\":\"{}\"}}",
+            "x".repeat(MAX_PROVIDER_EVENT_BYTES)
+        );
+        assert!(
+            decode_server_event(&oversized_inbound)
+                .unwrap_err()
+                .contains("exceeds")
+        );
     }
 
     #[test]

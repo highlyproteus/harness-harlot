@@ -23,6 +23,9 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const DEFAULT_PANE_LINES: usize = 60;
 const MAX_PANE_LINES: usize = 200;
 const WORKTREE_TIMEOUT: Duration = Duration::from_secs(30);
+const SUBPROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const STDERR_COMPLETION_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_SUBPROCESS_STDERR_BYTES: usize = 16 * 1024;
 const MAX_DIRECTORY_MATCHES: usize = 20;
 const MAX_LISTED_THREADS: usize = 20;
 const MAX_READ_THREAD_TURNS: usize = 30;
@@ -594,10 +597,10 @@ impl ToolExecutor {
         self.require_attached(workspace_id)?;
         let agent = Agent::parse(required_str(arguments, "agent")?)?;
         let command = launch_command(agent);
-        self.client.notify(&ClientRequest::WriteInput {
+        expect_ack(&self.client.call(&ClientRequest::WriteInput {
             pane_id,
             bytes: format!("{command}\r").into_bytes(),
-        })?;
+        })?)?;
         Ok(json!({ "pane_id": pane_id, "launched": command }))
     }
 
@@ -646,8 +649,11 @@ impl ToolExecutor {
                 for key in &keys {
                     bytes.extend_from_slice(key_bytes(key)?);
                 }
-                self.client
-                    .notify(&ClientRequest::WriteInput { pane_id, bytes })?;
+                expect_ack(
+                    &self
+                        .client
+                        .call(&ClientRequest::WriteInput { pane_id, bytes })?,
+                )?;
                 Ok(json!({ "status": "executed", "pane_id": pane_id }))
             }
             PendingAction::CloseTab { tab_id } => {
@@ -678,8 +684,11 @@ impl ToolExecutor {
         if submit {
             bytes.push(b'\r');
         }
-        self.client
-            .notify(&ClientRequest::WriteInput { pane_id, bytes })?;
+        expect_ack(
+            &self
+                .client
+                .call(&ClientRequest::WriteInput { pane_id, bytes })?,
+        )?;
         Ok(json!({ "status": "executed", "pane_id": pane_id }))
     }
 
@@ -1103,23 +1112,8 @@ fn run_git_worktree(repo: &Path, target: &Path, branch: &str, base: Option<&str>
     if let Some(base) = base {
         command.arg(base);
     }
-    let mut child = command.spawn().context("launch git worktree add")?;
-    let deadline = Instant::now() + WORKTREE_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait().context("wait for git worktree add")? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("git worktree add timed out after 30 seconds");
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let (status, stderr) =
+        run_child_with_stderr_timeout(&mut command, WORKTREE_TIMEOUT, "git worktree add")?;
     if !status.success() {
         bail!("git worktree add failed: {}", stderr.trim());
     }
@@ -1147,6 +1141,71 @@ fn pending_action(name: &str, arguments: &Value) -> Result<PendingAction> {
         }),
         _ => bail!("tool {name} cannot be approved"),
     }
+}
+
+fn run_child_with_stderr_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    operation: &str,
+) -> Result<(std::process::ExitStatus, String)> {
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("launch {operation}"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .with_context(|| format!("capture {operation} stderr"))?;
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+    thread::spawn(move || {
+        let mut captured = 0_usize;
+        let mut buffer = [0_u8; 8 * 1024];
+        while let Ok(read) = stderr.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            let keep = read.min(MAX_SUBPROCESS_STDERR_BYTES.saturating_sub(captured));
+            if keep > 0 && stderr_tx.send(buffer[..keep].to_vec()).is_err() {
+                break;
+            }
+            captured = captured.saturating_add(keep);
+        }
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut captured = Vec::with_capacity(MAX_SUBPROCESS_STDERR_BYTES);
+    let status = loop {
+        while let Ok(chunk) = stderr_rx.try_recv() {
+            captured.extend_from_slice(&chunk);
+        }
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait for {operation}"))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let reap_deadline = Instant::now() + SUBPROCESS_REAP_TIMEOUT;
+            while Instant::now() < reap_deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            bail!("{operation} timed out after {} seconds", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stderr_deadline = Instant::now() + STDERR_COMPLETION_TIMEOUT;
+    while captured.len() < MAX_SUBPROCESS_STDERR_BYTES && Instant::now() < stderr_deadline {
+        match stderr_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(chunk) => captured.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    captured.truncate(MAX_SUBPROCESS_STDERR_BYTES);
+    Ok((status, String::from_utf8_lossy(&captured).into_owned()))
 }
 
 fn pending_send_input(arguments: &Value) -> Result<PendingAction> {
@@ -1489,6 +1548,26 @@ mod tests {
                 "branch: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn subprocess_stderr_is_drained_without_deadlock_and_bounded() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("dd if=/dev/zero bs=1024 count=256 >&2; exit 7")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let (status, stderr) = run_child_with_stderr_timeout(
+            &mut command,
+            Duration::from_secs(2),
+            "stderr stress test",
+        )
+        .unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert!(stderr.len() <= MAX_SUBPROCESS_STDERR_BYTES);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

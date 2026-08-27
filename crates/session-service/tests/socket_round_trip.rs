@@ -214,10 +214,10 @@ async fn older_full_state_protocol_is_rejected_before_any_request() {
     server_task.await.unwrap();
 }
 
-/// Terminal input is one-way: the service writes no frame for it, so the next
-/// request's response is the very next frame the client reads.
+/// Terminal input is authoritative: callers receive the service result before
+/// they may claim that input was delivered.
 #[tokio::test]
-async fn terminal_input_is_not_acknowledged_on_the_wire() {
+async fn terminal_input_is_acknowledged_on_the_wire() {
     let (mut client, server) = UnixStream::pair().unwrap();
     let registry = SessionRegistry::new().expect("start seeded configured-shell PTY");
     let snapshot = registry.snapshot().unwrap();
@@ -253,6 +253,11 @@ async fn terminal_input_is_not_acknowledged_on_the_wire() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        read_message::<ServiceResponse>(&mut client).await.unwrap(),
+        ServiceResponse::Ack,
+        "WriteInput must return the service's authoritative result"
+    );
     write_message(
         &mut client,
         &ClientRequest::UpdateSelection {

@@ -15,6 +15,7 @@ const INPUT_CHUNK_SAMPLES: usize = 1_200;
 const INPUT_CHUNK_SAMPLES_F32: f32 = 1_200.0;
 const RESAMPLE_CHUNK_MILLIS: u32 = 10;
 const AUDIO_CHANNEL_CAPACITY: usize = 8;
+const MAX_PLAYBACK_SAMPLES: usize = 2_880_000;
 
 #[allow(clippy::cast_possible_truncation)]
 fn normalized_to_i16(value: f32) -> i16 {
@@ -261,14 +262,37 @@ impl OutputResampler {
             .item_id
             .clone()
             .context("playback item id is missing")?;
-        playback.lock().queue.push_back(PlaybackChunk {
-            item_id,
-            samples: self.output[..frames].to_vec(),
-            cursor: 0,
-        });
+        enqueue_playback_chunk(
+            &mut playback.lock(),
+            PlaybackChunk {
+                item_id,
+                samples: self.output[..frames].to_vec(),
+                cursor: 0,
+            },
+        );
         active.store(true, Ordering::Release);
         Ok(())
     }
+}
+
+fn enqueue_playback_chunk(playback: &mut PlaybackState, mut chunk: PlaybackChunk) {
+    if chunk.samples.len() > MAX_PLAYBACK_SAMPLES {
+        let keep_from = chunk.samples.len() - MAX_PLAYBACK_SAMPLES;
+        chunk.samples.drain(..keep_from);
+        chunk.cursor = 0;
+    }
+    let mut queued = playback
+        .queue
+        .iter()
+        .map(|queued| queued.samples.len().saturating_sub(queued.cursor))
+        .sum::<usize>();
+    while queued.saturating_add(chunk.samples.len()) > MAX_PLAYBACK_SAMPLES {
+        let Some(dropped) = playback.queue.pop_front() else {
+            break;
+        };
+        queued = queued.saturating_sub(dropped.samples.len().saturating_sub(dropped.cursor));
+    }
+    playback.queue.push_back(chunk);
 }
 
 pub(crate) struct AudioSystem {
@@ -542,4 +566,31 @@ fn output_stream<T: SizedSample + Copy + Send + 'static>(
             None,
         )
         .context("build audio output stream")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_queue_drops_oldest_audio_at_the_memory_bound() {
+        let mut playback = PlaybackState::default();
+        for index in 0..4 {
+            enqueue_playback_chunk(
+                &mut playback,
+                PlaybackChunk {
+                    item_id: format!("item-{index}"),
+                    samples: vec![0.0; MAX_PLAYBACK_SAMPLES / 2],
+                    cursor: 0,
+                },
+            );
+        }
+        let queued = playback
+            .queue
+            .iter()
+            .map(|chunk| chunk.samples.len().saturating_sub(chunk.cursor))
+            .sum::<usize>();
+        assert!(queued <= MAX_PLAYBACK_SAMPLES);
+        assert_eq!(playback.queue.front().unwrap().item_id, "item-2");
+    }
 }
