@@ -246,6 +246,7 @@ impl VoiceEngine {
         command_rx: Receiver<VoiceCommand>,
         accepted_user_items: Arc<AtomicUsize>,
     ) -> Result<Self> {
+        let thread_id = context.pane_id;
         let _ = ui.emit(VoiceUiEvent::State(EngineState::Connecting));
         let mut tools = ToolExecutor::connect()?;
         tools.authorize_context(context.workspace_id, context.working_dir.as_deref())?;
@@ -259,13 +260,12 @@ impl VoiceEngine {
             .as_deref()
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned);
-        let thread_id = context.pane_id;
-        let thread_generation = thread_id
-            .map(|_| threads::current_generation())
-            .transpose()?;
+        // Do not create a durable writer authority until the fallible tool
+        // authorization setup has succeeded. This keeps failed startup from
+        // leaving a pre-file authority behind indefinitely.
+        let thread_generation = thread_id.map(threads::prepare_writer).transpose()?;
         let mut thread_has_title = false;
         if let Some(thread_id) = thread_id {
-            threads::prune_thread_files(threads::ThreadRetention::default())?;
             thread_has_title =
                 threads::read_thread(thread_id)?.is_some_and(|thread| thread.title.is_some());
             threads::append_record(

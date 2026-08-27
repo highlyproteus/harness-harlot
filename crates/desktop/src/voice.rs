@@ -285,6 +285,12 @@ fn mark_persisted_summaries_cleared(sessions: &mut HashMap<Uuid, AssistantSessio
     }
 }
 
+fn mark_persisted_summary_deleted(sessions: &mut HashMap<Uuid, AssistantSession>, thread_id: Uuid) {
+    if let Some(session) = sessions.get_mut(&thread_id) {
+        session.persisted_summary = PersistedSummaryState::Absent;
+    }
+}
+
 fn reconcile_persisted_summary(
     session: &mut AssistantSession,
     pane_id: Uuid,
@@ -475,8 +481,9 @@ impl HhApp {
     }
 
     fn delete_saved_thread(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
-        if let Err(error) = threads::delete_thread(thread_id) {
-            self.report(&error);
+        match threads::delete_thread(thread_id) {
+            Ok(_) => mark_persisted_summary_deleted(&mut self.voice.sessions, thread_id),
+            Err(error) => self.report(&error),
         }
         self.voice.refresh_thread_index();
         cx.notify();

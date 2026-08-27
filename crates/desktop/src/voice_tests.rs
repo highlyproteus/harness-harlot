@@ -61,6 +61,29 @@ fn clearing_saved_history_updates_summary_only_session_ui() {
 }
 
 #[test]
+fn deleting_one_saved_thread_updates_only_matching_summary_ui() {
+    let deleted = Uuid::new_v4();
+    let retained = Uuid::new_v4();
+    let mut sessions = HashMap::from([
+        (deleted, AssistantSession::new()),
+        (retained, AssistantSession::new()),
+    ]);
+    sessions.get_mut(&deleted).unwrap().persisted_summary = PersistedSummaryState::Present;
+    sessions.get_mut(&retained).unwrap().persisted_summary = PersistedSummaryState::Present;
+
+    mark_persisted_summary_deleted(&mut sessions, deleted);
+
+    assert_eq!(
+        sessions.get(&deleted).unwrap().persisted_summary,
+        PersistedSummaryState::Absent
+    );
+    assert_eq!(
+        sessions.get(&retained).unwrap().persisted_summary,
+        PersistedSummaryState::Present
+    );
+}
+
+#[test]
 fn delayed_summary_event_does_not_restore_cleared_ui_state() {
     let pane_id = Uuid::new_v4();
     let mut session = AssistantSession::new();
