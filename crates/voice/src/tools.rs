@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     ClientRequest, Pane, PaneLayout, PaneStreamState, ServiceResponse, SessionNotification,
-    SessionSnapshot, TerminalLine,
+    SessionSnapshot, TerminalLine, TerminalTransport,
 };
 use hh_session_client::SessionClient;
 use serde_json::{Value, json};
@@ -55,36 +55,60 @@ enum PendingAction {
     ToolCall {
         name: String,
         arguments: Value,
+        authority: Option<MutationAuthority>,
     },
     SendInput {
         pane_id: Uuid,
         text: String,
         submit: bool,
+        authority: MutationAuthority,
     },
     SendKeys {
         pane_id: Uuid,
         keys: Vec<String>,
+        authority: MutationAuthority,
     },
     CloseTab {
         tab_id: Uuid,
+        authority: MutationAuthority,
     },
     CloseWorkstation {
         workspace_id: Uuid,
+        authority: MutationAuthority,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MutationAuthority {
+    Workspace {
+        workspace_id: Uuid,
+    },
+    Tab {
+        workspace_id: Uuid,
+        tab_id: Uuid,
+    },
+    Pane {
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        pane_id: Uuid,
+        transport: TerminalTransport,
     },
 }
 
 impl PendingAction {
     fn description(&self) -> String {
         match self {
-            Self::ToolCall { name, arguments } => format!("run {name} with {arguments}"),
+            Self::ToolCall {
+                name, arguments, ..
+            } => format!("run {name} with {arguments}"),
             Self::SendInput { pane_id, text, .. } => {
                 format!("send potentially destructive input to pane {pane_id}: {text}")
             }
-            Self::SendKeys { pane_id, keys } => {
+            Self::SendKeys { pane_id, keys, .. } => {
                 format!("send keys {} to pane {pane_id}", keys.join(", "))
             }
-            Self::CloseTab { tab_id } => format!("close tab {tab_id}"),
-            Self::CloseWorkstation { workspace_id } => {
+            Self::CloseTab { tab_id, .. } => format!("close tab {tab_id}"),
+            Self::CloseWorkstation { workspace_id, .. } => {
                 format!("close workstation {workspace_id}")
             }
         }
@@ -175,7 +199,8 @@ impl ToolExecutor {
     ) -> Result<Value> {
         let tier = classify_tool(name)?;
         if tier == TrustTier::T2 {
-            let result = self.request_approval(pending_action(name, arguments)?, ui);
+            let snapshot = self.refresh_snapshot()?;
+            let result = self.request_approval(pending_action(name, arguments, &snapshot)?, ui);
             let _ = ui.unbounded_send(VoiceUiEvent::ToolCall {
                 name: name.to_owned(),
                 summary: summarize_output(&result),
@@ -286,6 +311,16 @@ impl ToolExecutor {
         Ok(self.snapshot.as_ref().expect("snapshot initialized"))
     }
 
+    fn refresh_snapshot(&mut self) -> Result<SessionSnapshot> {
+        let response = self.client.call(&ClientRequest::GetSnapshot)?;
+        let ServiceResponse::Snapshot { snapshot } = response else {
+            bail!("unexpected GetSnapshot response: {response:?}");
+        };
+        self.snapshot_revision = Some(snapshot.revision);
+        self.snapshot = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
     fn list_workstations(&mut self) -> Result<Value> {
         let snapshot = self.ensure_snapshot()?.clone();
         if let Some(root) = &self.authorized_root {
@@ -362,6 +397,7 @@ impl ToolExecutor {
         let notifications = std::mem::take(&mut self.notification_buffer)
             .into_iter()
             .filter(|notification| self.notification_is_attached(notification))
+            .map(|notification| model_notification_summary(&notification))
             .collect::<Vec<_>>();
         Ok(json!({ "panes": statuses, "notifications": notifications }))
     }
@@ -491,6 +527,18 @@ impl ToolExecutor {
             bail!("unexpected CreateWorkspace response: {response:?}");
         };
         if let Some(directory) = &working_dir {
+            let snapshot = self.refresh_snapshot()?;
+            let workspace = terminal_workspace(&snapshot, workspace_id)?;
+            let pane_exists = workspace.tabs.iter().any(|tab| {
+                let mut panes = Vec::new();
+                collect_panes(&tab.layout, &mut panes);
+                panes
+                    .into_iter()
+                    .any(|pane| pane.id == pane_id && pane.kind.is_terminal())
+            });
+            if !pane_exists {
+                bail!("new workstation pane identity changed before setting its directory");
+            }
             expect_ack(&self.client.call(&ClientRequest::SetWorkspaceWorkingDir {
                 workspace_id,
                 working_dir: Some(directory.clone()),
@@ -571,6 +619,13 @@ impl ToolExecutor {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent {}", parent.display()))?;
         run_git_worktree(&repo_dir, &worktree_path, branch, base)?;
+        let snapshot = self.refresh_snapshot()?;
+        revalidate_mutation_authority(
+            &snapshot,
+            &MutationAuthority::Workspace { workspace_id },
+            &self.authorized_workspaces,
+            self.authorized_root.as_deref(),
+        )?;
         let response = self.client.call(&ClientRequest::CreateWorkspaceProject {
             workspace_id,
             working_dir: worktree_path.to_string_lossy().into_owned(),
@@ -627,8 +682,17 @@ impl ToolExecutor {
     }
 
     fn execute_pending(&mut self, action: PendingAction) -> Result<Value> {
+        let snapshot = self.refresh_snapshot()?;
+        revalidate_pending_action(
+            &snapshot,
+            &action,
+            &self.authorized_workspaces,
+            self.authorized_root.as_deref(),
+        )?;
         match action {
-            PendingAction::ToolCall { name, arguments } => match name.as_str() {
+            PendingAction::ToolCall {
+                name, arguments, ..
+            } => match name.as_str() {
                 "create_workstation" => self.create_workstation(&arguments),
                 "open_terminal_tab" => self.open_terminal_tab(&arguments),
                 "rename_tab" => self.rename_tab(&arguments),
@@ -641,10 +705,9 @@ impl ToolExecutor {
                 pane_id,
                 text,
                 submit,
+                ..
             } => self.write_input(pane_id, &text, submit),
-            PendingAction::SendKeys { pane_id, keys } => {
-                let workspace_id = self.workspace_for_pane(pane_id)?;
-                self.require_authorized(workspace_id)?;
+            PendingAction::SendKeys { pane_id, keys, .. } => {
                 let mut bytes = Vec::new();
                 for key in &keys {
                     bytes.extend_from_slice(key_bytes(key)?);
@@ -656,15 +719,12 @@ impl ToolExecutor {
                 )?;
                 Ok(json!({ "status": "executed", "pane_id": pane_id }))
             }
-            PendingAction::CloseTab { tab_id } => {
-                let workspace_id = self.workspace_for_tab(tab_id)?;
-                self.require_authorized(workspace_id)?;
+            PendingAction::CloseTab { tab_id, .. } => {
                 expect_ack(&self.client.call(&ClientRequest::CloseTab { tab_id })?)?;
                 self.snapshot = None;
                 Ok(json!({ "status": "executed", "tab_id": tab_id }))
             }
-            PendingAction::CloseWorkstation { workspace_id } => {
-                self.require_authorized(workspace_id)?;
+            PendingAction::CloseWorkstation { workspace_id, .. } => {
                 expect_ack(
                     &self
                         .client
@@ -678,8 +738,6 @@ impl ToolExecutor {
     }
 
     fn write_input(&mut self, pane_id: Uuid, text: &str, submit: bool) -> Result<Value> {
-        let workspace_id = self.workspace_for_pane(pane_id)?;
-        self.require_authorized(workspace_id)?;
         let mut bytes = text.as_bytes().to_vec();
         if submit {
             bytes.push(b'\r');
@@ -904,6 +962,20 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
+fn model_notification_summary(notification: &SessionNotification) -> Value {
+    let kind = match notification.kind {
+        hh_protocol::NotificationKind::Completed => "completed",
+        hh_protocol::NotificationKind::Attention => "attention",
+        hh_protocol::NotificationKind::Message => "message",
+    };
+    json!({
+        "pane_id": notification.pane_id,
+        "workspace_id": notification.workspace_id,
+        "kind": kind,
+        "state": "notification_received",
+    })
+}
+
 fn initial_notification_cursor(items: &[SessionNotification]) -> u64 {
     items
         .iter()
@@ -1120,25 +1192,57 @@ fn run_git_worktree(repo: &Path, target: &Path, branch: &str, base: Option<&str>
     Ok(())
 }
 
-fn pending_action(name: &str, arguments: &Value) -> Result<PendingAction> {
+fn pending_action(
+    name: &str,
+    arguments: &Value,
+    snapshot: &SessionSnapshot,
+) -> Result<PendingAction> {
     match name {
-        "send_input" => pending_send_input(arguments),
-        "send_keys" => pending_send_keys(arguments),
-        "close_tab" => Ok(PendingAction::CloseTab {
-            tab_id: required_uuid(arguments, "tab_id")?,
-        }),
-        "close_workstation" => Ok(PendingAction::CloseWorkstation {
-            workspace_id: required_uuid(arguments, "workspace_id")?,
-        }),
-        "create_workstation"
-        | "open_terminal_tab"
-        | "rename_tab"
-        | "open_project_tab"
-        | "create_worktree_tab"
-        | "launch_agent" => Ok(PendingAction::ToolCall {
+        "send_input" => pending_send_input(arguments, snapshot),
+        "send_keys" => pending_send_keys(arguments, snapshot),
+        "close_tab" => {
+            let tab_id = required_uuid(arguments, "tab_id")?;
+            Ok(PendingAction::CloseTab {
+                tab_id,
+                authority: mutation_authority_for_tab(snapshot, tab_id)?,
+            })
+        }
+        "close_workstation" => {
+            let workspace_id = required_uuid(arguments, "workspace_id")?;
+            Ok(PendingAction::CloseWorkstation {
+                workspace_id,
+                authority: mutation_authority_for_workspace(snapshot, workspace_id)?,
+            })
+        }
+        "create_workstation" => Ok(PendingAction::ToolCall {
             name: name.to_owned(),
             arguments: arguments.clone(),
+            authority: None,
         }),
+        "open_terminal_tab" | "open_project_tab" | "create_worktree_tab" => {
+            let workspace_id = required_uuid(arguments, "workspace_id")?;
+            Ok(PendingAction::ToolCall {
+                name: name.to_owned(),
+                arguments: arguments.clone(),
+                authority: Some(mutation_authority_for_workspace(snapshot, workspace_id)?),
+            })
+        }
+        "rename_tab" => {
+            let tab_id = required_uuid(arguments, "tab_id")?;
+            Ok(PendingAction::ToolCall {
+                name: name.to_owned(),
+                arguments: arguments.clone(),
+                authority: Some(mutation_authority_for_tab(snapshot, tab_id)?),
+            })
+        }
+        "launch_agent" => {
+            let pane_id = required_uuid(arguments, "pane_id")?;
+            Ok(PendingAction::ToolCall {
+                name: name.to_owned(),
+                arguments: arguments.clone(),
+                authority: Some(mutation_authority_for_pane(snapshot, pane_id)?),
+            })
+        }
         _ => bail!("tool {name} cannot be approved"),
     }
 }
@@ -1208,18 +1312,20 @@ fn run_child_with_stderr_timeout(
     Ok((status, String::from_utf8_lossy(&captured).into_owned()))
 }
 
-fn pending_send_input(arguments: &Value) -> Result<PendingAction> {
+fn pending_send_input(arguments: &Value, snapshot: &SessionSnapshot) -> Result<PendingAction> {
+    let pane_id = required_uuid(arguments, "pane_id")?;
     Ok(PendingAction::SendInput {
-        pane_id: required_uuid(arguments, "pane_id")?,
+        pane_id,
         text: required_str(arguments, "text")?.to_owned(),
         submit: arguments
             .get("submit")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        authority: mutation_authority_for_pane(snapshot, pane_id)?,
     })
 }
 
-fn pending_send_keys(arguments: &Value) -> Result<PendingAction> {
+fn pending_send_keys(arguments: &Value, snapshot: &SessionSnapshot) -> Result<PendingAction> {
     let keys = arguments
         .get("keys")
         .and_then(Value::as_array)
@@ -1234,9 +1340,11 @@ fn pending_send_keys(arguments: &Value) -> Result<PendingAction> {
     for key in &keys {
         let _ = key_bytes(key)?;
     }
+    let pane_id = required_uuid(arguments, "pane_id")?;
     Ok(PendingAction::SendKeys {
-        pane_id: required_uuid(arguments, "pane_id")?,
+        pane_id,
         keys,
+        authority: mutation_authority_for_pane(snapshot, pane_id)?,
     })
 }
 
@@ -1249,6 +1357,167 @@ fn key_bytes(key: &str) -> Result<&'static [u8]> {
         "tab" => Ok(b"\t"),
         "ctrl-c" => Ok(b"\x03"),
         _ => bail!("unsupported key {key}"),
+    }
+}
+
+fn mutation_authority_for_workspace(
+    snapshot: &SessionSnapshot,
+    workspace_id: Uuid,
+) -> Result<MutationAuthority> {
+    terminal_workspace(snapshot, workspace_id)?;
+    Ok(MutationAuthority::Workspace { workspace_id })
+}
+
+fn mutation_authority_for_tab(
+    snapshot: &SessionSnapshot,
+    tab_id: Uuid,
+) -> Result<MutationAuthority> {
+    snapshot
+        .workspaces
+        .iter()
+        .find_map(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .any(|tab| tab.id == tab_id)
+                .then_some(MutationAuthority::Tab {
+                    workspace_id: workspace.id,
+                    tab_id,
+                })
+        })
+        .with_context(|| format!("tab {tab_id} does not exist"))
+}
+
+fn mutation_authority_for_pane(
+    snapshot: &SessionSnapshot,
+    pane_id: Uuid,
+) -> Result<MutationAuthority> {
+    for workspace in &snapshot.workspaces {
+        for tab in &workspace.tabs {
+            let mut panes = Vec::new();
+            collect_panes(&tab.layout, &mut panes);
+            if let Some(pane) = panes.into_iter().find(|pane| pane.id == pane_id) {
+                if !pane.kind.is_terminal() {
+                    bail!("pane {pane_id} is not a terminal pane");
+                }
+                let transport = snapshot
+                    .terminal_transports
+                    .get(&pane_id)
+                    .filter(|transport| !matches!(transport, TerminalTransport::Unknown))
+                    .cloned()
+                    .with_context(|| format!("pane {pane_id} has no authoritative transport"))?;
+                return Ok(MutationAuthority::Pane {
+                    workspace_id: workspace.id,
+                    tab_id: tab.id,
+                    pane_id,
+                    transport,
+                });
+            }
+        }
+    }
+    bail!("pane {pane_id} does not exist")
+}
+
+fn revalidate_pending_action(
+    snapshot: &SessionSnapshot,
+    action: &PendingAction,
+    authorized_workspaces: &HashSet<Uuid>,
+    authorized_root: Option<&Path>,
+) -> Result<()> {
+    let authority = match action {
+        PendingAction::ToolCall { authority, .. } => authority.as_ref(),
+        PendingAction::SendInput { authority, .. }
+        | PendingAction::SendKeys { authority, .. }
+        | PendingAction::CloseTab { authority, .. }
+        | PendingAction::CloseWorkstation { authority, .. } => Some(authority),
+    };
+    if let Some(authority) = authority {
+        revalidate_mutation_authority(snapshot, authority, authorized_workspaces, authorized_root)?;
+    }
+    if let PendingAction::ToolCall {
+        name, arguments, ..
+    } = action
+        && let Some(root) = authorized_root
+    {
+        match name.as_str() {
+            "create_workstation" => {
+                let working_dir = arguments
+                    .get("working_dir")
+                    .and_then(Value::as_str)
+                    .context("working_dir is required within an authorized root")?;
+                canonical_directory_within(working_dir, root)?;
+            }
+            "open_project_tab" => {
+                canonical_directory_within(required_str(arguments, "working_dir")?, root)?;
+            }
+            "create_worktree_tab" => {
+                canonical_directory_within(required_str(arguments, "repo_dir")?, root)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn revalidate_mutation_authority(
+    snapshot: &SessionSnapshot,
+    authority: &MutationAuthority,
+    authorized_workspaces: &HashSet<Uuid>,
+    authorized_root: Option<&Path>,
+) -> Result<()> {
+    let workspace_id = match authority {
+        MutationAuthority::Workspace { workspace_id }
+        | MutationAuthority::Tab { workspace_id, .. }
+        | MutationAuthority::Pane { workspace_id, .. } => *workspace_id,
+    };
+    if !authorized_workspaces.contains(&workspace_id) {
+        bail!("workspace {workspace_id} is outside the authorized workspace boundary");
+    }
+    let workspace = terminal_workspace(snapshot, workspace_id)?;
+    if let Some(root) = authorized_root
+        && !workspace_directory_is_within(workspace, root)
+    {
+        bail!("workspace {workspace_id} is outside the canonical authorized root");
+    }
+
+    match authority {
+        MutationAuthority::Workspace { .. } => Ok(()),
+        MutationAuthority::Tab { tab_id, .. } => workspace
+            .tabs
+            .iter()
+            .any(|tab| tab.id == *tab_id)
+            .then_some(())
+            .with_context(|| format!("tab {tab_id} changed workspace or no longer exists")),
+        MutationAuthority::Pane {
+            tab_id,
+            pane_id,
+            transport,
+            ..
+        } => {
+            let tab = workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.id == *tab_id)
+                .with_context(|| format!("pane {pane_id} changed workspace or tab"))?;
+            let mut panes = Vec::new();
+            collect_panes(&tab.layout, &mut panes);
+            let pane = panes
+                .into_iter()
+                .find(|pane| pane.id == *pane_id)
+                .with_context(|| format!("pane {pane_id} changed workspace or tab"))?;
+            if !pane.kind.is_terminal() {
+                bail!("pane {pane_id} is no longer a terminal pane");
+            }
+            let current_transport = snapshot
+                .terminal_transports
+                .get(pane_id)
+                .filter(|current| !matches!(current, TerminalTransport::Unknown))
+                .with_context(|| format!("pane {pane_id} has no authoritative transport"))?;
+            if current_transport != transport {
+                bail!("pane {pane_id} terminal transport changed");
+            }
+            Ok(())
+        }
     }
 }
 
