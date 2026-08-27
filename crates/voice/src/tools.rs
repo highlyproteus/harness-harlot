@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -155,10 +156,11 @@ impl ToolExecutor {
         arguments: &str,
         memory: &mut dyn MemoryBackend,
         ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
+        cancelled: &AtomicBool,
     ) -> String {
         let parsed = serde_json::from_str::<Value>(arguments)
             .with_context(|| format!("parse arguments for {name}"))
-            .and_then(|arguments| self.execute_value(name, &arguments, memory, ui));
+            .and_then(|arguments| self.execute_value(name, &arguments, memory, ui, cancelled));
         let output = match parsed {
             Ok(value) => value,
             Err(error) => json!({ "error": format!("{error:#}") }),
@@ -172,7 +174,11 @@ impl ToolExecutor {
         arguments: &Value,
         memory: &mut dyn MemoryBackend,
         ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
+        cancelled: &AtomicBool,
     ) -> Result<Value> {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("tool execution cancelled");
+        }
         let tier = classify_tool(name)?;
         if tier == TrustTier::T2 {
             let result = self.request_approval(pending_action(name, arguments)?, ui);
@@ -211,13 +217,14 @@ impl ToolExecutor {
         approval_id: u64,
         approved: bool,
         ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
+        cancelled: &AtomicBool,
     ) -> Result<Value> {
         let action = self
             .pending_approvals
             .remove(&approval_id)
             .with_context(|| format!("approval {approval_id} is not pending"))?;
         let result = if approved {
-            self.execute_pending(action)?
+            self.execute_pending(action, cancelled)?
         } else {
             json!({ "status": "denied", "approval_id": approval_id })
         };
@@ -557,7 +564,7 @@ impl ToolExecutor {
         Ok(json!({ "pane_id": pane_id, "working_dir": working_dir }))
     }
 
-    fn create_worktree_tab(&mut self, arguments: &Value) -> Result<Value> {
+    fn create_worktree_tab(&mut self, arguments: &Value, cancelled: &AtomicBool) -> Result<Value> {
         let workspace_id = required_uuid(arguments, "workspace_id")?;
         self.require_attached_workstation(workspace_id)?;
         let repo_dir = canonical_git_repository(required_str(arguments, "repo_dir")?)?;
@@ -570,7 +577,7 @@ impl ToolExecutor {
             .context("worktree path has no parent")?;
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent {}", parent.display()))?;
-        run_git_worktree(&repo_dir, &worktree_path, branch, base)?;
+        run_git_worktree(&repo_dir, &worktree_path, branch, base, cancelled)?;
         let response = self.client.call(&ClientRequest::CreateWorkspaceProject {
             workspace_id,
             working_dir: worktree_path.to_string_lossy().into_owned(),
@@ -626,14 +633,17 @@ impl ToolExecutor {
         })
     }
 
-    fn execute_pending(&mut self, action: PendingAction) -> Result<Value> {
+    fn execute_pending(&mut self, action: PendingAction, cancelled: &AtomicBool) -> Result<Value> {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("tool execution cancelled");
+        }
         match action {
             PendingAction::ToolCall { name, arguments } => match name.as_str() {
                 "create_workstation" => self.create_workstation(&arguments),
                 "open_terminal_tab" => self.open_terminal_tab(&arguments),
                 "rename_tab" => self.rename_tab(&arguments),
                 "open_project_tab" => self.open_project_tab(&arguments),
-                "create_worktree_tab" => self.create_worktree_tab(&arguments),
+                "create_worktree_tab" => self.create_worktree_tab(&arguments, cancelled),
                 "launch_agent" => self.launch_agent(&arguments),
                 _ => bail!("unsupported pending voice tool {name}"),
             },
@@ -1097,7 +1107,13 @@ fn canonical_git_repository(path: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn run_git_worktree(repo: &Path, target: &Path, branch: &str, base: Option<&str>) -> Result<()> {
+fn run_git_worktree(
+    repo: &Path,
+    target: &Path,
+    branch: &str,
+    base: Option<&str>,
+    cancelled: &AtomicBool,
+) -> Result<()> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -1112,8 +1128,12 @@ fn run_git_worktree(repo: &Path, target: &Path, branch: &str, base: Option<&str>
     if let Some(base) = base {
         command.arg(base);
     }
-    let (status, stderr) =
-        run_child_with_stderr_timeout(&mut command, WORKTREE_TIMEOUT, "git worktree add")?;
+    let (status, stderr) = run_child_with_stderr_timeout(
+        &mut command,
+        WORKTREE_TIMEOUT,
+        "git worktree add",
+        cancelled,
+    )?;
     if !status.success() {
         bail!("git worktree add failed: {}", stderr.trim());
     }
@@ -1147,6 +1167,7 @@ fn run_child_with_stderr_timeout(
     command: &mut Command,
     timeout: Duration,
     operation: &str,
+    cancelled: &AtomicBool,
 ) -> Result<(std::process::ExitStatus, String)> {
     let mut child = command
         .spawn()
@@ -1182,6 +1203,17 @@ fn run_child_with_stderr_timeout(
             .with_context(|| format!("wait for {operation}"))?
         {
             break status;
+        }
+        if cancelled.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let reap_deadline = Instant::now() + SUBPROCESS_REAP_TIMEOUT;
+            while Instant::now() < reap_deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            bail!("{operation} cancelled");
         }
         if Instant::now() >= deadline {
             let _ = child.kill();

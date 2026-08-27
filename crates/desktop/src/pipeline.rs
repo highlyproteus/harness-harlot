@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::{Receiver, Sender};
 use gpui::{AppContext as _, AsyncApp, Context, WeakEntity};
 use hh_protocol::{ClientRequest, ServiceResponse};
 
@@ -20,6 +20,9 @@ use crate::session::{session_call, session_notify};
 /// Typed continuation applied with a response on the UI thread.
 pub(crate) type ApplyFn = Box<dyn FnOnce(&mut HhApp, &mut Context<HhApp>, Result<ServiceResponse>)>;
 use crate::{HhApp, SharedSessionClient};
+
+pub(crate) const CONTROL_PIPELINE_CAPACITY: usize = 32;
+pub(crate) const STREAM_PIPELINE_CAPACITY: usize = 8;
 
 /// One queued service request plus how its response lands back on the UI.
 pub(crate) struct PipelineJob {
@@ -42,13 +45,16 @@ impl PipelineJob {
 }
 /// The consumer side of one lane.
 pub(crate) struct PipelineLane {
-    rx: UnboundedReceiver<PipelineJob>,
+    rx: Receiver<PipelineJob>,
 }
 
-impl PipelineLane {
-    pub fn from_receiver(rx: UnboundedReceiver<PipelineJob>) -> Self {
-        Self { rx }
-    }
+pub(crate) fn bounded_lane(capacity: usize) -> (Sender<PipelineJob>, PipelineLane) {
+    assert!(capacity > 0, "pipeline capacity must be positive");
+    // futures-mpsc reserves one slot per sender in addition to its buffer.
+    // Each lane intentionally has exactly one sender, so subtract one to make
+    // the declared capacity the actual maximum retained job count.
+    let (tx, rx) = futures::channel::mpsc::channel(capacity - 1);
+    (tx, PipelineLane { rx })
 }
 /// lane's shared client under a UI update so the Arc stays current.
 pub(crate) fn spawn_lane(
@@ -119,4 +125,27 @@ pub(crate) async fn poll_once(this: &WeakEntity<HhApp>, cx: &mut AsyncApp) -> Op
         return None;
     };
     Some(state_changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job() -> PipelineJob {
+        PipelineJob {
+            request: ClientRequest::ShutdownService,
+            one_way: false,
+            followup_refresh: false,
+            apply: None,
+        }
+    }
+
+    #[test]
+    fn bounded_lane_rejects_jobs_beyond_its_declared_capacity() {
+        let (mut tx, _lane) = bounded_lane(2);
+        tx.try_send(job()).unwrap();
+        tx.try_send(job()).unwrap();
+
+        assert!(tx.try_send(job()).is_err());
+    }
 }

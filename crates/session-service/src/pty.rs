@@ -33,6 +33,8 @@ pub(crate) const INITIAL_ROWS: u16 = 30;
 
 pub(crate) const MAX_INPUT_FRAME: usize = 64 * 1024;
 
+const PTY_INPUT_COMPLETION_BOUND: Duration = Duration::from_secs(5);
+
 pub(crate) const MAX_RAW_PANE_EVENTS: usize = 32;
 
 pub(crate) const TMUX_ATTACH_STARTUP_GRACE: Duration = Duration::from_millis(75);
@@ -50,10 +52,15 @@ pub(crate) struct RawPaneEvent {
     pub(crate) at_ms: u64,
 }
 
+struct PtyInput {
+    bytes: Vec<u8>,
+    completion: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+}
+
 pub(crate) struct PtySession {
     pane_id: Uuid,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    input_tx: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
+    input_tx: Mutex<Option<std::sync::mpsc::SyncSender<PtyInput>>>,
     writer: Mutex<Option<thread::JoinHandle<()>>>,
     writer_exit: Mutex<std::sync::mpsc::Receiver<()>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
@@ -310,18 +317,22 @@ impl PtySession {
         // Input flows through a dedicated writer thread so a stopped child
         // with a full PTY buffer can never wedge a request handler: the
         // bounded channel below turns a stuck write into a timeout error.
-        let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+        let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<PtyInput>(64);
         let (writer_exit_tx, writer_exit) = std::sync::mpsc::channel::<()>();
         let writer_thread = thread::Builder::new()
             .name(format!("rmux-pty-writer-{pane_id}"))
             .spawn(move || {
                 let _writer_exit = writer_exit_tx;
                 let mut writer = writer;
-                while let Ok(bytes) = input_rx.recv() {
-                    if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                while let Ok(input) = input_rx.recv() {
+                    if let Err(error) = writer.write_all(&input.bytes).and_then(|()| writer.flush())
+                    {
+                        let message = format!("write terminal input: {error}");
+                        let _ = input.completion.send(Err(message));
                         eprintln!("pty writer for pane {pane_id} stopped: {error}");
                         break;
                     }
+                    let _ = input.completion.send(Ok(()));
                 }
             })
             .context("spawn PTY writer thread")?;
@@ -359,20 +370,23 @@ impl PtySession {
                 self.revision.fetch_add(1, Ordering::Release);
             }
         }
-        let input_tx = self.input_tx.lock();
-        let Some(input_tx) = input_tx.as_ref() else {
+        let Some(input_tx) = self.input_tx.lock().as_ref().cloned() else {
             bail!("terminal is not accepting input");
         };
         // A single bounded channel preserves keystroke/paste ordering while
         // turning a wedged writer (stopped child, full PTY buffer) into an
-        // error instead of a frozen handler thread. Holding the sender lock
-        // across the poll loop keeps concurrent callers ordered.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut queued = bytes.to_vec();
+        // error instead of a frozen handler thread. Clone the sender so the
+        // lifecycle lock itself never sits inside the completion bound.
+        let deadline = Instant::now() + PTY_INPUT_COMPLETION_BOUND;
+        let (completion, result) = std::sync::mpsc::sync_channel(1);
+        let mut queued = PtyInput {
+            bytes: bytes.to_vec(),
+            completion,
+        };
         loop {
             match input_tx.try_send(queued) {
-                Ok(()) => return Ok(()),
-                Err(std::sync::mpsc::TrySendError::Full(bytes)) => queued = bytes,
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(input)) => queued = input,
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                     bail!("terminal is not accepting input")
                 }
@@ -381,6 +395,17 @@ impl PtySession {
                 bail!("terminal is not accepting input");
             }
             thread::sleep(Duration::from_millis(5));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match result.recv_timeout(remaining) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => bail!(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                bail!("terminal input completion timed out after {PTY_INPUT_COMPLETION_BOUND:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("terminal input writer stopped before acknowledging completion")
+            }
         }
     }
 
