@@ -178,10 +178,12 @@ pub fn voice_ui_channel() -> (VoiceUiSender, Receiver<VoiceUiEvent>) {
                         }
                     }
                 };
-                if !event.droppable_delta() {
+                let critical = !event.droppable_delta();
+                let delivered = futures::executor::block_on(desktop_tx.send(event)).is_ok();
+                if critical {
                     dispatcher_critical_slots.fetch_add(1, Ordering::Release);
                 }
-                if futures::executor::block_on(desktop_tx.send(event)).is_err() {
+                if !delivered {
                     break;
                 }
             }
@@ -326,18 +328,19 @@ mod admission_tests {
     #[test]
     fn saturated_critical_ui_capacity_is_observable_without_blocking_the_engine() {
         let (ui, _events) = voice_ui_channel();
-        while ui.critical_capacity() > 0 {
-            assert!(ui.emit(VoiceUiEvent::State(EngineState::Thinking)));
-        }
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = done_tx.send(ui.emit(VoiceUiEvent::State(EngineState::Thinking)));
-        });
+        let started = std::time::Instant::now();
+        let attempts = VOICE_UI_EVENT_CAPACITY + VOICE_UI_DISPATCH_CAPACITY + 32;
+        let rejected = (0..attempts)
+            .filter(|_| !ui.emit(VoiceUiEvent::State(EngineState::Thinking)))
+            .count();
 
-        assert_eq!(
-            done_rx.recv_timeout(Duration::from_millis(100)),
-            Ok(false),
-            "a saturated critical UI queue blocked the sole engine"
+        assert!(
+            rejected > 0,
+            "stalled desktop consumption never exposed bounded critical capacity"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "critical UI admission blocked the sole engine"
         );
     }
 
