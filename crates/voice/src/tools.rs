@@ -44,13 +44,15 @@ const SEARCH_SKIP_DIRECTORIES: &[&str] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrustTier {
     T0,
-    T1,
     T2,
-    Meta,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PendingAction {
+    ToolCall {
+        name: String,
+        arguments: Value,
+    },
     SendInput {
         pane_id: Uuid,
         text: String,
@@ -71,6 +73,7 @@ enum PendingAction {
 impl PendingAction {
     fn description(&self) -> String {
         match self {
+            Self::ToolCall { name, arguments } => format!("run {name} with {arguments}"),
             Self::SendInput { pane_id, text, .. } => {
                 format!("send potentially destructive input to pane {pane_id}: {text}")
             }
@@ -88,17 +91,17 @@ impl PendingAction {
 #[derive(Debug)]
 pub(crate) struct ToolExecutor {
     client: SessionClient,
+    authorized_workspaces: HashSet<Uuid>,
+    authorized_root: Option<PathBuf>,
     attached_workspaces: HashSet<Uuid>,
     voice_created_panes: HashSet<Uuid>,
     pending_approvals: HashMap<u64, PendingAction>,
-    ui_only_approvals: HashSet<u64>,
     next_approval_id: u64,
     snapshot: Option<SessionSnapshot>,
     pane_states: HashMap<Uuid, PaneStreamState>,
     notification_buffer: Vec<SessionNotification>,
     snapshot_revision: Option<u64>,
     notification_cursor: u64,
-    own_pane: Option<Uuid>,
 }
 
 impl ToolExecutor {
@@ -110,17 +113,17 @@ impl ToolExecutor {
         };
         Ok(Self {
             client,
+            authorized_workspaces: HashSet::new(),
+            authorized_root: None,
             attached_workspaces: HashSet::new(),
             voice_created_panes: HashSet::new(),
             pending_approvals: HashMap::new(),
-            ui_only_approvals: HashSet::new(),
             next_approval_id: 1,
             snapshot: None,
             pane_states: HashMap::new(),
             notification_buffer: Vec::new(),
             snapshot_revision: None,
             notification_cursor,
-            own_pane: None,
         })
     }
 
@@ -128,10 +131,19 @@ impl ToolExecutor {
     /// an explicit `attach_project` call. Used when an assistant pane is
     /// planted into a known workstation.
     pub(crate) fn attach_workspace(&mut self, workspace_id: Uuid) {
+        self.authorized_workspaces.insert(workspace_id);
         self.attached_workspaces.insert(workspace_id);
     }
-    pub(crate) fn set_own_pane(&mut self, pane_id: Uuid) {
-        self.own_pane = Some(pane_id);
+    pub(crate) fn authorize_context(
+        &mut self,
+        workspace_id: Option<Uuid>,
+        working_dir: Option<&str>,
+    ) -> Result<()> {
+        if let Some(workspace_id) = workspace_id {
+            self.authorized_workspaces.insert(workspace_id);
+        }
+        self.authorized_root = working_dir.map(canonical_existing_directory).transpose()?;
+        Ok(())
     }
 
     pub(crate) fn execute(
@@ -158,49 +170,29 @@ impl ToolExecutor {
         memory: &mut dyn MemoryBackend,
         ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
     ) -> Result<Value> {
-        let tier = classify_tool(name, arguments, &self.voice_created_panes)?;
+        let tier = classify_tool(name)?;
+        if tier == TrustTier::T2 {
+            let result = self.request_approval(pending_action(name, arguments)?, ui);
+            let _ = ui.unbounded_send(VoiceUiEvent::ToolCall {
+                name: name.to_owned(),
+                summary: summarize_output(&result),
+            });
+            return Ok(result);
+        }
         let result = match name {
             "list_workstations" => self.list_workstations(),
             "read_pane" => self.read_pane(arguments),
             "check_status" => self.check_status(),
             "attach_project" => self.attach_project(arguments),
-            "list_directory" => Self::list_directory(arguments),
-            "find_directory" => Self::find_directory(arguments),
-            "list_threads" => Ok(Self::list_threads(arguments)),
-            "read_thread" => Self::read_thread(arguments),
+            "list_directory" => self.list_directory(arguments),
+            "find_directory" => self.find_directory(arguments),
+            "list_threads" => Ok(self.list_threads(arguments)),
+            "read_thread" => self.read_thread(arguments),
             "recall_memory" => {
                 let query = required_str(arguments, "query")?;
                 memory
                     .recall(query)
                     .map(|content| json!({ "content": content }))
-            }
-            "create_workstation" => self.create_workstation(arguments),
-            "open_terminal_tab" => self.open_terminal_tab(arguments),
-            "rename_tab" => self.rename_tab(arguments),
-            "open_project_tab" => self.open_project_tab(arguments),
-            "create_worktree_tab" => self.create_worktree_tab(arguments),
-            "launch_agent" => self.launch_agent(arguments),
-            "send_input" if tier == TrustTier::T1 => self.send_input_now(arguments),
-            "send_input" => Ok(self.request_approval(pending_send_input(arguments)?, false, ui)),
-            "send_keys" => Ok(self.request_approval(pending_send_keys(arguments)?, false, ui)),
-            "close_tab" => {
-                let tab_id = required_uuid(arguments, "tab_id")?;
-                let ui_only = self.tab_contains_own_pane(tab_id)?;
-                Ok(self.request_approval(PendingAction::CloseTab { tab_id }, ui_only, ui))
-            }
-            "close_workstation" => {
-                let workspace_id = required_uuid(arguments, "workspace_id")?;
-                let ui_only = self.workspace_contains_own_pane(workspace_id);
-                Ok(self.request_approval(
-                    PendingAction::CloseWorkstation { workspace_id },
-                    ui_only,
-                    ui,
-                ))
-            }
-            "approve_action" => {
-                let approval_id = required_u64(arguments, "approval_id")?;
-                let approved = required_bool(arguments, "approved")?;
-                self.resolve_approval(approval_id, approved, false, ui)
             }
             _ => bail!("unknown voice tool {name}"),
         }?;
@@ -211,26 +203,16 @@ impl ToolExecutor {
         Ok(result)
     }
 
-    pub(crate) fn resolve_approval(
+    pub(crate) fn resolve_ui_approval(
         &mut self,
         approval_id: u64,
         approved: bool,
-        via_ui: bool,
         ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
     ) -> Result<Value> {
-        let ui_only = self.ui_only_approvals.contains(&approval_id);
-        if approval_blocked_for_voice(ui_only, via_ui, approved) {
-            return Ok(json!({
-                "status": "requires_ui_approval",
-                "approval_id": approval_id,
-                "note": "tell the user to click Approve in the pane; a spoken yes cannot close the assistant's own tab",
-            }));
-        }
         let action = self
             .pending_approvals
             .remove(&approval_id)
             .with_context(|| format!("approval {approval_id} is not pending"))?;
-        self.ui_only_approvals.remove(&approval_id);
         let result = if approved {
             self.execute_pending(action)?
         } else {
@@ -303,12 +285,27 @@ impl ToolExecutor {
 
     fn list_workstations(&mut self) -> Result<Value> {
         let snapshot = self.ensure_snapshot()?.clone();
+        if let Some(root) = &self.authorized_root {
+            self.authorized_workspaces.extend(
+                snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| workspace_directory_is_within(workspace, root))
+                    .map(|workspace| workspace.id),
+            );
+        }
         let pane_states = self.pane_states.clone();
-        Ok(snapshot_summary(&snapshot, &pane_states))
+        Ok(snapshot_summary(
+            &snapshot,
+            &pane_states,
+            &self.authorized_workspaces,
+        ))
     }
 
     fn read_pane(&mut self, arguments: &Value) -> Result<Value> {
         let pane_id = required_uuid(arguments, "pane_id")?;
+        let workspace_id = self.workspace_for_pane(pane_id)?;
+        self.require_authorized(workspace_id)?;
         let lines = arguments
             .get("lines")
             .and_then(Value::as_u64)
@@ -359,12 +356,16 @@ impl ToolExecutor {
                 })
             })
             .collect::<Vec<_>>();
-        let notifications = std::mem::take(&mut self.notification_buffer);
+        let notifications = std::mem::take(&mut self.notification_buffer)
+            .into_iter()
+            .filter(|notification| self.notification_is_attached(notification))
+            .collect::<Vec<_>>();
         Ok(json!({ "panes": statuses, "notifications": notifications }))
     }
 
     fn attach_project(&mut self, arguments: &Value) -> Result<Value> {
         let workspace_id = required_uuid(arguments, "workspace_id")?;
+        self.require_authorized(workspace_id)?;
         let (title, working_dir) = {
             let workspace = terminal_workspace(self.ensure_snapshot()?, workspace_id)?;
             (workspace.title.clone(), workspace.working_dir.clone())
@@ -378,9 +379,15 @@ impl ToolExecutor {
         }))
     }
 
-    fn list_directory(arguments: &Value) -> Result<Value> {
-        let path = arguments.get("path").and_then(Value::as_str).unwrap_or("~");
-        let canonical = canonical_existing_directory(path)?;
+    fn list_directory(&self, arguments: &Value) -> Result<Value> {
+        let root = self
+            .authorized_root
+            .as_deref()
+            .context("no authorized workspace directory is available")?;
+        let canonical = match arguments.get("path").and_then(Value::as_str) {
+            Some(path) => canonical_directory_within(path, root)?,
+            None => root.to_path_buf(),
+        };
         let (directories, truncated) = subdirectory_names(&canonical)?;
         Ok(json!({
             "path": canonical,
@@ -389,10 +396,13 @@ impl ToolExecutor {
         }))
     }
 
-    fn find_directory(arguments: &Value) -> Result<Value> {
+    fn find_directory(&self, arguments: &Value) -> Result<Value> {
         let query = required_str(arguments, "query")?;
-        let home = std::env::var("HOME").context("HOME is not set")?;
-        let matches = find_directories(Path::new(&home), query);
+        let root = self
+            .authorized_root
+            .as_deref()
+            .context("no authorized workspace directory is available")?;
+        let matches = find_directories(root, query);
         let truncated = matches.len() > MAX_DIRECTORY_MATCHES;
         let matches = matches
             .into_iter()
@@ -402,8 +412,14 @@ impl ToolExecutor {
         Ok(json!({ "query": query, "matches": matches, "truncated": truncated }))
     }
 
-    fn list_threads(_arguments: &Value) -> Value {
+    fn list_threads(&self, _arguments: &Value) -> Value {
         let threads = threads::list_threads();
+        let threads = threads
+            .into_iter()
+            .filter(|thread| {
+                thread_workspace_is_authorized(thread.workspace_id, &self.authorized_workspaces)
+            })
+            .collect::<Vec<_>>();
         let truncated = threads.len() > MAX_LISTED_THREADS;
         let threads = threads
             .into_iter()
@@ -421,10 +437,13 @@ impl ToolExecutor {
         json!({ "threads": threads, "truncated": truncated })
     }
 
-    fn read_thread(arguments: &Value) -> Result<Value> {
+    fn read_thread(&self, arguments: &Value) -> Result<Value> {
         let thread_id = required_uuid(arguments, "thread_id")?;
         let thread = threads::read_thread(thread_id)
             .with_context(|| format!("thread {thread_id} not found"))?;
+        if !thread_workspace_is_authorized(thread.workspace_id, &self.authorized_workspaces) {
+            bail!("thread {thread_id} is outside the authorized workspace boundary");
+        }
         let mut turns = thread
             .entries
             .into_iter()
@@ -474,6 +493,7 @@ impl ToolExecutor {
                 working_dir: Some(directory.clone()),
             })?)?;
         }
+        self.authorized_workspaces.insert(workspace_id);
         self.attached_workspaces.insert(workspace_id);
         self.voice_created_panes.insert(pane_id);
         self.snapshot = None;
@@ -500,6 +520,8 @@ impl ToolExecutor {
     }
     fn rename_tab(&mut self, arguments: &Value) -> Result<Value> {
         let tab_id = required_uuid(arguments, "tab_id")?;
+        let workspace_id = self.workspace_for_tab(tab_id)?;
+        self.require_authorized(workspace_id)?;
         let title = required_str(arguments, "title")?.to_owned();
         expect_ack(&self.client.call(&ClientRequest::RenameTab {
             tab_id,
@@ -579,60 +601,47 @@ impl ToolExecutor {
         Ok(json!({ "pane_id": pane_id, "launched": command }))
     }
 
-    fn send_input_now(&mut self, arguments: &Value) -> Result<Value> {
-        let PendingAction::SendInput {
-            pane_id,
-            text,
-            submit,
-        } = pending_send_input(arguments)?
-        else {
-            unreachable!();
-        };
-        self.write_input(pane_id, &text, submit)
-    }
-
     fn request_approval(
         &mut self,
         action: PendingAction,
-        ui_only: bool,
         ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
     ) -> Value {
         let id = self.next_approval_id;
         self.next_approval_id = self.next_approval_id.saturating_add(1);
         let description = action.description();
         self.pending_approvals.insert(id, action);
-        if ui_only {
-            self.ui_only_approvals.insert(id);
-        }
         let _ = ui.unbounded_send(VoiceUiEvent::ApprovalRequested {
             id,
             description: description.clone(),
         });
-        if ui_only {
-            json!({
-                "status": "needs_approval",
-                "approval_id": id,
-                "action": description,
-                "requires_ui_click": true,
-                "note": "closing the assistant's own surface requires the user to click Approve in the pane",
-            })
-        } else {
-            json!({
-                "status": "needs_approval",
-                "approval_id": id,
-                "action": description,
-            })
-        }
+        json!({
+            "status": "needs_approval",
+            "approval_id": id,
+            "action": description,
+            "requires_ui_click": true,
+            "note": "the user must click Approve or Deny in the pane; spoken confirmation is not authorization",
+        })
     }
 
     fn execute_pending(&mut self, action: PendingAction) -> Result<Value> {
         match action {
+            PendingAction::ToolCall { name, arguments } => match name.as_str() {
+                "create_workstation" => self.create_workstation(&arguments),
+                "open_terminal_tab" => self.open_terminal_tab(&arguments),
+                "rename_tab" => self.rename_tab(&arguments),
+                "open_project_tab" => self.open_project_tab(&arguments),
+                "create_worktree_tab" => self.create_worktree_tab(&arguments),
+                "launch_agent" => self.launch_agent(&arguments),
+                _ => bail!("unsupported pending voice tool {name}"),
+            },
             PendingAction::SendInput {
                 pane_id,
                 text,
                 submit,
             } => self.write_input(pane_id, &text, submit),
             PendingAction::SendKeys { pane_id, keys } => {
+                let workspace_id = self.workspace_for_pane(pane_id)?;
+                self.require_authorized(workspace_id)?;
                 let mut bytes = Vec::new();
                 for key in &keys {
                     bytes.extend_from_slice(key_bytes(key)?);
@@ -642,11 +651,14 @@ impl ToolExecutor {
                 Ok(json!({ "status": "executed", "pane_id": pane_id }))
             }
             PendingAction::CloseTab { tab_id } => {
+                let workspace_id = self.workspace_for_tab(tab_id)?;
+                self.require_authorized(workspace_id)?;
                 expect_ack(&self.client.call(&ClientRequest::CloseTab { tab_id })?)?;
                 self.snapshot = None;
                 Ok(json!({ "status": "executed", "tab_id": tab_id }))
             }
             PendingAction::CloseWorkstation { workspace_id } => {
+                self.require_authorized(workspace_id)?;
                 expect_ack(
                     &self
                         .client
@@ -660,6 +672,8 @@ impl ToolExecutor {
     }
 
     fn write_input(&mut self, pane_id: Uuid, text: &str, submit: bool) -> Result<Value> {
+        let workspace_id = self.workspace_for_pane(pane_id)?;
+        self.require_authorized(workspace_id)?;
         let mut bytes = text.as_bytes().to_vec();
         if submit {
             bytes.push(b'\r');
@@ -676,6 +690,13 @@ impl ToolExecutor {
         Ok(())
     }
 
+    fn require_authorized(&self, workspace_id: Uuid) -> Result<()> {
+        if !self.authorized_workspaces.contains(&workspace_id) {
+            bail!("workspace {workspace_id} is outside the authorized workspace boundary");
+        }
+        Ok(())
+    }
+
     fn require_attached_workstation(&mut self, workspace_id: Uuid) -> Result<()> {
         {
             terminal_workspace(self.ensure_snapshot()?, workspace_id)?;
@@ -683,33 +704,14 @@ impl ToolExecutor {
         self.require_attached(workspace_id)
     }
 
-    fn tab_contains_own_pane(&mut self, tab_id: Uuid) -> Result<bool> {
-        let Some(own_pane) = self.own_pane else {
-            return Ok(false);
-        };
+    fn workspace_for_tab(&mut self, tab_id: Uuid) -> Result<Uuid> {
         let snapshot = self.ensure_snapshot()?;
-        for tab in snapshot
+        snapshot
             .workspaces
             .iter()
-            .flat_map(|workspace| workspace.tabs.iter())
-        {
-            if tab.id == tab_id {
-                let mut panes = Vec::new();
-                collect_panes(&tab.layout, &mut panes);
-                return Ok(panes.into_iter().any(|pane| pane.id == own_pane));
-            }
-        }
-        Ok(false)
-    }
-
-    fn workspace_contains_own_pane(&mut self, workspace_id: Uuid) -> bool {
-        let Some(own_pane) = self.own_pane else {
-            return false;
-        };
-        match self.workspace_for_pane(own_pane) {
-            Ok(own_workspace_id) => own_workspace_id == workspace_id,
-            Err(_) => false,
-        }
+            .find(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id))
+            .map(|workspace| workspace.id)
+            .with_context(|| format!("tab {tab_id} not found"))
     }
 
     fn workspace_for_pane(&mut self, pane_id: Uuid) -> Result<Uuid> {
@@ -727,11 +729,7 @@ impl ToolExecutor {
     }
 }
 
-pub(crate) fn classify_tool(
-    name: &str,
-    arguments: &Value,
-    voice_created_panes: &HashSet<Uuid>,
-) -> Result<TrustTier> {
+pub(crate) fn classify_tool(name: &str) -> Result<TrustTier> {
     match name {
         "list_workstations" | "read_pane" | "check_status" | "attach_project" | "recall_memory"
         | "list_directory" | "find_directory" | "list_threads" | "read_thread" => Ok(TrustTier::T0),
@@ -740,18 +738,11 @@ pub(crate) fn classify_tool(
         | "rename_tab"
         | "open_project_tab"
         | "create_worktree_tab"
-        | "launch_agent" => Ok(TrustTier::T1),
-        "send_input" => {
-            let pane_id = required_uuid(arguments, "pane_id")?;
-            let text = required_str(arguments, "text")?;
-            if voice_created_panes.contains(&pane_id) && !is_destructive_input(text) {
-                Ok(TrustTier::T1)
-            } else {
-                Ok(TrustTier::T2)
-            }
-        }
-        "send_keys" | "close_tab" | "close_workstation" => Ok(TrustTier::T2),
-        "approve_action" => Ok(TrustTier::Meta),
+        | "launch_agent"
+        | "send_input"
+        | "send_keys"
+        | "close_tab"
+        | "close_workstation" => Ok(TrustTier::T2),
         _ => bail!("unknown voice tool {name}"),
     }
 }
@@ -886,14 +877,6 @@ pub(crate) fn tool_schemas() -> Vec<Value> {
             json!({"workspace_id":{"type":"string"}}),
             &["workspace_id"],
         ),
-        tool(
-            "approve_action",
-            "Resolve a pending action after explicit confirmation",
-            json!({
-                "approval_id": {"type":"integer"}, "approved": {"type":"boolean"}
-            }),
-            &["approval_id", "approved"],
-        ),
     ]
 }
 
@@ -912,34 +895,12 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
-fn approval_blocked_for_voice(ui_only: bool, via_ui: bool, approved: bool) -> bool {
-    approved && !via_ui && ui_only
-}
-
 fn initial_notification_cursor(items: &[SessionNotification]) -> u64 {
     items
         .iter()
         .map(|notification| notification.id)
         .max()
         .unwrap_or(0)
-}
-
-pub(crate) fn is_destructive_input(text: &str) -> bool {
-    let normalized = text.trim_start().to_ascii_lowercase();
-    let command = normalized.split_whitespace().next().unwrap_or_default();
-    matches!(
-        command,
-        "sudo" | "rm" | "dd" | "shutdown" | "reboot" | "halt"
-    ) || command.starts_with("mkfs")
-        || (contains_command_pair(&normalized, "git", "push") && normalized.contains("--force"))
-        || (contains_command_pair(&normalized, "git", "reset") && normalized.contains("--hard"))
-}
-
-fn contains_command_pair(text: &str, first: &str, second: &str) -> bool {
-    text.split(|character: char| character.is_whitespace() || matches!(character, ';' | '&' | '|'))
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|pair| pair == [first, second])
 }
 
 pub(crate) fn validate_worktree_branch(branch: &str) -> Result<()> {
@@ -970,6 +931,34 @@ pub(crate) fn worktree_path(repo_dir: &Path, branch: &str) -> Result<PathBuf> {
     Ok(parent
         .join(format!("{repo_name}-worktrees"))
         .join(path_name))
+}
+
+fn thread_workspace_is_authorized(
+    workspace_id: Option<Uuid>,
+    authorized_workspaces: &HashSet<Uuid>,
+) -> bool {
+    workspace_id.is_some_and(|id| authorized_workspaces.contains(&id))
+}
+
+fn workspace_directory_is_within(workspace: &hh_protocol::Workspace, root: &Path) -> bool {
+    workspace
+        .working_dir
+        .as_deref()
+        .is_some_and(|working_dir| canonical_directory_within(working_dir, root).is_ok())
+}
+
+fn canonical_directory_within(path: &str, root: &Path) -> Result<PathBuf> {
+    let canonical = canonical_existing_directory(path)?;
+    let canonical_root = std::fs::canonicalize(root)
+        .with_context(|| format!("resolve authorized root {}", root.display()))?;
+    if !canonical.starts_with(&canonical_root) {
+        bail!(
+            "directory {} is outside the authorized workspace root {}",
+            canonical.display(),
+            canonical_root.display()
+        );
+    }
+    Ok(canonical)
 }
 
 fn canonical_existing_directory(path: &str) -> Result<PathBuf> {
@@ -1137,6 +1126,29 @@ fn run_git_worktree(repo: &Path, target: &Path, branch: &str, base: Option<&str>
     Ok(())
 }
 
+fn pending_action(name: &str, arguments: &Value) -> Result<PendingAction> {
+    match name {
+        "send_input" => pending_send_input(arguments),
+        "send_keys" => pending_send_keys(arguments),
+        "close_tab" => Ok(PendingAction::CloseTab {
+            tab_id: required_uuid(arguments, "tab_id")?,
+        }),
+        "close_workstation" => Ok(PendingAction::CloseWorkstation {
+            workspace_id: required_uuid(arguments, "workspace_id")?,
+        }),
+        "create_workstation"
+        | "open_terminal_tab"
+        | "rename_tab"
+        | "open_project_tab"
+        | "create_worktree_tab"
+        | "launch_agent" => Ok(PendingAction::ToolCall {
+            name: name.to_owned(),
+            arguments: arguments.clone(),
+        }),
+        _ => bail!("tool {name} cannot be approved"),
+    }
+}
+
 fn pending_send_input(arguments: &Value) -> Result<PendingAction> {
     Ok(PendingAction::SendInput {
         pane_id: required_uuid(arguments, "pane_id")?,
@@ -1198,10 +1210,15 @@ fn terminal_workspace(
     Ok(workspace)
 }
 
-fn snapshot_summary(snapshot: &SessionSnapshot, states: &HashMap<Uuid, PaneStreamState>) -> Value {
+fn snapshot_summary(
+    snapshot: &SessionSnapshot,
+    states: &HashMap<Uuid, PaneStreamState>,
+    authorized_workspaces: &HashSet<Uuid>,
+) -> Value {
     let workspaces = snapshot
         .workspaces
         .iter()
+        .filter(|workspace| authorized_workspaces.contains(&workspace.id))
         .map(|workspace| {
             let tabs = workspace
                 .tabs
@@ -1269,20 +1286,6 @@ fn required_uuid(value: &Value, field: &str) -> Result<Uuid> {
         .with_context(|| format!("{field} must be a UUID"))
 }
 
-fn required_u64(value: &Value, field: &str) -> Result<u64> {
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .with_context(|| format!("{field} must be an unsigned integer"))
-}
-
-fn required_bool(value: &Value, field: &str) -> Result<bool> {
-    value
-        .get(field)
-        .and_then(Value::as_bool)
-        .with_context(|| format!("{field} must be a boolean"))
-}
-
 fn expect_ack(response: &ServiceResponse) -> Result<()> {
     if matches!(response, ServiceResponse::Ack) {
         Ok(())
@@ -1344,72 +1347,31 @@ mod tests {
     }
 
     #[test]
-    fn only_voice_approval_of_ui_only_actions_is_blocked() {
-        for ui_only in [false, true] {
-            for via_ui in [false, true] {
-                for approved in [false, true] {
-                    assert_eq!(
-                        approval_blocked_for_voice(ui_only, via_ui, approved),
-                        ui_only && !via_ui && approved,
-                        "ui_only={ui_only}, via_ui={via_ui}, approved={approved}"
-                    );
-                }
-            }
-        }
+    fn model_cannot_resolve_approvals() {
+        assert!(
+            tool_schemas()
+                .iter()
+                .all(|schema| schema["name"] != "approve_action")
+        );
+        assert!(classify_tool("approve_action").is_err());
     }
 
     #[test]
-    fn destructive_input_detection_matches_only_declared_command_families() {
-        for command in [
-            "sudo launchctl reboot",
-            " rm -rf /tmp/x",
-            "mkfs.ext4 /dev/x",
-            "dd if=/dev/zero of=/dev/x",
-            "shutdown -h now",
-            "reboot",
-            "halt",
-            "git push origin main --force",
-            "git reset HEAD~1 --hard",
+    fn every_terminal_mutation_and_launch_requires_independent_approval() {
+        for name in [
+            "create_workstation",
+            "open_terminal_tab",
+            "rename_tab",
+            "open_project_tab",
+            "create_worktree_tab",
+            "launch_agent",
+            "send_input",
+            "send_keys",
+            "close_tab",
+            "close_workstation",
         ] {
-            assert!(is_destructive_input(command), "command: {command}");
+            assert_eq!(classify_tool(name).unwrap(), TrustTier::T2, "tool={name}");
         }
-        for command in ["echo rm", "git push origin main", "git reset --soft HEAD~1"] {
-            assert!(!is_destructive_input(command), "command: {command}");
-        }
-    }
-
-    #[test]
-    fn trust_tiers_distinguish_voice_created_foreign_and_destructive_input() {
-        let voice_pane = Uuid::new_v4();
-        let foreign_pane = Uuid::new_v4();
-        let voice_created = HashSet::from([voice_pane]);
-        assert_eq!(
-            classify_tool(
-                "send_input",
-                &json!({"pane_id": voice_pane, "text": "cargo check"}),
-                &voice_created,
-            )
-            .unwrap(),
-            TrustTier::T1
-        );
-        assert_eq!(
-            classify_tool(
-                "send_input",
-                &json!({"pane_id": foreign_pane, "text": "cargo check"}),
-                &voice_created,
-            )
-            .unwrap(),
-            TrustTier::T2
-        );
-        assert_eq!(
-            classify_tool(
-                "send_input",
-                &json!({"pane_id": voice_pane, "text": "rm -rf target"}),
-                &voice_created,
-            )
-            .unwrap(),
-            TrustTier::T2
-        );
     }
 
     #[test]
@@ -1438,14 +1400,17 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_summary_exposes_workspace_kind() {
+    fn snapshot_summary_omits_workspaces_outside_authorized_boundary() {
         let mut snapshot = SessionSnapshot::seeded();
-        let summary = snapshot_summary(&snapshot, &HashMap::new());
-        assert_eq!(summary["workspaces"][0]["kind"], "workstation");
+        let authorized_id = snapshot.workspaces[0].id;
+        let mut unrelated = snapshot.workspaces[0].clone();
+        unrelated.id = Uuid::new_v4();
+        unrelated.title = "Unrelated".to_owned();
+        snapshot.workspaces.push(unrelated);
 
-        snapshot.workspaces[0].kind = hh_protocol::WorkspaceKind::Assistant;
-        let summary = snapshot_summary(&snapshot, &HashMap::new());
-        assert_eq!(summary["workspaces"][0]["kind"], "assistant");
+        let summary = snapshot_summary(&snapshot, &HashMap::new(), &HashSet::from([authorized_id]));
+        assert_eq!(summary["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(summary["workspaces"][0]["id"], authorized_id.to_string());
     }
 
     #[test]
@@ -1465,6 +1430,34 @@ mod tests {
                 "workspace {workspace_id} is an assistant workspace; choose a kind=workstation target from list_workstations"
             )
         );
+    }
+
+    #[test]
+    fn thread_access_requires_matching_authorized_workspace() {
+        let authorized = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
+        let boundary = HashSet::from([authorized]);
+        assert!(thread_workspace_is_authorized(Some(authorized), &boundary));
+        assert!(!thread_workspace_is_authorized(Some(unrelated), &boundary));
+        assert!(!thread_workspace_is_authorized(None, &boundary));
+    }
+
+    #[test]
+    fn directory_access_stays_within_authorized_root() {
+        let root = std::env::temp_dir().join(format!("hh-boundary-{}", Uuid::new_v4()));
+        let allowed = root.join("allowed");
+        let outside = std::env::temp_dir().join(format!("hh-outside-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert_eq!(
+            canonical_directory_within(allowed.to_str().unwrap(), &root).unwrap(),
+            std::fs::canonicalize(&allowed).unwrap()
+        );
+        assert!(canonical_directory_within(outside.to_str().unwrap(), &root).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
