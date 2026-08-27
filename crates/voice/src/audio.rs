@@ -294,7 +294,7 @@ impl std::fmt::Debug for AudioSystem {
 }
 
 impl AudioSystem {
-    pub(crate) fn start() -> Result<Self> {
+    pub(crate) fn start(microphone_enabled: bool) -> Result<Self> {
         let host = cpal::default_host();
         let input_device = host
             .default_input_device()
@@ -332,7 +332,11 @@ impl AudioSystem {
             Arc::clone(&playback),
             Arc::clone(&playback_active),
         )?;
-        input_stream.play().context("start microphone stream")?;
+        if microphone_enabled {
+            input_stream.play().context("start microphone stream")?;
+        } else {
+            input_stream.pause().context("pause microphone stream")?;
+        }
         output_stream.play().context("start audio output stream")?;
         let output_rate = output_config.sample_rate;
         Ok(Self {
@@ -343,7 +347,7 @@ impl AudioSystem {
             playback_active,
             output_resampler: Mutex::new(OutputResampler::new(output_rate)?),
             output_rate,
-            input_enabled: true,
+            input_enabled: microphone_enabled,
         })
     }
 

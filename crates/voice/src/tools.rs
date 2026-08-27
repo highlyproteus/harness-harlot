@@ -186,7 +186,7 @@ impl ToolExecutor {
             "attach_project" => self.attach_project(arguments),
             "list_directory" => self.list_directory(arguments),
             "find_directory" => self.find_directory(arguments),
-            "list_threads" => Ok(self.list_threads(arguments)),
+            "list_threads" => self.list_threads(arguments),
             "read_thread" => self.read_thread(arguments),
             "recall_memory" => {
                 let query = required_str(arguments, "query")?;
@@ -412,8 +412,8 @@ impl ToolExecutor {
         Ok(json!({ "query": query, "matches": matches, "truncated": truncated }))
     }
 
-    fn list_threads(&self, _arguments: &Value) -> Value {
-        let threads = threads::list_threads();
+    fn list_threads(&self, _arguments: &Value) -> Result<Value> {
+        let threads = threads::list_threads()?;
         let threads = threads
             .into_iter()
             .filter(|thread| {
@@ -434,12 +434,12 @@ impl ToolExecutor {
                 })
             })
             .collect::<Vec<_>>();
-        json!({ "threads": threads, "truncated": truncated })
+        Ok(json!({ "threads": threads, "truncated": truncated }))
     }
 
     fn read_thread(&self, arguments: &Value) -> Result<Value> {
         let thread_id = required_uuid(arguments, "thread_id")?;
-        let thread = threads::read_thread(thread_id)
+        let thread = threads::read_thread(thread_id)?
             .with_context(|| format!("thread {thread_id} not found"))?;
         if !thread_workspace_is_authorized(thread.workspace_id, &self.authorized_workspaces) {
             bail!("thread {thread_id} is outside the authorized workspace boundary");

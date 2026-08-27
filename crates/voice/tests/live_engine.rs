@@ -11,7 +11,7 @@ use hh_voice::{
 #[test]
 #[ignore = "requires saved voice settings, a running hh-service, and network access"]
 fn live_engine_reports_state_transitions() {
-    let settings = VoiceSettings::load();
+    let settings = VoiceSettings::load().expect("load saved voice settings");
     assert!(
         !settings.api_key.trim().is_empty(),
         "no API key in saved voice settings"
@@ -101,7 +101,7 @@ fn live_engine_reports_state_transitions() {
 #[test]
 #[ignore = "creates a real terminal tab and requires saved settings, hh-service, and network"]
 fn live_engine_opens_requested_terminal_tab() {
-    let settings = VoiceSettings::load();
+    let settings = VoiceSettings::load().expect("load saved voice settings");
     assert!(
         !settings.api_key.trim().is_empty(),
         "no API key in saved voice settings"
@@ -179,7 +179,7 @@ fn live_engine_opens_requested_terminal_tab() {
 #[test]
 #[ignore = "creates a real terminal tab and requires saved settings, hh-service, and network"]
 fn live_engine_from_assistant_workspace_opens_workstation_terminal_tab() {
-    let settings = VoiceSettings::load();
+    let settings = VoiceSettings::load().expect("load saved voice settings");
     assert!(
         !settings.api_key.trim().is_empty(),
         "no API key in saved voice settings"

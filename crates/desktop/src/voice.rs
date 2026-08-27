@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::io;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{self, Read as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt as _;
@@ -26,6 +29,58 @@ use gpui::AppContext as _;
 
 const ASSISTANT_SUMMARY_MAX_BYTES: u64 = 16 * 1024;
 const MAX_ASSISTANT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ASSISTANT_IMAGE_DIMENSION: u32 = 8_192;
+const MAX_ASSISTANT_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+
+fn read_assistant_image(path: &Path) -> anyhow::Result<(String, String, PathBuf)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open assistant image {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect assistant image {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.uid() != rustix::process::geteuid().as_raw() {
+        anyhow::bail!("assistant image must be a regular file owned by the current user");
+    }
+    if metadata.len() > MAX_ASSISTANT_IMAGE_BYTES as u64 {
+        anyhow::bail!("image exceeds the 4 MiB attachment limit");
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(MAX_ASSISTANT_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read assistant image {}", path.display()))?;
+    if bytes.len() > MAX_ASSISTANT_IMAGE_BYTES {
+        anyhow::bail!("image grew past the 4 MiB attachment limit while reading");
+    }
+    let format = image::guess_format(&bytes).context("detect assistant image magic bytes")?;
+    let mime = match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::WebP => "image/webp",
+        _ => anyhow::bail!("unsupported file type; images (PNG, JPG, WebP) only for now"),
+    };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_ASSISTANT_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_ASSISTANT_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_ASSISTANT_IMAGE_PIXELS * 8);
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), format);
+    reader.limits(limits);
+    let decoded = reader.decode().context("decode bounded assistant image")?;
+    if u64::from(decoded.width()) * u64::from(decoded.height()) > MAX_ASSISTANT_IMAGE_PIXELS {
+        anyhow::bail!("assistant image exceeds the decoded pixel limit");
+    }
+    let filename = path.file_name().map_or_else(
+        || "image".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    Ok((
+        filename,
+        format!("data:{mime};base64,{}", BASE64.encode(bytes)),
+        path.to_path_buf(),
+    ))
+}
 
 fn local_datetime(at_ms: u64) -> Option<time::OffsetDateTime> {
     let datetime =
@@ -102,8 +157,12 @@ pub(crate) struct VoiceSettingsEditor {
 }
 
 impl VoiceSettingsEditor {
-    pub(crate) fn load() -> Self {
-        let settings = VoiceSettings::load();
+    pub(crate) fn load() -> anyhow::Result<Self> {
+        let settings = VoiceSettings::load()?;
+        Ok(Self::from_settings(settings))
+    }
+
+    fn from_settings(settings: VoiceSettings) -> Self {
         let honcho = settings.honcho.clone().unwrap_or_default();
         Self {
             api_key_input: settings.api_key.clone(),
@@ -150,7 +209,7 @@ impl AssistantSession {
             transcript: Vec::new(),
             ledger: Vec::new(),
             approvals: Vec::new(),
-            mic_muted: false,
+            mic_muted: true,
             speaker_muted: false,
             mic_level: 0.0,
             user_speaking: false,
@@ -163,7 +222,14 @@ impl AssistantSession {
 
     fn load(pane_id: Uuid) -> Self {
         let mut session = Self::new();
-        if let Some(thread) = threads::read_thread(pane_id) {
+        let thread = match threads::read_thread(pane_id) {
+            Ok(thread) => thread,
+            Err(error) => {
+                session.engine_state = EngineState::Error(format!("{error:#}"));
+                None
+            }
+        };
+        if let Some(thread) = thread {
             let mut transcript = thread
                 .entries
                 .into_iter()
@@ -205,6 +271,13 @@ fn toggle_microphone_muted(session: &mut AssistantSession) -> bool {
     !session.mic_muted
 }
 
+fn prepare_non_voice_start(session: &mut AssistantSession) {
+    session.mic_muted = true;
+    if let Some(engine) = session.engine.as_ref() {
+        engine.send(VoiceCommand::SetMicEnabled(false));
+    }
+}
+
 fn toggle_headphones_muted(session: &mut AssistantSession) -> bool {
     session.speaker_muted = !session.speaker_muted;
     session.speaker_muted
@@ -215,22 +288,34 @@ pub(crate) struct VoiceUi {
     pub sessions: HashMap<Uuid, AssistantSession>,
     pub settings_editor: VoiceSettingsEditor,
     pub quit_subscription: Option<gpui::Subscription>,
+    persistence_error: Option<String>,
 }
 
 impl VoiceUi {
     pub(crate) fn new() -> Self {
+        let (settings_editor, persistence_error) = match VoiceSettingsEditor::load() {
+            Ok(editor) => (editor, None),
+            Err(error) => (
+                VoiceSettingsEditor::from_settings(VoiceSettings::default()),
+                Some(format!("{error:#}")),
+            ),
+        };
         let mut voice = Self {
             sessions: HashMap::new(),
-            settings_editor: VoiceSettingsEditor::load(),
+            settings_editor,
             quit_subscription: None,
             thread_index: Vec::new(),
+            persistence_error,
         };
         voice.refresh_thread_index();
         voice
     }
 
     pub(crate) fn refresh_thread_index(&mut self) {
-        self.thread_index = threads::list_threads();
+        match threads::list_threads() {
+            Ok(threads) => self.thread_index = threads,
+            Err(error) => self.persistence_error = Some(format!("{error:#}")),
+        }
     }
 }
 
@@ -247,9 +332,22 @@ impl HhApp {
         }
         // A finished thread (startup failure or shutdown) never recovers;
         // replace it with a fresh engine.
-        let settings = VoiceSettings::load();
+        let settings = match VoiceSettings::load() {
+            Ok(settings) => settings,
+            Err(error) => {
+                let session = self
+                    .voice
+                    .sessions
+                    .entry(pane_id)
+                    .or_insert_with(|| AssistantSession::load(pane_id));
+                session.engine_state = EngineState::Error(format!("{error:#}"));
+                self.report(&error);
+                cx.notify();
+                return;
+            }
+        };
         if settings.api_key.trim().is_empty() && std::env::var("HH_OPENAI_API_KEY").is_err() {
-            self.voice.settings_editor = VoiceSettingsEditor::load();
+            self.voice.settings_editor = VoiceSettingsEditor::from_settings(settings);
             self.open_appearance_settings(cx);
             return;
         }
@@ -298,16 +396,49 @@ impl HhApp {
         cx.notify();
     }
 
+    /// Starts capture only from a visible start-voice control. Text, image,
+    /// and history paths call `start_assistant` and remain microphone-muted.
+    fn start_voice_assistant(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        let session = self
+            .voice
+            .sessions
+            .entry(pane_id)
+            .or_insert_with(|| AssistantSession::load(pane_id));
+        session.mic_muted = false;
+        if session
+            .engine
+            .as_ref()
+            .is_some_and(|engine| !engine.is_finished())
+        {
+            if let Some(engine) = session.engine.as_ref() {
+                engine.send(VoiceCommand::SetMicEnabled(true));
+                engine.send(VoiceCommand::Resume);
+            }
+        } else {
+            self.start_assistant(pane_id, cx);
+        }
+    }
+
     fn reopen_thread(&mut self, workspace_id: Uuid, thread_id: Uuid, cx: &mut Context<Self>) {
         self.dispatch_with(
             ClientRequest::CreateAssistantTab { workspace_id },
             Box::new(move |this, cx, result| match result {
                 Ok(ServiceResponse::PaneCreated { pane_id }) => {
-                    if threads::adopt_thread(thread_id, pane_id) {
+                    match threads::adopt_thread(thread_id, pane_id) {
+                        Ok(true) => {
+                            this.voice
+                                .sessions
+                                .insert(pane_id, AssistantSession::load(pane_id));
+                        }
+                        Ok(false) => {}
+                        Err(error) => this.report(&error),
+                    }
+                    prepare_non_voice_start(
                         this.voice
                             .sessions
-                            .insert(pane_id, AssistantSession::load(pane_id));
-                    }
+                            .entry(pane_id)
+                            .or_insert_with(|| AssistantSession::load(pane_id)),
+                    );
                     this.voice.refresh_thread_index();
                     this.focus_created_pane(workspace_id, pane_id, cx);
                     this.start_assistant(pane_id, cx);
@@ -317,6 +448,23 @@ impl HhApp {
             }),
         );
         self.layout.last_sizes.clear();
+        cx.notify();
+    }
+
+    fn delete_saved_thread(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
+        match threads::delete_thread(thread_id) {
+            Ok(_) => delete_assistant_summary(thread_id),
+            Err(error) => self.report(&error),
+        }
+        self.voice.refresh_thread_index();
+        cx.notify();
+    }
+
+    fn clear_saved_threads(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = threads::clear_all_threads() {
+            self.report(&error);
+        }
+        self.voice.refresh_thread_index();
         cx.notify();
     }
 
@@ -350,9 +498,7 @@ impl HhApp {
                         workspace_kind: workspace.kind,
                         working_dir,
                         instructions: workspace.instructions.clone(),
-                        prior_context: load_assistant_summary(pane_id).or_else(|| {
-                            threads::read_thread(pane_id).and_then(|thread| thread.summary)
-                        }),
+                        prior_context: load_assistant_summary(pane_id),
                     };
                 }
             }
@@ -385,6 +531,9 @@ impl HhApp {
             .sessions
             .entry(pane_id)
             .or_insert_with(|| AssistantSession::load(pane_id));
+        if let Some(session) = self.voice.sessions.get_mut(&pane_id) {
+            prepare_non_voice_start(session);
+        }
         let engine_running = self
             .voice
             .sessions
@@ -460,44 +609,7 @@ impl HhApp {
                 return;
             };
             let result = cx
-                .background_spawn(async move {
-                    let filename = path.file_name().map_or_else(
-                        || "image".to_owned(),
-                        |name| name.to_string_lossy().into_owned(),
-                    );
-                    let extension = path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .map(str::to_ascii_lowercase)
-                        .ok_or_else(|| anyhow::anyhow!("image must have a supported extension"))?;
-                    let mime = match extension.as_str() {
-                        "png" => "image/png",
-                        "jpg" | "jpeg" => "image/jpeg",
-                        "webp" => "image/webp",
-                        _ => {
-                            anyhow::bail!(
-                                "unsupported file type; images (PNG, JPG, WebP) only for now"
-                            )
-                        }
-                    };
-                    let metadata = std::fs::metadata(&path).map_err(|error| {
-                        anyhow::anyhow!("inspect assistant image {}: {error}", path.display())
-                    })?;
-                    if metadata.len() > MAX_ASSISTANT_IMAGE_BYTES as u64 {
-                        anyhow::bail!("image exceeds the 4 MiB attachment limit");
-                    }
-                    let bytes = std::fs::read(&path).map_err(|error| {
-                        anyhow::anyhow!("read assistant image {}: {error}", path.display())
-                    })?;
-                    if bytes.len() > MAX_ASSISTANT_IMAGE_BYTES {
-                        anyhow::bail!("image exceeds the 4 MiB attachment limit");
-                    }
-                    Ok::<_, anyhow::Error>((
-                        filename,
-                        format!("data:{mime};base64,{}", BASE64.encode(bytes)),
-                        path,
-                    ))
-                })
+                .background_spawn(async move { read_assistant_image(&path) })
                 .await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok((filename, data_url, path)) => {
@@ -991,12 +1103,34 @@ impl HhApp {
                 .gap(px(2.0))
                 .child(
                     div()
+                        .w_full()
                         .min_w(px(0.0))
-                        .truncate()
-                        .font_family(".SystemUIFont")
-                        .text_sm()
-                        .text_color(rgb(THEME.foreground))
-                        .child(title),
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .truncate()
+                                .font_family(".SystemUIFont")
+                                .text_sm()
+                                .text_color(rgb(THEME.foreground))
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .id(("assistant-delete-thread", element_key(thread_id)))
+                                .cursor_pointer()
+                                .font_family(".SystemUIFont")
+                                .text_xs()
+                                .text_color(rgb(THEME.danger))
+                                .child("Delete")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_saved_thread(thread_id, cx);
+                                    cx.stop_propagation();
+                                })),
+                        ),
                 )
                 .child(
                     div()
@@ -1021,10 +1155,30 @@ impl HhApp {
                 .gap(px(6.0))
                 .child(
                     div()
-                        .font_family(".SystemUIFont")
-                        .text_xs()
-                        .text_color(rgb(THEME.muted))
-                        .child("Previous threads"),
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_family(".SystemUIFont")
+                                .text_xs()
+                                .text_color(rgb(THEME.muted))
+                                .child("Previous threads"),
+                        )
+                        .child(
+                            div()
+                                .id(("assistant-clear-threads", element_key(pane_id)))
+                                .cursor_pointer()
+                                .font_family(".SystemUIFont")
+                                .text_xs()
+                                .text_color(rgb(THEME.danger))
+                                .child("Clear all")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_saved_threads(cx);
+                                    cx.stop_propagation();
+                                })),
+                        ),
                 )
                 .children(rows)
                 .into_any_element(),
@@ -1039,13 +1193,9 @@ impl HhApp {
     ) -> AnyElement {
         let label = "Start voice assistant";
         let button_id = "assistant-start";
-        let engine_present = session
-            .engine
-            .as_ref()
-            .is_some_and(|engine| !engine.is_finished());
         let error_line = match &session.engine_state {
             EngineState::Error(message) => Some(message.clone()),
-            _ => None,
+            _ => self.voice.persistence_error.clone(),
         };
         let previous_threads = self.render_previous_threads(pane_id, cx);
         div()
@@ -1084,11 +1234,7 @@ impl HhApp {
                     .hover(|element| element.opacity(0.9))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if engine_present {
-                            this.send_assistant_command(pane_id, VoiceCommand::Resume);
-                        } else {
-                            this.start_assistant(pane_id, cx);
-                        }
+                        this.start_voice_assistant(pane_id, cx);
                         cx.stop_propagation();
                     })),
             )
@@ -1642,10 +1788,8 @@ impl HhApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if voice_active {
                                     this.send_assistant_command(pane_id, VoiceCommand::Suspend);
-                                } else if engine_present {
-                                    this.send_assistant_command(pane_id, VoiceCommand::Resume);
                                 } else {
-                                    this.start_assistant(pane_id, cx);
+                                    this.start_voice_assistant(pane_id, cx);
                                 }
                                 cx.stop_propagation();
                             })),
@@ -2043,6 +2187,50 @@ impl HhApp {
 mod tests {
     use super::*;
 
+    fn tiny_png() -> Vec<u8> {
+        let image = image::DynamicImage::new_rgba8(1, 1);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn assistant_attachment_rejects_symlinks() {
+        let root = std::env::temp_dir().join(format!("hh-image-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("target.png");
+        let link = root.join("link.png");
+        std::fs::write(&target, tiny_png()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_assistant_image(&link).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn assistant_attachment_requires_matching_magic_and_successful_decode() {
+        let root = std::env::temp_dir().join(format!("hh-image-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let fake = root.join("fake.png");
+        std::fs::write(&fake, b"not a png").unwrap();
+        assert!(read_assistant_image(&fake).is_err());
+        let broken = root.join("broken.png");
+        std::fs::write(&broken, b"\x89PNG\r\n\x1a\nbroken").unwrap();
+        assert!(read_assistant_image(&broken).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn assistant_attachment_accepts_a_bounded_decodable_image() {
+        let root = std::env::temp_dir().join(format!("hh-image-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("pixel.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        let attachment = read_assistant_image(&path).unwrap();
+        assert_eq!(attachment.0, "pixel.png");
+        assert!(attachment.1.starts_with("data:image/png;base64,"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn suspended_assistant_keeps_the_live_surface_when_history_exists() {
         let mut session = AssistantSession::new();
@@ -2071,12 +2259,24 @@ mod tests {
         assert_eq!(&timestamp[2..3], ":");
     }
     #[test]
+    fn non_voice_start_revokes_prior_microphone_consent() {
+        let mut session = AssistantSession::new();
+        session.mic_muted = false;
+        prepare_non_voice_start(&mut session);
+        assert!(session.mic_muted);
+    }
+
+    #[test]
     fn audio_controls_toggle_mutes_without_suspending() {
         let mut session = AssistantSession::new();
         session.engine_state = EngineState::Listening;
 
-        assert!(!toggle_microphone_muted(&mut session));
-        assert!(session.mic_muted);
+        assert!(
+            session.mic_muted,
+            "new/text-only sessions need explicit mic consent"
+        );
+        assert!(toggle_microphone_muted(&mut session));
+        assert!(!session.mic_muted);
         assert_eq!(session.engine_state, EngineState::Listening);
 
         assert!(toggle_headphones_muted(&mut session));
