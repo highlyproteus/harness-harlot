@@ -285,6 +285,21 @@ fn mark_persisted_summaries_cleared(sessions: &mut HashMap<Uuid, AssistantSessio
     }
 }
 
+fn reconcile_persisted_summary(
+    session: &mut AssistantSession,
+    pane_id: Uuid,
+    thread_index: &[ThreadSummary],
+) {
+    session.persisted_summary = if thread_index
+        .iter()
+        .any(|summary| summary.thread_id == pane_id)
+    {
+        PersistedSummaryState::Present
+    } else {
+        PersistedSummaryState::Absent
+    };
+}
+
 fn toggle_headphones_muted(session: &mut AssistantSession) -> bool {
     session.speaker_muted = !session.speaker_muted;
     session.speaker_muted
@@ -796,8 +811,10 @@ impl HhApp {
             VoiceUiEvent::Usage { .. } => {}
             VoiceUiEvent::MicLevel(level) => session.mic_level = level.clamp(0.0, 1.0),
             VoiceUiEvent::SessionSummary { text: _ } => {
-                session.persisted_summary = PersistedSummaryState::Present;
                 self.voice.refresh_thread_index();
+                if let Some(session) = self.voice.sessions.get_mut(&pane_id) {
+                    reconcile_persisted_summary(session, pane_id, &self.voice.thread_index);
+                }
             }
         }
     }

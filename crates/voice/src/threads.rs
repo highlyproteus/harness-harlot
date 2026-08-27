@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -13,7 +14,14 @@ const MAX_THREAD_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RECORDS: usize = 10_000;
 const MAX_TEXT_CHARS: usize = 32 * 1024;
+const GENERATION_FILE: &str = ".generation";
 pub const MAX_THREAD_TITLE_CHARS: usize = 60;
+
+static STORAGE_LOCK: LazyLock<parking_lot::Mutex<()>> =
+    LazyLock::new(|| parking_lot::Mutex::new(()));
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThreadGeneration(u64);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -82,6 +90,24 @@ fn thread_path(dir: &Path, thread_id: Uuid) -> PathBuf {
     dir.join(format!("{thread_id}.jsonl"))
 }
 
+fn generation_path(dir: &Path) -> PathBuf {
+    dir.join(GENERATION_FILE)
+}
+
+fn current_generation_in(dir: &Path) -> Result<ThreadGeneration> {
+    let bytes = match hh_protocol::read_private_file(&generation_path(dir), 32) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ThreadGeneration(0));
+        }
+        Err(error) => return Err(error).context("read assistant thread generation"),
+    };
+    let text = std::str::from_utf8(&bytes).context("decode assistant thread generation")?;
+    Ok(ThreadGeneration(
+        text.parse().context("parse assistant thread generation")?,
+    ))
+}
+
 fn record_at_ms(record: &ThreadRecord) -> u64 {
     match record {
         ThreadRecord::Meta { at_ms, .. }
@@ -142,6 +168,19 @@ fn append_record_in(dir: &Path, thread_id: Uuid, record: &ThreadRecord) -> Resul
     file.sync_data()
         .with_context(|| format!("sync assistant thread {thread_id}"))?;
     Ok(())
+}
+
+fn append_record_for_generation_in(
+    dir: &Path,
+    generation: ThreadGeneration,
+    thread_id: Uuid,
+    record: &ThreadRecord,
+) -> Result<bool> {
+    if current_generation_in(dir)? != generation {
+        return Ok(false);
+    }
+    append_record_in(dir, thread_id, record)?;
+    Ok(true)
 }
 
 fn read_thread_in(dir: &Path, thread_id: Uuid) -> Result<Option<Thread>> {
@@ -321,13 +360,28 @@ fn required_thread_directory() -> Result<PathBuf> {
     thread_directory().context("HOME is not set and HH_STATE_DIR is not configured")
 }
 
-/// Appends one bounded record to a private thread file.
+/// Captures the generation that authorizes a newly started thread writer.
 ///
 /// # Errors
-/// Returns an error when the state directory or thread file is unsafe,
-/// unavailable, oversized, or cannot be written durably.
-pub fn append_record(thread_id: Uuid, record: &ThreadRecord) -> Result<()> {
-    append_record_in(&required_thread_directory()?, thread_id, record)
+/// Returns an error when the generation file is unsafe or malformed.
+pub fn current_generation() -> Result<ThreadGeneration> {
+    let _guard = STORAGE_LOCK.lock();
+    current_generation_in(&required_thread_directory()?)
+}
+
+/// Appends a record only while the writer's captured storage generation is current.
+///
+/// Returns `false` after Clear all has revoked the writer's generation.
+///
+/// # Errors
+/// Returns an error when generation state or the thread file cannot be read or written safely.
+pub fn append_record(
+    generation: ThreadGeneration,
+    thread_id: Uuid,
+    record: &ThreadRecord,
+) -> Result<bool> {
+    let _guard = STORAGE_LOCK.lock();
+    append_record_for_generation_in(&required_thread_directory()?, generation, thread_id, record)
 }
 
 /// Loads a thread from its bounded private record file.
@@ -383,11 +437,18 @@ fn delete_thread_in(dir: &Path, thread_id: Uuid) -> Result<bool> {
 }
 
 fn clear_all_threads_in(dir: &Path) -> Result<usize> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error).context("read assistant thread directory"),
-    };
+    hh_protocol::ensure_private_directory(dir)
+        .with_context(|| format!("prepare assistant thread directory {}", dir.display()))?;
+    let next_generation = current_generation_in(dir)?
+        .0
+        .checked_add(1)
+        .context("assistant thread generation exhausted")?;
+    hh_protocol::atomic_write_private(
+        &generation_path(dir),
+        next_generation.to_string().as_bytes(),
+    )
+    .context("advance assistant thread generation")?;
+    let entries = fs::read_dir(dir).context("read assistant thread directory")?;
     let mut deleted = 0;
     for entry in entries {
         let path = entry
@@ -423,6 +484,7 @@ pub fn delete_thread(thread_id: Uuid) -> Result<bool> {
 /// Returns an error when the directory cannot be enumerated or a thread file
 /// cannot be safely removed.
 pub fn clear_all_threads() -> Result<usize> {
+    let _guard = STORAGE_LOCK.lock();
     clear_all_threads_in(&required_thread_directory()?)
 }
 
@@ -662,6 +724,66 @@ mod tests {
         );
         assert_eq!(clear_all_threads_in(&dir).unwrap(), 1);
         assert_eq!(read_summary_in(&dir, current).unwrap(), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_all_revokes_active_generation_and_allows_new_writers() {
+        let dir = test_dir();
+        let stale_thread = Uuid::new_v4();
+        let fresh_thread = Uuid::new_v4();
+        let active_generation = current_generation_in(&dir).unwrap();
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                active_generation,
+                stale_thread,
+                &meta(stale_thread, 10),
+            )
+            .unwrap()
+        );
+
+        assert_eq!(clear_all_threads_in(&dir).unwrap(), 1);
+        assert!(list_threads_in(&dir).unwrap().is_empty());
+        assert!(
+            !append_record_for_generation_in(
+                &dir,
+                active_generation,
+                stale_thread,
+                &ThreadRecord::Turn {
+                    role: ThreadRole::Assistant,
+                    text: "delayed reply".to_owned(),
+                    at_ms: 20,
+                },
+            )
+            .unwrap()
+        );
+        assert!(
+            !append_record_for_generation_in(
+                &dir,
+                active_generation,
+                stale_thread,
+                &ThreadRecord::Summary {
+                    text: "shutdown summary".to_owned(),
+                    at_ms: 30,
+                },
+            )
+            .unwrap()
+        );
+        assert!(list_threads_in(&dir).unwrap().is_empty());
+
+        let fresh_generation = current_generation_in(&dir).unwrap();
+        assert_ne!(fresh_generation, active_generation);
+        assert!(
+            append_record_for_generation_in(
+                &dir,
+                fresh_generation,
+                fresh_thread,
+                &meta(fresh_thread, 40),
+            )
+            .unwrap()
+        );
+        assert_eq!(list_threads_in(&dir).unwrap()[0].thread_id, fresh_thread);
         fs::remove_dir_all(dir).unwrap();
     }
 

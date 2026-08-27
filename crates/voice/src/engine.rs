@@ -144,6 +144,7 @@ struct VoiceEngine {
     pending_memory_turns: VecDeque<(Role, String)>,
     transcripts: VecDeque<(Role, String)>,
     thread_id: Option<uuid::Uuid>,
+    thread_generation: Option<threads::ThreadGeneration>,
     thread_has_title: bool,
     completed_input_transcriptions: VecDeque<String>,
     pending_user_content: VecDeque<InputContent>,
@@ -216,12 +217,16 @@ impl VoiceEngine {
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned);
         let thread_id = context.pane_id;
+        let thread_generation = thread_id
+            .map(|_| threads::current_generation())
+            .transpose()?;
         let mut thread_has_title = false;
         if let Some(thread_id) = thread_id {
             threads::prune_thread_files(threads::ThreadRetention::default())?;
             thread_has_title =
                 threads::read_thread(thread_id)?.is_some_and(|thread| thread.title.is_some());
             threads::append_record(
+                thread_generation.context("thread generation is missing")?,
                 thread_id,
                 &ThreadRecord::Meta {
                     thread_id,
@@ -263,6 +268,7 @@ impl VoiceEngine {
             active_tool: None,
             pending_memory_turns: VecDeque::new(),
             thread_id,
+            thread_generation,
             thread_has_title,
             transcripts: VecDeque::with_capacity(MAX_TRANSCRIPT_TURNS),
             completed_input_transcriptions: VecDeque::with_capacity(MAX_TRANSCRIPT_TURNS),
@@ -580,16 +586,11 @@ impl VoiceEngine {
             ServerEvent::OutputTranscriptDone { transcript, .. } => {
                 self.record_memory_turn(Role::Assistant, &transcript);
                 self.push_transcript(Role::Assistant, transcript.clone());
-                if let Some(thread_id) = self.thread_id {
-                    threads::append_record(
-                        thread_id,
-                        &ThreadRecord::Turn {
-                            role: ThreadRole::Assistant,
-                            text: transcript.clone(),
-                            at_ms: threads::now_ms(),
-                        },
-                    )?;
-                }
+                self.append_thread_record(&ThreadRecord::Turn {
+                    role: ThreadRole::Assistant,
+                    text: transcript.clone(),
+                    at_ms: threads::now_ms(),
+                })?;
                 let _ = self.ui.unbounded_send(VoiceUiEvent::AssistantTranscript {
                     text: transcript,
                     final_: true,
@@ -808,15 +809,10 @@ impl VoiceEngine {
         self.connected_at = None;
         let summary = self.build_summary();
         if !summary.is_empty() {
-            if let Some(thread_id) = self.thread_id {
-                threads::append_record(
-                    thread_id,
-                    &ThreadRecord::Summary {
-                        text: summary.clone(),
-                        at_ms: threads::now_ms(),
-                    },
-                )?;
-            }
+            self.append_thread_record(&ThreadRecord::Summary {
+                text: summary.clone(),
+                at_ms: threads::now_ms(),
+            })?;
             let _ = self
                 .ui
                 .unbounded_send(VoiceUiEvent::SessionSummary { text: summary });
@@ -858,15 +854,10 @@ impl VoiceEngine {
         if summary.is_empty() {
             self.pending_instructions = None;
         } else {
-            if let Some(thread_id) = self.thread_id {
-                threads::append_record(
-                    thread_id,
-                    &ThreadRecord::Summary {
-                        text: summary.clone(),
-                        at_ms: threads::now_ms(),
-                    },
-                )?;
-            }
+            self.append_thread_record(&ThreadRecord::Summary {
+                text: summary.clone(),
+                at_ms: threads::now_ms(),
+            })?;
             let _ = self.ui.unbounded_send(VoiceUiEvent::SessionSummary {
                 text: summary.clone(),
             });
@@ -987,16 +978,11 @@ impl VoiceEngine {
                 name,
                 output,
             } => {
-                if let Some(thread_id) = self.thread_id
-                    && let Err(error) = threads::append_record(
-                        thread_id,
-                        &ThreadRecord::Tool {
-                            name,
-                            summary: output.chars().take(200).collect(),
-                            at_ms: threads::now_ms(),
-                        },
-                    )
-                {
+                if let Err(error) = self.append_thread_record(&ThreadRecord::Tool {
+                    name,
+                    summary: output.chars().take(200).collect(),
+                    at_ms: threads::now_ms(),
+                }) {
                     self.emit_error(&error);
                 }
                 if let Err(error) = self
@@ -1092,27 +1078,31 @@ impl VoiceEngine {
         summary.chars().take(MAX_SUMMARY_CHARS).collect()
     }
 
+    fn append_thread_record(&self, record: &ThreadRecord) -> Result<bool> {
+        match (self.thread_generation, self.thread_id) {
+            (Some(generation), Some(thread_id)) => {
+                threads::append_record(generation, thread_id, record)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn record_user_turn(&mut self, text: &str) -> Result<()> {
         self.record_memory_turn(Role::User, text);
         self.push_transcript(Role::User, text.to_owned());
-        if let Some(thread_id) = self.thread_id {
+        if self.thread_id.is_some() {
             let at_ms = threads::now_ms();
-            threads::append_record(
-                thread_id,
-                &ThreadRecord::Turn {
-                    role: ThreadRole::User,
-                    text: text.to_owned(),
+            self.append_thread_record(&ThreadRecord::Turn {
+                role: ThreadRole::User,
+                text: text.to_owned(),
+                at_ms,
+            })?;
+            if !self.thread_has_title
+                && self.append_thread_record(&ThreadRecord::Title {
+                    text: threads::thread_title(text),
                     at_ms,
-                },
-            )?;
-            if !self.thread_has_title {
-                threads::append_record(
-                    thread_id,
-                    &ThreadRecord::Title {
-                        text: threads::thread_title(text),
-                        at_ms,
-                    },
-                )?;
+                })?
+            {
                 self.thread_has_title = true;
             }
         }
@@ -1154,15 +1144,10 @@ impl VoiceEngine {
         let _ = self.audio.set_mic_enabled(false);
         let summary = self.build_summary();
         if !summary.is_empty() {
-            if let Some(thread_id) = self.thread_id
-                && let Err(error) = threads::append_record(
-                    thread_id,
-                    &ThreadRecord::Summary {
-                        text: summary.clone(),
-                        at_ms: threads::now_ms(),
-                    },
-                )
-            {
+            if let Err(error) = self.append_thread_record(&ThreadRecord::Summary {
+                text: summary.clone(),
+                at_ms: threads::now_ms(),
+            }) {
                 self.emit_error(&error);
             }
             let _ = self
