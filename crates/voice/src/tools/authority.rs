@@ -4,12 +4,24 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{
-    mutation_authority_for_pane, mutation_authority_for_tab, mutation_authority_for_workspace,
-    required_str, required_uuid,
+    DEFAULT_PANE_LINES, MAX_PANE_LINES, mutation_authority_for_pane, mutation_authority_for_tab,
+    mutation_authority_for_workspace, required_str, required_uuid, threads,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PendingAction {
+    ReadPane {
+        pane_id: Uuid,
+        lines: usize,
+        authority: MutationAuthority,
+    },
+    ReadThread {
+        thread_id: Uuid,
+        workspace_id: Uuid,
+    },
+    RecallMemory {
+        query: String,
+    },
     ToolCall {
         name: String,
         arguments: Value,
@@ -56,6 +68,11 @@ pub(super) enum MutationAuthority {
 impl PendingAction {
     pub(super) fn description(&self) -> String {
         match self {
+            Self::ReadPane { pane_id, lines, .. } => {
+                format!("read {lines} recent lines from pane {pane_id}")
+            }
+            Self::ReadThread { thread_id, .. } => format!("read saved thread {thread_id}"),
+            Self::RecallMemory { query } => format!("recall memory matching {query:?}"),
             Self::ToolCall {
                 name, arguments, ..
             } => format!("run {name} with {arguments}"),
@@ -79,6 +96,35 @@ pub(super) fn pending_action(
     snapshot: &SessionSnapshot,
 ) -> Result<PendingAction> {
     match name {
+        "read_pane" => {
+            let pane_id = required_uuid(arguments, "pane_id")?;
+            let lines = arguments
+                .get("lines")
+                .and_then(Value::as_u64)
+                .and_then(|lines| usize::try_from(lines).ok())
+                .unwrap_or(DEFAULT_PANE_LINES)
+                .clamp(1, MAX_PANE_LINES);
+            Ok(PendingAction::ReadPane {
+                pane_id,
+                lines,
+                authority: mutation_authority_for_pane(snapshot, pane_id)?,
+            })
+        }
+        "read_thread" => {
+            let thread_id = required_uuid(arguments, "thread_id")?;
+            let thread = threads::read_thread(thread_id)?
+                .with_context(|| format!("thread {thread_id} not found"))?;
+            let workspace_id = thread
+                .workspace_id
+                .context("saved thread has no workspace authority")?;
+            Ok(PendingAction::ReadThread {
+                thread_id,
+                workspace_id,
+            })
+        }
+        "recall_memory" => Ok(PendingAction::RecallMemory {
+            query: required_str(arguments, "query")?.to_owned(),
+        }),
         "send_input" => pending_send_input(arguments, snapshot),
         "send_keys" => pending_send_keys(arguments, snapshot),
         "close_tab" => {

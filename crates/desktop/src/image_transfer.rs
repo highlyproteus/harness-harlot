@@ -720,6 +720,32 @@ fn cleanup_aborted_transfer(
     }
 }
 
+fn complete_transferred_paste(
+    authority: &FileTransferAuthority,
+    paths: &[PathBuf],
+    owned_local_path: Option<&Path>,
+    fetch_snapshot: impl FnOnce() -> Result<SessionSnapshot>,
+    prepare: impl FnOnce(&[PathBuf]) -> Result<Vec<u8>>,
+    write: impl FnOnce(Vec<u8>) -> Result<()>,
+    cleanup: impl FnOnce(&FileTransferAuthority, &[PathBuf], Option<&Path>) -> Result<()>,
+) -> Result<()> {
+    let result = (|| {
+        let snapshot = fetch_snapshot()?;
+        revalidate_transfer_authority(&snapshot, authority)?;
+        let bytes = prepare(paths)?;
+        write(bytes)
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match cleanup(authority, paths, owned_local_path) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "aborted transfer cleanup also failed: {cleanup_error:#}"
+            ))),
+        },
+    }
+}
+
 impl HhApp {
     pub(crate) fn paste_image_to_terminal(
         &mut self,
@@ -787,29 +813,38 @@ impl HhApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result.and_then(|(paths, owned_local_path)| {
-                    let response = session_call(&control_client, &ClientRequest::GetSnapshot)
-                        .context("refresh transfer authority before terminal path insertion")?;
-                    let ServiceResponse::Snapshot { snapshot } = response else {
-                        bail!("unexpected GetSnapshot response before terminal path insertion: {response:?}");
-                    };
-                    if let Err(authority_error) =
-                        revalidate_transfer_authority(&snapshot, &authority)
-                    {
-                        return match cleanup_aborted_transfer(
-                            &authority,
-                            &paths,
-                            owned_local_path.as_deref(),
-                        ) {
-                            Ok(()) => Err(authority_error),
-                            Err(cleanup_error) => Err(authority_error.context(format!(
-                                "aborted transfer cleanup also failed: {cleanup_error:#}"
-                            ))),
-                        };
-                    }
-                    prepare_paste(&shell_join_paths(&paths), bracketed).map_err(anyhow::Error::msg)
+                    complete_transferred_paste(
+                        &authority,
+                        &paths,
+                        owned_local_path.as_deref(),
+                        || {
+                            let response = session_call(&control_client, &ClientRequest::GetSnapshot)
+                                .context("refresh transfer authority before terminal path insertion")?;
+                            let ServiceResponse::Snapshot { snapshot } = response else {
+                                bail!("unexpected GetSnapshot response before terminal path insertion: {response:?}");
+                            };
+                            Ok(snapshot)
+                        },
+                        |paths| {
+                            prepare_paste(&shell_join_paths(paths), bracketed)
+                                .map_err(anyhow::Error::msg)
+                        },
+                        |bytes| {
+                            let response = session_call(
+                                &control_client,
+                                &ClientRequest::WriteInput { pane_id, bytes },
+                            )
+                            .context("insert transferred paths into terminal")?;
+                            ensure!(
+                                matches!(response, ServiceResponse::Ack),
+                                "unexpected WriteInput response: {response:?}"
+                            );
+                            Ok(())
+                        },
+                        cleanup_aborted_transfer,
+                    )
                 }) {
-                    Ok(bytes) => {
-                        this.dispatch_control(ClientRequest::WriteInput { pane_id, bytes });
+                    Ok(()) => {
                         this.session.connection_error = None;
                     }
                     Err(error) => this.session.connection_error = Some(format!("{error:#}")),
@@ -825,21 +860,125 @@ impl HhApp {
 mod tests {
     use super::{
         CLIPBOARD_IMAGE_RETENTION, FileTransferTarget, cleanup_stale_clipboard_images,
-        materialize_clipboard_image, read_bounded_stderr, receive_stderr_with_timeout,
-        reconcile_remote_source_cleanup, remote_paste_path, revalidate_transfer_authority,
-        scp_upload_command_with, shell_join_paths, ssh_cleanup_command_with,
-        ssh_private_directory_command_with, ssh_private_files_command_with, stage_remote_source,
-        transfer_authority_for_pane, transfer_target_for_pane, validate_transfer_paths,
+        complete_transferred_paste, materialize_clipboard_image, read_bounded_stderr,
+        receive_stderr_with_timeout, reconcile_remote_source_cleanup, remote_paste_path,
+        revalidate_transfer_authority, scp_upload_command_with, shell_join_paths,
+        ssh_cleanup_command_with, ssh_private_directory_command_with,
+        ssh_private_files_command_with, stage_remote_source, transfer_authority_for_pane,
+        transfer_target_for_pane, validate_transfer_paths,
     };
     use gpui::{Image, ImageFormat};
     use hh_protocol::{
         PaneKind, PaneLayout, SessionSnapshot, TerminalTransport, WorkspaceConnection,
         WorkspaceConnectionStatus,
     };
+    use std::cell::Cell;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+
+    #[test]
+    fn snapshot_fetch_failure_after_transfer_attempts_owned_artifact_cleanup() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
+            PaneLayout::Leaf { pane } => pane.id,
+            _ => unreachable!(),
+        };
+        snapshot
+            .terminal_transports
+            .insert(pane_id, TerminalTransport::Local);
+        let authority = transfer_authority_for_pane(&snapshot, pane_id).unwrap();
+        let cleanup_attempted = Cell::new(false);
+
+        let error = complete_transferred_paste(
+            &authority,
+            &[PathBuf::from("/tmp/app-owned-staged.png")],
+            Some(Path::new("/tmp/app-owned-staged.png")),
+            || anyhow::bail!("snapshot unavailable"),
+            |_| unreachable!("paste preparation must not run"),
+            |_| unreachable!("write must not run"),
+            |_, _, _| {
+                cleanup_attempted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("snapshot unavailable"));
+        assert!(cleanup_attempted.get());
+    }
+
+    #[test]
+    fn paste_preparation_failure_after_transfer_attempts_owned_artifact_cleanup() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
+            PaneLayout::Leaf { pane } => pane.id,
+            _ => unreachable!(),
+        };
+        snapshot
+            .terminal_transports
+            .insert(pane_id, TerminalTransport::Local);
+        let authority = transfer_authority_for_pane(&snapshot, pane_id).unwrap();
+        let cleanup_attempted = Cell::new(false);
+
+        let error = complete_transferred_paste(
+            &authority,
+            &[PathBuf::from("/tmp/app-owned-staged.png")],
+            Some(Path::new("/tmp/app-owned-staged.png")),
+            || Ok(snapshot.clone()),
+            |_| anyhow::bail!("paste preparation failed"),
+            |_| unreachable!("write must not run"),
+            |_, _, owned_local_path| {
+                assert_eq!(
+                    owned_local_path,
+                    Some(Path::new("/tmp/app-owned-staged.png"))
+                );
+                cleanup_attempted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("paste preparation failed"));
+        assert!(cleanup_attempted.get());
+    }
+
+    #[test]
+    fn write_input_failure_after_transfer_attempts_cleanup_without_claiming_user_source() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
+            PaneLayout::Leaf { pane } => pane.id,
+            _ => unreachable!(),
+        };
+        snapshot.terminal_transports.insert(
+            pane_id,
+            TerminalTransport::SystemSsh {
+                destination: "developer@build-node".to_owned(),
+            },
+        );
+        let authority = transfer_authority_for_pane(&snapshot, pane_id).unwrap();
+        let cleanup_attempted = Cell::new(false);
+
+        let error = complete_transferred_paste(
+            &authority,
+            &[PathBuf::from("/tmp/harness-harlot-paste/remote-file.png")],
+            None,
+            || Ok(snapshot.clone()),
+            |_| Ok(b"prepared".to_vec()),
+            |_| anyhow::bail!("write input failed"),
+            |_, paths, owned_local_path| {
+                assert_eq!(paths.len(), 1);
+                assert_eq!(owned_local_path, None);
+                cleanup_attempted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("write input failed"));
+        assert!(cleanup_attempted.get());
+    }
 
     #[test]
     fn transferred_path_insertion_rejects_transport_or_pane_change() {

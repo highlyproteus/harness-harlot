@@ -933,7 +933,7 @@ impl VoiceEngine {
             anyhow::bail!("tool execution is already in progress");
         }
         let mut tools = self.tools.take().context("tool executor is unavailable")?;
-        let memory = self
+        let mut memory = self
             .memory
             .take()
             .context("memory backend is unavailable")?;
@@ -942,7 +942,13 @@ impl VoiceEngine {
         let worker_cancelled = Arc::clone(&cancelled);
         let (result_tx, result) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let result = tools.resolve_ui_approval(approval_id, approved, &ui, &worker_cancelled);
+            let result = tools.resolve_ui_approval(
+                approval_id,
+                approved,
+                memory.as_mut(),
+                &ui,
+                &worker_cancelled,
+            );
             let completion = if worker_cancelled.load(Ordering::Acquire) {
                 ToolCompletion::Cancelled
             } else {
