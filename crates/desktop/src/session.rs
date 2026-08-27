@@ -83,10 +83,20 @@ impl HhApp {
         }
     }
 
-    /// Enqueues a control-lane request with no follow-up refresh. Terminal
-    /// input and selection updates are written one-way.
+    /// Enqueues low-latency control work. Terminal bytes use their own
+    /// byte-bounded coalescing lane, so generic control saturation cannot drop
+    /// accepted keystrokes or pastes.
     pub(crate) fn dispatch_control(&mut self, request: ClientRequest) {
         let wake_poll = terminal_poll_wake_requested(&request);
+        if let ClientRequest::WriteInput { pane_id, bytes } = request {
+            match self.session.terminal_input_tx.try_send(pane_id, &bytes) {
+                Ok(()) => {
+                    let _ = self.session.poll_wake_tx.try_send(());
+                }
+                Err(error) => self.session.connection_error = Some(error.to_owned()),
+            }
+            return;
+        }
         let one_way = PipelineJob::is_one_way(&request);
         let queued = self
             .session
@@ -99,9 +109,8 @@ impl HhApp {
             })
             .is_ok();
         if !queued {
-            self.session.connection_error = Some(
-                "control pipeline overloaded; newest terminal input was not queued".to_owned(),
-            );
+            self.session.connection_error =
+                Some("control pipeline overloaded; newest request was not queued".to_owned());
         } else if wake_poll {
             let _ = self.session.poll_wake_tx.try_send(());
         }

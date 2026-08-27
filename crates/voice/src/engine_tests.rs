@@ -52,9 +52,9 @@ fn restored_user_content_precedes_content_queued_during_send() {
 }
 
 #[test]
-fn pending_user_content_and_narration_are_bounded() {
+fn admitted_user_content_is_truncated_within_the_pending_bound() {
     let mut pending = VecDeque::new();
-    for index in 0..(MAX_PENDING_USER_ITEMS + 5) {
+    for index in 0..MAX_PENDING_USER_ITEMS {
         queue_pending_user_content(
             &mut pending,
             InputContent::InputText {
@@ -63,6 +63,12 @@ fn pending_user_content_and_narration_are_bounded() {
         );
     }
     assert_eq!(pending.len(), MAX_PENDING_USER_ITEMS);
+    assert_eq!(
+        pending.front(),
+        Some(&InputContent::InputText {
+            text: format!("0:{}", "x".repeat(MAX_USER_TEXT_CHARS - 2)),
+        })
+    );
     assert!(pending.iter().all(|item| match item {
         InputContent::InputText { text } => text.chars().count() <= MAX_USER_TEXT_CHARS,
         InputContent::InputImage { .. } => true,

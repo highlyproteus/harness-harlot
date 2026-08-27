@@ -228,6 +228,7 @@ impl SessionRegistry {
             crate::persistence::validate_custom_icon_id(icon)?;
         }
         let mut state = self.state.write();
+        let previous_snapshot = state.snapshot.clone();
         let workspace = state
             .snapshot
             .workspaces
@@ -240,8 +241,11 @@ impl SessionRegistry {
         workspace.custom_icon = icon;
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
-        drop(state);
-        self.write_snapshot(&bytes)
+        if let Err(error) = self.write_snapshot(&bytes) {
+            state.snapshot = previous_snapshot;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn create_workspace(&self, title: Option<&str>) -> Result<(Uuid, Uuid)> {
@@ -1047,6 +1051,32 @@ mod tests {
         assert!(
             registry
                 .create_assistant_workspace(Some("Must rollback"), None, None)
+                .is_err()
+        );
+        assert_eq!(registry.snapshot().unwrap(), before);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_custom_icon_persistence_does_not_publish_live_state() {
+        let directory =
+            std::env::temp_dir().join(format!("hh-icon-persistence-test-{}", Uuid::new_v4()));
+        create_owner_only_directory(&directory);
+        let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
+        let before = registry.snapshot().unwrap();
+        let workspace_id = before.workspaces[0].id;
+        registry
+            .store
+            .as_ref()
+            .unwrap()
+            .inject_failure_before_replace(true);
+
+        assert!(
+            registry
+                .set_workspace_custom_icon(
+                    workspace_id,
+                    Some("00000000-0000-4000-8000-000000000004.png".to_owned()),
+                )
                 .is_err()
         );
         assert_eq!(registry.snapshot().unwrap(), before);

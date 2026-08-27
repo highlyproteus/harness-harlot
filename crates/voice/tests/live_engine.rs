@@ -6,6 +6,7 @@ use hh_protocol::{ClientRequest, ServiceResponse};
 use hh_session_client::SessionClient;
 use hh_voice::{
     AssistantContext, EngineState, VoiceCommand, VoiceSettings, VoiceUiEvent, spawn_engine,
+    voice_ui_channel,
 };
 
 #[test]
@@ -16,7 +17,7 @@ fn live_engine_reports_state_transitions() {
         !settings.api_key.trim().is_empty(),
         "no API key in saved voice settings"
     );
-    let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded();
+    let (ui_tx, mut ui_rx) = voice_ui_channel();
     let engine = spawn_engine(settings, AssistantContext::default(), ui_tx).expect("spawn engine");
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -129,7 +130,7 @@ fn live_engine_opens_requested_terminal_tab() {
         instructions: workspace.instructions.clone(),
         prior_context: None,
     };
-    let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded();
+    let (ui_tx, mut ui_rx) = voice_ui_channel();
     let engine = spawn_engine(settings, context, ui_tx).expect("spawn engine");
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -218,7 +219,7 @@ fn live_engine_from_assistant_workspace_opens_workstation_terminal_tab() {
         instructions: assistant.instructions.clone(),
         prior_context: None,
     };
-    let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded();
+    let (ui_tx, mut ui_rx) = voice_ui_channel();
     let engine = spawn_engine(settings, context, ui_tx).expect("spawn engine");
 
     let deadline = Instant::now() + Duration::from_secs(45);

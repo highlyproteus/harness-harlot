@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,9 +52,136 @@ pub(crate) struct RawPaneEvent {
     pub(crate) at_ms: u64,
 }
 
+const INPUT_QUEUED: u8 = 0;
+const INPUT_WRITING: u8 = 1;
+const INPUT_COMPLETED: u8 = 2;
+const INPUT_CANCELLED: u8 = 3;
+
+#[derive(Clone)]
 struct PtyInput {
+    inner: Arc<PtyInputInner>,
+}
+
+struct PtyInputInner {
     bytes: Vec<u8>,
+    state: AtomicU8,
     completion: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+}
+
+impl PtyInput {
+    fn new(
+        bytes: Vec<u8>,
+    ) -> (
+        Self,
+        std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+    ) {
+        let (completion, result) = std::sync::mpsc::sync_channel(1);
+        (
+            Self {
+                inner: Arc::new(PtyInputInner {
+                    bytes,
+                    state: AtomicU8::new(INPUT_QUEUED),
+                    completion,
+                }),
+            },
+            result,
+        )
+    }
+
+    fn begin_write(&self) -> bool {
+        self.inner
+            .state
+            .compare_exchange(
+                INPUT_QUEUED,
+                INPUT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel_if_queued(&self) -> bool {
+        if self
+            .inner
+            .state
+            .compare_exchange(
+                INPUT_QUEUED,
+                INPUT_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let _ = self
+            .inner
+            .completion
+            .send(Err("terminal input cancelled before write".to_owned()));
+        true
+    }
+
+    fn finish(&self, result: std::result::Result<(), String>) {
+        self.inner.state.store(INPUT_COMPLETED, Ordering::Release);
+        let _ = self.inner.completion.send(result);
+    }
+
+    fn delivery_is_ambiguous(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == INPUT_WRITING
+    }
+}
+
+fn run_input_writer(
+    mut writer: impl Write,
+    input_rx: &std::sync::mpsc::Receiver<PtyInput>,
+    pane_id: Uuid,
+) {
+    while let Ok(input) = input_rx.recv() {
+        if !input.begin_write() {
+            continue;
+        }
+        if let Err(error) = writer
+            .write_all(&input.inner.bytes)
+            .and_then(|()| writer.flush())
+        {
+            let message = format!("write terminal input: {error}");
+            input.finish(Err(message));
+            eprintln!("pty writer for pane {pane_id} stopped: {error}");
+            break;
+        }
+        input.finish(Ok(()));
+    }
+}
+
+fn await_input_completion(
+    input: &PtyInput,
+    result: &std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+    timeout: Duration,
+) -> Result<()> {
+    match result.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => bail!(error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            if input.cancel_if_queued() {
+                bail!("terminal input timed out and was cancelled before write after {timeout:?}")
+            }
+            if input.delivery_is_ambiguous() {
+                bail!(
+                    "terminal input delivery is ambiguous after {timeout:?}: the writer began before timeout; do not retry automatically"
+                )
+            }
+            match result.try_recv() {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => bail!(error),
+                Err(_) => {
+                    bail!("terminal input writer stopped without a recoverable delivery outcome")
+                }
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("terminal input writer stopped before acknowledging completion")
+        }
+    }
 }
 
 pub(crate) struct PtySession {
@@ -323,17 +450,7 @@ impl PtySession {
             .name(format!("rmux-pty-writer-{pane_id}"))
             .spawn(move || {
                 let _writer_exit = writer_exit_tx;
-                let mut writer = writer;
-                while let Ok(input) = input_rx.recv() {
-                    if let Err(error) = writer.write_all(&input.bytes).and_then(|()| writer.flush())
-                    {
-                        let message = format!("write terminal input: {error}");
-                        let _ = input.completion.send(Err(message));
-                        eprintln!("pty writer for pane {pane_id} stopped: {error}");
-                        break;
-                    }
-                    let _ = input.completion.send(Ok(()));
-                }
+                run_input_writer(writer, &input_rx, pane_id);
             })
             .context("spawn PTY writer thread")?;
 
@@ -378,11 +495,8 @@ impl PtySession {
         // error instead of a frozen handler thread. Clone the sender so the
         // lifecycle lock itself never sits inside the completion bound.
         let deadline = Instant::now() + PTY_INPUT_COMPLETION_BOUND;
-        let (completion, result) = std::sync::mpsc::sync_channel(1);
-        let mut queued = PtyInput {
-            bytes: bytes.to_vec(),
-            completion,
-        };
+        let (input, result) = PtyInput::new(bytes.to_vec());
+        let mut queued = input.clone();
         loop {
             match input_tx.try_send(queued) {
                 Ok(()) => break,
@@ -397,16 +511,7 @@ impl PtySession {
             thread::sleep(Duration::from_millis(5));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match result.recv_timeout(remaining) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => bail!(error),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                bail!("terminal input completion timed out after {PTY_INPUT_COMPLETION_BOUND:?}")
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("terminal input writer stopped before acknowledging completion")
-            }
-        }
+        await_input_completion(&input, &result, remaining)
     }
 
     pub(crate) fn resize(&self, columns: u16, rows: u16) -> Result<()> {
@@ -641,6 +746,113 @@ mod tests {
 
     use crate::layout::first_pane_id;
     use crate::registry::SessionRegistry;
+
+    #[derive(Clone)]
+    struct StalledWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        started: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Write for StalledWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            {
+                let (started, wake) = &*self.started;
+                *started.lock().unwrap() = true;
+                wake.notify_all();
+            }
+            let (released, wake) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.bytes.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancelled_queued_input_never_executes_after_a_stalled_write_releases() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let started = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let writer = StalledWriter {
+            bytes: Arc::clone(&bytes),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let (first, first_result) = PtyInput::new(b"first".to_vec());
+        let (second, second_result) = PtyInput::new(b"second".to_vec());
+        tx.send(first).unwrap();
+        tx.send(second.clone()).unwrap();
+        drop(tx);
+        let worker = thread::spawn(move || run_input_writer(writer, &rx, Uuid::nil()));
+
+        let (did_start, wake) = &*started;
+        let mut did_start = did_start.lock().unwrap();
+        while !*did_start {
+            did_start = wake.wait(did_start).unwrap();
+        }
+        drop(did_start);
+        let timeout = await_input_completion(&second, &second_result, Duration::ZERO).unwrap_err();
+        assert!(timeout.to_string().contains("cancelled before write"));
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+
+        assert!(
+            first_result
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            second_result
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
+        worker.join().unwrap();
+        assert_eq!(&*bytes.lock(), b"first");
+    }
+
+    #[test]
+    fn timeout_after_writer_starts_reports_ambiguous_delivery() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let started = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let writer = StalledWriter {
+            bytes: Arc::clone(&bytes),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (input, result) = PtyInput::new(b"begun".to_vec());
+        tx.send(input.clone()).unwrap();
+        drop(tx);
+        let worker = thread::spawn(move || run_input_writer(writer, &rx, Uuid::nil()));
+
+        let (did_start, wake) = &*started;
+        let mut did_start = did_start.lock().unwrap();
+        while !*did_start {
+            did_start = wake.wait(did_start).unwrap();
+        }
+        drop(did_start);
+        let timeout = await_input_completion(&input, &result, Duration::ZERO).unwrap_err();
+        assert!(timeout.to_string().contains("delivery is ambiguous"));
+        assert!(timeout.to_string().contains("do not retry automatically"));
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        worker.join().unwrap();
+        assert_eq!(&*bytes.lock(), b"begun");
+    }
 
     #[test]
     fn rejects_oversized_terminal_input_frames() {
