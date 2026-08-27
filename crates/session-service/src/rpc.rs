@@ -166,9 +166,25 @@ pub(crate) fn handle_request(
         | ClientRequest::DisconnectWorkspace { .. }
         | ClientRequest::ReconnectWorkspace { .. }
         | ClientRequest::DeleteWorkspace { .. } => handle_workspaces_request(sessions, request),
-        ClientRequest::WriteInput { .. }
-        | ClientRequest::WriteAuthorizedInput { .. }
-        | ClientRequest::BeginSelection { .. }
+        ClientRequest::WriteInput { pane_id, bytes } => {
+            Ok(match sessions.write_input_with_delivery(pane_id, &bytes) {
+                Ok(()) => ServiceResponse::Ack,
+                Err(error) => ServiceResponse::DeliveryError {
+                    message: error.to_string(),
+                    disposition: error.disposition(),
+                },
+            })
+        }
+        ClientRequest::WriteAuthorizedInput { authority, bytes } => Ok(
+            match sessions.authorized_write_input_with_delivery(&authority, &bytes) {
+                Ok(()) => ServiceResponse::Ack,
+                Err(error) => ServiceResponse::DeliveryError {
+                    message: error.to_string(),
+                    disposition: error.disposition(),
+                },
+            },
+        ),
+        ClientRequest::BeginSelection { .. }
         | ClientRequest::UpdateSelection { .. }
         | ClientRequest::ClearSelection { .. }
         | ClientRequest::CopySelection { .. }
@@ -580,14 +596,6 @@ fn handle_terminal_request(
     request: ClientRequest,
 ) -> Result<ServiceResponse> {
     match request {
-        ClientRequest::WriteInput { pane_id, bytes } => {
-            sessions.write_input(pane_id, &bytes)?;
-            Ok(ServiceResponse::Ack)
-        }
-        ClientRequest::WriteAuthorizedInput { authority, bytes } => {
-            sessions.authorized_write_input(&authority, &bytes)?;
-            Ok(ServiceResponse::Ack)
-        }
         ClientRequest::BeginSelection {
             pane_id,
             point,
@@ -1124,17 +1132,23 @@ mod tests {
                 read_error.to_string().contains("authority"),
                 "{read_error:#}"
             );
-            let write_error = handle_request(
+            let write_response = handle_request(
                 &registry,
                 ClientRequest::WriteAuthorizedInput {
                     authority: changed,
                     bytes: b"must not be written".to_vec(),
                 },
             )
-            .expect_err("authority-bound write must reject a changed tuple component");
+            .expect("authority-bound write rejection must be delivery-classified");
             assert!(
-                write_error.to_string().contains("authority"),
-                "{write_error:#}"
+                matches!(
+                    write_response,
+                    ServiceResponse::DeliveryError {
+                        disposition: hh_protocol::DeliveryDisposition::DefinitelyUnsent,
+                        ref message,
+                    } if message.contains("authority")
+                ),
+                "{write_response:?}"
             );
         }
     }
@@ -1442,18 +1456,21 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        let error = handle_request(
+        let response = handle_request(
             &registry,
             ClientRequest::WriteInput {
                 pane_id,
                 bytes: b"must fail".to_vec(),
             },
         )
-        .expect_err("RPC must not acknowledge input that the PTY writer failed to flush");
+        .unwrap();
 
-        assert!(
-            error.to_string().contains("write terminal input"),
-            "unexpected error: {error:#}"
-        );
+        assert!(matches!(
+            response,
+            ServiceResponse::DeliveryError {
+                message,
+                disposition: hh_protocol::DeliveryDisposition::Indeterminate,
+            } if message.contains("write terminal input")
+        ));
     }
 }

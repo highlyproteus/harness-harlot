@@ -16,9 +16,10 @@ use crate::process::{configured_shell, local_shell_command, system_ssh_command};
 use crate::tmux::{tmux_local_attach_command, tmux_ssh_attach_command};
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    MAX_TERMINAL_CELLS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS,
-    MIN_TERMINAL_ROWS, NotificationKind, TerminalModes, TerminalModifiers, TerminalMouseAction,
-    TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind, TmuxSessionId,
+    DeliveryDisposition, MAX_TERMINAL_CELLS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS,
+    MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS, NotificationKind, TerminalModes, TerminalModifiers,
+    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
+    TmuxSessionId,
 };
 use hh_terminal_model::TerminalModel;
 use parking_lot::Mutex;
@@ -34,6 +35,40 @@ pub(crate) const INITIAL_ROWS: u16 = 30;
 pub(crate) const MAX_INPUT_FRAME: usize = 64 * 1024;
 
 const PTY_INPUT_COMPLETION_BOUND: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+pub(crate) struct InputDeliveryError {
+    message: String,
+    disposition: DeliveryDisposition,
+}
+
+impl InputDeliveryError {
+    pub(crate) fn definitely_unsent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            disposition: DeliveryDisposition::DefinitelyUnsent,
+        }
+    }
+
+    fn indeterminate(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            disposition: DeliveryDisposition::Indeterminate,
+        }
+    }
+
+    pub(crate) const fn disposition(&self) -> DeliveryDisposition {
+        self.disposition
+    }
+}
+
+impl std::fmt::Display for InputDeliveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for InputDeliveryError {}
 
 pub(crate) const MAX_RAW_PANE_EVENTS: usize = 32;
 
@@ -157,29 +192,33 @@ fn await_input_completion(
     input: &PtyInput,
     result: &std::sync::mpsc::Receiver<std::result::Result<(), String>>,
     timeout: Duration,
-) -> Result<()> {
+) -> std::result::Result<(), InputDeliveryError> {
     match result.recv_timeout(timeout) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => bail!(error),
+        Ok(Err(error)) => Err(InputDeliveryError::indeterminate(error)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             if input.cancel_if_queued() {
-                bail!("terminal input timed out and was cancelled before write after {timeout:?}")
+                return Err(InputDeliveryError::definitely_unsent(format!(
+                    "terminal input timed out and was cancelled before write after {timeout:?}"
+                )));
             }
             if input.delivery_is_ambiguous() {
-                bail!(
+                return Err(InputDeliveryError::indeterminate(format!(
                     "terminal input delivery is ambiguous after {timeout:?}: the writer began before timeout; do not retry automatically"
-                )
+                )));
             }
             match result.try_recv() {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => bail!(error),
-                Err(_) => {
-                    bail!("terminal input writer stopped without a recoverable delivery outcome")
-                }
+                Ok(Err(error)) => Err(InputDeliveryError::indeterminate(error)),
+                Err(_) => Err(InputDeliveryError::indeterminate(
+                    "terminal input writer stopped without a recoverable delivery outcome",
+                )),
             }
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            bail!("terminal input writer stopped before acknowledging completion")
+            Err(InputDeliveryError::indeterminate(
+                "terminal input writer stopped before acknowledging completion",
+            ))
         }
     }
 }
@@ -470,9 +509,11 @@ impl PtySession {
         }))
     }
 
-    pub(crate) fn write_input(&self, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write_input(&self, bytes: &[u8]) -> std::result::Result<(), InputDeliveryError> {
         if bytes.len() > MAX_INPUT_FRAME {
-            bail!("terminal input exceeds {MAX_INPUT_FRAME}-byte frame limit");
+            return Err(InputDeliveryError::definitely_unsent(format!(
+                "terminal input exceeds {MAX_INPUT_FRAME}-byte frame limit"
+            )));
         }
         // Typing snaps the viewport back to the live bottom (stock terminal
         // behavior). While `display_offset` is nonzero, `Grid::scroll_up`
@@ -488,7 +529,9 @@ impl PtySession {
             }
         }
         let Some(input_tx) = self.input_tx.lock().as_ref().cloned() else {
-            bail!("terminal is not accepting input");
+            return Err(InputDeliveryError::definitely_unsent(
+                "terminal is not accepting input",
+            ));
         };
         // A single bounded channel preserves keystroke/paste ordering while
         // turning a wedged writer (stopped child, full PTY buffer) into an
@@ -502,11 +545,15 @@ impl PtySession {
                 Ok(()) => break,
                 Err(std::sync::mpsc::TrySendError::Full(input)) => queued = input,
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    bail!("terminal is not accepting input")
+                    return Err(InputDeliveryError::definitely_unsent(
+                        "terminal is not accepting input",
+                    ));
                 }
             }
             if Instant::now() >= deadline {
-                bail!("terminal is not accepting input");
+                return Err(InputDeliveryError::definitely_unsent(
+                    "terminal is not accepting input",
+                ));
             }
             thread::sleep(Duration::from_millis(5));
         }

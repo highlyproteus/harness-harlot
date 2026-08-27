@@ -11,9 +11,9 @@ use crate::elements::{SidebarResizeCaptureElement, TerminalInputElement};
 use crate::view_models::{ColorTarget, DialogAction, Modal};
 use crate::{
     ConsumeChordPrefix, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp, NewBrowserTab,
-    NewTab, NewWorkspace, PaneDrag, ReattachPane, ShowCommandPalette, ShowNotifications,
-    ShowSettings, SplitDown, SplitRight, THEME, TerminalZoomIn, TerminalZoomOut, TogglePaneZoom,
-    ToggleSidebar, ToggleVoiceMic,
+    NewTab, NewWorkspace, PaneDrag, ReattachPane, RetryTerminalInput, ShowCommandPalette,
+    ShowNotifications, ShowSettings, SplitDown, SplitRight, THEME, TerminalZoomIn, TerminalZoomOut,
+    TogglePaneZoom, ToggleSidebar, ToggleVoiceMic,
 };
 
 impl Render for HhApp {
@@ -193,6 +193,10 @@ impl Render for HhApp {
             }))
             .on_action(cx.listener(|this, _: &ReattachPane, _, cx| {
                 this.execute_command(AppCommand::ReattachPane, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &RetryTerminalInput, _, cx| {
+                this.execute_command(AppCommand::RetryTerminalInput, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &ShowNotifications, _, cx| {

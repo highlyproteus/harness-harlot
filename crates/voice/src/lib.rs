@@ -13,11 +13,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use futures::SinkExt;
-use futures::channel::mpsc::{Receiver, Sender};
-use parking_lot::Mutex;
+use futures::channel::mpsc::Receiver;
 
 pub(crate) const MAX_ACCEPTED_USER_ITEMS: usize = 16;
 pub const VOICE_UI_EVENT_CAPACITY: usize = 64;
+const VOICE_UI_DISPATCH_CAPACITY: usize = 256;
 
 pub use settings::{HonchoSettings, VoiceSettings};
 pub use threads::{
@@ -110,26 +110,88 @@ impl VoiceUiEvent {
 /// backpressure and are never discarded.
 #[derive(Clone, Debug)]
 pub struct VoiceUiSender {
-    tx: Arc<Mutex<Sender<VoiceUiEvent>>>,
+    critical_tx: std::sync::mpsc::SyncSender<VoiceUiEvent>,
+    delta_tx: std::sync::mpsc::SyncSender<VoiceUiEvent>,
+    critical_slots: Arc<AtomicUsize>,
 }
 
 impl VoiceUiSender {
     pub(crate) fn emit(&self, event: VoiceUiEvent) -> bool {
-        let mut tx = self.tx.lock();
         if event.droppable_delta() {
-            tx.try_send(event).is_ok()
+            self.delta_tx.try_send(event).is_ok()
         } else {
-            futures::executor::block_on(tx.send(event)).is_ok()
+            if self
+                .critical_slots
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
+                    if slots > 0 { Some(slots - 1) } else { None }
+                })
+                .is_err()
+            {
+                return false;
+            }
+            if self.critical_tx.try_send(event).is_ok() {
+                true
+            } else {
+                self.critical_slots.fetch_add(1, Ordering::Release);
+                false
+            }
         }
+    }
+
+    pub(crate) fn critical_capacity(&self) -> usize {
+        self.critical_slots.load(Ordering::Acquire)
     }
 }
 
 #[must_use]
+/// Creates the bounded engine-to-desktop Voice event channel.
+///
+/// # Panics
+///
+/// Panics if the process cannot spawn the dedicated Voice UI dispatcher thread.
 pub fn voice_ui_channel() -> (VoiceUiSender, Receiver<VoiceUiEvent>) {
-    let (tx, rx) = futures::channel::mpsc::channel(VOICE_UI_EVENT_CAPACITY - 1);
+    let (mut desktop_tx, rx) = futures::channel::mpsc::channel(VOICE_UI_EVENT_CAPACITY - 1);
+    let (critical_tx, critical_rx) =
+        std::sync::mpsc::sync_channel::<VoiceUiEvent>(VOICE_UI_DISPATCH_CAPACITY);
+    let (delta_tx, delta_rx) =
+        std::sync::mpsc::sync_channel::<VoiceUiEvent>(VOICE_UI_EVENT_CAPACITY);
+    let critical_slots = Arc::new(AtomicUsize::new(VOICE_UI_DISPATCH_CAPACITY));
+    let dispatcher_critical_slots = Arc::clone(&critical_slots);
+    std::thread::Builder::new()
+        .name("hh-voice-ui-dispatch".to_owned())
+        .spawn(move || {
+            loop {
+                let event = match critical_rx.try_recv() {
+                    Ok(event) => event,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        match critical_rx.recv_timeout(Duration::from_millis(2)) {
+                            Ok(event) => event,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                match delta_rx.try_recv() {
+                                    Ok(event) => event,
+                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                                    Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                                }
+                            }
+                        }
+                    }
+                };
+                if !event.droppable_delta() {
+                    dispatcher_critical_slots.fetch_add(1, Ordering::Release);
+                }
+                if futures::executor::block_on(desktop_tx.send(event)).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn voice UI dispatcher");
     (
         VoiceUiSender {
-            tx: Arc::new(Mutex::new(tx)),
+            critical_tx,
+            delta_tx,
+            critical_slots,
         },
         rx,
     )
@@ -259,6 +321,44 @@ mod admission_tests {
         assert_eq!(accepted.len(), MAX_ACCEPTED_USER_ITEMS);
         assert_eq!(accepted.first().map(String::as_str), Some("0"));
         assert_eq!(accepted.last().map(String::as_str), Some("15"));
+    }
+
+    #[test]
+    fn saturated_critical_ui_capacity_is_observable_without_blocking_the_engine() {
+        let (ui, _events) = voice_ui_channel();
+        while ui.critical_capacity() > 0 {
+            assert!(ui.emit(VoiceUiEvent::State(EngineState::Thinking)));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(ui.emit(VoiceUiEvent::State(EngineState::Thinking)));
+        });
+
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Ok(false),
+            "a saturated critical UI queue blocked the sole engine"
+        );
+    }
+
+    #[test]
+    fn critical_ui_emit_does_not_block_the_engine_when_desktop_is_stalled() {
+        let (ui, _events) = voice_ui_channel();
+        for _ in 0..VOICE_UI_EVENT_CAPACITY {
+            ui.emit(VoiceUiEvent::MicLevel(0.0));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+
+        std::thread::spawn(move || {
+            let emitted = ui.emit(VoiceUiEvent::State(EngineState::Thinking));
+            let _ = done_tx.send(emitted);
+        });
+
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Ok(true),
+            "critical UI delivery synchronously stalled the engine"
+        );
     }
 
     #[test]

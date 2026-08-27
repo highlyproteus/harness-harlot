@@ -358,3 +358,13 @@ fn microphone_capture_starts_without_consent_and_only_explicit_enable_grants_it(
     consent.apply_command(true);
     assert!(consent.capture_enabled());
 }
+
+#[test]
+fn ambiguous_user_send_retires_admission_without_creating_a_response() {
+    let disposition = user_send_failure_disposition(false);
+
+    assert_eq!(disposition, UserSendFailureDisposition::Indeterminate);
+    assert!(disposition.retires_admission());
+    assert!(!disposition.restores_content());
+    assert!(!UserSendFailureDisposition::creates_response());
+}

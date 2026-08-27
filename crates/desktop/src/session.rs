@@ -6,7 +6,7 @@ use hh_protocol::{
     ClientRequest, PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse,
     SessionSnapshot, Workspace,
 };
-use hh_session_client::SessionClient;
+use hh_session_client::{DeliveryCallError, SessionClient};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,24 @@ pub(crate) fn session_call(
     request: &ClientRequest,
 ) -> anyhow::Result<ServiceResponse> {
     with_session_client(client, |client| client.call(request))
+}
+
+pub(crate) fn session_call_with_delivery(
+    client: &SharedSessionClient,
+    request: &ClientRequest,
+) -> std::result::Result<ServiceResponse, DeliveryCallError> {
+    let mut client = client.lock();
+    if client.is_none() {
+        *client = Some(SessionClient::connect().map_err(DeliveryCallError::definitely_unsent)?);
+    }
+    let result = client
+        .as_mut()
+        .expect("session client initialized")
+        .call_with_delivery(request);
+    if result.is_err() {
+        *client = None;
+    }
+    result
 }
 
 pub(crate) fn session_notify(
@@ -53,6 +71,16 @@ pub(crate) fn with_session_client<T>(
 }
 
 impl HhApp {
+    pub(crate) fn retry_undelivered_terminal_input(&mut self, cx: &mut Context<Self>) {
+        if self.session.terminal_input_tx.replay_recoverable() {
+            self.session.connection_error = None;
+        } else {
+            self.session.connection_error =
+                Some("there is no definitely-undelivered terminal input to retry".to_owned());
+        }
+        cx.notify();
+    }
+
     pub(crate) fn control_client_handle(&self) -> SharedSessionClient {
         Arc::clone(&self.session.control_client)
     }

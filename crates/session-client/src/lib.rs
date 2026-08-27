@@ -6,9 +6,45 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    ClientRequest, PROTOCOL_VERSION, ServiceResponse, WireError, legacy_socket_path, read_message,
-    socket_path, write_message,
+    ClientRequest, DeliveryDisposition, PROTOCOL_VERSION, ServiceResponse, WireError,
+    legacy_socket_path, read_message, socket_path, write_message,
 };
+
+#[derive(Debug)]
+pub struct DeliveryCallError {
+    error: anyhow::Error,
+    disposition: DeliveryDisposition,
+}
+
+impl DeliveryCallError {
+    fn new(error: impl Into<anyhow::Error>, disposition: DeliveryDisposition) -> Self {
+        Self {
+            error: error.into(),
+            disposition,
+        }
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> DeliveryDisposition {
+        self.disposition
+    }
+
+    pub fn definitely_unsent(error: impl Into<anyhow::Error>) -> Self {
+        Self::new(error, DeliveryDisposition::DefinitelyUnsent)
+    }
+}
+
+impl std::fmt::Display for DeliveryCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for DeliveryCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
 
 /// A persistent, serialized connection to the local session service.
 ///
@@ -153,31 +189,79 @@ impl SessionClient {
     /// Returns an error after a failed response read, a failed reconnect or
     /// retry, or a service-side request rejection.
     pub fn call(&mut self, request: &ClientRequest) -> Result<ServiceResponse> {
+        self.call_with_delivery(request).map_err(anyhow::Error::new)
+    }
+
+    /// Sends one request while preserving whether a failed mutation is safe to
+    /// offer for explicit replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a delivery-classified error when connection, request transport,
+    /// response transport, decoding, or the service-side operation fails.
+    pub fn call_with_delivery(
+        &mut self,
+        request: &ClientRequest,
+    ) -> std::result::Result<ServiceResponse, DeliveryCallError> {
         if !self.valid {
-            *self = Self::connect()?;
+            *self = Self::connect().map_err(|error| {
+                DeliveryCallError::new(error, DeliveryDisposition::DefinitelyUnsent)
+            })?;
         }
         let response = match write_message(&mut self.stream, request) {
             Ok(()) => match read_message(&mut self.reader) {
                 Ok(response) => response,
                 Err(error) => {
                     self.invalidate();
-                    return Err(error.into());
+                    return Err(DeliveryCallError::new(
+                        error,
+                        DeliveryDisposition::Indeterminate,
+                    ));
                 }
             },
             Err(WireError::Io(_)) => {
-                *self = Self::connect()?;
-                match self.exchange(request) {
-                    Ok(response) => response,
+                *self = Self::connect().map_err(|error| {
+                    DeliveryCallError::new(error, DeliveryDisposition::DefinitelyUnsent)
+                })?;
+                match write_message(&mut self.stream, request) {
+                    Ok(()) => match read_message(&mut self.reader) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.invalidate();
+                            return Err(DeliveryCallError::new(
+                                error,
+                                DeliveryDisposition::Indeterminate,
+                            ));
+                        }
+                    },
                     Err(error) => {
                         self.invalidate();
-                        return Err(error.into());
+                        return Err(DeliveryCallError::new(
+                            error,
+                            DeliveryDisposition::DefinitelyUnsent,
+                        ));
                     }
                 }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(DeliveryCallError::new(
+                    error,
+                    DeliveryDisposition::DefinitelyUnsent,
+                ));
+            }
         };
         match response {
-            ServiceResponse::Error { message } => bail!("service request failed: {message}"),
+            ServiceResponse::DeliveryError {
+                message,
+                disposition,
+            } => Err(DeliveryCallError::new(
+                anyhow::anyhow!(message),
+                disposition,
+            )),
+            ServiceResponse::Error { message } => Err(DeliveryCallError::new(
+                anyhow::anyhow!("service request failed: {message}"),
+                DeliveryDisposition::Indeterminate,
+            )),
             response => Ok(response),
         }
     }
@@ -197,11 +281,6 @@ impl SessionClient {
             write_message(&mut self.stream, request)?;
         }
         Ok(())
-    }
-
-    fn exchange(&mut self, request: &ClientRequest) -> Result<ServiceResponse, WireError> {
-        write_message(&mut self.stream, request)?;
-        read_message(&mut self.reader)
     }
 
     fn invalidate(&mut self) {
@@ -248,6 +327,42 @@ mod tests {
 
         assert!(client.call(&ClientRequest::GetSnapshot).is_err());
         assert!(!client.valid, "a timed-out stream must never be reused");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn terminal_delivery_rejection_preserves_structured_disposition() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(client_stream.try_clone().unwrap());
+        let mut client = SessionClient {
+            stream: client_stream,
+            reader,
+            valid: true,
+        };
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let request = read_message::<ClientRequest>(&mut reader).unwrap();
+            assert_eq!(request, ClientRequest::GetSnapshot);
+            write_message(
+                &mut server_stream,
+                &ServiceResponse::DeliveryError {
+                    message: "terminal rejected input before write".to_owned(),
+                    disposition: DeliveryDisposition::DefinitelyUnsent,
+                },
+            )
+            .unwrap();
+        });
+
+        let error = client
+            .call_with_delivery(&ClientRequest::GetSnapshot)
+            .unwrap_err();
+
+        assert_eq!(error.disposition(), DeliveryDisposition::DefinitelyUnsent);
+        assert!(
+            error
+                .to_string()
+                .contains("terminal rejected input before write")
+        );
         server.join().unwrap();
     }
 

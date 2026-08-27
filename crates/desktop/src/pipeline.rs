@@ -18,7 +18,7 @@ use hh_protocol::{ClientRequest, ServiceResponse};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use crate::session::{session_call, session_notify};
+use crate::session::{session_call, session_call_with_delivery, session_notify};
 
 /// Typed continuation applied with a response on the UI thread.
 pub(crate) type ApplyFn = Box<dyn FnOnce(&mut HhApp, &mut Context<HhApp>, Result<ServiceResponse>)>;
@@ -65,7 +65,16 @@ pub(crate) fn bounded_lane(capacity: usize) -> (Sender<PipelineJob>, PipelineLan
 #[derive(Default)]
 struct TerminalInputBuffer {
     queued: VecDeque<(Uuid, Vec<u8>)>,
+    in_flight: Option<(Uuid, Vec<u8>)>,
+    recoverable: VecDeque<(Uuid, Vec<u8>)>,
     buffered_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalInputDelivery {
+    Delivered,
+    DefinitelyUnsent,
+    Indeterminate,
 }
 
 #[derive(Clone)]
@@ -149,17 +158,69 @@ impl TerminalInputSender {
         Ok(())
     }
 
+    /// Explicitly moves definitely-unsent input back to the delivery queue.
+    /// Ambiguous mutations are never placed in the recoverable queue.
+    pub(crate) fn replay_recoverable(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.recoverable.is_empty() {
+            return false;
+        }
+        let mut replay = std::mem::take(&mut state.recoverable);
+        replay.append(&mut state.queued);
+        state.queued = replay;
+        drop(state);
+        let _ = self.wake.lock().try_send(());
+        true
+    }
+
     #[cfg(test)]
     fn drain_for_test(&self) -> Vec<(Uuid, Vec<u8>)> {
-        self.state.lock().queued.drain(..).collect()
+        let mut state = self.state.lock();
+        let drained = state.queued.drain(..).collect::<Vec<_>>();
+        state.buffered_bytes -= drained.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
+        drained
+    }
+
+    #[cfg(test)]
+    fn recoverable_for_test(&self) -> Vec<(Uuid, Vec<u8>)> {
+        self.state.lock().recoverable.iter().cloned().collect()
     }
 }
 
-fn pop_terminal_input(state: &Mutex<TerminalInputBuffer>) -> Option<(Uuid, Vec<u8>)> {
+fn begin_terminal_input(state: &Mutex<TerminalInputBuffer>) -> Option<(Uuid, Vec<u8>)> {
     let mut state = state.lock();
+    debug_assert!(state.in_flight.is_none());
     let next = state.queued.pop_front()?;
-    state.buffered_bytes -= next.1.len();
+    state.in_flight = Some(next.clone());
     Some(next)
+}
+
+fn finish_terminal_input(
+    state: &Mutex<TerminalInputBuffer>,
+    input: (Uuid, Vec<u8>),
+    delivery: TerminalInputDelivery,
+) {
+    let mut state = state.lock();
+    debug_assert_eq!(state.in_flight.as_ref(), Some(&input));
+    state.in_flight = None;
+    match delivery {
+        TerminalInputDelivery::DefinitelyUnsent => state.recoverable.push_back(input),
+        TerminalInputDelivery::Delivered | TerminalInputDelivery::Indeterminate => {
+            state.buffered_bytes -= input.1.len();
+        }
+    }
+}
+
+fn terminal_input_delivery(
+    result: &std::result::Result<ServiceResponse, hh_session_client::DeliveryCallError>,
+) -> TerminalInputDelivery {
+    match result {
+        Ok(ServiceResponse::Ack) => TerminalInputDelivery::Delivered,
+        Err(error) if error.disposition() == hh_protocol::DeliveryDisposition::DefinitelyUnsent => {
+            TerminalInputDelivery::DefinitelyUnsent
+        }
+        Ok(_) | Err(_) => TerminalInputDelivery::Indeterminate,
+    }
 }
 
 pub(crate) fn spawn_terminal_input_lane(
@@ -170,18 +231,28 @@ pub(crate) fn spawn_terminal_input_lane(
     cx.spawn(async move |this, cx: &mut AsyncApp| {
         let mut wake_rx = lane.wake_rx;
         while wake_rx.next().await.is_some() {
-            while let Some((pane_id, bytes)) = pop_terminal_input(&lane.state) {
+            while let Some((pane_id, bytes)) = begin_terminal_input(&lane.state) {
                 let Ok(client) = this.update(cx, |this, _| Arc::clone(client_of(this))) else {
+                    finish_terminal_input(
+                        &lane.state,
+                        (pane_id, bytes),
+                        TerminalInputDelivery::DefinitelyUnsent,
+                    );
                     return;
                 };
-                let request = ClientRequest::WriteInput { pane_id, bytes };
+                let request = ClientRequest::WriteInput {
+                    pane_id,
+                    bytes: bytes.clone(),
+                };
                 let result = cx
-                    .background_spawn(async move { session_call(&client, &request) })
+                    .background_spawn(async move { session_call_with_delivery(&client, &request) })
                     .await;
+                let delivery = terminal_input_delivery(&result);
+                finish_terminal_input(&lane.state, (pane_id, bytes), delivery);
                 let Ok(()) = this.update(cx, |this, _| match result {
                     Ok(ServiceResponse::Ack) => {}
                     Ok(response) => this.report_unexpected(&response),
-                    Err(error) => this.report(&error),
+                    Err(error) => this.report(&anyhow::Error::new(error)),
                 }) else {
                     return;
                 };
@@ -281,6 +352,29 @@ mod tests {
         tx.try_send(job()).unwrap();
 
         assert!(tx.try_send(job()).is_err());
+    }
+
+    #[test]
+    fn definite_terminal_delivery_failure_is_retained_until_explicit_replay() {
+        let (tx, lane) = terminal_input_channel(16);
+        let pane_id = uuid::Uuid::nil();
+        tx.try_send(pane_id, b"typed").unwrap();
+
+        let in_flight =
+            begin_terminal_input(&lane.state).expect("accepted input becomes in flight");
+        finish_terminal_input(
+            &lane.state,
+            in_flight,
+            TerminalInputDelivery::DefinitelyUnsent,
+        );
+
+        assert_eq!(
+            tx.recoverable_for_test(),
+            vec![(pane_id, b"typed".to_vec())]
+        );
+        assert_eq!(tx.drain_for_test(), Vec::<(Uuid, Vec<u8>)>::new());
+        assert!(tx.replay_recoverable());
+        assert_eq!(tx.drain_for_test(), vec![(pane_id, b"typed".to_vec())]);
     }
 
     #[test]

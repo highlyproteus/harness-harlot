@@ -343,6 +343,13 @@ pub enum ClientRequest {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryDisposition {
+    DefinitelyUnsent,
+    Indeterminate,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServiceResponse {
@@ -408,6 +415,10 @@ pub enum ServiceResponse {
     },
     Error {
         message: String,
+    },
+    DeliveryError {
+        message: String,
+        disposition: DeliveryDisposition,
     },
 }
 

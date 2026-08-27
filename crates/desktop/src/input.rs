@@ -91,6 +91,7 @@ impl HhApp {
                     self.reattach_pane(pane_id, cx);
                 }
             }
+            AppCommand::RetryTerminalInput => self.retry_undelivered_terminal_input(cx),
             AppCommand::ShowNotifications => self.toggle_sidebar_activity(cx),
             AppCommand::ToggleVoiceMic => {
                 if let Some(pane_id) = self.layout.focused_pane
