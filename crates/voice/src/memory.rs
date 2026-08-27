@@ -12,6 +12,12 @@ const MAX_MESSAGE_BATCH: usize = 20;
 const MAX_PREAMBLE_CHARS: usize = 1_500;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedirectPolicy {
+    HttpsOnly,
+    ValidatedLoopbackHttp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Role {
     User,
     Assistant,
@@ -68,6 +74,7 @@ pub(crate) struct HonchoBackend {
 impl HonchoBackend {
     pub(crate) fn new(settings: HonchoSettings) -> Result<Self> {
         let base_url = validate_honcho_base_url(&settings.base_url)?;
+        let redirect_policy = honcho_redirect_policy(&base_url)?;
         let workspace = encode_path_segment(&settings.workspace);
         let unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -77,6 +84,7 @@ impl HonchoBackend {
         let agent = ureq::builder()
             .timeout_connect(HONCHO_TIMEOUT)
             .timeout(HONCHO_TIMEOUT)
+            .https_only(redirect_policy == RedirectPolicy::HttpsOnly)
             .build();
         let mut backend = Self {
             agent,
@@ -194,6 +202,15 @@ fn validate_honcho_base_url(value: &str) -> Result<String> {
     Ok(value.trim_end_matches('/').to_owned())
 }
 
+fn honcho_redirect_policy(base_url: &str) -> Result<RedirectPolicy> {
+    let parsed = Url::parse(base_url).context("parse validated Honcho base URL")?;
+    match parsed.scheme() {
+        "https" => Ok(RedirectPolicy::HttpsOnly),
+        "http" => Ok(RedirectPolicy::ValidatedLoopbackHttp),
+        _ => bail!("validated Honcho base URL has an unsupported scheme"),
+    }
+}
+
 impl MemoryBackend for HonchoBackend {
     fn record_turn(&mut self, role: Role, text: &str) {
         if text.trim().is_empty() {
@@ -299,6 +316,22 @@ mod tests {
         ] {
             assert!(validate_honcho_base_url(rejected).is_err(), "{rejected}");
         }
+    }
+
+    #[test]
+    fn honcho_redirect_policy_requires_https_after_remote_validation() {
+        assert_eq!(
+            honcho_redirect_policy("https://honcho.example.com").unwrap(),
+            RedirectPolicy::HttpsOnly
+        );
+        assert_eq!(
+            honcho_redirect_policy("http://127.0.0.1:8000").unwrap(),
+            RedirectPolicy::ValidatedLoopbackHttp
+        );
+        assert_eq!(
+            honcho_redirect_policy("http://localhost:8000").unwrap(),
+            RedirectPolicy::ValidatedLoopbackHttp
+        );
     }
 
     #[test]

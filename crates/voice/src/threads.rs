@@ -214,6 +214,10 @@ fn read_thread_in(dir: &Path, thread_id: Uuid) -> Result<Option<Thread>> {
     }))
 }
 
+fn read_summary_in(dir: &Path, thread_id: Uuid) -> Result<Option<String>> {
+    Ok(read_thread_in(dir, thread_id)?.and_then(|thread| thread.summary))
+}
+
 fn list_threads_in(dir: &Path) -> Result<Vec<ThreadSummary>> {
     let files = match fs::read_dir(dir) {
         Ok(files) => files,
@@ -333,6 +337,14 @@ pub fn append_record(thread_id: Uuid, record: &ThreadRecord) -> Result<()> {
 /// be read.
 pub fn read_thread(thread_id: Uuid) -> Result<Option<Thread>> {
     read_thread_in(&required_thread_directory()?, thread_id)
+}
+
+/// Loads the latest summary from the retained thread record.
+///
+/// # Errors
+/// Returns an error when the thread file is unsafe, malformed, or unavailable.
+pub fn read_summary(thread_id: Uuid) -> Result<Option<String>> {
+    read_summary_in(&required_thread_directory()?, thread_id)
 }
 
 /// Lists saved threads after validating their private files.
@@ -597,6 +609,59 @@ mod tests {
         assert!(read_thread_in(&dir, newest).unwrap().is_some());
         assert!(read_thread_in(&dir, over_count).unwrap().is_none());
         assert!(read_thread_in(&dir, old).unwrap().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn summary_lifecycle_follows_clear_and_retention() {
+        let dir = test_dir();
+        let old = Uuid::new_v4();
+        let current = Uuid::new_v4();
+        append_record_in(&dir, old, &meta(old, 10)).unwrap();
+        append_record_in(
+            &dir,
+            old,
+            &ThreadRecord::Summary {
+                text: "old context".to_owned(),
+                at_ms: 10,
+            },
+        )
+        .unwrap();
+        append_record_in(&dir, current, &meta(current, 100)).unwrap();
+        append_record_in(
+            &dir,
+            current,
+            &ThreadRecord::Summary {
+                text: "current context".to_owned(),
+                at_ms: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_summary_in(&dir, old).unwrap().as_deref(),
+            Some("old context")
+        );
+        assert_eq!(
+            prune_thread_files_in(
+                &dir,
+                ThreadRetention {
+                    max_count: 10,
+                    max_age_ms: 50,
+                    max_total_bytes: u64::MAX,
+                },
+                100,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(read_summary_in(&dir, old).unwrap(), None);
+        assert_eq!(
+            read_summary_in(&dir, current).unwrap().as_deref(),
+            Some("current context")
+        );
+        assert_eq!(clear_all_threads_in(&dir).unwrap(), 1);
+        assert_eq!(read_summary_in(&dir, current).unwrap(), None);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{self, Read as _};
+use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -27,10 +27,11 @@ use crate::view_models::{AssistantComposer, ComposerAttachment, Modal, TooltipVi
 use crate::{HhApp, PANE_HEADER_HEIGHT, THEME};
 use gpui::AppContext as _;
 
-const ASSISTANT_SUMMARY_MAX_BYTES: u64 = 16 * 1024;
 const MAX_ASSISTANT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ASSISTANT_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_ASSISTANT_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+const VOICE_PRIVACY_URL: &str =
+    "https://gitlab.com/highlyproteus/harness-harlot/-/blob/main/PRIVACY.md";
 
 fn read_assistant_image(path: &Path) -> anyhow::Result<(String, String, PathBuf)> {
     let file = OpenOptions::new()
@@ -230,6 +231,11 @@ impl AssistantSession {
             }
         };
         if let Some(thread) = thread {
+            session.persisted_summary = if thread.summary.is_some() {
+                PersistedSummaryState::Present
+            } else {
+                PersistedSummaryState::Absent
+            };
             let mut transcript = thread
                 .entries
                 .into_iter()
@@ -252,11 +258,6 @@ impl AssistantSession {
             transcript.reverse();
             session.transcript = transcript;
         }
-        session.persisted_summary = if load_assistant_summary(pane_id).is_some() {
-            PersistedSummaryState::Present
-        } else {
-            PersistedSummaryState::Absent
-        };
         session
     }
 }
@@ -275,6 +276,12 @@ fn prepare_non_voice_start(session: &mut AssistantSession) {
     session.mic_muted = true;
     if let Some(engine) = session.engine.as_ref() {
         engine.send(VoiceCommand::SetMicEnabled(false));
+    }
+}
+
+fn mark_persisted_summaries_cleared(sessions: &mut HashMap<Uuid, AssistantSession>) {
+    for session in sessions.values_mut() {
+        session.persisted_summary = PersistedSummaryState::Absent;
     }
 }
 
@@ -453,17 +460,17 @@ impl HhApp {
     }
 
     fn delete_saved_thread(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
-        match threads::delete_thread(thread_id) {
-            Ok(_) => delete_assistant_summary(thread_id),
-            Err(error) => self.report(&error),
+        if let Err(error) = threads::delete_thread(thread_id) {
+            self.report(&error);
         }
         self.voice.refresh_thread_index();
         cx.notify();
     }
 
     fn clear_saved_threads(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = threads::clear_all_threads() {
-            self.report(&error);
+        match threads::clear_all_threads() {
+            Ok(_) => mark_persisted_summaries_cleared(&mut self.voice.sessions),
+            Err(error) => self.report(&error),
         }
         self.voice.refresh_thread_index();
         cx.notify();
@@ -499,7 +506,7 @@ impl HhApp {
                         workspace_kind: workspace.kind,
                         working_dir,
                         instructions: workspace.instructions.clone(),
-                        prior_context: load_assistant_summary(pane_id),
+                        prior_context: threads::read_summary(pane_id).ok().flatten(),
                     };
                 }
             }
@@ -708,7 +715,6 @@ impl HhApp {
                 })
                 .detach();
             }
-            delete_assistant_summary(pane_id);
         }
         self.voice.refresh_thread_index();
     }
@@ -789,8 +795,8 @@ impl HhApp {
             }
             VoiceUiEvent::Usage { .. } => {}
             VoiceUiEvent::MicLevel(level) => session.mic_level = level.clamp(0.0, 1.0),
-            VoiceUiEvent::SessionSummary { text } => {
-                save_assistant_summary(pane_id, &text);
+            VoiceUiEvent::SessionSummary { text: _ } => {
+                session.persisted_summary = PersistedSummaryState::Present;
                 self.voice.refresh_thread_index();
             }
         }
@@ -872,43 +878,6 @@ impl HhApp {
                 .and_then(|index| index.checked_sub(1));
         }
         session.transcript_scroll.scroll_to_bottom();
-    }
-}
-
-fn assistant_context_directory() -> Option<PathBuf> {
-    hh_protocol::state_directory().map(|directory| directory.join("assistant-context"))
-}
-
-fn assistant_context_path(pane_id: Uuid) -> Option<PathBuf> {
-    assistant_context_directory().map(|directory| directory.join(format!("{pane_id}.txt")))
-}
-
-fn save_assistant_summary(pane_id: Uuid, text: &str) {
-    let Some(path) = assistant_context_path(pane_id) else {
-        return;
-    };
-    let result = (|| -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            hh_protocol::ensure_private_directory(parent)?;
-        }
-        hh_protocol::atomic_write_private(&path, text.as_bytes())
-    })();
-    if let Err(error) = result {
-        eprintln!("assistant context for {pane_id} was not persisted: {error}");
-    }
-}
-
-fn load_assistant_summary(pane_id: Uuid) -> Option<String> {
-    let path = assistant_context_path(pane_id)?;
-    let bytes = hh_protocol::read_private_file(&path, ASSISTANT_SUMMARY_MAX_BYTES).ok()?;
-    String::from_utf8(bytes)
-        .ok()
-        .filter(|text| !text.is_empty())
-}
-
-fn delete_assistant_summary(pane_id: Uuid) {
-    if let Some(path) = assistant_context_path(pane_id) {
-        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1314,6 +1283,16 @@ impl HhApp {
                     .text_xs()
                     .text_color(rgb(THEME.dim))
                     .child("Changes apply to the next assistant session."),
+            )
+            .child(
+                div()
+                    .id("voice-privacy-disclosure")
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.accent))
+                    .child("Voice privacy and data handling")
+                    .on_click(cx.listener(|_, _, _, cx| cx.open_url(VOICE_PRIVACY_URL))),
             )
             .into_any_element()
     }

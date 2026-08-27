@@ -12,9 +12,9 @@ and data practices.
 Voice Mode is inactive until you use an Assistant pane. Typing a message,
 attaching an image, or reopening a saved thread may connect the Assistant to
 OpenAI, but those actions do not grant microphone access. Microphone capture
-starts only after you use the visible start-voice control. Muting, suspending,
-or stopping the Assistant disables capture, and a later text-only start revokes
-any earlier microphone consent.
+hardware is not enumerated, configured, or opened until you use the visible
+start-voice control. Muting, suspending, or stopping the Assistant disables
+capture, and a later text-only start revokes any earlier microphone consent.
 
 ## Data sent to OpenAI
 
@@ -69,7 +69,11 @@ records per thread.
 Default local thread retention keeps at most 200 threads, 90 days of activity,
 and 64 MiB in total, deleting the oldest or expired files when a limit is
 exceeded. The Assistant history UI can delete one saved thread or clear all
-saved threads. Those controls affect local thread files only.
+saved threads. Session summaries live in those same retained thread files, so
+delete and retention controls cover summaries as well as visible turns.
+
+This disclosure is included in macOS and Linux packages and is linked from the
+Voice settings panel.
 
 Attached images are read only after you select them. Harness Harlot rejects
 symbolic links, non-regular or foreign-owned files, oversized input, mismatched
@@ -86,10 +90,9 @@ and cannot be resolved by the model or by spoken confirmation.
 
 ## Security and questions
 
-Do not include secrets in public issues. Report a suspected vulnerability using
-[GitHub private vulnerability reporting](https://github.com/highlyproteus/harness-harlot/security/advisories/new).
-For non-sensitive questions about this document, use the project's GitHub issue
-tracker.
+Do not include secrets in public issues. Contact the maintainers privately for
+sensitive vulnerability reports. For non-sensitive questions, use the project's
+[GitLab issue tracker](https://gitlab.com/highlyproteus/harness-harlot/-/issues).
 
 Material changes to Voice data handling are documented here and in the project
 changelog as part of release preparation.

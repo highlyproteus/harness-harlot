@@ -71,6 +71,7 @@ for required in \
   Harness-Harlot/share/applications/com.harnessharlot.desktop.desktop \
   Harness-Harlot/share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png \
   Harness-Harlot/share/licenses/harness-harlot/LICENSE \
+  Harness-Harlot/share/licenses/harness-harlot/PRIVACY.md \
   Harness-Harlot/share/licenses/harness-harlot/THIRD_PARTY_NOTICES.md \
   Harness-Harlot/share/licenses/harness-harlot/ASSET_NOTICES.md \
   Harness-Harlot/share/harness-harlot/install-id

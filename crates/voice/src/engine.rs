@@ -231,7 +231,7 @@ impl VoiceEngine {
                 },
             )?;
         }
-        let audio = AudioSystem::start(false)?;
+        let audio = AudioSystem::start()?;
         let memory: Box<dyn MemoryBackend> = match backend(settings.honcho.clone()) {
             Ok(memory) => memory,
             Err(error) => {
