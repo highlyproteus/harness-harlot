@@ -3,8 +3,8 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use gpui::{AppContext as _, Context, Image, ImageFormat};
 use hh_protocol::{
-    ClientRequest, ServiceResponse, SessionSnapshot, TerminalModes, ensure_private_directory,
-    validate_ssh_host,
+    ClientRequest, PaneKind, ServiceResponse, SessionSnapshot, TerminalModes, TerminalTransport,
+    ensure_private_directory, validate_ssh_host,
 };
 use std::fs::{self, OpenOptions};
 use std::io::Read;
@@ -39,6 +39,24 @@ struct FileTransferAuthority {
     tab_id: Uuid,
     pane_id: Uuid,
     target: FileTransferTarget,
+}
+
+impl FileTransferAuthority {
+    fn pane_authority(&self) -> hh_protocol::PaneAuthority {
+        let transport = match &self.target {
+            FileTransferTarget::Local => TerminalTransport::Local,
+            FileTransferTarget::SystemSsh(destination) => TerminalTransport::SystemSsh {
+                destination: destination.clone(),
+            },
+        };
+        hh_protocol::PaneAuthority {
+            workspace_id: self.workspace_id,
+            tab_id: self.tab_id,
+            pane_id: self.pane_id,
+            kind: PaneKind::Terminal,
+            transport,
+        }
+    }
 }
 
 enum FilePasteSource {
@@ -832,7 +850,10 @@ impl HhApp {
                         |bytes| {
                             let response = session_call(
                                 &control_client,
-                                &ClientRequest::WriteInput { pane_id, bytes },
+                                &ClientRequest::WriteAuthorizedInput {
+                                    authority: authority.pane_authority(),
+                                    bytes,
+                                },
                             )
                             .context("insert transferred paths into terminal")?;
                             ensure!(

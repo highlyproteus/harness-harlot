@@ -290,6 +290,37 @@ impl SessionRegistry {
         ))
     }
 
+    pub fn authorized_pane_snapshot(
+        &self,
+        authority: &hh_protocol::PaneAuthority,
+    ) -> Result<(TerminalScreen, StreamDiagnostics)> {
+        let started = Instant::now();
+        let screen = {
+            let state = self.state.read();
+            state
+                .authorized_terminal(authority)?
+                .session
+                .screen(authority.pane_id)?
+        };
+        let screen_bytes = serialized_len(&screen)?;
+        let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics();
+        Ok((
+            screen,
+            StreamDiagnostics {
+                panes_considered: 1,
+                panes_subscribed: 1,
+                screens_queued: 1,
+                screens_delivered: 1,
+                screen_bytes,
+                preparation_micros: u64::try_from(started.elapsed().as_micros())
+                    .unwrap_or(u64::MAX),
+                service_cpu_milli_percent,
+                service_memory_bytes,
+                ..StreamDiagnostics::default()
+            },
+        ))
+    }
+
     pub(crate) fn service_metrics(&self) -> (u32, u64) {
         let pid = Pid::from_u32(std::process::id());
         let mut sampler = self.diagnostics_sampler.lock();

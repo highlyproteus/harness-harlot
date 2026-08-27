@@ -16,9 +16,9 @@ use crate::persistence::{MAX_TITLE_CHARS, SnapshotStore, default_snapshot_path};
 use anyhow::{Context, Result, bail, ensure};
 use hh_protocol::{
     HistoryArchiveStatus, HistoryClearScope, HistoryCursor, HistoryPageDirection, HistorySettings,
-    NotificationKind, Pane, PaneKind, PaneStatus, PaneStreamState, SessionNotification,
-    SessionSnapshot, StreamDiagnostics, TerminalHistoryPage, TerminalIdentity, TerminalProfile,
-    TerminalScreen, TerminalTransport, TmuxSessionId, WorkspaceConnection,
+    NotificationKind, Pane, PaneAuthority, PaneKind, PaneStatus, PaneStreamState,
+    SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalHistoryPage, TerminalIdentity,
+    TerminalProfile, TerminalScreen, TerminalTransport, TmuxSessionId, WorkspaceConnection,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -159,6 +159,44 @@ pub(crate) struct RegistryState {
 }
 
 impl RegistryState {
+    pub(crate) fn authorized_terminal(
+        &self,
+        authority: &PaneAuthority,
+    ) -> Result<&TerminalRuntimePane> {
+        ensure!(
+            !matches!(authority.transport, TerminalTransport::Unknown),
+            "pane authority transport must be exact"
+        );
+        let workspace = self
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == authority.workspace_id)
+            .context("pane authority workspace changed or no longer exists")?;
+        let tab = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.id == authority.tab_id)
+            .context("pane authority tab changed or no longer exists")?;
+        let pane = crate::layout::find_pane(&tab.layout, authority.pane_id)
+            .context("pane authority mapping changed or no longer exists")?;
+        ensure!(pane.kind == authority.kind, "pane authority kind changed");
+        let terminal = self.terminal_pane(authority.pane_id)?;
+        let transport = match &terminal.kind {
+            RuntimePaneKind::Local | RuntimePaneKind::TmuxLocal { .. } => TerminalTransport::Local,
+            RuntimePaneKind::SystemSsh { host } | RuntimePaneKind::TmuxSystemSsh { host, .. } => {
+                TerminalTransport::SystemSsh {
+                    destination: host.clone(),
+                }
+            }
+        };
+        ensure!(
+            transport == authority.transport,
+            "pane authority transport changed"
+        );
+        Ok(terminal)
+    }
+
     pub(crate) fn new_pane(&mut self, id: Uuid, cwd: Option<&Path>) -> Pane {
         let title = cwd.and_then(Path::file_name).map_or_else(
             || {

@@ -912,6 +912,27 @@ impl SessionRegistry {
         Ok(())
     }
 
+    pub fn authorized_write_input(
+        &self,
+        authority: &hh_protocol::PaneAuthority,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut state = self.state.write();
+        state
+            .authorized_terminal(authority)?
+            .session
+            .write_input(bytes)?;
+        if find_pane_in_snapshot(&state.snapshot, authority.pane_id).is_some_and(|pane| {
+            matches!(
+                pane.status,
+                PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention
+            )
+        }) {
+            state.set_pane_status(authority.pane_id, PaneStatus::Working);
+        }
+        Ok(())
+    }
+
     pub fn begin_selection(
         &self,
         pane_id: Uuid,
