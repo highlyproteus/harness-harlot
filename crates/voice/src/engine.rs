@@ -1,13 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use futures::channel::mpsc::UnboundedSender;
 use hh_protocol::{SessionNotification, WorkspaceKind};
 
 use crate::audio::{AudioInputEvent, AudioSystem};
@@ -20,6 +19,7 @@ use crate::threads::{self, ThreadRecord, ThreadRole};
 use crate::tools::{ToolExecutor, tool_schemas};
 use crate::{
     AssistantContext, EngineState, VoiceCommand, VoiceEngineHandle, VoiceSettings, VoiceUiEvent,
+    VoiceUiSender,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -32,7 +32,7 @@ const SESSION_ROLL_INPUT_TOKENS: u64 = 90_000;
 const MAX_TRANSCRIPT_TURNS: usize = 100;
 const MAX_TRANSCRIPT_CHARS: usize = 32 * 1024;
 const MAX_USER_TEXT_CHARS: usize = 32 * 1024;
-const MAX_PENDING_USER_ITEMS: usize = 16;
+const MAX_PENDING_USER_ITEMS: usize = crate::MAX_ACCEPTED_USER_ITEMS;
 const MAX_NARRATION_ITEMS: usize = 64;
 #[cfg(test)]
 const MAX_NARRATION_CHARS: usize = 2 * 1024;
@@ -97,7 +97,7 @@ const BASE_INSTRUCTIONS: &str = concat!(
 pub(crate) fn spawn(
     mut settings: VoiceSettings,
     context: AssistantContext,
-    ui: UnboundedSender<VoiceUiEvent>,
+    ui: VoiceUiSender,
 ) -> Result<VoiceEngineHandle> {
     if settings.api_key.trim().is_empty()
         && let Ok(api_key) = std::env::var("HH_OPENAI_API_KEY")
@@ -108,22 +108,31 @@ pub(crate) fn spawn(
         anyhow::bail!("OpenAI API key is empty");
     }
     let (command_tx, command_rx) = std::sync::mpsc::sync_channel(64);
+    let accepted_user_items = Arc::new(AtomicUsize::new(0));
+    let engine_accepted_user_items = Arc::clone(&accepted_user_items);
     let join = std::thread::Builder::new()
         .name("hh-voice-engine".to_owned())
-        .spawn(
-            move || match VoiceEngine::new(settings, context, ui.clone(), command_rx) {
+        .spawn(move || {
+            match VoiceEngine::new(
+                settings,
+                context,
+                ui.clone(),
+                command_rx,
+                engine_accepted_user_items,
+            ) {
                 Ok(mut engine) => engine.run(),
                 Err(error) => {
                     eprintln!("voice engine failed to start: {error:#}");
-                    let _ = ui.unbounded_send(VoiceUiEvent::State(EngineState::Error(format!(
+                    let _ = ui.emit(VoiceUiEvent::State(EngineState::Error(format!(
                         "{error:#}"
                     ))));
                 }
-            },
-        )
+            }
+        })
         .context("spawn voice engine thread")?;
     Ok(VoiceEngineHandle {
         command_tx,
+        accepted_user_items,
         join: Some(join),
     })
 }
@@ -132,8 +141,9 @@ pub(crate) fn spawn(
 struct VoiceEngine {
     settings: VoiceSettings,
     context: AssistantContext,
-    ui: UnboundedSender<VoiceUiEvent>,
+    ui: VoiceUiSender,
     command_rx: Receiver<VoiceCommand>,
+    accepted_user_items: Arc<AtomicUsize>,
     realtime_tx: SyncSender<RealtimeInbound>,
     realtime_rx: Receiver<RealtimeInbound>,
     realtime: Option<RealtimeHandle>,
@@ -168,6 +178,7 @@ struct VoiceEngine {
 struct PendingUserSend {
     result: Receiver<crate::realtime::RecoverableSendResult>,
     user_text: Vec<String>,
+    user_item_count: usize,
 }
 
 struct ActiveTool {
@@ -199,10 +210,11 @@ impl VoiceEngine {
     fn new(
         settings: VoiceSettings,
         context: AssistantContext,
-        ui: UnboundedSender<VoiceUiEvent>,
+        ui: VoiceUiSender,
         command_rx: Receiver<VoiceCommand>,
+        accepted_user_items: Arc<AtomicUsize>,
     ) -> Result<Self> {
-        let _ = ui.unbounded_send(VoiceUiEvent::State(EngineState::Connecting));
+        let _ = ui.emit(VoiceUiEvent::State(EngineState::Connecting));
         let mut tools = ToolExecutor::connect()?;
         tools.authorize_context(context.workspace_id, context.working_dir.as_deref())?;
         if context.workspace_kind == WorkspaceKind::Workstation
@@ -235,7 +247,7 @@ impl VoiceEngine {
         let memory: Box<dyn MemoryBackend> = match backend(settings.honcho.clone()) {
             Ok(memory) => memory,
             Err(error) => {
-                let _ = ui.unbounded_send(VoiceUiEvent::ToolCall {
+                let _ = ui.emit(VoiceUiEvent::ToolCall {
                     name: "memory.error".to_owned(),
                     summary: format!("Honcho disabled: {error:#}"),
                 });
@@ -254,6 +266,7 @@ impl VoiceEngine {
             context,
             ui,
             command_rx,
+            accepted_user_items,
             realtime_tx,
             realtime_rx,
             realtime,
@@ -377,7 +390,7 @@ impl VoiceEngine {
                     let now = Instant::now();
                     if now.saturating_duration_since(self.last_mic_level) >= MIC_LEVEL_INTERVAL {
                         self.last_mic_level = now;
-                        let _ = self.ui.unbounded_send(VoiceUiEvent::MicLevel(chunk.rms));
+                        let _ = self.ui.emit(VoiceUiEvent::MicLevel(chunk.rms));
                     }
                     let output_quiet = self.last_output_audio.is_none_or(|last_output| {
                         now.saturating_duration_since(last_output) >= HALF_DUPLEX_RELEASE_DELAY
@@ -398,7 +411,7 @@ impl VoiceEngine {
                     }
                 }
                 AudioInputEvent::Error(error) => {
-                    let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+                    let _ = self.ui.emit(VoiceUiEvent::ToolCall {
                         name: "audio.error".to_owned(),
                         summary: error,
                     });
@@ -431,12 +444,10 @@ impl VoiceEngine {
                 self.connected_at = Some(Instant::now());
                 self.reconnect_roll = false;
                 self.suspended = false;
-                let _ = self
-                    .ui
-                    .unbounded_send(VoiceUiEvent::State(EngineState::Listening));
+                let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Listening));
             }
             RealtimeInbound::Disconnected(error) => {
-                let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+                let _ = self.ui.emit(VoiceUiEvent::ToolCall {
                     name: "realtime.reconnect".to_owned(),
                     summary: error,
                 });
@@ -444,13 +455,11 @@ impl VoiceEngine {
                 self.connected_at = None;
                 self.reconnect_roll = true;
                 if !self.suspended {
-                    let _ = self
-                        .ui
-                        .unbounded_send(VoiceUiEvent::State(EngineState::Connecting));
+                    let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Connecting));
                 }
             }
             RealtimeInbound::Warning(error) => {
-                let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+                let _ = self.ui.emit(VoiceUiEvent::ToolCall {
                     name: "realtime.warning".to_owned(),
                     summary: error,
                 });
@@ -469,16 +478,14 @@ impl VoiceEngine {
             | ServerEvent::Unknown => {}
             ServerEvent::Error { error } => {
                 let code = error.code.as_deref().unwrap_or(&error.error_type);
-                let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+                let _ = self.ui.emit(VoiceUiEvent::ToolCall {
                     name: "realtime.error".to_owned(),
                     summary: format!("{code}: {}", error.message),
                 });
             }
             ServerEvent::SpeechStarted { .. } => {
                 self.user_speaking = true;
-                let _ = self
-                    .ui
-                    .unbounded_send(VoiceUiEvent::UserSpeech { active: true });
+                let _ = self.ui.emit(VoiceUiEvent::UserSpeech { active: true });
                 self.last_activity = Instant::now();
                 // Server VAD is configured to interrupt the response. Always
                 // clear local playback too, including in the default mode, so
@@ -494,7 +501,7 @@ impl VoiceEngine {
                     return Ok(());
                 }
                 self.last_activity = Instant::now();
-                let _ = self.ui.unbounded_send(VoiceUiEvent::UserTranscript {
+                let _ = self.ui.emit(VoiceUiEvent::UserTranscript {
                     text: delta,
                     final_: false,
                 });
@@ -512,7 +519,7 @@ impl VoiceEngine {
                 self.clear_user_speaking();
                 self.last_activity = Instant::now();
                 self.record_user_turn(&transcript)?;
-                let _ = self.ui.unbounded_send(VoiceUiEvent::UserTranscript {
+                let _ = self.ui.emit(VoiceUiEvent::UserTranscript {
                     text: transcript,
                     final_: true,
                 });
@@ -520,9 +527,7 @@ impl VoiceEngine {
             ServerEvent::ResponseCreated { .. } => {
                 self.last_activity = Instant::now();
                 self.response_active = true;
-                let _ = self
-                    .ui
-                    .unbounded_send(VoiceUiEvent::State(EngineState::Thinking));
+                let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Thinking));
             }
             ServerEvent::ResponseDone { response } => {
                 self.response_active = false;
@@ -531,13 +536,13 @@ impl VoiceEngine {
                 } else {
                     let _ = self.audio.stop_and_clear();
                     let status = response.status.as_deref().unwrap_or("unknown");
-                    let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+                    let _ = self.ui.emit(VoiceUiEvent::ToolCall {
                         name: "realtime.response".to_owned(),
                         summary: format!("response ended with status {status}"),
                     });
                 }
                 if let Some(usage) = response.usage {
-                    let _ = self.ui.unbounded_send(VoiceUiEvent::Usage {
+                    let _ = self.ui.emit(VoiceUiEvent::Usage {
                         input_tokens: usage.input_tokens,
                         output_tokens: usage.output_tokens,
                     });
@@ -550,7 +555,7 @@ impl VoiceEngine {
                 } else {
                     EngineState::Listening
                 };
-                let _ = self.ui.unbounded_send(VoiceUiEvent::State(state));
+                let _ = self.ui.emit(VoiceUiEvent::State(state));
             }
             ServerEvent::OutputAudioDelta { item_id, delta } => {
                 let now = Instant::now();
@@ -567,12 +572,10 @@ impl VoiceEngine {
                     .collect::<Vec<_>>();
                 self.audio.push_output(&item_id, &samples)?;
                 self.last_output_audio = Some(now);
-                let _ = self
-                    .ui
-                    .unbounded_send(VoiceUiEvent::State(EngineState::Speaking));
+                let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Speaking));
             }
             ServerEvent::OutputTranscriptDelta { delta, .. } => {
-                let _ = self.ui.unbounded_send(VoiceUiEvent::AssistantTranscript {
+                let _ = self.ui.emit(VoiceUiEvent::AssistantTranscript {
                     text: delta,
                     final_: false,
                 });
@@ -590,7 +593,7 @@ impl VoiceEngine {
                         },
                     )?;
                 }
-                let _ = self.ui.unbounded_send(VoiceUiEvent::AssistantTranscript {
+                let _ = self.ui.emit(VoiceUiEvent::AssistantTranscript {
                     text: transcript,
                     final_: true,
                 });
@@ -602,10 +605,8 @@ impl VoiceEngine {
             } => {
                 let _ = self
                     .ui
-                    .unbounded_send(VoiceUiEvent::ToolCallStarted { name: name.clone() });
-                let _ = self
-                    .ui
-                    .unbounded_send(VoiceUiEvent::State(EngineState::ToolRunning));
+                    .emit(VoiceUiEvent::ToolCallStarted { name: name.clone() });
+                let _ = self.ui.emit(VoiceUiEvent::State(EngineState::ToolRunning));
                 self.start_function_tool(call_id, name, arguments)?;
             }
         }
@@ -623,7 +624,7 @@ impl VoiceEngine {
         if now.saturating_duration_since(self.last_playback_progress) >= MIC_LEVEL_INTERVAL {
             self.last_playback_progress = now;
             if let Some((played_ms, total_ms)) = self.audio.playback_progress() {
-                let _ = self.ui.unbounded_send(VoiceUiEvent::PlaybackProgress {
+                let _ = self.ui.emit(VoiceUiEvent::PlaybackProgress {
                     played_ms,
                     total_ms,
                 });
@@ -643,7 +644,7 @@ impl VoiceEngine {
                         }
                     }
                     Err(error) => {
-                        let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+                        let _ = self.ui.emit(VoiceUiEvent::ToolCall {
                             name: "status.poll".to_owned(),
                             summary: format!("{error:#}"),
                         });
@@ -677,6 +678,7 @@ impl VoiceEngine {
             let content = std::mem::take(&mut self.pending_user_content)
                 .into_iter()
                 .collect::<Vec<_>>();
+            let user_item_count = content.len();
             let user_text = content
                 .iter()
                 .filter_map(|item| match item {
@@ -693,7 +695,11 @@ impl VoiceEngine {
             };
             match realtime.send_recoverable_async(event.clone()) {
                 Ok(result) => {
-                    self.pending_user_send = Some(PendingUserSend { result, user_text });
+                    self.pending_user_send = Some(PendingUserSend {
+                        result,
+                        user_text,
+                        user_item_count,
+                    });
                 }
                 Err(error) => {
                     restore_pending_user_content(&mut self.pending_user_content, event);
@@ -729,6 +735,8 @@ impl VoiceEngine {
         };
         match pending.result.try_recv() {
             Ok(Ok(())) => {
+                self.accepted_user_items
+                    .fetch_sub(pending.user_item_count, Ordering::AcqRel);
                 for text in pending.user_text {
                     if let Err(error) = self.record_user_turn(&text) {
                         self.emit_error(&error);
@@ -769,9 +777,7 @@ impl VoiceEngine {
     fn clear_user_speaking(&mut self) {
         if self.user_speaking {
             self.user_speaking = false;
-            let _ = self
-                .ui
-                .unbounded_send(VoiceUiEvent::UserSpeech { active: false });
+            let _ = self.ui.emit(VoiceUiEvent::UserSpeech { active: false });
         }
     }
 
@@ -789,9 +795,7 @@ impl VoiceEngine {
             self.send(ClientEvent::ResponseCancel)?;
             self.response_active = false;
         }
-        let _ = self
-            .ui
-            .unbounded_send(VoiceUiEvent::State(EngineState::Listening));
+        let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Listening));
         Ok(())
     }
 
@@ -817,14 +821,10 @@ impl VoiceEngine {
                     },
                 )?;
             }
-            let _ = self
-                .ui
-                .unbounded_send(VoiceUiEvent::SessionSummary { text: summary });
+            let _ = self.ui.emit(VoiceUiEvent::SessionSummary { text: summary });
         }
         self.clear_user_speaking();
-        let _ = self
-            .ui
-            .unbounded_send(VoiceUiEvent::State(EngineState::Suspended));
+        let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Suspended));
         Ok(())
     }
 
@@ -847,9 +847,7 @@ impl VoiceEngine {
             .set_mic_enabled(self.mic_consent.capture_enabled())?;
         self.suspended = false;
         self.last_activity = Instant::now();
-        let _ = self
-            .ui
-            .unbounded_send(VoiceUiEvent::State(EngineState::Connecting));
+        let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Connecting));
         Ok(())
     }
 
@@ -867,7 +865,7 @@ impl VoiceEngine {
                     },
                 )?;
             }
-            let _ = self.ui.unbounded_send(VoiceUiEvent::SessionSummary {
+            let _ = self.ui.emit(VoiceUiEvent::SessionSummary {
                 text: summary.clone(),
             });
             self.pending_instructions = Some(summary);
@@ -882,7 +880,7 @@ impl VoiceEngine {
             self.settings.model.clone(),
             self.realtime_tx.clone(),
         )?);
-        let _ = self.ui.unbounded_send(VoiceUiEvent::ToolCall {
+        let _ = self.ui.emit(VoiceUiEvent::ToolCall {
             name: "session.roll".to_owned(),
             summary: reason.to_owned(),
         });
@@ -1009,9 +1007,7 @@ impl VoiceEngine {
                     self.emit_error(&error);
                 } else {
                     self.response_active = true;
-                    let _ = self
-                        .ui
-                        .unbounded_send(VoiceUiEvent::State(EngineState::Thinking));
+                    let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Thinking));
                 }
             }
             ToolCompletion::Approval {
@@ -1037,9 +1033,7 @@ impl VoiceEngine {
                 Err(error) => self.emit_error(&error),
             },
             ToolCompletion::Cancelled => {
-                let _ = self
-                    .ui
-                    .unbounded_send(VoiceUiEvent::State(EngineState::Listening));
+                let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Listening));
             }
         }
     }
@@ -1136,11 +1130,9 @@ impl VoiceEngine {
 
     fn emit_error(&self, error: &anyhow::Error) {
         eprintln!("voice engine error: {error:#}");
-        let _ = self
-            .ui
-            .unbounded_send(VoiceUiEvent::State(EngineState::Error(format!(
-                "{error:#}"
-            ))));
+        let _ = self.ui.emit(VoiceUiEvent::State(EngineState::Error(format!(
+            "{error:#}"
+        ))));
     }
 
     fn shutdown_resources(&mut self) {
@@ -1165,9 +1157,7 @@ impl VoiceEngine {
             {
                 self.emit_error(&error);
             }
-            let _ = self
-                .ui
-                .unbounded_send(VoiceUiEvent::SessionSummary { text: summary });
+            let _ = self.ui.emit(VoiceUiEvent::SessionSummary { text: summary });
         }
         if let Some(memory) = self.memory.as_mut() {
             memory.flush();
@@ -1201,9 +1191,7 @@ fn queue_pending_user_content(pending: &mut VecDeque<InputContent>, content: Inp
         },
         image @ InputContent::InputImage { .. } => image,
     };
-    if pending.len() == MAX_PENDING_USER_ITEMS {
-        pending.pop_front();
-    }
+    debug_assert!(pending.len() < MAX_PENDING_USER_ITEMS);
     pending.push_back(content);
 }
 

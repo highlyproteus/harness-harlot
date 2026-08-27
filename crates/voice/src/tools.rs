@@ -15,10 +15,10 @@ use hh_session_client::SessionClient;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::VoiceUiEvent;
 use crate::harness::{Agent, launch_command};
 use crate::memory::MemoryBackend;
 use crate::threads::{self, ThreadRecord, ThreadRole};
+use crate::{VoiceUiEvent, VoiceUiSender};
 
 mod authority;
 
@@ -118,7 +118,7 @@ impl ToolExecutor {
         name: &str,
         arguments: &str,
         memory: &mut dyn MemoryBackend,
-        ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
+        ui: &VoiceUiSender,
         cancelled: &AtomicBool,
     ) -> String {
         let parsed = serde_json::from_str::<Value>(arguments)
@@ -136,7 +136,7 @@ impl ToolExecutor {
         name: &str,
         arguments: &Value,
         memory: &mut dyn MemoryBackend,
-        ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
+        ui: &VoiceUiSender,
         cancelled: &AtomicBool,
     ) -> Result<Value> {
         if cancelled.load(Ordering::Acquire) {
@@ -146,7 +146,7 @@ impl ToolExecutor {
         if tier == TrustTier::T2 {
             let snapshot = self.refresh_snapshot()?;
             let result = self.request_approval(pending_action(name, arguments, &snapshot)?, ui);
-            let _ = ui.unbounded_send(VoiceUiEvent::ToolCall {
+            let _ = ui.emit(VoiceUiEvent::ToolCall {
                 name: name.to_owned(),
                 summary: summarize_output(&result),
             });
@@ -169,7 +169,7 @@ impl ToolExecutor {
             }
             _ => bail!("unknown voice tool {name}"),
         }?;
-        let _ = ui.unbounded_send(VoiceUiEvent::ToolCall {
+        let _ = ui.emit(VoiceUiEvent::ToolCall {
             name: name.to_owned(),
             summary: summarize_output(&result),
         });
@@ -180,7 +180,7 @@ impl ToolExecutor {
         &mut self,
         approval_id: u64,
         approved: bool,
-        ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
+        ui: &VoiceUiSender,
         cancelled: &AtomicBool,
     ) -> Result<Value> {
         let action = self
@@ -192,7 +192,7 @@ impl ToolExecutor {
         } else {
             json!({ "status": "denied", "approval_id": approval_id })
         };
-        let _ = ui.unbounded_send(VoiceUiEvent::ApprovalResolved {
+        let _ = ui.emit(VoiceUiEvent::ApprovalResolved {
             id: approval_id,
             approved,
         });
@@ -605,16 +605,12 @@ impl ToolExecutor {
         Ok(json!({ "pane_id": pane_id, "launched": command }))
     }
 
-    fn request_approval(
-        &mut self,
-        action: PendingAction,
-        ui: &futures::channel::mpsc::UnboundedSender<VoiceUiEvent>,
-    ) -> Value {
+    fn request_approval(&mut self, action: PendingAction, ui: &VoiceUiSender) -> Value {
         let id = self.next_approval_id;
         self.next_approval_id = self.next_approval_id.saturating_add(1);
         let description = action.description();
         self.pending_approvals.insert(id, action);
-        let _ = ui.unbounded_send(VoiceUiEvent::ApprovalRequested {
+        let _ = ui.emit(VoiceUiEvent::ApprovalRequested {
             id,
             description: description.clone(),
         });

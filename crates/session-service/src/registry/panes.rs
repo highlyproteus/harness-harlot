@@ -692,6 +692,7 @@ impl SessionRegistry {
             persistence::validate_custom_icon_id(icon)?;
         }
         let mut state = self.state.write();
+        let previous_snapshot = state.snapshot.clone();
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         if pane.custom_title.is_none() {
@@ -700,8 +701,11 @@ impl SessionRegistry {
         pane.custom_icon = icon;
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
-        drop(state);
-        self.write_snapshot(&bytes)
+        if let Err(error) = self.write_snapshot(&bytes) {
+            state.snapshot = previous_snapshot;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn reset_pane_identity(&self, pane_id: Uuid) -> Result<()> {

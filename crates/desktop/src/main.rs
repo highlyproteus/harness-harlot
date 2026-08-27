@@ -231,12 +231,16 @@ struct SessionState {
     /// Screen traffic only: pane updates, targeted pane snapshots, history
     /// status. Kept separate so a keystroke never waits behind a screen payload.
     stream_client: SharedSessionClient,
-    /// Everything else, including terminal input and selection updates.
+    /// Everything else except terminal input and selection updates.
     control_client: SharedSessionClient,
+    /// Dedicated terminal-input connection, never blocked by generic control work.
+    input_client: SharedSessionClient,
     /// Enqueue side of the stream lane's serialized request pipeline.
     stream_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
     /// Enqueue side of the control lane's serialized request pipeline.
     control_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
+    /// Lossless/coalescing terminal-input lane, bounded by accepted bytes.
+    terminal_input_tx: pipeline::TerminalInputSender,
     /// Interrupts an idle screen poll when input is queued. Capacity one
     /// coalesces a burst of keystrokes instead of scheduling a poll per byte.
     poll_wake_tx: futures::channel::mpsc::Sender<()>,
@@ -254,22 +258,30 @@ struct SessionState {
     history_status: Option<HistoryArchiveStatus>,
 }
 
+struct SessionChannels {
+    stream_client: SharedSessionClient,
+    control_client: SharedSessionClient,
+    input_client: SharedSessionClient,
+    stream_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
+    control_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
+    terminal_input_tx: pipeline::TerminalInputSender,
+    poll_wake_tx: futures::channel::mpsc::Sender<()>,
+}
+
 impl SessionState {
     fn new(
-        stream_client: SharedSessionClient,
-        control_client: SharedSessionClient,
-        stream_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
-        control_tx: futures::channel::mpsc::Sender<pipeline::PipelineJob>,
-        poll_wake_tx: futures::channel::mpsc::Sender<()>,
+        channels: SessionChannels,
         window_active: bool,
         connection_error: Option<String>,
     ) -> Self {
         Self {
-            stream_client,
-            control_client,
-            stream_tx,
-            control_tx,
-            poll_wake_tx,
+            stream_client: channels.stream_client,
+            control_client: channels.control_client,
+            input_client: channels.input_client,
+            stream_tx: channels.stream_tx,
+            control_tx: channels.control_tx,
+            terminal_input_tx: channels.terminal_input_tx,
+            poll_wake_tx: channels.poll_wake_tx,
             snapshot: None,
             screens: HashMap::new(),
             pane_states: HashMap::new(),
@@ -524,10 +536,16 @@ impl HhApp {
             Ok(client) => (Arc::new(Mutex::new(Some(client))), None),
             Err(error) => (Arc::new(Mutex::new(None)), Some(format!("{error:#}"))),
         };
-        let startup_connection_error = startup_connection_error.or(second_error);
+        let (input_client, third_error) = match SessionClient::connect() {
+            Ok(client) => (Arc::new(Mutex::new(Some(client))), None),
+            Err(error) => (Arc::new(Mutex::new(None)), Some(format!("{error:#}"))),
+        };
+        let startup_connection_error = startup_connection_error.or(second_error).or(third_error);
         let (stream_tx, stream_lane) = pipeline::bounded_lane(pipeline::STREAM_PIPELINE_CAPACITY);
         let (control_tx, control_lane) =
             pipeline::bounded_lane(pipeline::CONTROL_PIPELINE_CAPACITY);
+        let (terminal_input_tx, terminal_input_lane) =
+            pipeline::terminal_input_channel(pipeline::TERMINAL_INPUT_CAPACITY_BYTES);
         let (poll_wake_tx, mut poll_wake_rx) = futures::channel::mpsc::channel(1);
         #[cfg(all(target_os = "macos", feature = "browser"))]
         let browser_parent_view = native_nsview(window);
@@ -540,11 +558,15 @@ impl HhApp {
             custom_icons: load_custom_icons(),
             ui_state_store,
             session: SessionState::new(
-                stream_client,
-                control_client,
-                stream_tx,
-                control_tx,
-                poll_wake_tx,
+                SessionChannels {
+                    stream_client,
+                    control_client,
+                    input_client,
+                    stream_tx,
+                    control_tx,
+                    terminal_input_tx,
+                    poll_wake_tx,
+                },
                 window.is_window_active(),
                 startup_connection_error,
             ),
@@ -569,6 +591,9 @@ impl HhApp {
         }
         pipeline::spawn_lane(cx, stream_lane, |app: &HhApp| &app.session.stream_client);
         pipeline::spawn_lane(cx, control_lane, |app: &HhApp| &app.session.control_client);
+        pipeline::spawn_terminal_input_lane(cx, terminal_input_lane, |app: &HhApp| {
+            &app.session.input_client
+        });
         #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
         {
             app.browser.cef_shutdown_subscription = Some(cx.on_app_quit(|this, _| {

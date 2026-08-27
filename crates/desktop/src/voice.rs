@@ -18,7 +18,7 @@ use hh_protocol::{ClientRequest, Pane, ServiceResponse};
 use hh_voice::threads::{self, ThreadRecord, ThreadRole, ThreadSummary};
 use hh_voice::{
     AssistantContext, EngineState, HonchoSettings, VoiceCommand, VoiceEngineHandle, VoiceSettings,
-    VoiceUiEvent, spawn_engine,
+    VoiceUiEvent, spawn_engine, voice_ui_channel,
 };
 use uuid::Uuid;
 
@@ -359,7 +359,7 @@ impl HhApp {
             return false;
         }
         let context = self.assistant_context_for_pane(pane_id);
-        let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded();
+        let (ui_tx, mut ui_rx) = voice_ui_channel();
         match spawn_engine(settings, context, ui_tx) {
             Ok(engine) => {
                 let session = self
