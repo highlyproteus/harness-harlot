@@ -144,7 +144,7 @@ impl ToolExecutor {
         &mut self,
         name: &str,
         arguments: &Value,
-        memory: &mut dyn MemoryBackend,
+        _memory: &mut dyn MemoryBackend,
         ui: &VoiceUiSender,
         cancelled: &AtomicBool,
     ) -> Result<Value> {
