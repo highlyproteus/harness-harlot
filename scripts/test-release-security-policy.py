@@ -61,6 +61,9 @@ stable = job(RELEASE, "sign-stable-v2")
 assert "environment: stable-signing-v2" in stable
 assert "HH_UPDATE_SIGNING_SEED" in stable
 assert "contents: write" not in stable
+assert "git/tags/$tag_object" in stable
+assert "commit.verification.verified" in stable
+assert "commit_author" in stable
 has_no_build_surface(stable, "sign-stable-v2")
 assert "assert set(by_name) == expected_files" in stable, (
     "stable signing must reject every extra unsigned release input"
@@ -119,6 +122,9 @@ assert all(copy == CANONICAL_SIGNER for copy in signer_copies), (
 for package_name, source in (("macOS", MAC_PACKAGE), ("Linux", LINUX_PACKAGE)):
     assert "HH_RELEASE_UNSIGNED" in source, f"{package_name} package lacks unsigned mode"
     assert "-v2.update.json" in source, f"{package_name} package lacks rotated feed name"
+    assert "git verify-tag" not in source, (
+        f"{package_name} package incorrectly depends on runner-local SSH allowed signers"
+    )
 
 expected_sha256 = {
     "70c8b97c4dead81b67a8fb29b80da12681e008d4ae9a9778f59e5a2f2adc4e08",

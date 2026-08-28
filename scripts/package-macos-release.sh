@@ -121,10 +121,9 @@ fi
 if [ "$test_mode" != 1 ]; then
   head_commit=$(git rev-parse HEAD)
   if [ "$channel" = stable ]; then
-    git verify-tag "$HH_RELEASE_TAG"
     tag_commit=$(git rev-parse "$HH_RELEASE_TAG^{commit}")
     if [ "$tag_commit" != "$head_commit" ]; then
-      echo "signed release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
+      echo "release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
       exit 2
     fi
   elif [ "$HH_RELEASE_COMMIT" != "$head_commit" ]; then
