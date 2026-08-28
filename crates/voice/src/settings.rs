@@ -162,8 +162,13 @@ mod tests {
 
     #[test]
     fn unsupported_settings_schema_is_an_error() {
-        let path =
-            std::env::temp_dir().join(format!("hh-voice-settings-{}.json", uuid::Uuid::new_v4()));
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("hh-voice-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("settings.json");
         hh_protocol::atomic_write_private(
             &path,
             br#"{"schema_version":999,"model":"m","voice":"v","full_duplex":false,"idle_timeout_secs":1,"honcho":null}"#,
@@ -172,5 +177,6 @@ mod tests {
         let error = load_from(&path).unwrap_err();
         assert!(error.to_string().contains("schema version"));
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }
