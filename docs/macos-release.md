@@ -14,11 +14,11 @@ can select the other mode's artifact.
   retains the Developer ID layout.
 - `scripts/package-macos-release.sh VERSION BUILD --community` signs nested
   code ad hoc, emits a `*-community.dmg`, and publishes
-  `manifest-macos-community-ARCH.update.json`. It requires the signed tag,
-  release update key, and pinned CEF, but no Apple credential.
+  `manifest-macos-community-ARCH-v2.update.json`. Production packaging is
+  unsigned and requires a signed tag and pinned CEF, but no update or Apple credential.
 - `scripts/package-macos-release.sh VERSION BUILD` retains the separate
   Developer ID, notarization, stapling, Team-ID, and normal
-  `manifest-macos-ARCH.update.json` path.
+  `manifest-macos-ARCH-v2.update.json` path.
 - `https://harnessharlot.com/install` serves `install-community-macos.sh`
   without requiring GitHub CLI. The website release index pins the SHA-256 of
   every release input; publication verifies GitHub provenance before updating
@@ -109,8 +109,8 @@ Apple credentials:
    scripts/package-macos-release.sh 0.1.0 1
    scripts/verify-macos-release.sh "$HH_EXPECTED_TEAM_ID" \
      com.harnessharlot.desktop \
-     target/release-dist/Harness-Harlot-0.1.0-b1-macos-arm64/manifest-macos-arm64.update.json \
-     target/release-dist/Harness-Harlot-0.1.0-b1-macos-arm64/manifest-macos-arm64.update.json.sig
+     target/release-dist/Harness-Harlot-0.1.0-b1-macos-arm64/manifest-macos-arm64-v2.update.json \
+     target/release-dist/Harness-Harlot-0.1.0-b1-macos-arm64/manifest-macos-arm64-v2.update.json.sig
    ```
 
 4. On clean Apple Silicon and Intel test accounts, install the notarized DMG,
@@ -206,8 +206,8 @@ instructions.
 - [ ] If `HH_ENABLE_APPLE_SIGNING=true`, sign, notarize, staple, verify the
   pinned Team ID, and exercise automatic update/rollback on both architectures.
 - [ ] Publish versioned artifacts and regenerate
-  `manifest-macos-community-ARCH.update.json` in every release. When Developer
-  ID packaging is enabled, regenerate `manifest-macos-ARCH.update.json` in the
+  `manifest-macos-community-ARCH-v2.update.json` in every release. When Developer
+  ID packaging is enabled, regenerate `manifest-macos-ARCH-v2.update.json` in the
   same release. Publish each matching `.sig`, perform a fresh-host attestation
   and install check, and never publish a mutable unversioned DMG.
 

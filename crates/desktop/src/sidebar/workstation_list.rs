@@ -49,6 +49,7 @@ struct WorkspaceGroupRow {
 #[allow(clippy::struct_excessive_bools)]
 struct WorkspaceSectionCtx {
     workspace_id: Uuid,
+    is_assistant: bool,
     index: usize,
     pinned: bool,
     active: bool,
@@ -60,6 +61,7 @@ struct WorkspaceSectionCtx {
     active_text: u32,
     workspace_title: String,
     workspace_dir: Option<String>,
+    custom_icon: Option<String>,
     drop_above: bool,
     drop_below: bool,
 }
@@ -183,6 +185,7 @@ impl HhApp {
         };
         let ctx = WorkspaceSectionCtx {
             workspace_id,
+            is_assistant: workspace.is_assistant(),
             index,
             pinned,
             active,
@@ -194,6 +197,7 @@ impl HhApp {
             active_text,
             workspace_title,
             workspace_dir,
+            custom_icon: workspace.custom_icon.clone(),
             drop_above,
             drop_below,
         };
@@ -911,6 +915,16 @@ impl HhApp {
     }
 
     fn render_workspace_card_title(&self, ctx: &WorkspaceSectionCtx) -> AnyElement {
+        let title = if ctx.is_assistant {
+            ctx.workspace_title.clone()
+        } else {
+            format!("{}  {}", ctx.index + 1, ctx.workspace_title)
+        };
+        let icon_path = ctx
+            .custom_icon
+            .as_deref()
+            .and_then(|icon| self.custom_icon_path(icon));
+        let has_icon = icon_path.is_some();
         div()
             .min_w(px(0.0))
             .overflow_hidden()
@@ -919,15 +933,43 @@ impl HhApp {
             .flex_col()
             .child(
                 div()
-                    .truncate()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(if ctx.active || ctx.connected || ctx.offline {
-                        rgb(ctx.active_text)
-                    } else {
-                        rgb(THEME.foreground)
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .when_some(icon_path, |element, path| {
+                        element.child(
+                            img(path)
+                                .flex_none()
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .object_fit(gpui::ObjectFit::Contain)
+                                .rounded(px(3.0)),
+                        )
                     })
-                    .child(format!("{}  {}", ctx.index + 1, ctx.workspace_title)),
+                    .when(ctx.is_assistant && !has_icon, |element| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .w(px(8.0))
+                                .h(px(8.0))
+                                .rounded_full()
+                                .bg(rgb(THEME.accent)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if ctx.active || ctx.connected || ctx.offline {
+                                rgb(ctx.active_text)
+                            } else {
+                                rgb(THEME.foreground)
+                            })
+                            .child(title),
+                    ),
             )
             .when_some(ctx.workspace_dir.clone(), |element, directory| {
                 element.child(

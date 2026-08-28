@@ -215,7 +215,7 @@ signature_url=$(plutil -extract "$asset_prefix.signature.url" raw -o - "$index")
 signature_sha256=$(plutil -extract "$asset_prefix.signature.sha256" raw -o - "$index")
 signature_size=$(plutil -extract "$asset_prefix.signature.size" raw -o - "$index")
 dmg_name="Harness-Harlot-${version}-b${build}-macos-${architecture}-community.dmg"
-manifest_name="manifest-macos-community-${architecture}.update.json"
+manifest_name="manifest-macos-community-${architecture}-v2.update.json"
 signature_name="$manifest_name.sig"
 [ "$dmg_url" = "https://github.com/$REPOSITORY/releases/download/$tag/$dmg_name" ] || {
   echo "release index contains an untrusted or noncanonical DMG URL" >&2

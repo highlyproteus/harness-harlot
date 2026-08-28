@@ -47,6 +47,34 @@ pub(crate) enum TerminalPointerAction {
     Ignore,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalUrlOpenTarget {
+    External,
+    EmbeddedSplit,
+}
+
+/// Resolve native link-click behavior without opening a URL twice for a
+/// double-click sequence. GPUI reports the first click as count 1 and the
+/// repeat as count 2, so only the first release performs navigation.
+pub(crate) fn terminal_url_open_target(
+    modifiers: gpui::Modifiers,
+    click_count: usize,
+) -> Option<TerminalUrlOpenTarget> {
+    if click_count != 1 {
+        return None;
+    }
+    let embedded = if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    };
+    Some(if embedded {
+        TerminalUrlOpenTarget::EmbeddedSplit
+    } else {
+        TerminalUrlOpenTarget::External
+    })
+}
+
 /// Preserve clicks for mouse-aware programs while letting a normal left drag
 /// become a native terminal selection. This avoids requiring a hidden Shift
 /// modifier just to copy text from tmux, vim, and similar programs.
@@ -248,9 +276,17 @@ pub(crate) fn terminal_input_bytes(
     alt: bool,
     platform: bool,
 ) -> Option<Vec<u8>> {
-    // Command/Super is an application modifier, not a PTY modifier. Unmatched
-    // platform shortcuts remain available to the OS instead of becoming text.
+    // Command+Left/Right is the native macOS line-boundary gesture. Translate
+    // it to the terminal's Home/End sequences instead of dropping it with
+    // unmatched application shortcuts. On other platforms Super remains an
+    // application/OS modifier and is not forwarded to the PTY.
     if platform {
+        #[cfg(target_os = "macos")]
+        match key {
+            "left" => return Some(b"\x1b[H".to_vec()),
+            "right" => return Some(b"\x1b[F".to_vec()),
+            _ => {}
+        }
         return None;
     }
     if control && key.len() == 1 {
@@ -258,6 +294,27 @@ pub(crate) fn terminal_input_bytes(
             .as_bytes()
             .first()
             .map(|byte| vec![byte.to_ascii_lowercase() & 0x1f]);
+    }
+    if control {
+        match key {
+            "left" => return Some(b"\x1b[1;5D".to_vec()),
+            "right" => return Some(b"\x1b[1;5C".to_vec()),
+            _ => {}
+        }
+    }
+    if alt && !shift && !control {
+        #[cfg(target_os = "macos")]
+        match key {
+            "left" => return Some(b"\x1bb".to_vec()),
+            "right" => return Some(b"\x1bf".to_vec()),
+            _ => {}
+        }
+        #[cfg(not(target_os = "macos"))]
+        match key {
+            "left" => return Some(b"\x1b[1;3D".to_vec()),
+            "right" => return Some(b"\x1b[1;3C".to_vec()),
+            _ => {}
+        }
     }
     // Shift uses the standard xterm legacy encodings: CSI Z for backtab and
     // the modifier parameter (2 = shift) on navigation keys. Shifted
@@ -317,13 +374,12 @@ mod tests {
     use super::{
         Bounds, MAX_PASTE_BYTES, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD,
         TERMINAL_VERTICAL_PADDING, TerminalAttributes, TerminalColor, TerminalLine, TerminalPoint,
-        TerminalPointerAction, TerminalRun, TerminalSelection, prepare_paste, selection_span,
-        terminal_grid_for_pane, terminal_input_bytes, terminal_point_at, terminal_pointer_action,
-        terminal_run_display_text, typography, url_at_column,
+        TerminalPointerAction, TerminalRun, TerminalSelection, TerminalUrlOpenTarget,
+        prepare_paste, selection_span, terminal_grid_for_pane, terminal_input_bytes,
+        terminal_point_at, terminal_pointer_action, terminal_run_display_text,
+        terminal_url_open_target, typography, url_at_column,
     };
-    use gpui::px;
-    use gpui::size;
-    use gpui::{MouseButton, point};
+    use gpui::{Modifiers, MouseButton, point, px, size};
     use hh_protocol::TerminalSelectionKind;
 
     #[test]
@@ -410,6 +466,57 @@ mod tests {
         assert_eq!(
             terminal_input_bytes("x", Some("x"), false, false, false, true),
             None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_command_arrows_move_to_prompt_line_boundaries() {
+        assert_eq!(
+            terminal_input_bytes("left", None, false, false, false, true),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            terminal_input_bytes("right", None, false, false, false, true),
+            Some(b"\x1b[F".to_vec())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_option_arrows_move_by_words() {
+        assert_eq!(
+            terminal_input_bytes("left", None, false, false, true, false),
+            Some(b"\x1bb".to_vec())
+        );
+        assert_eq!(
+            terminal_input_bytes("right", None, false, false, true, false),
+            Some(b"\x1bf".to_vec())
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_alt_arrows_use_xterm_word_navigation_sequences() {
+        assert_eq!(
+            terminal_input_bytes("left", None, false, false, true, false),
+            Some(b"\x1b[1;3D".to_vec())
+        );
+        assert_eq!(
+            terminal_input_bytes("right", None, false, false, true, false),
+            Some(b"\x1b[1;3C".to_vec())
+        );
+    }
+
+    #[test]
+    fn control_arrows_use_xterm_word_navigation_sequences() {
+        assert_eq!(
+            terminal_input_bytes("left", None, false, true, false, false),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+        assert_eq!(
+            terminal_input_bytes("right", None, false, true, false, false),
+            Some(b"\x1b[1;5C".to_vec())
         );
     }
 
@@ -523,6 +630,50 @@ mod tests {
         );
         assert_eq!(url_at_column(&line, 3), None);
         assert_eq!(url_at_column(&line, 31), None);
+    }
+
+    #[test]
+    fn ordinary_url_click_opens_externally_once_per_click_sequence() {
+        assert_eq!(
+            terminal_url_open_target(Modifiers::default(), 1),
+            Some(TerminalUrlOpenTarget::External)
+        );
+        assert_eq!(terminal_url_open_target(Modifiers::default(), 2), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_command_click_opens_url_in_an_embedded_split() {
+        let command = Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            terminal_url_open_target(command, 1),
+            Some(TerminalUrlOpenTarget::EmbeddedSplit)
+        );
+
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            terminal_url_open_target(control, 1),
+            Some(TerminalUrlOpenTarget::External)
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_control_click_opens_url_in_an_embedded_split() {
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            terminal_url_open_target(control, 1),
+            Some(TerminalUrlOpenTarget::EmbeddedSplit)
+        );
     }
 
     #[test]

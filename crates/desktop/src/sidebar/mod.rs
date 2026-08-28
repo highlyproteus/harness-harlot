@@ -3,9 +3,9 @@ use crate::appearance::workstation_banner_artwork;
 use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     SidebarSection, banner_fit_size, click_suppression_active, composite_rgb, element_key,
-    readable_text_color, render_bell_icon, render_sidebar_toggle_icon,
-    render_terminal_profile_icon, rgba_with_alpha, sidebar_width_for_visibility,
-    tab_identity_presentation, workstation_banner_header_height,
+    readable_text_color, render_bell_icon, render_headphones_icon, render_microphone_icon,
+    render_sidebar_toggle_icon, render_terminal_profile_icon, rgba_with_alpha,
+    sidebar_width_for_visibility, tab_identity_presentation, workstation_banner_header_height,
 };
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
@@ -744,6 +744,78 @@ impl HhApp {
                     .text_color(rgb(row_text))
                     .child(identity.label),
             )
+            .when(pane.kind.is_assistant(), |element| {
+                let (mic_muted, speaker_muted) = self
+                    .voice
+                    .sessions
+                    .get(&pane_id)
+                    .map_or((false, false), |session| {
+                        (session.mic_muted, session.speaker_muted)
+                    });
+                element
+                    .child(
+                        div()
+                            .id(("assistant-mic-sidebar", element_key(pane_id)))
+                            .flex_none()
+                            .size(px(18.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|element| element.bg(rgb(THEME.elevated)))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: if mic_muted {
+                                        "Unmute microphone".to_owned()
+                                    } else {
+                                        "Mute microphone".to_owned()
+                                    },
+                                })
+                                .into()
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_assistant_mic(pane_id, cx);
+                                cx.stop_propagation();
+                            }))
+                            .child(render_microphone_icon(if mic_muted {
+                                THEME.danger
+                            } else {
+                                row_text
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(("assistant-headphones-sidebar", element_key(pane_id)))
+                            .flex_none()
+                            .size(px(18.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|element| element.bg(rgb(THEME.elevated)))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: if speaker_muted {
+                                        "Unmute headphones".to_owned()
+                                    } else {
+                                        "Mute headphones".to_owned()
+                                    },
+                                })
+                                .into()
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_assistant_speaker(pane_id, cx);
+                                cx.stop_propagation();
+                            }))
+                            .child(render_headphones_icon(if speaker_muted {
+                                THEME.danger
+                            } else {
+                                row_text
+                            })),
+                    )
+            })
             .into_any_element()
     }
 

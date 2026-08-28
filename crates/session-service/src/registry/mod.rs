@@ -16,26 +16,28 @@ use crate::persistence::{MAX_TITLE_CHARS, SnapshotStore, default_snapshot_path};
 use anyhow::{Context, Result, bail, ensure};
 use hh_protocol::{
     HistoryArchiveStatus, HistoryClearScope, HistoryCursor, HistoryPageDirection, HistorySettings,
-    NotificationKind, Pane, PaneKind, PaneStreamState, SessionNotification, SessionSnapshot,
-    StreamDiagnostics, TerminalHistoryPage, TerminalIdentity, TerminalProfile, TerminalScreen,
-    TmuxSessionId, WorkspaceConnection,
+    NotificationKind, Pane, PaneAuthority, PaneKind, PaneStatus, PaneStreamState,
+    SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalHistoryPage, TerminalIdentity,
+    TerminalProfile, TerminalScreen, TerminalTransport, TmuxSessionId, WorkspaceConnection,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::process::{fallback_cwd, shell_title, valid_local_cwd};
-use crate::pty::PtySession;
+use crate::pty::{PtySession, RawPaneEvent};
 use crate::registry::identity::{
     refresh_process_metadata, refresh_runtime_metadata, set_pane_runtime_label,
 };
 use crate::registry::remote::{RemoteLsGate, TmuxScanGate};
+use crate::registry::status::{contract_status, heuristic_status};
 use crate::registry::streaming::DiagnosticsSampler;
 pub use remote::{TmuxAttachmentResult, TmuxScanResult};
 
 mod identity;
 mod panes;
 mod remote;
+mod status;
 mod streaming;
 mod tabs;
 mod workspaces;
@@ -51,6 +53,7 @@ pub(crate) struct RuntimePane {
 pub(crate) enum RuntimePaneBackend {
     Terminal(TerminalRuntimePane),
     Browser,
+    Assistant,
 }
 
 #[derive(Debug)]
@@ -61,20 +64,21 @@ pub(crate) struct TerminalRuntimePane {
     recovered: bool,
     exit_status: Option<String>,
     detected_command_profile: Option<TerminalProfile>,
+    omp_title_status: Option<PaneStatus>,
 }
 
 impl RuntimePane {
     pub(crate) fn terminal(&self) -> Option<&TerminalRuntimePane> {
         match &self.backend {
             RuntimePaneBackend::Terminal(terminal) => Some(terminal),
-            RuntimePaneBackend::Browser => None,
+            RuntimePaneBackend::Browser | RuntimePaneBackend::Assistant => None,
         }
     }
 
     pub(crate) fn terminal_mut(&mut self) -> Option<&mut TerminalRuntimePane> {
         match &mut self.backend {
             RuntimePaneBackend::Terminal(terminal) => Some(terminal),
-            RuntimePaneBackend::Browser => None,
+            RuntimePaneBackend::Browser | RuntimePaneBackend::Assistant => None,
         }
     }
 }
@@ -155,6 +159,44 @@ pub(crate) struct RegistryState {
 }
 
 impl RegistryState {
+    pub(crate) fn authorized_terminal(
+        &self,
+        authority: &PaneAuthority,
+    ) -> Result<&TerminalRuntimePane> {
+        ensure!(
+            !matches!(authority.transport, TerminalTransport::Unknown),
+            "pane authority transport must be exact"
+        );
+        let workspace = self
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == authority.workspace_id)
+            .context("pane authority workspace changed or no longer exists")?;
+        let tab = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.id == authority.tab_id)
+            .context("pane authority tab changed or no longer exists")?;
+        let pane = crate::layout::find_pane(&tab.layout, authority.pane_id)
+            .context("pane authority mapping changed or no longer exists")?;
+        ensure!(pane.kind == authority.kind, "pane authority kind changed");
+        let terminal = self.terminal_pane(authority.pane_id)?;
+        let transport = match &terminal.kind {
+            RuntimePaneKind::Local | RuntimePaneKind::TmuxLocal { .. } => TerminalTransport::Local,
+            RuntimePaneKind::SystemSsh { host } | RuntimePaneKind::TmuxSystemSsh { host, .. } => {
+                TerminalTransport::SystemSsh {
+                    destination: host.clone(),
+                }
+            }
+        };
+        ensure!(
+            transport == authority.transport,
+            "pane authority transport changed"
+        );
+        Ok(terminal)
+    }
+
     pub(crate) fn new_pane(&mut self, id: Uuid, cwd: Option<&Path>) -> Pane {
         let title = cwd.and_then(Path::file_name).map_or_else(
             || {
@@ -171,10 +213,22 @@ impl RegistryState {
             shell: shell_title(),
             color: None,
             identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
         }
+    }
+
+    pub(crate) fn set_pane_status(&mut self, pane_id: Uuid, status: PaneStatus) {
+        let Some(pane) = find_pane_mut_in_snapshot(&mut self.snapshot, pane_id) else {
+            return;
+        };
+        if pane.status == status {
+            return;
+        }
+        pane.status = status;
+        self.snapshot.revision = self.snapshot.revision.saturating_add(1);
     }
 
     pub(crate) fn terminal_pane(&self, pane_id: Uuid) -> Result<&TerminalRuntimePane> {
@@ -182,7 +236,7 @@ impl RegistryState {
             .get(&pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?
             .terminal()
-            .with_context(|| format!("pane {pane_id} is a browser, not a terminal"))
+            .with_context(|| format!("pane {pane_id} is not a terminal"))
     }
 
     pub(crate) fn terminal_pane_mut(&mut self, pane_id: Uuid) -> Result<&mut TerminalRuntimePane> {
@@ -190,7 +244,7 @@ impl RegistryState {
             .get_mut(&pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?
             .terminal_mut()
-            .with_context(|| format!("pane {pane_id} is a browser, not a terminal"))
+            .with_context(|| format!("pane {pane_id} is not a terminal"))
     }
 
     pub(crate) fn require_terminal_layout_pane(&self, pane_id: Uuid) -> Result<()> {
@@ -201,6 +255,9 @@ impl RegistryState {
             Some(RuntimePane {
                 backend: RuntimePaneBackend::Browser,
             }) => bail!("browser tabs cannot create terminal panes"),
+            Some(RuntimePane {
+                backend: RuntimePaneBackend::Assistant,
+            }) => bail!("assistant tabs cannot create terminal panes"),
             None => bail!("pane {pane_id} does not exist"),
         }
     }
@@ -219,7 +276,72 @@ impl RegistryState {
             .collect::<Vec<_>>();
         for (pane_id, events) in pending {
             for event in events {
-                self.append_notification(pane_id, event.kind, event.message, event.at_ms);
+                self.apply_pane_event(pane_id, event);
+            }
+        }
+    }
+
+    fn apply_pane_event(&mut self, pane_id: Uuid, event: RawPaneEvent) {
+        let (profile, current_status) = find_pane_in_snapshot(&self.snapshot, pane_id)
+            .map(|pane| (pane.identity.profile, pane.status))
+            .unwrap_or_default();
+        match (event.kind, event.message) {
+            (NotificationKind::Message, Some(message)) => {
+                if let Some(status) = contract_status(&message) {
+                    self.set_pane_status(pane_id, status);
+                    match status {
+                        PaneStatus::NeedsApproval => self.append_notification(
+                            pane_id,
+                            NotificationKind::Attention,
+                            Some("needs approval".to_owned()),
+                            event.at_ms,
+                        ),
+                        PaneStatus::NeedsInput => self.append_notification(
+                            pane_id,
+                            NotificationKind::Attention,
+                            Some("needs input".to_owned()),
+                            event.at_ms,
+                        ),
+                        PaneStatus::Done => self.append_notification(
+                            pane_id,
+                            NotificationKind::Completed,
+                            None,
+                            event.at_ms,
+                        ),
+                        PaneStatus::Idle | PaneStatus::Working | PaneStatus::Attention => {}
+                    }
+                    return;
+                }
+                if let Some(status) = heuristic_status(profile, &message) {
+                    self.set_pane_status(pane_id, status);
+                }
+                self.append_notification(
+                    pane_id,
+                    NotificationKind::Message,
+                    Some(message),
+                    event.at_ms,
+                );
+            }
+            (NotificationKind::Attention, message) => {
+                self.append_notification(
+                    pane_id,
+                    NotificationKind::Attention,
+                    message,
+                    event.at_ms,
+                );
+                if !matches!(profile, TerminalProfile::Terminal | TerminalProfile::Tmux) {
+                    self.set_pane_status(
+                        pane_id,
+                        if current_status == PaneStatus::NeedsApproval {
+                            PaneStatus::NeedsInput
+                        } else {
+                            PaneStatus::Attention
+                        },
+                    );
+                }
+            }
+            (kind, message) => {
+                self.append_notification(pane_id, kind, message, event.at_ms);
             }
         }
     }
@@ -386,6 +508,7 @@ pub(crate) fn serialized_len(value: &impl Serialize) -> Result<u64> {
 )]
 pub(crate) fn encode_desired_state(state: &RegistryState) -> Result<Vec<u8>> {
     let mut snapshot = state.snapshot.clone();
+    snapshot.terminal_transports.clear();
     let runtime_only_panes = state
         .panes
         .iter()
@@ -441,6 +564,26 @@ pub(crate) fn encode_desired_state(state: &RegistryState) -> Result<Vec<u8>> {
     SnapshotStore::encode_with_offline(&snapshot, &cwd_by_pane, &offline_panes)
 }
 
+pub(crate) fn snapshot_with_runtime_transports(state: &RegistryState) -> SessionSnapshot {
+    let mut snapshot = state.snapshot.clone();
+    snapshot.terminal_transports.clear();
+    for (pane_id, runtime) in &state.panes {
+        let Some(terminal) = runtime.terminal() else {
+            continue;
+        };
+        let transport = match &terminal.kind {
+            RuntimePaneKind::Local | RuntimePaneKind::TmuxLocal { .. } => TerminalTransport::Local,
+            RuntimePaneKind::SystemSsh { host } | RuntimePaneKind::TmuxSystemSsh { host, .. } => {
+                TerminalTransport::SystemSsh {
+                    destination: host.clone(),
+                }
+            }
+        };
+        snapshot.terminal_transports.insert(*pane_id, transport);
+    }
+    snapshot
+}
+
 pub(crate) fn terminate_runtime_panes(panes: &HashMap<Uuid, RuntimePane>) {
     for terminal in panes.values().filter_map(RuntimePane::terminal) {
         let _ = terminal.session.terminate_and_wait();
@@ -490,6 +633,15 @@ impl SessionRegistry {
                 );
                 continue;
             }
+            if matches!(pane_kind, PaneKind::Assistant) {
+                panes.insert(
+                    pane_id,
+                    RuntimePane {
+                        backend: RuntimePaneBackend::Assistant,
+                    },
+                );
+                continue;
+            }
             if recovered.offline_panes.contains(&pane_id) {
                 continue;
             }
@@ -512,6 +664,7 @@ impl SessionRegistry {
                                 recovered: true,
                                 exit_status: None,
                                 detected_command_profile: None,
+                                omp_title_status: None,
                             }),
                         },
                     );
@@ -582,6 +735,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             )]),
@@ -601,7 +755,7 @@ impl SessionRegistry {
         })
     }
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
-        Ok(self.state.read().snapshot.clone())
+        Ok(snapshot_with_runtime_transports(&self.state.read()))
     }
 
     pub fn request_shutdown(&self) -> Result<()> {
@@ -752,6 +906,7 @@ pub(crate) fn create_owner_only_directory(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hh_protocol::{DropPlacement, WorkspaceConnectionStatus};
 
     #[test]
     fn service_shutdown_requires_zero_live_terminals() {
@@ -763,5 +918,141 @@ mod tests {
         registry.close_pane(pane_id).unwrap();
         registry.request_shutdown().unwrap();
         assert!(registry.shutdown_requested());
+    }
+
+    fn status_state(profile: TerminalProfile) -> (RegistryState, Uuid) {
+        let mut snapshot = SessionSnapshot::seeded();
+        let pane_id = first_pane_id(&snapshot).unwrap();
+        let pane = find_pane_mut_in_snapshot(&mut snapshot, pane_id).unwrap();
+        pane.identity.profile = profile;
+        (
+            RegistryState {
+                snapshot,
+                panes: HashMap::new(),
+                notifications: VecDeque::new(),
+                next_notification_id: 1,
+                next_terminal_number: 2,
+                next_group_number: 1,
+                last_identity_refresh: None,
+            },
+            pane_id,
+        )
+    }
+
+    #[test]
+    fn contract_event_is_swallowed_and_synthesizes_attention() {
+        let (mut state, pane_id) = status_state(TerminalProfile::Omp);
+        state.apply_pane_event(
+            pane_id,
+            RawPaneEvent {
+                kind: NotificationKind::Message,
+                message: Some("hh-status: needs-approval".to_owned()),
+                at_ms: 7,
+            },
+        );
+
+        assert_eq!(
+            find_pane_in_snapshot(&state.snapshot, pane_id)
+                .unwrap()
+                .status,
+            PaneStatus::NeedsApproval
+        );
+        assert_eq!(state.notifications.len(), 1);
+        assert_eq!(state.notifications[0].kind, NotificationKind::Attention);
+        assert_eq!(
+            state.notifications[0].message.as_deref(),
+            Some("needs approval")
+        );
+    }
+
+    #[test]
+    fn heuristic_event_sets_status_and_preserves_message() {
+        let (mut state, pane_id) = status_state(TerminalProfile::Codex);
+        state.apply_pane_event(
+            pane_id,
+            RawPaneEvent {
+                kind: NotificationKind::Message,
+                message: Some("Approval requested: edit src/lib.rs".to_owned()),
+                at_ms: 8,
+            },
+        );
+
+        assert_eq!(
+            find_pane_in_snapshot(&state.snapshot, pane_id)
+                .unwrap()
+                .status,
+            PaneStatus::NeedsApproval
+        );
+        assert_eq!(state.notifications.len(), 1);
+        assert_eq!(state.notifications[0].kind, NotificationKind::Message);
+        assert_eq!(
+            state.notifications[0].message.as_deref(),
+            Some("Approval requested: edit src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn agent_bell_upgrades_approval_to_input() {
+        let (mut state, pane_id) = status_state(TerminalProfile::Omp);
+        state.set_pane_status(pane_id, PaneStatus::NeedsApproval);
+        state.apply_pane_event(
+            pane_id,
+            RawPaneEvent {
+                kind: NotificationKind::Attention,
+                message: None,
+                at_ms: 9,
+            },
+        );
+
+        assert_eq!(
+            find_pane_in_snapshot(&state.snapshot, pane_id)
+                .unwrap()
+                .status,
+            PaneStatus::NeedsInput
+        );
+        assert_eq!(state.notifications[0].kind, NotificationKind::Attention);
+    }
+
+    #[test]
+    fn pane_input_clears_stale_prompt_status() {
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        registry
+            .state
+            .write()
+            .set_pane_status(pane_id, PaneStatus::NeedsInput);
+
+        registry.write_input(pane_id, b"x").unwrap();
+
+        assert_eq!(
+            find_pane_in_snapshot(&registry.snapshot().unwrap(), pane_id)
+                .unwrap()
+                .status,
+            PaneStatus::Working
+        );
+    }
+
+    #[test]
+    fn local_runtime_replacement_inside_ssh_workstation_projects_local_transport() {
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        {
+            let mut state = registry.state.write();
+            state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
+                destination: "developer@build-node".to_owned(),
+                status: WorkspaceConnectionStatus::Connected,
+            };
+        }
+
+        registry
+            .move_pane_to_split(pane_id, pane_id, DropPlacement::Right)
+            .unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let pane_ids = pane_ids_in_snapshot(&snapshot);
+
+        assert_eq!(pane_ids.len(), 2);
+        assert!(pane_ids.iter().all(|pane_id| {
+            snapshot.terminal_transports.get(pane_id) == Some(&TerminalTransport::Local)
+        }));
     }
 }

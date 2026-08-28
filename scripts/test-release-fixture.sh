@@ -46,6 +46,7 @@ app="$repository_root/target/release/Harness Harlot.app"
 [ -x "$app/Contents/MacOS/hh-service" ]
 [ -x "$app/Contents/MacOS/hh-update-tool" ]
 [ -f "$app/Contents/Resources/licenses/LICENSE" ]
+[ -f "$app/Contents/Resources/licenses/PRIVACY.md" ]
 [ -f "$app/Contents/Resources/licenses/THIRD_PARTY_NOTICES.md" ]
 [ -f "$app/Contents/Resources/licenses/ASSET_NOTICES.md" ]
 [ -f "$app/Contents/Resources/licenses/third_party/licenses/Apache-2.0.txt" ]
@@ -68,8 +69,8 @@ grep -F "fixture support is not compiled into this updater" \
   "$work/embedded-updater.out" >/dev/null
 
 
-[ -f "$distribution/manifest-macos-${architecture}.update.json" ]
-[ -f "$distribution/manifest-macos-${architecture}.update.json.sig" ]
-grep -F '"channel": "edge"' "$distribution/manifest-macos-${architecture}.update.json" >/dev/null
+[ -f "$distribution/manifest-macos-${architecture}-v2.update.json" ]
+[ -f "$distribution/manifest-macos-${architecture}-v2.update.json.sig" ]
+grep -F '"channel": "edge"' "$distribution/manifest-macos-${architecture}-v2.update.json" >/dev/null
 
 echo "release fixture signs inside-out, publishes channel manifests, and bundles hh, hh-service, and hh-update-tool"

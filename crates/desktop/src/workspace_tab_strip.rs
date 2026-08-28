@@ -6,7 +6,7 @@ use gpui::{
     MouseDownEvent, ParentElement, Point, StatefulInteractiveElement, Styled, StyledImage, div,
     img, px, rgb,
 };
-use hh_protocol::{AppearanceColor, Workspace};
+use hh_protocol::{AppearanceColor, PaneStatus, Workspace};
 use std::time::Instant;
 
 use crate::helpers::{
@@ -17,7 +17,9 @@ use crate::helpers::{
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
 };
-use crate::{HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
+use crate::{
+    HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT, max_pane_status, pane_status_color,
+};
 
 impl HhApp {
     #[allow(clippy::too_many_lines)]
@@ -33,6 +35,7 @@ impl HhApp {
             WorkspaceTabScope::Workstation => None,
             WorkspaceTabScope::Project(project_id) => Some(project_id),
         };
+        let assistant = workspace.is_assistant();
         let active_tab = workspace_strip_active_tab(workspace, scope, self.layout.focused_pane);
         let tabs = tab_set
             .tabs
@@ -94,11 +97,13 @@ impl HhApp {
                         .bg(rgb(tab.color.map_or(THEME.dim, AppearanceColor::as_rgb)))
                         .into_any_element()
                 };
-                let pane_count = {
+                let (pane_count, status) = {
                     let mut panes = Vec::new();
                     collect_terminal_tabs(&tab.layout, &mut panes);
-                    panes.len()
+                    let status = max_pane_status(panes.iter().map(|pane| pane.status));
+                    (panes.len(), status)
                 };
+                let status_color = pane_status_color(status);
                 let tab_id = tab.id;
                 let close_tooltip = if is_standalone {
                     format!("Close {label}…")
@@ -257,6 +262,16 @@ impl HhApp {
                                 .child(pane_count.to_string()),
                         )
                     })
+                    .when(status != PaneStatus::Idle, |element| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .rounded_full()
+                                .bg(rgb(status_color.expect("non-idle status has a color"))),
+                        )
+                    })
                     .child(
                         div()
                             .id(("close-workspace-strip-tab", element_key(tab_id)))
@@ -329,21 +344,27 @@ impl HhApp {
                             .bg(rgb(THEME.elevated))
                             .text_color(rgb(THEME.foreground))
                     })
-                    .tooltip(|_, cx| {
-                        cx.new(|_| TooltipView {
-                            text: "Add project, terminal, browser, or group".to_owned(),
-                        })
-                        .into()
+                    .tooltip({
+                        let text = if assistant {
+                            "New thread".to_owned()
+                        } else {
+                            "Add project, terminal, browser, or group".to_owned()
+                        };
+                        move |_, cx| cx.new(|_| TooltipView { text: text.clone() }).into()
                     })
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.editor.modal = Modal::CreateMenu(CreateMenu {
-                            position: event.position(),
-                            target: CreateMenuTarget::TabStrip {
-                                workspace_id,
-                                target_tab,
-                            },
-                        });
-                        cx.notify();
+                        if assistant {
+                            this.new_assistant_tab(workspace_id, cx);
+                        } else {
+                            this.editor.modal = Modal::CreateMenu(CreateMenu {
+                                position: event.position(),
+                                target: CreateMenuTarget::TabStrip {
+                                    workspace_id,
+                                    target_tab,
+                                },
+                            });
+                            cx.notify();
+                        }
                     }))
                     .child("+"),
             )

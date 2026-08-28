@@ -17,10 +17,10 @@ use crate::registry::identity::{
 use crate::registry::workspaces::remember_recent_color;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    AppearanceColor, MAX_PANES, Pane, PaneKind, PaneLayout, SplitAxis, Tab, TerminalIdentity,
-    TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalProfile,
-    TerminalSelectionKind, WorkspaceConnection, WorkspaceConnectionStatus, normalize_browser_url,
-    normalize_browser_url_or_default, validate_ssh_host,
+    AppearanceColor, MAX_PANES, Pane, PaneKind, PaneLayout, PaneStatus, SplitAxis, Tab,
+    TerminalIdentity, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
+    TerminalProfile, TerminalSelectionKind, WorkspaceConnection, WorkspaceConnectionStatus,
+    normalize_browser_url, normalize_browser_url_or_default, validate_ssh_host,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -92,6 +92,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );
@@ -170,6 +171,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );
@@ -211,6 +213,7 @@ impl SessionRegistry {
             shell: String::new(),
             color: None,
             identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -269,6 +272,7 @@ impl SessionRegistry {
     /// This request is rejected once any layout exists, so a repeated click or
     /// retried request cannot create duplicate terminals.
     pub fn create_workspace_terminal(&self, workspace_id: Uuid) -> Result<Uuid> {
+        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
         let (connection, working_dir) = {
             let state = self.state.read();
             if state.panes.len() >= MAX_PANES {
@@ -323,6 +327,7 @@ impl SessionRegistry {
                 shell: pane_shell,
                 color: None,
                 identity: TerminalIdentity::default(),
+                status: hh_protocol::PaneStatus::default(),
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
@@ -352,6 +357,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );
@@ -406,6 +412,7 @@ impl SessionRegistry {
                 shell: "ssh".to_owned(),
                 color: None,
                 identity: TerminalIdentity::default(),
+                status: hh_protocol::PaneStatus::default(),
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
@@ -431,6 +438,7 @@ impl SessionRegistry {
                         recovered: false,
                         exit_status: None,
                         detected_command_profile: None,
+                        omp_title_status: None,
                     }),
                 },
             );
@@ -447,6 +455,7 @@ impl SessionRegistry {
     }
 
     pub fn create_browser_tab(&self, workspace_id: Uuid, url: Option<&str>) -> Result<Uuid> {
+        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
         let url = normalize_browser_url_or_default(url)?;
         let title = browser_title(&url, None);
         let pane_id = Uuid::new_v4();
@@ -480,6 +489,7 @@ impl SessionRegistry {
                     shell: String::new(),
                     color: None,
                     identity: TerminalIdentity::default(),
+                    status: hh_protocol::PaneStatus::default(),
                     custom_title: None,
                     profile_override: None,
                     custom_icon: None,
@@ -490,6 +500,108 @@ impl SessionRegistry {
             pane_id,
             RuntimePane {
                 backend: RuntimePaneBackend::Browser,
+            },
+        );
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)?;
+        Ok(pane_id)
+    }
+
+    pub fn create_assistant_tab(&self, workspace_id: Uuid) -> Result<Uuid> {
+        let pane_id = Uuid::new_v4();
+        let mut state = self.state.write();
+        if state.panes.len() >= MAX_PANES {
+            bail!("pane limit of {MAX_PANES} reached");
+        }
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+        if workspace.tabs.len() >= MAX_TABS_PER_WORKSPACE {
+            bail!("workstation tab limit of {MAX_TABS_PER_WORKSPACE} reached");
+        }
+        let tab_title = if workspace.is_assistant() {
+            format!("Thread {}", workspace.tabs.len() + 1)
+        } else {
+            "Assistant".to_owned()
+        };
+        workspace.tabs.push(Tab {
+            id: Uuid::new_v4(),
+            title: tab_title,
+            custom_title: None,
+            project_dir: None,
+            color: None,
+            custom_icon: None,
+            parent_tab: None,
+            pinned: false,
+            layout: PaneLayout::Leaf {
+                pane: Pane {
+                    id: pane_id,
+                    kind: PaneKind::Assistant,
+                    title: "Assistant".to_owned(),
+                    shell: String::new(),
+                    color: None,
+                    identity: TerminalIdentity::default(),
+                    status: hh_protocol::PaneStatus::default(),
+                    custom_title: None,
+                    profile_override: None,
+                    custom_icon: None,
+                },
+            },
+        });
+        state.panes.insert(
+            pane_id,
+            RuntimePane {
+                backend: RuntimePaneBackend::Assistant,
+            },
+        );
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)?;
+        Ok(pane_id)
+    }
+
+    pub fn create_group_assistant(&self, target_pane: Uuid) -> Result<Uuid> {
+        let pane_id = Uuid::new_v4();
+        let mut state = self.state.write();
+        if state.panes.len() >= MAX_PANES {
+            bail!("pane limit of {MAX_PANES} reached");
+        }
+        let tab = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find_map(|workspace| {
+                workspace
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| layout_contains(&tab.layout, target_pane))
+            })
+            .with_context(|| format!("target pane {target_pane} does not exist"))?;
+        let pane = Pane {
+            id: pane_id,
+            kind: PaneKind::Assistant,
+            title: "Assistant".to_owned(),
+            shell: String::new(),
+            color: None,
+            identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        if !add_tab(&mut tab.layout, target_pane, pane) {
+            bail!("target pane {target_pane} does not exist");
+        }
+        state.panes.insert(
+            pane_id,
+            RuntimePane {
+                backend: RuntimePaneBackend::Assistant,
             },
         );
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
@@ -544,12 +656,16 @@ impl SessionRegistry {
 
     pub fn set_pane_profile(&self, pane_id: Uuid, profile: Option<TerminalProfile>) -> Result<()> {
         let mut state = self.state.write();
-        let terminal = state.terminal_pane(pane_id)?;
-        let (title_signal, command_profile, cwd) = (
-            terminal.session.terminal_title(),
-            terminal.detected_command_profile,
-            terminal.last_valid_cwd.clone(),
-        );
+        let terminal_identity = match state.panes.get(&pane_id) {
+            Some(runtime) => runtime.terminal().map(|terminal| {
+                (
+                    terminal.session.terminal_title(),
+                    terminal.detected_command_profile,
+                    terminal.last_valid_cwd.clone(),
+                )
+            }),
+            None => bail!("pane {pane_id} does not exist"),
+        };
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         if pane.custom_title.is_none() {
@@ -557,12 +673,14 @@ impl SessionRegistry {
         }
         pane.profile_override = profile;
         pane.custom_icon = None;
-        resolve_pane_identity(
-            pane,
-            title_signal.as_deref(),
-            command_profile,
-            Some(cwd.as_path()),
-        );
+        if let Some((title_signal, command_profile, cwd)) = terminal_identity {
+            resolve_pane_identity(
+                pane,
+                title_signal.as_deref(),
+                command_profile,
+                Some(cwd.as_path()),
+            );
+        }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
@@ -574,6 +692,7 @@ impl SessionRegistry {
             persistence::validate_custom_icon_id(icon)?;
         }
         let mut state = self.state.write();
+        let previous_snapshot = state.snapshot.clone();
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         if pane.custom_title.is_none() {
@@ -582,29 +701,38 @@ impl SessionRegistry {
         pane.custom_icon = icon;
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
-        drop(state);
-        self.write_snapshot(&bytes)
+        if let Err(error) = self.write_snapshot(&bytes) {
+            state.snapshot = previous_snapshot;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn reset_pane_identity(&self, pane_id: Uuid) -> Result<()> {
         let mut state = self.state.write();
-        let terminal = state.terminal_pane(pane_id)?;
-        let (title_signal, command_profile, cwd) = (
-            terminal.session.terminal_title(),
-            terminal.detected_command_profile,
-            terminal.last_valid_cwd.clone(),
-        );
+        let terminal_identity = match state.panes.get(&pane_id) {
+            Some(runtime) => runtime.terminal().map(|terminal| {
+                (
+                    terminal.session.terminal_title(),
+                    terminal.detected_command_profile,
+                    terminal.last_valid_cwd.clone(),
+                )
+            }),
+            None => bail!("pane {pane_id} does not exist"),
+        };
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
         pane.custom_title = None;
         pane.profile_override = None;
         pane.custom_icon = None;
-        resolve_pane_identity(
-            pane,
-            title_signal.as_deref(),
-            command_profile,
-            Some(cwd.as_path()),
-        );
+        if let Some((title_signal, command_profile, cwd)) = terminal_identity {
+            resolve_pane_identity(
+                pane,
+                title_signal.as_deref(),
+                command_profile,
+                Some(cwd.as_path()),
+            );
+        }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
@@ -738,8 +866,10 @@ impl SessionRegistry {
         let previous = std::mem::replace(&mut runtime.session, session);
         runtime.exit_status = None;
         runtime.recovered = false;
+        runtime.omp_title_status = None;
         let shell_label = kind.shell_label();
         set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, &shell_label);
+        state.set_pane_status(pane_id, PaneStatus::Idle);
         refresh_workspace_activity(&mut state);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
@@ -769,7 +899,62 @@ impl SessionRegistry {
     }
 
     pub fn write_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<()> {
-        self.pane(pane_id)?.write_input(bytes)
+        self.write_input_with_delivery(pane_id, bytes)
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn write_input_with_delivery(
+        &self,
+        pane_id: Uuid,
+        bytes: &[u8],
+    ) -> std::result::Result<(), crate::pty::InputDeliveryError> {
+        let pane = self.pane(pane_id).map_err(|error| {
+            crate::pty::InputDeliveryError::definitely_unsent(format!("{error:#}"))
+        })?;
+        pane.write_input(bytes)?;
+        let mut state = self.state.write();
+        if find_pane_in_snapshot(&state.snapshot, pane_id).is_some_and(|pane| {
+            matches!(
+                pane.status,
+                PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention
+            )
+        }) {
+            state.set_pane_status(pane_id, PaneStatus::Working);
+        }
+        Ok(())
+    }
+
+    pub fn authorized_write_input(
+        &self,
+        authority: &hh_protocol::PaneAuthority,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.authorized_write_input_with_delivery(authority, bytes)
+            .map_err(anyhow::Error::new)
+    }
+
+    pub(crate) fn authorized_write_input_with_delivery(
+        &self,
+        authority: &hh_protocol::PaneAuthority,
+        bytes: &[u8],
+    ) -> std::result::Result<(), crate::pty::InputDeliveryError> {
+        let mut state = self.state.write();
+        state
+            .authorized_terminal(authority)
+            .map_err(|error| {
+                crate::pty::InputDeliveryError::definitely_unsent(format!("{error:#}"))
+            })?
+            .session
+            .write_input(bytes)?;
+        if find_pane_in_snapshot(&state.snapshot, authority.pane_id).is_some_and(|pane| {
+            matches!(
+                pane.status,
+                PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention
+            )
+        }) {
+            state.set_pane_status(authority.pane_id, PaneStatus::Working);
+        }
+        Ok(())
     }
 
     pub fn begin_selection(
@@ -906,14 +1091,19 @@ mod tests {
 
         let dead_session = {
             let mut state = registry.state.write();
-            let terminal = state
-                .panes
-                .get_mut(&pane_id)
-                .unwrap()
-                .terminal_mut()
-                .unwrap();
-            terminal.exit_status = Some("Exited with code 255".to_owned());
-            Arc::clone(&terminal.session)
+            let dead_session = {
+                let terminal = state
+                    .panes
+                    .get_mut(&pane_id)
+                    .unwrap()
+                    .terminal_mut()
+                    .unwrap();
+                terminal.exit_status = Some("Exited with code 255".to_owned());
+                terminal.omp_title_status = Some(PaneStatus::Done);
+                Arc::clone(&terminal.session)
+            };
+            state.set_pane_status(pane_id, PaneStatus::Done);
+            dead_session
         };
         dead_session.terminate_and_wait().unwrap();
 
@@ -939,6 +1129,17 @@ mod tests {
         );
         let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
         assert!(!pane.shell.contains("exited"), "shell: {}", pane.shell);
+        assert_eq!(pane.status, PaneStatus::Idle);
+        assert_eq!(
+            registry
+                .state
+                .read()
+                .panes
+                .get(&pane_id)
+                .and_then(RuntimePane::terminal)
+                .and_then(|terminal| terminal.omp_title_status),
+            None
+        );
         registry
             .write_input(pane_id, b"printf 'REATTACHED\\n'\r")
             .unwrap();

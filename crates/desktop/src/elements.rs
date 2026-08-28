@@ -93,6 +93,8 @@ impl Element for WorkspaceTextInputElement {
         let editor = dialog.map(|dialog| match self.field {
             WorkspaceCreationField::Name => &dialog.name,
             WorkspaceCreationField::Destination => &dialog.destination,
+            WorkspaceCreationField::WorkingDir => &dialog.working_dir,
+            WorkspaceCreationField::Instructions => &dialog.instructions,
         });
         let content = editor.map_or("", |editor| editor.text.as_str());
         let display_text = if content.is_empty() {

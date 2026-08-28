@@ -1,5 +1,5 @@
 //! Pane streaming, notifications, and diagnostics sampling.
-use super::{PaneUpdateBatch, SessionRegistry, serialized_len};
+use super::{PaneUpdateBatch, SessionRegistry, serialized_len, snapshot_with_runtime_transports};
 use crate::registry::identity::refresh_runtime_metadata;
 use anyhow::{Result, bail};
 use hh_protocol::{
@@ -83,7 +83,7 @@ pub(crate) fn cpu_milli_percent(percent: f32) -> u32 {
 impl SessionRegistry {
     pub fn state(&self) -> Result<(SessionSnapshot, Vec<TerminalScreen>)> {
         let state = self.state.read();
-        let snapshot = state.snapshot.clone();
+        let snapshot = snapshot_with_runtime_transports(&state);
         let screens = state
             .panes
             .iter()
@@ -149,8 +149,8 @@ impl SessionRegistry {
         let state = self.state.read();
 
         let session_revision = state.snapshot.revision;
-        let snapshot =
-            (snapshot_revision != Some(session_revision)).then(|| state.snapshot.clone());
+        let snapshot = (snapshot_revision != Some(session_revision))
+            .then(|| snapshot_with_runtime_transports(&state));
         let mut screens = Vec::new();
         let mut pane_states = Vec::with_capacity(state.panes.len());
         let mut coalesced_revisions = 0_u64;
@@ -271,6 +271,37 @@ impl SessionRegistry {
     pub fn pane_snapshot(&self, pane_id: Uuid) -> Result<(TerminalScreen, StreamDiagnostics)> {
         let started = Instant::now();
         let screen = self.pane(pane_id)?.screen(pane_id)?;
+        let screen_bytes = serialized_len(&screen)?;
+        let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics();
+        Ok((
+            screen,
+            StreamDiagnostics {
+                panes_considered: 1,
+                panes_subscribed: 1,
+                screens_queued: 1,
+                screens_delivered: 1,
+                screen_bytes,
+                preparation_micros: u64::try_from(started.elapsed().as_micros())
+                    .unwrap_or(u64::MAX),
+                service_cpu_milli_percent,
+                service_memory_bytes,
+                ..StreamDiagnostics::default()
+            },
+        ))
+    }
+
+    pub fn authorized_pane_snapshot(
+        &self,
+        authority: &hh_protocol::PaneAuthority,
+    ) -> Result<(TerminalScreen, StreamDiagnostics)> {
+        let started = Instant::now();
+        let screen = {
+            let state = self.state.read();
+            state
+                .authorized_terminal(authority)?
+                .session
+                .screen(authority.pane_id)?
+        };
         let screen_bytes = serialized_len(&screen)?;
         let (service_cpu_milli_percent, service_memory_bytes) = self.service_metrics();
         Ok((

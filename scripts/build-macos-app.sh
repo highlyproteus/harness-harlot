@@ -113,6 +113,7 @@ cp "$repository_root/packaging/macos/Harness-Harlot.icns" \
 cp "$repository_root/crates/desktop/assets/harnessharlot-banner.png" \
   "$contents_directory/Resources/harnessharlot-banner.png"
 cp "$repository_root/LICENSE" "$notices_directory/LICENSE"
+cp "$repository_root/PRIVACY.md" "$notices_directory/PRIVACY.md"
 cp "$repository_root/THIRD_PARTY_NOTICES.md" "$notices_directory/THIRD_PARTY_NOTICES.md"
 cp "$repository_root/ASSET_NOTICES.md" "$notices_directory/ASSET_NOTICES.md"
 cp "$repository_root"/third_party/licenses/* "$notices_directory/third_party/licenses/"

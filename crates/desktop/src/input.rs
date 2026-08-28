@@ -14,6 +14,14 @@ use gpui::{
 };
 use hh_protocol::{ClientRequest, SplitAxis};
 use std::ops::Range;
+use uuid::Uuid;
+
+pub(crate) fn assistant_composer_is_active(
+    composer_pane: Option<Uuid>,
+    focused_pane: Option<Uuid>,
+) -> bool {
+    composer_pane.is_some() && composer_pane == focused_pane
+}
 
 pub(crate) fn browser_key_text(
     key: &str,
@@ -55,7 +63,7 @@ impl HhApp {
         if matches!(command, AppCommand::SplitRight | AppCommand::SplitDown)
             && self.layout.focused_pane.is_some_and(|pane_id| {
                 self.pane_metadata(pane_id)
-                    .is_some_and(|pane| pane.kind.is_browser())
+                    .is_some_and(|pane| !pane.kind.is_terminal())
             })
         {
             return;
@@ -83,7 +91,18 @@ impl HhApp {
                     self.reattach_pane(pane_id, cx);
                 }
             }
+            AppCommand::RetryTerminalInput => self.retry_undelivered_terminal_input(cx),
             AppCommand::ShowNotifications => self.toggle_sidebar_activity(cx),
+            AppCommand::ToggleVoiceMic => {
+                if let Some(pane_id) = self.layout.focused_pane
+                    && self
+                        .pane_metadata(pane_id)
+                        .is_some_and(|pane| pane.kind.is_assistant())
+                {
+                    self.toggle_assistant_mic(pane_id, cx);
+                }
+            }
+            AppCommand::ShowSettings => self.open_appearance_settings(cx),
         }
     }
 
@@ -186,6 +205,12 @@ impl HhApp {
                     dialog.field = match (dialog.kind, dialog.field) {
                         (WorkspaceCreationKind::SystemSsh, WorkspaceCreationField::Name) => {
                             WorkspaceCreationField::Destination
+                        }
+                        (WorkspaceCreationKind::Assistant, WorkspaceCreationField::Name) => {
+                            WorkspaceCreationField::WorkingDir
+                        }
+                        (WorkspaceCreationKind::Assistant, WorkspaceCreationField::WorkingDir) => {
+                            WorkspaceCreationField::Instructions
                         }
                         _ => WorkspaceCreationField::Name,
                     };
@@ -430,6 +455,123 @@ impl HhApp {
         }
     }
 
+    fn handle_assistant_composer_key(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> BrowserKeyRoute {
+        if !assistant_composer_is_active(
+            self.editor
+                .assistant_composer
+                .as_ref()
+                .map(|composer| composer.pane_id),
+            self.layout.focused_pane,
+        ) {
+            return BrowserKeyRoute::NotEditing;
+        }
+
+        let route_to_input_context = match event.keystroke.key.as_str() {
+            "a" if event.keystroke.modifiers.platform => {
+                if let Some(composer) = self.editor.assistant_composer.as_mut() {
+                    composer.select_all();
+                }
+                cx.notify();
+                false
+            }
+            "c" if event.keystroke.modifiers.platform => {
+                let selected = self
+                    .editor
+                    .assistant_composer
+                    .as_ref()
+                    .and_then(|composer| composer.selected_text())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        let pane_id = self.layout.focused_pane?;
+                        let session = self.voice.sessions.get(&pane_id)?;
+                        let index = session.selected_transcript?;
+                        session
+                            .transcript
+                            .get(index)
+                            .map(|entry| entry.text.clone())
+                    });
+                if let Some(selected) = selected {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                }
+                false
+            }
+            "x" if event.keystroke.modifiers.platform => {
+                if let Some(selected) = self
+                    .editor
+                    .assistant_composer
+                    .as_mut()
+                    .and_then(|composer| composer.cut_selection())
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                    cx.notify();
+                }
+                false
+            }
+            "v" if event.keystroke.modifiers.platform => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                    && let Some(composer) = self.editor.assistant_composer.as_mut()
+                {
+                    composer.insert(&text);
+                    cx.notify();
+                }
+                false
+            }
+            "enter" => {
+                if event.keystroke.modifiers.shift {
+                    if let Some(composer) = self.editor.assistant_composer.as_mut() {
+                        composer.insert("\n");
+                    }
+                    cx.notify();
+                } else {
+                    self.submit_assistant_composer(cx);
+                }
+                false
+            }
+            "escape" => {
+                self.editor.assistant_composer = None;
+                self.editor.ime_preedit.clear();
+                cx.notify();
+                false
+            }
+            "backspace" => {
+                if let Some(composer) = self.editor.assistant_composer.as_mut() {
+                    composer.backspace();
+                }
+                cx.notify();
+                false
+            }
+            _ if event.keystroke.modifiers.platform => true,
+            _ if !event.keystroke.modifiers.platform && !event.keystroke.modifiers.control => {
+                let text = browser_key_text(
+                    &event.keystroke.key,
+                    event.keystroke.key_char.as_deref(),
+                    event.keystroke.modifiers.shift,
+                    event.keystroke.modifiers.alt,
+                );
+                if let Some(text) = text {
+                    if let Some(composer) = self.editor.assistant_composer.as_mut() {
+                        composer.insert(&text);
+                    }
+                    cx.notify();
+                    false
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+
+        if route_to_input_context {
+            BrowserKeyRoute::PassToInput
+        } else {
+            BrowserKeyRoute::Consumed
+        }
+    }
+
     pub(crate) fn handle_key(
         &mut self,
         event: &KeyDownEvent,
@@ -448,6 +590,14 @@ impl HhApp {
             return;
         }
         match self.handle_browser_url_key(event, cx) {
+            BrowserKeyRoute::NotEditing => {}
+            BrowserKeyRoute::Consumed => {
+                cx.stop_propagation();
+                return;
+            }
+            BrowserKeyRoute::PassToInput => return,
+        }
+        match self.handle_assistant_composer_key(event, cx) {
             BrowserKeyRoute::NotEditing => {}
             BrowserKeyRoute::Consumed => {
                 cx.stop_propagation();
@@ -527,9 +677,11 @@ impl HhApp {
                 return;
             }
             Modal::AppearanceSettings => {
-                if keystroke.key == "escape" {
+                if keystroke.key == "escape" && self.voice.settings_editor.active_field.is_none() {
                     self.editor.modal = Modal::None;
                     cx.notify();
+                } else {
+                    self.handle_voice_settings_key(keystroke, cx);
                 }
                 cx.stop_propagation();
                 return;
@@ -653,7 +805,12 @@ impl HhApp {
             keystroke.modifiers.platform,
         );
         if let (Some(pane_id), Some(bytes)) = (self.layout.focused_pane, bytes) {
-            self.dispatch_control(ClientRequest::WriteInput { pane_id, bytes });
+            if self
+                .pane_metadata(pane_id)
+                .is_some_and(|pane| pane.kind.is_terminal())
+            {
+                self.dispatch_control(ClientRequest::WriteInput { pane_id, bytes });
+            }
             cx.stop_propagation();
         }
     }
@@ -854,7 +1011,8 @@ impl EntityInputHandler for HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::browser_key_text;
+    use super::{assistant_composer_is_active, browser_key_text};
+    use uuid::Uuid;
 
     #[test]
     fn browser_url_key_text_falls_back_to_printable_physical_keys() {
@@ -872,5 +1030,17 @@ mod tests {
         );
         assert_eq!(browser_key_text("left", None, false, false), None);
         assert_eq!(browser_key_text("a", None, false, true), None);
+    }
+    #[test]
+    fn assistant_composer_routes_only_for_its_focused_pane() {
+        let composer = Uuid::new_v4();
+        let terminal = Uuid::new_v4();
+        assert!(assistant_composer_is_active(Some(composer), Some(composer)));
+        assert!(!assistant_composer_is_active(
+            Some(composer),
+            Some(terminal)
+        ));
+        assert!(!assistant_composer_is_active(Some(composer), None));
+        assert!(!assistant_composer_is_active(None, Some(composer)));
     }
 }

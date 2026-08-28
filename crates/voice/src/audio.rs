@@ -1,0 +1,690 @@
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
+
+use anyhow::{Context, Result, bail};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Device, SampleFormat, SizedSample, Stream, StreamConfig};
+use parking_lot::Mutex;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
+
+const REALTIME_RATE: u32 = 24_000;
+const INPUT_CHUNK_SAMPLES: usize = 1_200;
+const INPUT_CHUNK_SAMPLES_F32: f32 = 1_200.0;
+const RESAMPLE_CHUNK_MILLIS: u32 = 10;
+const AUDIO_CHANNEL_CAPACITY: usize = 8;
+const MAX_PLAYBACK_SAMPLES: usize = 2_880_000;
+
+#[allow(clippy::cast_possible_truncation)]
+fn normalized_to_i16(value: f32) -> i16 {
+    (value.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn normalized_to_u16(value: f32) -> u16 {
+    ((value.clamp(-1.0, 1.0) + 1.0) * 32_767.5).round() as u16
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AudioInputChunk {
+    pub samples: Vec<i16>,
+    pub rms: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AudioInputEvent {
+    Chunk(AudioInputChunk),
+    Error(String),
+}
+
+struct InputProcessor {
+    channels: usize,
+    chunk_frames: usize,
+    pending: VecDeque<f32>,
+    input: Vec<f32>,
+    output: Vec<f32>,
+    pcm: VecDeque<i16>,
+    resampler: Async<f32>,
+}
+
+impl InputProcessor {
+    fn new(sample_rate: u32, channels: usize) -> Result<Self> {
+        let chunk_frames = usize::try_from(sample_rate / (1_000 / RESAMPLE_CHUNK_MILLIS))
+            .unwrap_or(480)
+            .max(64);
+        let resampler = Async::<f32>::new_poly(
+            f64::from(REALTIME_RATE) / f64::from(sample_rate),
+            1.1,
+            PolynomialDegree::Cubic,
+            chunk_frames,
+            1,
+            FixedAsync::Input,
+        )
+        .context("create microphone resampler")?;
+        let output_frames = resampler.output_frames_max();
+        Ok(Self {
+            channels,
+            chunk_frames,
+            pending: VecDeque::with_capacity(chunk_frames * 2),
+            input: vec![0.0; chunk_frames],
+            output: vec![0.0; output_frames],
+            pcm: VecDeque::with_capacity(INPUT_CHUNK_SAMPLES * 2),
+            resampler,
+        })
+    }
+
+    fn process<T: Copy>(
+        &mut self,
+        data: &[T],
+        convert: fn(T) -> f32,
+        sender: &SyncSender<AudioInputEvent>,
+    ) {
+        let channel_count =
+            f32::from(u16::try_from(self.channels).expect("CPAL channel count fits in u16"));
+        for frame in data.chunks_exact(self.channels) {
+            let mono = frame.iter().copied().map(convert).sum::<f32>() / channel_count;
+            self.pending.push_back(mono.clamp(-1.0, 1.0));
+        }
+        while self.pending.len() >= self.chunk_frames {
+            for sample in &mut self.input {
+                *sample = self.pending.pop_front().unwrap_or_default();
+            }
+            let input = InterleavedSlice::new(&self.input, 1, self.chunk_frames)
+                .expect("valid mono input adapter");
+            let output_capacity = self.output.len();
+            let mut output = InterleavedSlice::new_mut(&mut self.output, 1, output_capacity)
+                .expect("valid mono output adapter");
+            let frames = match self
+                .resampler
+                .process_into_buffer(&input, &mut output, None)
+            {
+                Ok((_, frames)) => frames,
+                Err(error) => {
+                    let _ = sender.try_send(AudioInputEvent::Error(format!(
+                        "resample microphone audio: {error}"
+                    )));
+                    return;
+                }
+            };
+            self.pcm.extend(
+                self.output[..frames]
+                    .iter()
+                    .map(|sample| normalized_to_i16(*sample)),
+            );
+            while self.pcm.len() >= INPUT_CHUNK_SAMPLES {
+                let mut samples = Vec::with_capacity(INPUT_CHUNK_SAMPLES);
+                samples.extend(self.pcm.drain(..INPUT_CHUNK_SAMPLES));
+                let energy = samples
+                    .iter()
+                    .map(|sample| {
+                        let sample = f32::from(*sample) / f32::from(i16::MAX);
+                        sample * sample
+                    })
+                    .sum::<f32>();
+                let rms = (energy / INPUT_CHUNK_SAMPLES_F32).sqrt();
+                let _ = sender.try_send(AudioInputEvent::Chunk(AudioInputChunk { samples, rms }));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlaybackChunk {
+    item_id: String,
+    samples: Vec<f32>,
+    cursor: usize,
+}
+
+#[derive(Debug, Default)]
+struct PlaybackState {
+    queue: VecDeque<PlaybackChunk>,
+    current_item_id: Option<String>,
+    played_device_frames: u64,
+}
+
+struct OutputResampler {
+    item_id: Option<String>,
+    chunk_frames: usize,
+    pending: VecDeque<f32>,
+    input: Vec<f32>,
+    output: Vec<f32>,
+    resampler: Async<f32>,
+}
+
+impl OutputResampler {
+    fn new(device_rate: u32) -> Result<Self> {
+        let chunk_frames = usize::try_from(REALTIME_RATE / (1_000 / RESAMPLE_CHUNK_MILLIS))
+            .unwrap_or(240)
+            .max(64);
+        let resampler = Async::<f32>::new_poly(
+            f64::from(device_rate) / f64::from(REALTIME_RATE),
+            1.1,
+            PolynomialDegree::Cubic,
+            chunk_frames,
+            1,
+            FixedAsync::Input,
+        )
+        .context("create playback resampler")?;
+        let output_frames = resampler.output_frames_max();
+        Ok(Self {
+            item_id: None,
+            chunk_frames,
+            pending: VecDeque::with_capacity(chunk_frames * 2),
+            input: vec![0.0; chunk_frames],
+            output: vec![0.0; output_frames],
+            resampler,
+        })
+    }
+
+    fn push(
+        &mut self,
+        item_id: &str,
+        samples: &[i16],
+        playback: &Arc<Mutex<PlaybackState>>,
+        active: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        if self
+            .item_id
+            .as_deref()
+            .is_some_and(|current| current != item_id)
+        {
+            self.flush(playback, active)?;
+        }
+        self.item_id = Some(item_id.to_owned());
+        self.pending.extend(
+            samples
+                .iter()
+                .map(|sample| f32::from(*sample) / f32::from(i16::MAX)),
+        );
+        self.process_full_chunks(playback, active)
+    }
+
+    fn finish(
+        &mut self,
+        playback: &Arc<Mutex<PlaybackState>>,
+        active: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        self.flush(playback, active)
+    }
+
+    fn flush(
+        &mut self,
+        playback: &Arc<Mutex<PlaybackState>>,
+        active: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        if self.pending.is_empty() {
+            self.item_id = None;
+            return Ok(());
+        }
+        let valid = self.pending.len().min(self.chunk_frames);
+        self.input.fill(0.0);
+        for sample in self.input.iter_mut().take(valid) {
+            *sample = self.pending.pop_front().unwrap_or_default();
+        }
+        self.process_chunk(playback, active, Some(valid))?;
+        self.item_id = None;
+        Ok(())
+    }
+
+    fn process_full_chunks(
+        &mut self,
+        playback: &Arc<Mutex<PlaybackState>>,
+        active: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        while self.pending.len() >= self.chunk_frames {
+            for sample in &mut self.input {
+                *sample = self.pending.pop_front().unwrap_or_default();
+            }
+            self.process_chunk(playback, active, None)?;
+        }
+        Ok(())
+    }
+
+    fn process_chunk(
+        &mut self,
+        playback: &Arc<Mutex<PlaybackState>>,
+        active: &Arc<AtomicBool>,
+        partial_len: Option<usize>,
+    ) -> Result<()> {
+        let input = InterleavedSlice::new(&self.input, 1, self.chunk_frames)
+            .expect("valid playback input adapter");
+        let output_capacity = self.output.len();
+        let mut output = InterleavedSlice::new_mut(&mut self.output, 1, output_capacity)
+            .expect("valid playback output adapter");
+        let indexing = partial_len.map(|length| rubato::Indexing::new().partial_len(length));
+        let (_, frames) = self
+            .resampler
+            .process_into_buffer(&input, &mut output, indexing.as_ref())
+            .context("resample assistant audio")?;
+        let item_id = self
+            .item_id
+            .clone()
+            .context("playback item id is missing")?;
+        enqueue_playback_chunk(
+            &mut playback.lock(),
+            PlaybackChunk {
+                item_id,
+                samples: self.output[..frames].to_vec(),
+                cursor: 0,
+            },
+        );
+        active.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+fn enqueue_playback_chunk(playback: &mut PlaybackState, mut chunk: PlaybackChunk) {
+    if chunk.samples.len() > MAX_PLAYBACK_SAMPLES {
+        let keep_from = chunk.samples.len() - MAX_PLAYBACK_SAMPLES;
+        chunk.samples.drain(..keep_from);
+        chunk.cursor = 0;
+    }
+    let mut queued = playback
+        .queue
+        .iter()
+        .map(|queued| queued.samples.len().saturating_sub(queued.cursor))
+        .sum::<usize>();
+    while queued.saturating_add(chunk.samples.len()) > MAX_PLAYBACK_SAMPLES {
+        let Some(dropped) = playback.queue.pop_front() else {
+            break;
+        };
+        queued = queued.saturating_sub(dropped.samples.len().saturating_sub(dropped.cursor));
+    }
+    playback.queue.push_back(chunk);
+}
+
+trait MicrophoneCapture {
+    fn play(&self) -> Result<()>;
+    fn pause(&self) -> Result<()>;
+    fn try_input(&self) -> Option<AudioInputEvent>;
+}
+
+struct CpalMicrophoneCapture {
+    stream: Stream,
+    input: Receiver<AudioInputEvent>,
+}
+
+impl MicrophoneCapture for CpalMicrophoneCapture {
+    fn play(&self) -> Result<()> {
+        self.stream.play().context("start microphone stream")
+    }
+
+    fn pause(&self) -> Result<()> {
+        self.stream.pause().context("pause microphone stream")
+    }
+
+    fn try_input(&self) -> Option<AudioInputEvent> {
+        self.input.try_recv().ok()
+    }
+}
+
+type MicrophoneFactory = Box<dyn FnMut() -> Result<Box<dyn MicrophoneCapture>>>;
+
+struct LazyMicrophone {
+    capture: Option<Box<dyn MicrophoneCapture>>,
+    factory: MicrophoneFactory,
+    enabled: bool,
+}
+
+impl LazyMicrophone {
+    fn new(factory: MicrophoneFactory) -> Self {
+        Self {
+            capture: None,
+            factory,
+            enabled: false,
+        }
+    }
+
+    fn try_input(&self) -> Option<AudioInputEvent> {
+        self.capture
+            .as_ref()
+            .and_then(|capture| capture.try_input())
+    }
+
+    fn set_enabled(&mut self, enabled: bool) -> Result<()> {
+        if self.enabled == enabled {
+            return Ok(());
+        }
+        if enabled {
+            if self.capture.is_none() {
+                self.capture = Some((self.factory)()?);
+            }
+            self.capture
+                .as_ref()
+                .expect("microphone capture was initialized")
+                .play()?;
+        } else if let Some(capture) = self.capture.as_ref() {
+            capture.pause()?;
+        }
+        self.enabled = enabled;
+        Ok(())
+    }
+}
+
+pub(crate) struct AudioSystem {
+    microphone: LazyMicrophone,
+    _output_stream: Stream,
+    playback: Arc<Mutex<PlaybackState>>,
+    playback_active: Arc<AtomicBool>,
+    output_resampler: Mutex<OutputResampler>,
+    output_rate: u32,
+}
+
+impl std::fmt::Debug for AudioSystem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AudioSystem")
+            .field("playback_active", &self.playback_active())
+            .field("output_rate", &self.output_rate)
+            .field("input_enabled", &self.microphone.enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AudioSystem {
+    pub(crate) fn start() -> Result<Self> {
+        let host = cpal::default_host();
+        let output_device = host
+            .default_output_device()
+            .context("no default audio output")?;
+        let output_supported = output_device
+            .default_output_config()
+            .context("read default output configuration")?;
+        let output_format = output_supported.sample_format();
+        let output_config: StreamConfig = output_supported.into();
+
+        let playback = Arc::new(Mutex::new(PlaybackState::default()));
+        let playback_active = Arc::new(AtomicBool::new(false));
+        let output_stream = build_output_stream(
+            &output_device,
+            &output_config,
+            output_format,
+            Arc::clone(&playback),
+            Arc::clone(&playback_active),
+        )?;
+        output_stream.play().context("start audio output stream")?;
+        let output_rate = output_config.sample_rate;
+        Ok(Self {
+            microphone: LazyMicrophone::new(Box::new(build_default_microphone)),
+            _output_stream: output_stream,
+            playback,
+            playback_active,
+            output_resampler: Mutex::new(OutputResampler::new(output_rate)?),
+            output_rate,
+        })
+    }
+
+    pub(crate) fn try_input(&self) -> Option<AudioInputEvent> {
+        self.microphone.try_input()
+    }
+
+    pub(crate) fn set_mic_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.microphone.set_enabled(enabled)
+    }
+
+    pub(crate) fn push_output(&self, item_id: &str, samples: &[i16]) -> Result<()> {
+        self.output_resampler
+            .lock()
+            .push(item_id, samples, &self.playback, &self.playback_active)
+    }
+
+    pub(crate) fn finish_output(&self) -> Result<()> {
+        self.output_resampler
+            .lock()
+            .finish(&self.playback, &self.playback_active)
+    }
+
+    pub(crate) fn playback_active(&self) -> bool {
+        self.playback_active.load(Ordering::Acquire)
+    }
+    /// `(played_ms, total_ms)` for the item currently playing. `total` grows as
+    /// more audio streams in, so callers must treat the fraction as monotonic
+    /// only after clamping.
+    pub(crate) fn playback_progress(&self) -> Option<(u64, u64)> {
+        if !self.playback_active() {
+            return None;
+        }
+        let playback = self.playback.lock();
+        let current = playback
+            .current_item_id
+            .clone()
+            .or_else(|| playback.queue.front().map(|chunk| chunk.item_id.clone()))?;
+        let queued: u64 = playback
+            .queue
+            .iter()
+            .filter(|chunk| chunk.item_id == current)
+            .map(|chunk| u64::try_from(chunk.samples.len() - chunk.cursor).unwrap_or_default())
+            .sum();
+        let rate = u64::from(self.output_rate);
+        let played_ms = playback.played_device_frames.saturating_mul(1_000) / rate;
+        let total_ms = playback
+            .played_device_frames
+            .saturating_add(queued)
+            .saturating_mul(1_000)
+            / rate;
+        Some((played_ms, total_ms))
+    }
+
+    pub(crate) fn stop_and_clear(&self) -> (Option<String>, u64) {
+        self.output_resampler.lock().pending.clear();
+        let mut playback = self.playback.lock();
+        playback.queue.clear();
+        let item_id = playback.current_item_id.take();
+        let played_ms =
+            playback.played_device_frames.saturating_mul(1_000) / u64::from(self.output_rate);
+        playback.played_device_frames = 0;
+        self.playback_active.store(false, Ordering::Release);
+        (item_id, played_ms)
+    }
+}
+
+fn build_default_microphone() -> Result<Box<dyn MicrophoneCapture>> {
+    let input_device = cpal::default_host()
+        .default_input_device()
+        .context("no default microphone")?;
+    let input_supported = input_device
+        .default_input_config()
+        .context("read default microphone configuration")?;
+    let input_format = input_supported.sample_format();
+    let input_config: StreamConfig = input_supported.into();
+    let (sender, input) = std::sync::mpsc::sync_channel(AUDIO_CHANNEL_CAPACITY);
+    let processor =
+        InputProcessor::new(input_config.sample_rate, usize::from(input_config.channels))?;
+    let stream = build_input_stream(
+        &input_device,
+        &input_config,
+        input_format,
+        processor,
+        sender,
+    )?;
+    Ok(Box::new(CpalMicrophoneCapture { stream, input }))
+}
+
+fn build_input_stream(
+    device: &Device,
+    config: &StreamConfig,
+    format: SampleFormat,
+    processor: InputProcessor,
+    sender: SyncSender<AudioInputEvent>,
+) -> Result<Stream> {
+    match format {
+        SampleFormat::F32 => input_stream::<f32>(device, config, processor, sender, |value| value),
+        SampleFormat::I16 => input_stream::<i16>(device, config, processor, sender, |value| {
+            f32::from(value) / f32::from(i16::MAX)
+        }),
+        SampleFormat::U16 => input_stream::<u16>(device, config, processor, sender, |value| {
+            (f32::from(value) - 32_768.0) / 32_768.0
+        }),
+        unsupported => bail!("unsupported microphone sample format {unsupported}"),
+    }
+}
+
+fn input_stream<T: SizedSample + Copy + Send + 'static>(
+    device: &Device,
+    config: &StreamConfig,
+    mut processor: InputProcessor,
+    sender: SyncSender<AudioInputEvent>,
+    convert: fn(T) -> f32,
+) -> Result<Stream> {
+    let error_sender = sender.clone();
+    device
+        .build_input_stream(
+            *config,
+            move |data: &[T], _| processor.process(data, convert, &sender),
+            move |error| {
+                let _ = error_sender.try_send(AudioInputEvent::Error(format!(
+                    "microphone stream: {error}"
+                )));
+            },
+            None,
+        )
+        .context("build microphone stream")
+}
+
+fn build_output_stream(
+    device: &Device,
+    config: &StreamConfig,
+    format: SampleFormat,
+    playback: Arc<Mutex<PlaybackState>>,
+    active: Arc<AtomicBool>,
+) -> Result<Stream> {
+    match format {
+        SampleFormat::F32 => {
+            output_stream::<f32>(device, config, playback, active, std::convert::identity)
+        }
+        SampleFormat::I16 => {
+            output_stream::<i16>(device, config, playback, active, normalized_to_i16)
+        }
+        SampleFormat::U16 => {
+            output_stream::<u16>(device, config, playback, active, normalized_to_u16)
+        }
+        unsupported => bail!("unsupported output sample format {unsupported}"),
+    }
+}
+
+fn output_stream<T: SizedSample + Copy + Send + 'static>(
+    device: &Device,
+    config: &StreamConfig,
+    playback: Arc<Mutex<PlaybackState>>,
+    active: Arc<AtomicBool>,
+    convert: fn(f32) -> T,
+) -> Result<Stream> {
+    let channels = usize::from(config.channels);
+    let error_active = Arc::clone(&active);
+    device
+        .build_output_stream(
+            *config,
+            move |data: &mut [T], _| {
+                let mut playback = playback.lock();
+                for frame in data.chunks_mut(channels) {
+                    while playback
+                        .queue
+                        .front()
+                        .is_some_and(|chunk| chunk.cursor >= chunk.samples.len())
+                    {
+                        playback.queue.pop_front();
+                    }
+                    let next_item_id = playback.queue.front().and_then(|chunk| {
+                        (playback.current_item_id.as_deref() != Some(chunk.item_id.as_str()))
+                            .then(|| chunk.item_id.clone())
+                    });
+                    if let Some(item_id) = next_item_id {
+                        playback.current_item_id = Some(item_id);
+                        playback.played_device_frames = 0;
+                    }
+                    let next = playback.queue.front_mut().map(|chunk| {
+                        let sample = chunk.samples[chunk.cursor];
+                        chunk.cursor += 1;
+                        sample
+                    });
+                    let sample = if let Some(sample) = next {
+                        playback.played_device_frames =
+                            playback.played_device_frames.saturating_add(1);
+                        sample
+                    } else {
+                        active.store(false, Ordering::Release);
+                        0.0
+                    };
+                    frame.fill(convert(sample));
+                }
+            },
+            move |_error| {
+                error_active.store(false, Ordering::Release);
+            },
+            None,
+        )
+        .context("build audio output stream")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn microphone_factory_is_lazy_until_explicit_enable() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct FakeCapture {
+            plays: Arc<AtomicUsize>,
+        }
+
+        impl MicrophoneCapture for FakeCapture {
+            fn play(&self) -> Result<()> {
+                self.plays.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn pause(&self) -> Result<()> {
+                Ok(())
+            }
+
+            fn try_input(&self) -> Option<AudioInputEvent> {
+                None
+            }
+        }
+
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let plays = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&factory_calls);
+        let played = Arc::clone(&plays);
+        let mut microphone = LazyMicrophone::new(Box::new(move || {
+            called.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeCapture {
+                plays: Arc::clone(&played),
+            }))
+        }));
+
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        microphone.set_enabled(false).unwrap();
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+
+        microphone.set_enabled(true).unwrap();
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(plays.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn playback_queue_drops_oldest_audio_at_the_memory_bound() {
+        let mut playback = PlaybackState::default();
+        for index in 0..4 {
+            enqueue_playback_chunk(
+                &mut playback,
+                PlaybackChunk {
+                    item_id: format!("item-{index}"),
+                    samples: vec![0.0; MAX_PLAYBACK_SAMPLES / 2],
+                    cursor: 0,
+                },
+            );
+        }
+        let queued = playback
+            .queue
+            .iter()
+            .map(|chunk| chunk.samples.len().saturating_sub(chunk.cursor))
+            .sum::<usize>();
+        assert!(queued <= MAX_PLAYBACK_SAMPLES);
+        assert_eq!(playback.queue.front().unwrap().item_id, "item-2");
+    }
+}

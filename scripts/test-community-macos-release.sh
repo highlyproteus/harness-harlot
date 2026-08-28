@@ -82,6 +82,18 @@ printf '********************************' | base64 > "$key"
 chmod 600 "$key"
 cargo build --locked --release -p hh-release-signer --bin hh-release-sign
 public_key=$("$repository_root/target/release/hh-release-sign" public-key --private-key "$key")
+
+unsigned_distribution=$(
+  HH_RELEASE_TEST_MODE=1 \
+  HH_RELEASE_BUILD=1 \
+  HH_ALLOW_DIRTY_TEST_PACKAGE=1 \
+  HH_RELEASE_UNSIGNED=1 \
+  "$repository_root/scripts/package-macos-release.sh" "$version" 1 --community | sed -n '$p'
+)
+unsigned_manifest="$unsigned_distribution/manifest-macos-community-${architecture}-v2.update.json"
+[ -f "$unsigned_manifest" ]
+[ ! -e "$unsigned_manifest.sig" ]
+
 distribution=$(
   HH_RELEASE_TEST_MODE=1 \
   HH_RELEASE_BUILD=1 \
@@ -95,10 +107,10 @@ case "$(basename "$distribution")" in
   TESTONLY-Harness-Harlot-"$version"-b1-macos-"$architecture"-community) ;;
   *) echo "community fixture artifact name is not isolated" >&2; exit 1 ;;
 esac
-manifest="$distribution/manifest-macos-community-${architecture}.update.json"
+manifest="$distribution/manifest-macos-community-${architecture}-v2.update.json"
 [ -f "$manifest" ]
 [ -f "$manifest.sig" ]
-[ ! -e "$distribution/manifest-macos-${architecture}.update.json" ]
+[ ! -e "$distribution/manifest-macos-${architecture}-v2.update.json" ]
 artifact=$(plutil -extract artifacts.0.file_name raw -o - "$manifest")
 case "$artifact" in
   *-macos-"$architecture"-community.dmg) ;;

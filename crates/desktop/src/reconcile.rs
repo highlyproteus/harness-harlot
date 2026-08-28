@@ -214,8 +214,13 @@ mod tests {
         SessionState {
             stream_client: Arc::new(Mutex::new(None)),
             control_client: Arc::new(Mutex::new(None)),
-            stream_tx: futures::channel::mpsc::unbounded().0,
-            control_tx: futures::channel::mpsc::unbounded().0,
+            input_client: Arc::new(Mutex::new(None)),
+            stream_tx: crate::pipeline::bounded_lane(crate::pipeline::STREAM_PIPELINE_CAPACITY).0,
+            control_tx: crate::pipeline::bounded_lane(crate::pipeline::CONTROL_PIPELINE_CAPACITY).0,
+            terminal_input_tx: crate::pipeline::terminal_input_channel(
+                crate::pipeline::TERMINAL_INPUT_CAPACITY_BYTES,
+            )
+            .0,
             poll_wake_tx: futures::channel::mpsc::channel(1).0,
             snapshot: None,
             screens: HashMap::new(),

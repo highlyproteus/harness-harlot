@@ -1,0 +1,15 @@
+[package]
+name = "hh-session-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reusable client for the local Harness Harlot session service"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+hh-protocol = { path = "../protocol" }
+
+[lints]
+workspace = true

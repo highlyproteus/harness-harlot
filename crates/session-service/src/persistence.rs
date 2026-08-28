@@ -9,12 +9,13 @@ use anyhow::{Context, Result, bail};
 use hh_protocol::{
     AppearanceColor, AppearanceSettings, MAX_BROWSER_URL_LEN, Pane, PaneKind, PaneLayout,
     SessionSnapshot, SplitAxis, Tab, TerminalIdentity, TerminalProfile, Workspace,
-    WorkspaceConnection, WorkspaceConnectionStatus, validate_ssh_host, validate_workspace_dir,
+    WorkspaceConnection, WorkspaceConnectionStatus, WorkspaceKind, validate_ssh_host,
+    validate_workspace_dir,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 10;
+const SCHEMA_VERSION: u16 = 12;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 pub(crate) const MAX_WORKSPACES: usize = 16;
@@ -23,6 +24,7 @@ const MAX_PANES: usize = 32;
 const MAX_LAYOUT_DEPTH: usize = 16;
 pub(crate) const MAX_TITLE_CHARS: usize = 80;
 const MAX_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_INSTRUCTIONS_CHARS: usize = 4096;
 pub(crate) const MAX_RECENT_COLORS: usize = 8;
 
 #[derive(Clone, Debug)]
@@ -252,6 +254,12 @@ struct DesiredWorkspace {
     connection: WorkspaceConnection,
     #[serde(default)]
     working_dir: Option<String>,
+    #[serde(default)]
+    kind: WorkspaceKind,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    custom_icon: Option<String>,
     tabs: Vec<DesiredTab>,
 }
 
@@ -342,6 +350,9 @@ impl DesiredState {
                         }
                     },
                     working_dir: workspace.working_dir.clone(),
+                    kind: workspace.kind,
+                    instructions: workspace.instructions.clone(),
+                    custom_icon: workspace.custom_icon.clone(),
                     tabs: workspace
                         .tabs
                         .iter()
@@ -409,6 +420,9 @@ impl DesiredState {
                     }
                 },
                 working_dir: workspace.working_dir,
+                kind: workspace.kind,
+                instructions: workspace.instructions,
+                custom_icon: workspace.custom_icon,
                 tabs: workspace
                     .tabs
                     .into_iter()
@@ -432,6 +446,7 @@ impl DesiredState {
             snapshot: SessionSnapshot {
                 revision: self.revision.saturating_add(1),
                 appearance,
+                terminal_transports: std::collections::HashMap::new(),
                 workspaces,
             },
             cwd_by_pane,
@@ -465,6 +480,16 @@ impl DesiredState {
             }
             if let Some(working_dir) = &workspace.working_dir {
                 validate_workspace_dir(working_dir).map_err(anyhow::Error::from)?;
+            }
+            if let Some(icon) = &workspace.custom_icon {
+                validate_custom_icon_id(icon)?;
+            }
+            if workspace
+                .instructions
+                .as_deref()
+                .is_some_and(|instructions| instructions.chars().count() > MAX_INSTRUCTIONS_CHARS)
+            {
+                bail!("assistant instructions too long");
             }
             if workspace.tabs.len() > MAX_TABS_PER_WORKSPACE {
                 bail!("workstation must contain at most {MAX_TABS_PER_WORKSPACE} tabs");
@@ -647,7 +672,7 @@ impl DesiredPane {
                 .clone()
                 .unwrap_or_else(|| match &pane.kind {
                     PaneKind::Terminal => "Terminal".to_owned(),
-                    PaneKind::Browser { .. } => pane.title.clone(),
+                    PaneKind::Browser { .. } | PaneKind::Assistant => pane.title.clone(),
                 }),
             color: pane.color,
             custom_title: pane.custom_title.clone(),
@@ -680,7 +705,7 @@ impl DesiredPane {
                 PaneKind::Terminal => self
                     .profile_override
                     .map(|profile| profile.display_name().to_owned()),
-                PaneKind::Browser { .. } => Some(self.title.clone()),
+                PaneKind::Browser { .. } | PaneKind::Assistant => Some(self.title.clone()),
             })
             .unwrap_or_else(|| "Terminal".to_owned());
         Pane {
@@ -690,6 +715,7 @@ impl DesiredPane {
             shell: String::new(),
             color: self.color,
             identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title,
             profile_override: self.profile_override,
             custom_icon: self.custom_icon,
@@ -723,6 +749,11 @@ impl DesiredPane {
                 }
                 if self.local_cwd.is_some() {
                     bail!("browser panes may not persist terminal CWD metadata");
+                }
+            }
+            PaneKind::Assistant => {
+                if self.local_cwd.is_some() {
+                    bail!("assistant panes may not persist terminal CWD metadata");
                 }
             }
         }
@@ -860,6 +891,80 @@ mod tests {
     }
 
     #[test]
+    fn assistant_workspace_metadata_and_pane_round_trip() {
+        let directory = test_directory("assistant-workspace");
+        let store = SnapshotStore::new(directory.join("sessions.json"));
+        let mut snapshot = SessionSnapshot::seeded();
+        let workspace_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        snapshot.workspaces.push(Workspace {
+            id: workspace_id,
+            title: "Research".to_owned(),
+            color: None,
+            pinned: false,
+            pin_order: 0,
+            order: 2,
+            active_terminal_count: 0,
+            connection: WorkspaceConnection::Local,
+            working_dir: Some("/tmp".to_owned()),
+            kind: WorkspaceKind::Assistant,
+            instructions: Some("Answer tersely".to_owned()),
+            custom_icon: Some("00000000-0000-4000-8000-000000000004.png".to_owned()),
+            tabs: vec![Tab {
+                id: Uuid::new_v4(),
+                title: "Thread 1".to_owned(),
+                custom_title: None,
+                project_dir: None,
+                color: None,
+                custom_icon: None,
+                parent_tab: None,
+                pinned: false,
+                layout: PaneLayout::Leaf {
+                    pane: Pane {
+                        id: pane_id,
+                        kind: PaneKind::Assistant,
+                        title: "Assistant".to_owned(),
+                        shell: String::new(),
+                        color: None,
+                        identity: TerminalIdentity::default(),
+                        status: hh_protocol::PaneStatus::default(),
+                        custom_title: None,
+                        profile_override: None,
+                        custom_icon: None,
+                    },
+                },
+            }],
+        });
+
+        store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
+        let recovered = store.load().unwrap();
+        let workspace = recovered
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("recovered assistant workspace");
+        assert_eq!(workspace.kind, WorkspaceKind::Assistant);
+        assert_eq!(workspace.instructions.as_deref(), Some("Answer tersely"));
+        assert_eq!(
+            workspace.custom_icon.as_deref(),
+            Some("00000000-0000-4000-8000-000000000004.png")
+        );
+        assert!(matches!(
+            &workspace.tabs[0].layout,
+            PaneLayout::Leaf {
+                pane: Pane {
+                    id,
+                    kind: PaneKind::Assistant,
+                    ..
+                }
+            } if *id == pane_id
+        ));
+        assert!(!recovered.cwd_by_pane.contains_key(&pane_id));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn ssh_workspace_layout_recovers_offline_without_runtime_or_secret_material() {
         let directory = test_directory("ssh-layout");
         let path = directory.join("sessions.json");
@@ -877,6 +982,7 @@ mod tests {
             shell: "ssh".to_owned(),
             color: None,
             identity: TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -978,6 +1084,7 @@ mod tests {
             profile: TerminalProfile::Claude,
             source: hh_protocol::TerminalIdentitySource::Command,
         };
+        pane.status = hh_protocol::PaneStatus::Working;
         pane.custom_title = Some("Release shell".to_owned());
         pane.profile_override = Some(TerminalProfile::Gemini);
         pane.custom_icon = Some("00000000-0000-4000-8000-000000000001.png".to_owned());
@@ -1011,6 +1118,7 @@ mod tests {
             Some("00000000-0000-4000-8000-000000000001.png")
         );
         assert_eq!(recovered_pane.identity, TerminalIdentity::default());
+        assert_eq!(recovered_pane.status, hh_protocol::PaneStatus::Idle);
 
         let old: DesiredState = serde_json::from_str(
             r#"{
@@ -1224,5 +1332,21 @@ mod tests {
             second: Box::new(DesiredLayout::Leaf { pane }),
         };
         assert!(desired.validate().is_err());
+    }
+
+    #[test]
+    fn overlong_assistant_instructions_are_rejected() {
+        let snapshot = SessionSnapshot::seeded();
+        let mut desired =
+            DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot), &HashSet::new()).unwrap();
+        desired.workspaces[0].kind = WorkspaceKind::Assistant;
+        desired.workspaces[0].instructions = Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1));
+        assert!(
+            desired
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("assistant instructions too long")
+        );
     }
 }

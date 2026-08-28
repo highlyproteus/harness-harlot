@@ -31,6 +31,10 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [async_zip 0.0.17](https://github.com/Majored/rs-async-zip) — MIT
 - [atomic 0.5.3](https://github.com/Amanieu/atomic-rs) — Apache-2.0 OR MIT
 - [atomic-waker 1.1.2](https://github.com/smol-rs/atomic-waker) — Apache-2.0 OR MIT
+- [audio-codec-algorithms 0.8.1](https://github.com/karip/audio-codec-algorithms) — 0BSD OR Apache-2.0
+- [audioadapter 5.0.0](https://github.com/HEnquist/audioadapter-rs) — MIT OR Apache-2.0
+- [audioadapter-buffers 5.2.0](https://github.com/HEnquist/audioadapter-buffers-rs) — MIT OR Apache-2.0
+- [audioadapter-sample 5.2.0](https://github.com/HEnquist/audioadapter-sample-rs) — MIT OR Apache-2.0
 - [autocfg 1.5.1](https://github.com/cuviper/autocfg) — Apache-2.0 OR MIT
 - [av-scenechange 0.14.1](https://github.com/rust-av/av-scenechange) — MIT
 - [av1-grain 0.2.5](https://github.com/rust-av/av1-grain) — BSD-2-Clause
@@ -65,6 +69,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [cfg_aliases 0.1.1](https://github.com/katharostech/cfg_aliases) — MIT
 - [cfg_aliases 0.2.2](https://github.com/katharostech/cfg_aliases) — MIT
 - [cgl 0.3.2](https://github.com/servo/cgl-rs) — MIT  OR  Apache-2.0
+- [chacha20 0.10.2](https://github.com/RustCrypto/stream-ciphers) — MIT OR Apache-2.0
 - [clang-sys 1.9.1](https://github.com/KyleMayes/clang-sys) — Apache-2.0
 - [cocoa 0.26.0](https://github.com/servo/core-foundation-rs) — MIT OR Apache-2.0
 - [cocoa-foundation 0.2.0](https://github.com/servo/core-foundation-rs) — MIT OR Apache-2.0
@@ -86,6 +91,8 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [core-text 21.0.0](https://github.com/servo/core-foundation-rs) — MIT OR Apache-2.0
 - [core-video 0.4.3](https://github.com/rust-media/apple-media-rs) — MIT OR Apache-2.0
 - [core_maths 0.1.1](https://github.com/robertbastian/core_maths) — MIT
+- [coreaudio-rs 0.14.2](https://github.com/RustAudio/coreaudio-rs.git) — MIT OR Apache-2.0
+- [cpal 0.18.2](https://github.com/RustAudio/cpal) — Apache-2.0
 - [cpufeatures 0.2.17](https://github.com/RustCrypto/utils) — MIT OR Apache-2.0
 - [cpufeatures 0.3.0](https://github.com/RustCrypto/utils) — MIT OR Apache-2.0
 - [crc32fast 1.5.0](https://github.com/srijs/rust-crc32fast) — MIT OR Apache-2.0
@@ -100,6 +107,8 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [cursor-icon 1.2.0](https://github.com/rust-windowing/cursor-icon) — MIT OR Apache-2.0 OR Zlib
 - [curve25519-dalek 4.1.3](https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek) — BSD-3-Clause
 - [curve25519-dalek-derive 0.1.1](https://github.com/dalek-cryptography/curve25519-dalek) — MIT OR Apache-2.0
+- [dasp_sample 0.11.0](https://github.com/rustaudio/sample.git) — MIT OR Apache-2.0
+- [data-encoding 2.11.1](https://github.com/ia0/data-encoding) — MIT
 - [data-url 0.3.2](https://github.com/servo/rust-url) — MIT OR Apache-2.0
 - [deflate64 0.1.12](https://github.com/anatawa12/deflate64-rs) — MIT
 - [deranged 0.5.8](https://github.com/jhpratt/deranged) — MIT OR Apache-2.0
@@ -110,6 +119,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [dirs 5.0.1](https://github.com/soc/dirs-rs) — MIT OR Apache-2.0
 - [dirs-sys 0.3.7](https://github.com/dirs-dev/dirs-sys-rs) — MIT OR Apache-2.0
 - [dirs-sys 0.4.1](https://github.com/dirs-dev/dirs-sys-rs) — MIT OR Apache-2.0
+- [dispatch2 0.3.1](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
 - [displaydoc 0.2.7](https://github.com/yaahc/displaydoc) — MIT OR Apache-2.0
 - [downcast-rs 1.2.1](https://github.com/marcianx/downcast-rs) — MIT OR Apache-2.0
 - [dtor 0.0.6](https://github.com/mmastrac/rust-ctor) — Apache-2.0 OR MIT
@@ -186,14 +196,16 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [heck 0.4.1](https://github.com/withoutboats/heck) — MIT OR Apache-2.0
 - [heck 0.5.0](https://github.com/withoutboats/heck) — MIT OR Apache-2.0
 - [hexf-parse 0.2.1](https://github.com/lifthrasiir/hexf) — CC0-1.0
-- [hh-cef-view 0.1.13](https://crates.io/crates/hh-cef-view) — MIT
-- [hh-desktop 0.1.13](https://crates.io/crates/hh-desktop) — MIT
-- [hh-macos-icon 0.1.13](https://crates.io/crates/hh-macos-icon) — MIT
-- [hh-protocol 0.1.13](https://crates.io/crates/hh-protocol) — MIT
-- [hh-release-signer 0.1.13](https://crates.io/crates/hh-release-signer) — MIT
-- [hh-session-service 0.1.13](https://crates.io/crates/hh-session-service) — MIT
-- [hh-terminal-model 0.1.13](https://crates.io/crates/hh-terminal-model) — MIT
-- [hh-updater 0.1.13](https://crates.io/crates/hh-updater) — MIT
+- [hh-cef-view 0.1.14](https://crates.io/crates/hh-cef-view) — MIT
+- [hh-desktop 0.1.14](https://crates.io/crates/hh-desktop) — MIT
+- [hh-macos-icon 0.1.14](https://crates.io/crates/hh-macos-icon) — MIT
+- [hh-protocol 0.1.14](https://crates.io/crates/hh-protocol) — MIT
+- [hh-release-signer 0.1.14](https://crates.io/crates/hh-release-signer) — MIT
+- [hh-session-client 0.1.14](https://crates.io/crates/hh-session-client) — MIT
+- [hh-session-service 0.1.14](https://crates.io/crates/hh-session-service) — MIT
+- [hh-terminal-model 0.1.14](https://crates.io/crates/hh-terminal-model) — MIT
+- [hh-updater 0.1.14](https://crates.io/crates/hh-updater) — MIT
+- [hh-voice 0.1.14](https://crates.io/crates/hh-voice) — MIT
 - [hidden-trait 0.1.2](https://github.com/kvark/hidden-trait) — MIT
 - [home 0.5.12](https://github.com/rust-lang/cargo) — MIT OR Apache-2.0
 - [http 1.5.0](https://github.com/hyperium/http) — MIT OR Apache-2.0
@@ -242,6 +254,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [lyon_geom 1.0.19](https://github.com/nical/lyon) — MIT OR Apache-2.0
 - [lyon_path 1.0.19](https://github.com/nical/lyon) — MIT OR Apache-2.0
 - [lyon_tessellation 1.0.20](https://github.com/nical/lyon) — MIT OR Apache-2.0
+- [mach2 0.6.0](https://github.com/JohnTitor/mach2) — BSD-2-Clause OR MIT OR Apache-2.0
 - [malloc_buf 0.0.6](https://github.com/SSheldon/malloc_buf) — MIT
 - [maybe-rayon 0.1.1](https://github.com/shssoichiro/maybe-rayon) — MIT
 - [memchr 2.8.3](https://github.com/BurntSushi/memchr) — Unlicense OR MIT
@@ -271,10 +284,14 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [num-rational 0.4.2](https://github.com/rust-num/num-rational) — MIT OR Apache-2.0
 - [num-traits 0.2.19](https://github.com/rust-num/num-traits) — MIT OR Apache-2.0
 - [num_cpus 1.17.0](https://github.com/seanmonstar/num_cpus) — MIT OR Apache-2.0
+- [num_threads 0.1.7](https://github.com/jhpratt/num_threads) — MIT OR Apache-2.0
 - [objc 0.2.7](http://github.com/SSheldon/rust-objc) — MIT
 - [objc2 0.6.4](https://github.com/madsmtm/objc2) — MIT
 - [objc2-app-kit 0.3.2](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
+- [objc2-audio-toolbox 0.3.2](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
 - [objc2-cloud-kit 0.3.2](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
+- [objc2-core-audio 0.3.2](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
+- [objc2-core-audio-types 0.3.2](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
 - [objc2-core-data 0.3.2](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
 - [objc2-core-foundation 0.3.2](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
 - [objc2-core-graphics 0.3.2](https://github.com/madsmtm/objc2) — Zlib OR Apache-2.0 OR MIT
@@ -311,6 +328,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [potential_utf 0.1.5](https://github.com/unicode-org/icu4x) — Unicode-3.0
 - [powerfmt 0.2.0](https://github.com/jhpratt/powerfmt) — MIT OR Apache-2.0
 - [prettyplease 0.2.37](https://github.com/dtolnay/prettyplease) — MIT OR Apache-2.0
+- [primal-check 0.3.4](https://github.com/huonw/primal) — MIT OR Apache-2.0
 - [proc-macro-error-attr2 2.0.0](https://github.com/GnomedDev/proc-macro-error-2) — MIT OR Apache-2.0
 - [proc-macro-error2 2.0.1](https://github.com/GnomedDev/proc-macro-error-2) — MIT OR Apache-2.0
 - [proc-macro2 1.0.107](https://github.com/dtolnay/proc-macro2) — MIT OR Apache-2.0
@@ -323,12 +341,15 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [qoi 0.4.1](https://github.com/aldanor/qoi-rust) — MIT OR Apache-2.0
 - [quick-error 2.0.1](http://github.com/tailhook/quick-error) — MIT OR Apache-2.0
 - [quote 1.0.47](https://github.com/dtolnay/quote) — MIT OR Apache-2.0
+- [rand 0.10.2](https://github.com/rust-random/rand) — MIT OR Apache-2.0
+- [rand_core 0.10.1](https://github.com/rust-random/rand_core) — MIT OR Apache-2.0
 - [rav1e 0.8.1](https://github.com/xiph/rav1e/) — BSD-2-Clause
 - [ravif 0.13.0](https://github.com/kornelski/cavif-rs) — BSD-3-Clause
 - [raw-cpuid 11.6.0](https://github.com/gz/rust-cpuid) — MIT
 - [raw-window-handle 0.6.2](https://github.com/rust-windowing/raw-window-handle) — MIT OR Apache-2.0 OR Zlib
 - [rayon 1.12.0](https://github.com/rayon-rs/rayon) — MIT OR Apache-2.0
 - [rayon-core 1.13.0](https://github.com/rayon-rs/rayon) — MIT OR Apache-2.0
+- [realfft 3.5.0](https://github.com/HEnquist/realfft) — MIT
 - [reborrow 0.5.5](https://github.com/sarah-ek/reborrow/) — MIT
 - [ref-cast 1.0.26](https://github.com/dtolnay/ref-cast) — MIT OR Apache-2.0
 - [ref-cast-impl 1.0.26](https://github.com/dtolnay/ref-cast) — MIT OR Apache-2.0
@@ -339,12 +360,14 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [rgb 0.8.53](https://github.com/kornelski/rust-rgb) — MIT
 - [ring 0.17.14](https://github.com/briansmith/ring) — Apache-2.0 AND ISC
 - [roxmltree 0.20.0](https://github.com/RazrFalcon/roxmltree) — MIT OR Apache-2.0
+- [rubato 5.0.0](https://github.com/HEnquist/rubato) — MIT OR Apache-2.0
 - [rust-embed 8.12.0](https://pyrossh.dev/repos/rust-embed) — MIT
 - [rust-embed-impl 8.12.0](https://pyrossh.dev/repos/rust-embed) — MIT
 - [rust-embed-utils 8.12.0](https://pyrossh.dev/repos/rust-embed) — MIT
 - [rustc-hash 1.1.0](https://github.com/rust-lang-nursery/rustc-hash) — Apache-2.0 OR MIT
 - [rustc-hash 2.1.3](https://github.com/rust-lang/rustc-hash) — Apache-2.0 OR MIT
 - [rustc_version 0.4.1](https://github.com/djc/rustc-version-rs) — MIT OR Apache-2.0
+- [rustfft 6.4.1](https://github.com/ejmahler/RustFFT) — MIT OR Apache-2.0
 - [rustix 0.38.44](https://github.com/bytecodealliance/rustix) — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 - [rustix 1.1.4](https://github.com/bytecodealliance/rustix) — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 - [rustix-openpty 0.2.0](https://github.com/sunfishcode/rustix-openpty) — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
@@ -374,6 +397,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [serde_spanned 0.6.9](https://github.com/toml-rs/toml) — MIT OR Apache-2.0
 - [serde_urlencoded 0.7.1](https://github.com/nox/serde_urlencoded) — MIT OR Apache-2.0
 - [serial2 0.2.38](https://github.com/de-vri-es/serial2-rs) — BSD-2-Clause OR Apache-2.0
+- [sha1 0.11.0](https://github.com/RustCrypto/hashes) — MIT OR Apache-2.0
 - [sha1_smol 1.0.1](https://github.com/mitsuhiko/sha1-smol) — BSD-3-Clause
 - [sha2 0.10.9](https://github.com/RustCrypto/hashes) — MIT OR Apache-2.0
 - [sha2 0.11.0](https://github.com/RustCrypto/hashes) — MIT OR Apache-2.0
@@ -397,6 +421,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [stacksafe 0.1.4](https://github.com/fast/stacksafe) — Apache-2.0
 - [stacksafe-macro 0.1.4](https://github.com/fast/stacksafe) — Apache-2.0
 - [static_assertions 1.1.0](https://github.com/nvzqz/static-assertions-rs) — MIT OR Apache-2.0
+- [strength_reduce 0.2.4](http://github.com/ejmahler/strength_reduce) — MIT OR Apache-2.0
 - [strict-num 0.1.1](https://github.com/RazrFalcon/strict-num) — MIT
 - [strum 0.26.3](https://github.com/Peternator7/strum) — MIT
 - [strum 0.27.2](https://github.com/Peternator7/strum) — MIT
@@ -435,6 +460,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [tokio-macros 2.7.2](https://github.com/tokio-rs/tokio) — MIT
 - [tokio-rustls 0.26.4](https://github.com/rustls/tokio-rustls) — MIT OR Apache-2.0
 - [tokio-socks 0.5.3](https://github.com/sticnarf/tokio-socks) — MIT
+- [tokio-tungstenite 0.30.0](https://github.com/snapview/tokio-tungstenite) — MIT
 - [tokio-util 0.7.19](https://github.com/tokio-rs/tokio) — MIT
 - [toml 0.8.23](https://github.com/toml-rs/toml) — MIT OR Apache-2.0
 - [toml_datetime 0.6.11](https://github.com/toml-rs/toml) — MIT OR Apache-2.0
@@ -445,8 +471,10 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [tower-service 0.3.3](https://github.com/tower-rs/tower) — MIT
 - [tracing 0.1.44](https://github.com/tokio-rs/tracing) — MIT
 - [tracing-core 0.1.36](https://github.com/tokio-rs/tracing) — MIT
+- [transpose 0.2.3](https://github.com/ejmahler/transpose) — MIT OR Apache-2.0
 - [try-lock 0.2.5](https://github.com/seanmonstar/try-lock) — MIT
 - [ttf-parser 0.25.1](https://github.com/harfbuzz/ttf-parser) — MIT OR Apache-2.0
+- [tungstenite 0.30.0](https://github.com/snapview/tungstenite-rs) — MIT OR Apache-2.0
 - [typeid 1.0.3](https://github.com/dtolnay/typeid) — MIT OR Apache-2.0
 - [typenum 1.20.1](https://github.com/paholg/typenum) — MIT OR Apache-2.0
 - [unicase 2.9.0](https://github.com/seanmonstar/unicase) — MIT OR Apache-2.0
@@ -468,6 +496,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [value-bag 1.13.2](https://github.com/sval-rs/value-bag) — Apache-2.0 OR MIT
 - [value-bag-serde1 1.13.2](https://crates.io/crates/value-bag-serde1) — Apache-2.0 OR MIT
 - [version_check 0.9.5](https://github.com/SergioBenitez/version_check) — MIT OR Apache-2.0
+- [visibility 0.1.1](https://github.com/danielhenrymantilla/visibility.rs) — Zlib OR MIT OR Apache-2.0
 - [vte 0.15.0](https://github.com/alacritty/vte) — Apache-2.0 OR MIT
 - [waker-fn 1.2.0](https://github.com/smol-rs/waker-fn) — Apache-2.0 OR MIT
 - [walkdir 2.5.0](https://github.com/BurntSushi/walkdir) — Unlicense OR MIT
@@ -476,6 +505,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [webpki-roots 1.0.9](https://github.com/rustls/webpki-roots) — CDLA-Permissive-2.0
 - [weezl 0.1.12](https://github.com/image-rs/weezl) — MIT OR Apache-2.0
 - [which 6.0.3](https://github.com/harryfei/which-rs.git) — MIT
+- [windowfunctions 0.1.1](https://github.com/HEnquist/windowfunctions-rs) — MIT
 - [winnow 0.7.15](https://github.com/winnow-rs/winnow) — MIT
 - [writeable 0.6.3](https://github.com/unicode-org/icu4x) — Unicode-3.0
 - [xattr 0.2.3](https://github.com/Stebalien/xattr) — MIT OR Apache-2.0
@@ -694,7 +724,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
       same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
-   Copyright 2023 Jacob Pratt et al.
+   Copyright 2021 Jacob Pratt
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -864,6 +894,26 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 // ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+```
+
+### BSD Zero Clause License
+
+```text
+BSD Zero Clause License
+
+Copyright (c) 2024-2025 The Contributors of Audio Codec Algorithms
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
 
 ```
 
@@ -1335,24 +1385,6 @@ the following restrictions:
     misrepresented as being the original software.
 
  3. This notice may not be removed or altered from any source distribution.
-
-```
-
-### BSD Zero Clause License
-
-```text
-Copyright (C) Jonas Schievink <jonasschievink@gmail.com>
-
-Permission to use, copy, modify, and/or distribute this software for
-any purpose with or without fee is hereby granted.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
-AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
-OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ```
 

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hh_protocol::{AppearanceColor, PaneKind, PaneLayout, SplitAxis};
+use hh_protocol::{AppearanceColor, PaneKind, PaneLayout, SplitAxis, WorkspaceKind};
 use hh_session_service::SessionRegistry;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use uuid::Uuid;
@@ -128,6 +128,164 @@ fn browser_tabs_round_trip_without_a_pty_and_reject_terminal_operations() {
             .unwrap_err()
             .to_string()
             .contains("not a terminal")
+    );
+
+    drop(recovered);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn assistant_tabs_round_trip_without_a_pty_and_reject_terminal_operations() {
+    let directory = test_directory("assistant");
+    let path = directory.join("sessions.json");
+    let registry = SessionRegistry::persistent(&path).unwrap();
+    let working_dir = directory.to_string_lossy().into_owned();
+    let (workspace_id, assistant_id) = registry
+        .create_assistant_workspace(
+            Some("Research"),
+            Some(working_dir.clone()),
+            Some("  Answer tersely  ".to_owned()),
+        )
+        .unwrap();
+    let color = AppearanceColor::new(0x12, 0x34, 0x56);
+    registry.set_pane_color(assistant_id, Some(color)).unwrap();
+    registry.rename_pane(assistant_id, "Helper").unwrap();
+    registry.set_pane_custom_icon(assistant_id, None).unwrap();
+    registry.reset_pane_identity(assistant_id).unwrap();
+    registry
+        .set_workspace_custom_icon(
+            workspace_id,
+            Some("00000000-0000-4000-8000-000000000004.png".to_owned()),
+        )
+        .unwrap();
+
+    let snapshot = registry.snapshot().unwrap();
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .expect("assistant workspace created");
+    assert_eq!(workspace.title, "Research");
+    assert_eq!(workspace.kind, WorkspaceKind::Assistant);
+    assert_eq!(workspace.instructions.as_deref(), Some("Answer tersely"));
+    assert_eq!(workspace.working_dir.as_deref(), Some(working_dir.as_str()));
+    assert_eq!(workspace.active_terminal_count, 0);
+    let tab = &workspace.tabs[0];
+    let PaneLayout::Leaf { pane } = &tab.layout else {
+        panic!("assistant pane is not a leaf");
+    };
+    assert_eq!(pane.kind, PaneKind::Assistant);
+    assert_eq!(pane.title, "Helper");
+    assert_eq!(pane.color, Some(color));
+    assert_eq!(pane.custom_title, None);
+    assert_eq!(tab.title, "Thread 1");
+    for error in [
+        registry.create_workspace_tab(workspace_id).unwrap_err(),
+        registry
+            .create_workspace_group(workspace_id, None)
+            .unwrap_err(),
+        registry
+            .create_workspace_project(workspace_id, &working_dir, None)
+            .unwrap_err(),
+        registry
+            .create_workspace_terminal(workspace_id)
+            .unwrap_err(),
+        registry.create_browser_tab(workspace_id, None).unwrap_err(),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("assistant workspaces only hold assistant threads")
+        );
+    }
+
+    let split_error = registry
+        .create_pane(assistant_id, SplitAxis::Horizontal)
+        .unwrap_err();
+    assert!(
+        split_error
+            .to_string()
+            .contains("assistant tabs cannot create terminal panes")
+    );
+    let input_error = registry.write_input(assistant_id, b"ignored").unwrap_err();
+    assert!(input_error.to_string().contains("not a terminal"));
+    let updates = registry.pane_updates(None, &[], &[], false, 0).unwrap();
+    assert!(updates.pane_states.iter().any(|state| {
+        state.pane_id == assistant_id
+            && state.revision == 0
+            && !state.subscribed
+            && !state.dirty
+            && !state.exited
+    }));
+    registry.persist().unwrap();
+    drop(registry);
+
+    let recovered = SessionRegistry::persistent(&path).unwrap();
+    let snapshot = recovered.snapshot().unwrap();
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .expect("recovered assistant workspace");
+    assert_eq!(workspace.kind, WorkspaceKind::Assistant);
+    assert_eq!(workspace.instructions.as_deref(), Some("Answer tersely"));
+    assert_eq!(
+        workspace.custom_icon.as_deref(),
+        Some("00000000-0000-4000-8000-000000000004.png")
+    );
+    let pane = workspace
+        .tabs
+        .iter()
+        .find_map(|tab| match &tab.layout {
+            PaneLayout::Leaf { pane } if pane.id == assistant_id => Some(pane),
+            _ => None,
+        })
+        .expect("recovered assistant tab");
+    assert_eq!(pane.kind, PaneKind::Assistant);
+    assert_eq!(pane.title, "Helper");
+    assert_eq!(pane.color, Some(color));
+    assert_eq!(pane.custom_title, None);
+    assert!(
+        recovered
+            .write_input(assistant_id, b"ignored")
+            .unwrap_err()
+            .to_string()
+            .contains("not a terminal")
+    );
+    let second_thread = recovered.create_assistant_tab(workspace_id).unwrap();
+    let snapshot = recovered.snapshot().unwrap();
+    assert!(
+        snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("assistant workspace")
+            .tabs
+            .iter()
+            .any(|tab| {
+                tab.title == "Thread 2"
+                    && matches!(&tab.layout, PaneLayout::Leaf { pane } if pane.id == second_thread)
+            })
+    );
+    let grouped = recovered
+        .create_group_assistant(first_pane(&recovered))
+        .unwrap();
+    let snapshot = recovered.snapshot().unwrap();
+    assert!(
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .any(|tab| layout_contains_pane(&tab.layout, grouped, PaneKind::Assistant))
+    );
+    recovered.close_pane(grouped).unwrap();
+    let snapshot = recovered.snapshot().unwrap();
+    assert!(
+        !snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .any(|tab| layout_contains_pane(&tab.layout, grouped, PaneKind::Assistant))
     );
 
     drop(recovered);
@@ -408,6 +566,19 @@ fn wait_for_process_cwd(registry: &SessionRegistry, pane_id: Uuid, expected: &Pa
 fn first_pane(registry: &SessionRegistry) -> Uuid {
     let snapshot = registry.snapshot().unwrap();
     leaf(&snapshot.workspaces[0].tabs[0].layout).id
+}
+
+fn layout_contains_pane(layout: &PaneLayout, pane_id: Uuid, kind: PaneKind) -> bool {
+    match layout {
+        PaneLayout::Leaf { pane } => pane.id == pane_id && pane.kind == kind,
+        PaneLayout::Stack { panes, .. } => panes
+            .iter()
+            .any(|pane| pane.id == pane_id && pane.kind == kind),
+        PaneLayout::Split { first, second, .. } => {
+            layout_contains_pane(first, pane_id, kind.clone())
+                || layout_contains_pane(second, pane_id, kind)
+        }
+    }
 }
 
 fn leaf(layout: &PaneLayout) -> &hh_protocol::Pane {

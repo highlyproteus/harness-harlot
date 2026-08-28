@@ -26,11 +26,14 @@ pub enum AppCommand {
     TogglePaneZoom,
     EqualizePanes,
     ReattachPane,
+    RetryTerminalInput,
     ShowNotifications,
+    ToggleVoiceMic,
+    ShowSettings,
 }
 
 impl AppCommand {
-    const COUNT: usize = 17;
+    const COUNT: usize = 20;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,9 +161,30 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         default_bindings: &["cmd-shift-r"],
     },
     CommandDescriptor {
+        command: AppCommand::RetryTerminalInput,
+        id: "terminal.retry-undelivered-input",
+        title: "Retry Undelivered Terminal Input",
+        category: "Terminal",
+        default_bindings: &[],
+    },
+    CommandDescriptor {
         command: AppCommand::ShowNotifications,
         id: "app.session.notifications",
         title: "Show Notifications",
+        category: "Application",
+        default_bindings: &[],
+    },
+    CommandDescriptor {
+        command: AppCommand::ToggleVoiceMic,
+        id: "voice.toggle-mic",
+        title: "Toggle Assistant Microphone",
+        category: "Voice",
+        default_bindings: &["cmd-shift-m"],
+    },
+    CommandDescriptor {
+        command: AppCommand::ShowSettings,
+        id: "app.settings",
+        title: "Open Settings",
         category: "Application",
         default_bindings: &[],
     },
@@ -194,7 +218,10 @@ const fn check_registry() {
             !descriptor.default_bindings.is_empty()
                 || matches!(
                     descriptor.command,
-                    AppCommand::NewBrowserTab | AppCommand::ShowNotifications
+                    AppCommand::NewBrowserTab
+                        | AppCommand::RetryTerminalInput
+                        | AppCommand::ShowNotifications
+                        | AppCommand::ShowSettings
                 )
         );
         let mut inner = outer + 1;

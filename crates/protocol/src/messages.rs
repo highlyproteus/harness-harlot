@@ -8,8 +8,8 @@ use crate::history::{
     TerminalHistoryPage,
 };
 use crate::model::{
-    AppearanceColor, SessionSnapshot, SplitAxis, TmuxScanScope, TmuxSession,
-    TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
+    AppearanceColor, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport, TmuxScanScope,
+    TmuxSession, TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
 };
 use crate::profile::TerminalProfile;
 use crate::terminal::{
@@ -17,6 +17,17 @@ use crate::terminal::{
     TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen,
     TerminalSelectionKind,
 };
+
+/// Exact pane identity and transport approved by a trusted caller. The service
+/// compares this tuple while holding registry state through the read/write edge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PaneAuthority {
+    pub workspace_id: Uuid,
+    pub tab_id: Uuid,
+    pub pane_id: Uuid,
+    pub kind: PaneKind,
+    pub transport: TerminalTransport,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -41,6 +52,9 @@ pub enum ClientRequest {
     GetPaneSnapshot {
         pane_id: Uuid,
     },
+    GetAuthorizedPaneSnapshot {
+        authority: PaneAuthority,
+    },
     CreatePane {
         target_pane: Uuid,
         axis: SplitAxis,
@@ -62,6 +76,12 @@ pub enum ClientRequest {
         target_pane: Uuid,
         url: Option<String>,
     },
+    CreateAssistantTab {
+        workspace_id: Uuid,
+    },
+    CreateGroupAssistant {
+        target_pane: Uuid,
+    },
     CreateWorkspaceGroup {
         workspace_id: Uuid,
         #[serde(default)]
@@ -75,6 +95,23 @@ pub enum ClientRequest {
         workspace_id: Uuid,
         working_dir: String,
         title: Option<String>,
+    },
+    /// Creates a project only after the service resolves the consumed path and
+    /// verifies canonical containment at the operation edge.
+    CreateAuthorizedWorkspaceProject {
+        workspace_id: Uuid,
+        working_dir: String,
+        authorized_root: String,
+        title: Option<String>,
+    },
+    /// Creates a Git worktree and project tab under the same service-side
+    /// canonical-root authority operation.
+    CreateAuthorizedWorktreeProject {
+        workspace_id: Uuid,
+        repo_dir: String,
+        authorized_root: String,
+        branch: String,
+        base: Option<String>,
     },
     SetTabWorkingDir {
         tab_id: Uuid,
@@ -194,8 +231,24 @@ pub enum ClientRequest {
         workspace_id: Uuid,
         color: Option<AppearanceColor>,
     },
+    SetWorkspaceCustomIcon {
+        workspace_id: Uuid,
+        icon: Option<String>,
+    },
     CreateWorkspace {
         title: Option<String>,
+    },
+    /// Creates a workspace and applies its directory only after service-side
+    /// canonical-root containment succeeds at the mutation edge.
+    CreateAuthorizedWorkspace {
+        title: Option<String>,
+        working_dir: String,
+        authorized_root: String,
+    },
+    CreateAssistantWorkspace {
+        title: Option<String>,
+        working_dir: Option<String>,
+        instructions: Option<String>,
     },
     CreateSshWorkspace {
         title: Option<String>,
@@ -229,6 +282,10 @@ pub enum ClientRequest {
     },
     WriteInput {
         pane_id: Uuid,
+        bytes: Vec<u8>,
+    },
+    WriteAuthorizedInput {
+        authority: PaneAuthority,
         bytes: Vec<u8>,
     },
     BeginSelection {
@@ -284,6 +341,13 @@ pub enum ClientRequest {
         query: String,
         before: Option<HistoryCursor>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryDisposition {
+    DefinitelyUnsent,
+    Indeterminate,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -352,6 +416,10 @@ pub enum ServiceResponse {
     Error {
         message: String,
     },
+    DeliveryError {
+        message: String,
+        disposition: DeliveryDisposition,
+    },
 }
 
 #[cfg(test)]
@@ -386,6 +454,35 @@ mod tests {
                     "type": "create_browser_tab",
                     "workspace_id": workspace_id,
                     "url": "https://example.com",
+                }),
+            ),
+            (
+                ClientRequest::CreateAssistantTab { workspace_id },
+                serde_json::json!({
+                    "type": "create_assistant_tab",
+                    "workspace_id": workspace_id,
+                }),
+            ),
+            (
+                ClientRequest::CreateAssistantWorkspace {
+                    title: Some("Research".to_owned()),
+                    working_dir: Some("/srv/projects".to_owned()),
+                    instructions: Some("Answer tersely".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "create_assistant_workspace",
+                    "title": "Research",
+                    "working_dir": "/srv/projects",
+                    "instructions": "Answer tersely",
+                }),
+            ),
+            (
+                ClientRequest::CreateGroupAssistant {
+                    target_pane: pane_id,
+                },
+                serde_json::json!({
+                    "type": "create_group_assistant",
+                    "target_pane": pane_id,
                 }),
             ),
             (
@@ -520,6 +617,17 @@ mod tests {
                 serde_json::json!({
                     "type": "set_tab_custom_icon",
                     "tab_id": tab_id,
+                    "icon": "00000000-0000-4000-8000-000000000004.png",
+                }),
+            ),
+            (
+                ClientRequest::SetWorkspaceCustomIcon {
+                    workspace_id,
+                    icon: Some("00000000-0000-4000-8000-000000000004.png".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "set_workspace_custom_icon",
+                    "workspace_id": workspace_id,
                     "icon": "00000000-0000-4000-8000-000000000004.png",
                 }),
             ),

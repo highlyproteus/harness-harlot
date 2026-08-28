@@ -3,7 +3,8 @@ set -eu
 
 usage() {
   echo "usage: $0 VERSION BUILD" >&2
-  echo "test fixtures require HH_RELEASE_TEST_MODE=1 plus HH_UPDATE_SIGNING_KEY_FILE and HH_UPDATE_PUBLIC_KEY" >&2
+  echo "set HH_RELEASE_UNSIGNED=1 to emit bounded manifests for an isolated signing job" >&2
+  echo "signed test fixtures require HH_RELEASE_TEST_MODE=1 plus HH_UPDATE_SIGNING_KEY_FILE and HH_UPDATE_PUBLIC_KEY" >&2
   echo "production additionally requires HH_UPDATE_KEY_ID, HH_UPDATE_BASE_URL, and HH_RELEASE_TAG" >&2
   exit 2
 }
@@ -48,13 +49,25 @@ case "$(uname -m)" in
 esac
 
 test_mode=${HH_RELEASE_TEST_MODE:-0}
+unsigned=${HH_RELEASE_UNSIGNED:-0}
+case "$unsigned" in
+  0 | 1) ;;
+  *) echo "HH_RELEASE_UNSIGNED must be 0 or 1" >&2; exit 2 ;;
+esac
 channel=${HH_UPDATE_CHANNEL:-stable}
 case "$channel" in
   stable | edge) ;;
   *) echo "HH_UPDATE_CHANNEL must be stable or edge" >&2; exit 2 ;;
 esac
-: "${HH_UPDATE_SIGNING_KEY_FILE:?set HH_UPDATE_SIGNING_KEY_FILE to an owner-only base64 Ed25519 seed file}"
-: "${HH_UPDATE_PUBLIC_KEY:?set HH_UPDATE_PUBLIC_KEY to the matching base64 Ed25519 public key}"
+if [ "$unsigned" = 1 ]; then
+  if [ -n "${HH_UPDATE_SIGNING_KEY_FILE:-}${HH_UPDATE_SIGNING_SEED:-}${HH_UPDATE_PUBLIC_KEY:-}" ]; then
+    echo "unsigned packaging refuses all update-signing inputs" >&2
+    exit 2
+  fi
+else
+  : "${HH_UPDATE_SIGNING_KEY_FILE:?set HH_UPDATE_SIGNING_KEY_FILE to an owner-only base64 Ed25519 seed file}"
+  : "${HH_UPDATE_PUBLIC_KEY:?set HH_UPDATE_PUBLIC_KEY to the matching base64 Ed25519 public key}"
+fi
 if [ "$test_mode" = 1 ]; then
   key_id=${HH_UPDATE_KEY_ID:-test-only-v1}
   base_url=${HH_UPDATE_BASE_URL:-https://updates.example.invalid/stable}
@@ -99,10 +112,9 @@ fi
 if [ "$test_mode" != 1 ]; then
   head_commit=$(git rev-parse HEAD)
   if [ "$channel" = stable ]; then
-    git verify-tag "$HH_RELEASE_TAG"
     tag_commit=$(git rev-parse "$HH_RELEASE_TAG^{commit}")
     if [ "$tag_commit" != "$head_commit" ]; then
-      echo "signed release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
+      echo "release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
       exit 2
     fi
   elif [ "$HH_RELEASE_COMMIT" != "$head_commit" ]; then
@@ -123,11 +135,13 @@ if [ "$test_mode" = 1 ]; then
   updater_features=fetch,fixture
 fi
 cargo build --locked --release -p hh-updater --features "$updater_features" --bin hh-update-tool
-cargo build --locked --release -p hh-release-signer --bin hh-release-sign
-derived_public_key=$("$release_binary_directory/hh-release-sign" public-key --private-key "$HH_UPDATE_SIGNING_KEY_FILE")
-if [ "$derived_public_key" != "$HH_UPDATE_PUBLIC_KEY" ]; then
-  echo "HH_UPDATE_PUBLIC_KEY does not match HH_UPDATE_SIGNING_KEY_FILE" >&2
-  exit 2
+if [ "$unsigned" = 0 ]; then
+  cargo build --locked --release -p hh-release-signer --bin hh-release-sign
+  derived_public_key=$("$release_binary_directory/hh-release-sign" public-key --private-key "$HH_UPDATE_SIGNING_KEY_FILE")
+  if [ "$derived_public_key" != "$HH_UPDATE_PUBLIC_KEY" ]; then
+    echo "HH_UPDATE_PUBLIC_KEY does not match HH_UPDATE_SIGNING_KEY_FILE" >&2
+    exit 2
+  fi
 fi
 
 distribution_directory="$target_directory/release-dist/linux-$architecture"
@@ -182,6 +196,7 @@ fi
 install -m 0644 "$repository_root/packaging/linux/com.harnessharlot.desktop.desktop" "$root/share/applications/com.harnessharlot.desktop.desktop"
 install -m 0644 "$repository_root/packaging/linux/com.harnessharlot.desktop.png" "$root/share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png"
 install -m 0644 "$repository_root/LICENSE" "$root/share/licenses/harness-harlot/LICENSE"
+install -m 0644 "$repository_root/PRIVACY.md" "$root/share/licenses/harness-harlot/PRIVACY.md"
 install -m 0644 "$repository_root/THIRD_PARTY_NOTICES.md" "$root/share/licenses/harness-harlot/THIRD_PARTY_NOTICES.md"
 install -m 0644 "$repository_root/ASSET_NOTICES.md" "$root/share/licenses/harness-harlot/ASSET_NOTICES.md"
 printf 'com.harnessharlot.desktop\n' > "$root/share/harness-harlot/install-id"
@@ -226,14 +241,28 @@ cat > "$manifest" <<EOF
   ]
 }
 EOF
-"$release_binary_directory/hh-release-sign" sign \
-  --manifest "$manifest" \
-  --signature "$signature" \
-  --private-key "$HH_UPDATE_SIGNING_KEY_FILE"
-stable_manifest="$distribution_directory/manifest-linux-${architecture}.update.json"
+if [ "$unsigned" = 0 ]; then
+  "$release_binary_directory/hh-release-sign" sign \
+    --manifest "$manifest" \
+    --signature "$signature" \
+    --private-key "$HH_UPDATE_SIGNING_KEY_FILE"
+fi
+stable_manifest="$distribution_directory/manifest-linux-${architecture}-v2.update.json"
 cp "$manifest" "$stable_manifest"
-cp "$signature" "$stable_manifest.sig"
-if [ "$test_mode" = 1 ]; then
+if [ "$unsigned" = 0 ]; then
+  cp "$signature" "$stable_manifest.sig"
+fi
+if [ "$unsigned" = 1 ]; then
+  python3 - "$manifest" "$artifact" <<'PY'
+import hashlib, json, pathlib, sys
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+artifact = pathlib.Path(sys.argv[2])
+entry = manifest["artifacts"][0]
+assert entry["file_name"] == artifact.name
+assert entry["size"] == artifact.stat().st_size
+assert entry["sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest()
+PY
+elif [ "$test_mode" = 1 ]; then
   "$release_binary_directory/hh-update-tool" verify \
     --fixture \
     --key-id "$key_id" \

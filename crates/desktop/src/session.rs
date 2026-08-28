@@ -2,11 +2,11 @@
 
 use gpui::AppContext;
 use gpui::{Context, Window};
-use hh_desktop::SessionClient;
 use hh_protocol::{
     ClientRequest, PaneLayout, PaneRevisionCursor, PaneStreamState, ServiceResponse,
     SessionSnapshot, Workspace,
 };
+use hh_session_client::{DeliveryCallError, SessionClient};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,24 @@ pub(crate) fn session_call(
     request: &ClientRequest,
 ) -> anyhow::Result<ServiceResponse> {
     with_session_client(client, |client| client.call(request))
+}
+
+pub(crate) fn session_call_with_delivery(
+    client: &SharedSessionClient,
+    request: &ClientRequest,
+) -> std::result::Result<ServiceResponse, DeliveryCallError> {
+    let mut client = client.lock();
+    if client.is_none() {
+        *client = Some(SessionClient::connect().map_err(DeliveryCallError::definitely_unsent)?);
+    }
+    let result = client
+        .as_mut()
+        .expect("session client initialized")
+        .call_with_delivery(request);
+    if result.is_err() {
+        *client = None;
+    }
+    result
 }
 
 pub(crate) fn session_notify(
@@ -53,6 +71,20 @@ pub(crate) fn with_session_client<T>(
 }
 
 impl HhApp {
+    pub(crate) fn retry_undelivered_terminal_input(&mut self, cx: &mut Context<Self>) {
+        if self.session.terminal_input_tx.replay_recoverable() {
+            self.session.connection_error = None;
+        } else {
+            self.session.connection_error =
+                Some("there is no definitely-undelivered terminal input to retry".to_owned());
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn control_client_handle(&self) -> SharedSessionClient {
+        Arc::clone(&self.session.control_client)
+    }
+
     /// One synchronous startup fetch. All later refreshes flow through the
     /// async pipelines and the shared poll cycle.
     pub(crate) fn initial_state_fetch(&mut self, cx: &mut Context<Self>) -> bool {
@@ -63,31 +95,51 @@ impl HhApp {
     /// visible state refreshes without waiting for the next poll tick.
     pub(crate) fn dispatch(&mut self, request: ClientRequest) {
         let one_way = PipelineJob::is_one_way(&request);
-        let _ = self.session.control_tx.unbounded_send(PipelineJob {
-            request,
-            one_way,
-            followup_refresh: true,
-            apply: None,
-        });
-    }
-
-    /// Enqueues a control-lane request with no follow-up refresh. Terminal
-    /// input and selection updates are written one-way.
-    pub(crate) fn dispatch_control(&mut self, request: ClientRequest) {
-        let wake_poll = terminal_poll_wake_requested(&request);
-        let one_way = PipelineJob::is_one_way(&request);
         if self
             .session
             .control_tx
-            .unbounded_send(PipelineJob {
+            .try_send(PipelineJob {
+                request,
+                one_way,
+                followup_refresh: true,
+                apply: None,
+            })
+            .is_err()
+        {
+            self.session.connection_error =
+                Some("control pipeline overloaded; newest request was not queued".to_owned());
+        }
+    }
+
+    /// Enqueues low-latency control work. Terminal bytes use their own
+    /// byte-bounded coalescing lane, so generic control saturation cannot drop
+    /// accepted keystrokes or pastes.
+    pub(crate) fn dispatch_control(&mut self, request: ClientRequest) {
+        let wake_poll = terminal_poll_wake_requested(&request);
+        if let ClientRequest::WriteInput { pane_id, bytes } = request {
+            match self.session.terminal_input_tx.try_send(pane_id, &bytes) {
+                Ok(()) => {
+                    let _ = self.session.poll_wake_tx.try_send(());
+                }
+                Err(error) => self.session.connection_error = Some(error.to_owned()),
+            }
+            return;
+        }
+        let one_way = PipelineJob::is_one_way(&request);
+        let queued = self
+            .session
+            .control_tx
+            .try_send(PipelineJob {
                 request,
                 one_way,
                 followup_refresh: false,
                 apply: None,
             })
-            .is_ok()
-            && wake_poll
-        {
+            .is_ok();
+        if !queued {
+            self.session.connection_error =
+                Some("control pipeline overloaded; newest request was not queued".to_owned());
+        } else if wake_poll {
             let _ = self.session.poll_wake_tx.try_send(());
         }
     }
@@ -96,23 +148,39 @@ impl HhApp {
     /// with the response on the UI thread, followed by one poll cycle.
     pub(crate) fn dispatch_with(&mut self, request: ClientRequest, apply: ApplyFn) {
         let one_way = PipelineJob::is_one_way(&request);
-        let _ = self.session.control_tx.unbounded_send(PipelineJob {
-            request,
-            one_way,
-            followup_refresh: true,
-            apply: Some(apply),
-        });
+        if self
+            .session
+            .control_tx
+            .try_send(PipelineJob {
+                request,
+                one_way,
+                followup_refresh: true,
+                apply: Some(apply),
+            })
+            .is_err()
+        {
+            self.session.connection_error =
+                Some("control pipeline overloaded; newest request was not queued".to_owned());
+        }
     }
 
     /// Enqueues a stream-lane request (screen traffic) with a typed
     /// continuation; no follow-up refresh.
     pub(crate) fn dispatch_stream_with(&mut self, request: ClientRequest, apply: ApplyFn) {
-        let _ = self.session.stream_tx.unbounded_send(PipelineJob {
-            request,
-            one_way: false,
-            followup_refresh: false,
-            apply: Some(apply),
-        });
+        if self
+            .session
+            .stream_tx
+            .try_send(PipelineJob {
+                request,
+                one_way: false,
+                followup_refresh: false,
+                apply: Some(apply),
+            })
+            .is_err()
+        {
+            self.session.connection_error =
+                Some("stream pipeline overloaded; newest request was not queued".to_owned());
+        }
     }
 
     pub(crate) fn pane_update_request(&self) -> ClientRequest {
@@ -211,6 +279,22 @@ impl HhApp {
                 self.session.connection_error != previous
             }
         };
+        let mut live_assistants = std::collections::HashSet::new();
+        if let Some(snapshot) = self.session.snapshot.as_ref() {
+            for workspace in &snapshot.workspaces {
+                for tab in &workspace.tabs {
+                    let mut panes = Vec::new();
+                    crate::helpers::collect_terminal_tabs(&tab.layout, &mut panes);
+                    live_assistants.extend(
+                        panes
+                            .into_iter()
+                            .filter(|pane| pane.kind.is_assistant())
+                            .map(|pane| pane.id),
+                    );
+                }
+            }
+        }
+        self.prune_assistant_sessions(&live_assistants, cx);
         state_changed | self.sync_browser_callback_state()
     }
 
@@ -233,7 +317,7 @@ impl HhApp {
         let notifications_changed = self.auto_read_pane_notifications(pane_id, cx);
         if self
             .pane_metadata(pane_id)
-            .is_some_and(|pane| pane.kind.is_browser())
+            .is_some_and(|pane| !pane.kind.is_terminal())
         {
             let changed = self.layout.focused_pane != Some(pane_id);
             self.layout.focused_pane = Some(pane_id);

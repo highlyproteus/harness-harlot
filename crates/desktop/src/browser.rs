@@ -964,7 +964,7 @@ impl HhApp {
                 self.pane_metadata(pane_id)
                     .and_then(|pane| match pane.kind {
                         PaneKind::Browser { url } => Some(url),
-                        PaneKind::Terminal => None,
+                        PaneKind::Terminal | PaneKind::Assistant => None,
                     })
             })
     }
@@ -974,7 +974,7 @@ impl HhApp {
         self.pane_metadata(pane_id)
             .and_then(|pane| match pane.kind {
                 PaneKind::Browser { url } => Some(url),
-                PaneKind::Terminal => None,
+                PaneKind::Terminal | PaneKind::Assistant => None,
             })
     }
 
@@ -991,7 +991,7 @@ impl HhApp {
         let url =
             match &pane.kind {
                 PaneKind::Browser { url } => url.clone(),
-                PaneKind::Terminal => {
+                PaneKind::Terminal | PaneKind::Assistant => {
                     // A kind mismatch must degrade, never crash the render path.
                     return div()
                         .size_full()
@@ -1134,7 +1134,7 @@ impl HhApp {
         let url =
             match &pane.kind {
                 PaneKind::Browser { url } => url.clone(),
-                PaneKind::Terminal => {
+                PaneKind::Terminal | PaneKind::Assistant => {
                     // A kind mismatch must degrade, never crash the render path.
                     return div()
                         .size_full()

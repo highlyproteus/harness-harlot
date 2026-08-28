@@ -10,7 +10,8 @@ mod tabs;
 mod terminal_io;
 
 pub(crate) use bindings::{
-    abbreviate_home, append_rename_text, element_key, gpui_binding, product_name, split_element_key,
+    abbreviate_home, append_rename_text, element_key, expand_home, gpui_binding, product_name,
+    split_element_key,
 };
 pub(crate) use dnd::{
     HeaderDropZone, click_suppression_active, header_drop_zone, split_placement_at,
@@ -28,9 +29,10 @@ pub(crate) use history_ui::{
     history_warning_text, live_scroll_target, wheel_delta_lines,
 };
 pub(crate) use icons::{
-    IDENTITY_MARK_SIZE, render_bell_icon, render_sidebar_toggle_icon, render_terminal_profile_icon,
-    render_terminal_profile_mark, resolved_terminal_accent, resolved_workspace_color,
-    tab_identity_presentation, workspace_is_selectable,
+    IDENTITY_MARK_SIZE, render_bell_icon, render_headphones_icon, render_microphone_icon,
+    render_sidebar_toggle_icon, render_terminal_profile_icon, render_terminal_profile_mark,
+    resolved_terminal_accent, resolved_workspace_color, tab_identity_presentation,
+    workspace_is_selectable,
 };
 pub(crate) use layout::{
     apply_layout_control_mutation, collect_terminal_tabs, find_pane, inactive_stack_contains,
@@ -49,7 +51,8 @@ pub(crate) use tabs::{
     workspace_tab_standalone_pane,
 };
 pub(crate) use terminal_io::{
-    TerminalPointerAction, plain_history_line, prepare_paste, selection_span,
-    terminal_grid_for_pane, terminal_input_bytes, terminal_modifiers, terminal_mouse_button,
-    terminal_point_at, terminal_pointer_action, terminal_run_display_text, url_at_column,
+    TerminalPointerAction, TerminalUrlOpenTarget, plain_history_line, prepare_paste,
+    selection_span, terminal_grid_for_pane, terminal_input_bytes, terminal_modifiers,
+    terminal_mouse_button, terminal_point_at, terminal_pointer_action, terminal_run_display_text,
+    terminal_url_open_target, url_at_column,
 };

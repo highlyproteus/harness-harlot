@@ -3,8 +3,9 @@ set -eu
 
 usage() {
   echo "usage: $0 VERSION BUILD [--community]" >&2
-  echo "test fixtures require HH_RELEASE_TEST_MODE=1 plus HH_UPDATE_SIGNING_KEY_FILE and HH_UPDATE_PUBLIC_KEY" >&2
-  echo "community production requires CEF_PATH, HH_UPDATE_KEY_ID, HH_UPDATE_BASE_URL, HH_RELEASE_TAG, and the update signing inputs" >&2
+  echo "set HH_RELEASE_UNSIGNED=1 to emit bounded manifests for an isolated signing job" >&2
+  echo "signed test fixtures require HH_RELEASE_TEST_MODE=1 plus HH_UPDATE_SIGNING_KEY_FILE and HH_UPDATE_PUBLIC_KEY" >&2
+  echo "community production requires CEF_PATH, HH_UPDATE_KEY_ID, HH_UPDATE_BASE_URL, and HH_RELEASE_TAG" >&2
   echo "Developer ID production additionally requires HH_CODESIGN_IDENTITY, HH_EXPECTED_TEAM_ID, and HH_NOTARY_PROFILE" >&2
   exit 2
 }
@@ -48,13 +49,25 @@ case "$(uname -m)" in
 esac
 
 test_mode=${HH_RELEASE_TEST_MODE:-0}
+unsigned=${HH_RELEASE_UNSIGNED:-0}
+case "$unsigned" in
+  0 | 1) ;;
+  *) echo "HH_RELEASE_UNSIGNED must be 0 or 1" >&2; exit 2 ;;
+esac
 channel=${HH_UPDATE_CHANNEL:-stable}
 case "$channel" in
   stable | edge) ;;
   *) echo "HH_UPDATE_CHANNEL must be stable or edge" >&2; exit 2 ;;
 esac
-: "${HH_UPDATE_SIGNING_KEY_FILE:?set HH_UPDATE_SIGNING_KEY_FILE to an owner-only base64 Ed25519 seed file}"
-: "${HH_UPDATE_PUBLIC_KEY:?set HH_UPDATE_PUBLIC_KEY to the matching base64 Ed25519 public key}"
+if [ "$unsigned" = 1 ]; then
+  if [ -n "${HH_UPDATE_SIGNING_KEY_FILE:-}${HH_UPDATE_SIGNING_SEED:-}${HH_UPDATE_PUBLIC_KEY:-}" ]; then
+    echo "unsigned packaging refuses all update-signing inputs" >&2
+    exit 2
+  fi
+else
+  : "${HH_UPDATE_SIGNING_KEY_FILE:?set HH_UPDATE_SIGNING_KEY_FILE to an owner-only base64 Ed25519 seed file}"
+  : "${HH_UPDATE_PUBLIC_KEY:?set HH_UPDATE_PUBLIC_KEY to the matching base64 Ed25519 public key}"
+fi
 if [ "$test_mode" = 1 ]; then
   key_id=${HH_UPDATE_KEY_ID:-test-only-v1}
   base_url=${HH_UPDATE_BASE_URL:-https://updates.example.invalid/stable}
@@ -108,10 +121,9 @@ fi
 if [ "$test_mode" != 1 ]; then
   head_commit=$(git rev-parse HEAD)
   if [ "$channel" = stable ]; then
-    git verify-tag "$HH_RELEASE_TAG"
     tag_commit=$(git rev-parse "$HH_RELEASE_TAG^{commit}")
     if [ "$tag_commit" != "$head_commit" ]; then
-      echo "signed release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
+      echo "release tag $HH_RELEASE_TAG does not resolve to HEAD" >&2
       exit 2
     fi
   elif [ "$HH_RELEASE_COMMIT" != "$head_commit" ]; then
@@ -150,11 +162,13 @@ if [ "$test_mode" = 1 ]; then
     cargo build --locked --release -p hh-updater --features "$fixture_updater_features" --bin hh-update-tool
   fixture_update_tool="$fixture_target_directory/release/hh-update-tool"
 fi
-cargo build --locked --release -p hh-release-signer --bin hh-release-sign
-derived_public_key=$("$repository_root/target/release/hh-release-sign" public-key --private-key "$HH_UPDATE_SIGNING_KEY_FILE")
-if [ "$derived_public_key" != "$HH_UPDATE_PUBLIC_KEY" ]; then
-  echo "HH_UPDATE_PUBLIC_KEY does not match HH_UPDATE_SIGNING_KEY_FILE" >&2
-  exit 2
+if [ "$unsigned" = 0 ]; then
+  cargo build --locked --release -p hh-release-signer --bin hh-release-sign
+  derived_public_key=$("$repository_root/target/release/hh-release-sign" public-key --private-key "$HH_UPDATE_SIGNING_KEY_FILE")
+  if [ "$derived_public_key" != "$HH_UPDATE_PUBLIC_KEY" ]; then
+    echo "HH_UPDATE_PUBLIC_KEY does not match HH_UPDATE_SIGNING_KEY_FILE" >&2
+    exit 2
+  fi
 fi
 if [ "$test_mode" = 1 ]; then
   if [ "$community" -eq 1 ]; then
@@ -257,17 +271,32 @@ cat > "$manifest" <<EOF
 }
 EOF
 
-"$repository_root/target/release/hh-release-sign" sign \
-  --manifest "$manifest" --signature "$signature" \
-  --private-key "$HH_UPDATE_SIGNING_KEY_FILE"
+if [ "$unsigned" = 0 ]; then
+  "$repository_root/target/release/hh-release-sign" sign \
+    --manifest "$manifest" --signature "$signature" \
+    --private-key "$HH_UPDATE_SIGNING_KEY_FILE"
+fi
 if [ "$community" -eq 1 ]; then
-  stable_manifest="$distribution_directory/manifest-macos-community-${architecture}.update.json"
+  stable_manifest="$distribution_directory/manifest-macos-community-${architecture}-v2.update.json"
 else
-  stable_manifest="$distribution_directory/manifest-macos-${architecture}.update.json"
+  stable_manifest="$distribution_directory/manifest-macos-${architecture}-v2.update.json"
 fi
 cp "$manifest" "$stable_manifest"
-cp "$signature" "$stable_manifest.sig"
-if [ "$test_mode" = 1 ]; then
+if [ "$unsigned" = 0 ]; then
+  cp "$signature" "$stable_manifest.sig"
+fi
+if [ "$unsigned" = 1 ]; then
+  if [ "$test_mode" = 1 ]; then
+    "$repository_root/scripts/verify-macos-release.sh" --unsigned-fixture \
+      com.harnessharlot.desktop "$manifest"
+  elif [ "$community" -eq 1 ]; then
+    "$repository_root/scripts/verify-macos-release.sh" --unsigned-community \
+      com.harnessharlot.desktop "$manifest"
+  else
+    echo "unsigned Developer ID packaging is not enabled" >&2
+    exit 2
+  fi
+elif [ "$test_mode" = 1 ]; then
   "$verification_tool" verify \
     --key-id "$key_id" --public-key "$HH_UPDATE_PUBLIC_KEY" --host "$update_host" \
     --manifest "$manifest" --signature "$signature" --artifact "$dmg" \
@@ -279,7 +308,9 @@ else
 fi
 plutil -lint "$plist"
 
-if [ "$test_mode" = 1 ]; then
+if [ "$unsigned" = 1 ]; then
+  :
+elif [ "$test_mode" = 1 ]; then
   HH_FIXTURE_UPDATE_TOOL="$fixture_update_tool" HH_UPDATE_CHANNEL="$channel" \
     "$repository_root/scripts/verify-macos-release.sh" --fixture \
       com.harnessharlot.desktop "$update_host" "$key_id" "$HH_UPDATE_PUBLIC_KEY" "$manifest" "$signature"

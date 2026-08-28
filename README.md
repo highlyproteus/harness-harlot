@@ -71,7 +71,8 @@ The bootstrap requires `curl`, `python3`, GNU `sha256sum`, and `tar`; these are
 present by default on supported Ubuntu installations or available from the
 standard package repositories.
 
-Browser tabs require the matching distribution packages:
+The desktop package uses the matching distribution runtime libraries. Browser tabs
+need GTK, NSS, and GBM; Voice Mode needs ALSA:
 
 ```text
 Ubuntu 22.04:  libgtk-3-0 libnss3 libasound2 libgbm1
@@ -105,6 +106,21 @@ A group displays several terminals together in one view — and can include a br
 ## Browser tabs
 
 Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profile directory.
+
+## Voice Mode
+
+Assistant panes support typed messages, image attachments, and optional spoken
+conversation through the OpenAI Realtime API. Text and image actions can start
+an Assistant connection, but the microphone remains off until you use the
+visible start-voice control. Voice is conversation-only: it receives no provider
+tools or approval path and cannot inspect or control terminals, panes,
+workstations, files, Git, agents, or memory retrieval.
+
+OpenAI and optional Honcho credentials are not saved to the settings file. Set
+`HH_OPENAI_API_KEY` and, when needed, `HH_HONCHO_BEARER` in the launch
+environment. See [Voice Mode privacy and data handling](PRIVACY.md) for the data
+sent to providers, local retention limits, deletion controls, and workspace
+authorization boundaries.
 
 ## tmux
 
@@ -172,4 +188,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 ## License
 
-Harness Harlot is available under the [MIT License](LICENSE).
+Harness Harlot is available under the [MIT License](LICENSE). See also
+[Voice Mode privacy and data handling](PRIVACY.md),
+[security reporting](SECURITY.md), and [third-party notices](THIRD_PARTY_NOTICES.md).

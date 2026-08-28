@@ -7,19 +7,27 @@
 //! request ordering: keystrokes, pastes, and mutations apply in the order
 //! the UI emitted them.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::{Receiver, Sender};
 use gpui::{AppContext as _, AsyncApp, Context, WeakEntity};
 use hh_protocol::{ClientRequest, ServiceResponse};
+use parking_lot::Mutex;
+use uuid::Uuid;
 
-use crate::session::{session_call, session_notify};
+use crate::session::{session_call, session_call_with_delivery, session_notify};
 
 /// Typed continuation applied with a response on the UI thread.
 pub(crate) type ApplyFn = Box<dyn FnOnce(&mut HhApp, &mut Context<HhApp>, Result<ServiceResponse>)>;
 use crate::{HhApp, SharedSessionClient};
+
+pub(crate) const CONTROL_PIPELINE_CAPACITY: usize = 32;
+pub(crate) const STREAM_PIPELINE_CAPACITY: usize = 8;
+pub(crate) const TERMINAL_INPUT_CAPACITY_BYTES: usize = 256 * 1024;
+const TERMINAL_INPUT_FRAME_BYTES: usize = 64 * 1024;
 
 /// One queued service request plus how its response lands back on the UI.
 pub(crate) struct PipelineJob {
@@ -37,21 +45,221 @@ pub(crate) struct PipelineJob {
 impl PipelineJob {
     /// Whether the request is answered on the wire at all.
     pub(crate) fn is_one_way(request: &ClientRequest) -> bool {
-        matches!(
-            request,
-            ClientRequest::WriteInput { .. } | ClientRequest::UpdateSelection { .. }
-        )
+        matches!(request, ClientRequest::UpdateSelection { .. })
     }
 }
 /// The consumer side of one lane.
 pub(crate) struct PipelineLane {
-    rx: UnboundedReceiver<PipelineJob>,
+    rx: Receiver<PipelineJob>,
 }
 
-impl PipelineLane {
-    pub fn from_receiver(rx: UnboundedReceiver<PipelineJob>) -> Self {
-        Self { rx }
+pub(crate) fn bounded_lane(capacity: usize) -> (Sender<PipelineJob>, PipelineLane) {
+    assert!(capacity > 0, "pipeline capacity must be positive");
+    // futures-mpsc reserves one slot per sender in addition to its buffer.
+    // Each lane intentionally has exactly one sender, so subtract one to make
+    // the declared capacity the actual maximum retained job count.
+    let (tx, rx) = futures::channel::mpsc::channel(capacity - 1);
+    (tx, PipelineLane { rx })
+}
+
+#[derive(Default)]
+struct TerminalInputBuffer {
+    queued: VecDeque<(Uuid, Vec<u8>)>,
+    in_flight: Option<(Uuid, Vec<u8>)>,
+    recoverable: VecDeque<(Uuid, Vec<u8>)>,
+    buffered_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalInputDelivery {
+    Delivered,
+    DefinitelyUnsent,
+    Indeterminate,
+}
+
+#[derive(Clone)]
+pub(crate) struct TerminalInputSender {
+    state: Arc<Mutex<TerminalInputBuffer>>,
+    wake: Arc<Mutex<Sender<()>>>,
+    capacity_bytes: usize,
+}
+
+pub(crate) struct TerminalInputLane {
+    state: Arc<Mutex<TerminalInputBuffer>>,
+    wake_rx: Receiver<()>,
+}
+
+pub(crate) fn terminal_input_channel(
+    capacity_bytes: usize,
+) -> (TerminalInputSender, TerminalInputLane) {
+    assert!(
+        capacity_bytes > 0,
+        "terminal input capacity must be positive"
+    );
+    let state = Arc::new(Mutex::new(TerminalInputBuffer::default()));
+    let (wake, wake_rx) = futures::channel::mpsc::channel(1);
+    (
+        TerminalInputSender {
+            state: Arc::clone(&state),
+            wake: Arc::new(Mutex::new(wake)),
+            capacity_bytes,
+        },
+        TerminalInputLane { state, wake_rx },
+    )
+}
+
+impl TerminalInputSender {
+    pub(crate) fn try_send(&self, pane_id: Uuid, bytes: &[u8]) -> Result<(), &'static str> {
+        if bytes.len() > TERMINAL_INPUT_FRAME_BYTES {
+            return Err("terminal input exceeds the 65536-byte frame limit");
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.lock();
+        if state.buffered_bytes.saturating_add(bytes.len()) > self.capacity_bytes {
+            return Err("terminal input buffer is full; input was rejected");
+        }
+        let previous_last_len = state.queued.back().map(|(_, bytes)| bytes.len());
+        let coalesced = state.queued.back_mut().is_some_and(|(last_pane, pending)| {
+            if *last_pane == pane_id
+                && pending.len().saturating_add(bytes.len()) <= TERMINAL_INPUT_FRAME_BYTES
+            {
+                pending.extend_from_slice(bytes);
+                true
+            } else {
+                false
+            }
+        });
+        if !coalesced {
+            state.queued.push_back((pane_id, bytes.to_vec()));
+        }
+        state.buffered_bytes += bytes.len();
+        drop(state);
+
+        let mut wake = self.wake.lock();
+        if let Err(error) = wake.try_send(())
+            && error.is_disconnected()
+        {
+            let mut state = self.state.lock();
+            state.buffered_bytes -= bytes.len();
+            if coalesced {
+                state
+                    .queued
+                    .back_mut()
+                    .expect("coalesced terminal input remains queued")
+                    .1
+                    .truncate(previous_last_len.expect("coalesced input had a prior frame"));
+            } else {
+                state.queued.pop_back();
+            }
+            return Err("terminal input worker is unavailable; input was rejected");
+        }
+        Ok(())
     }
+
+    /// Explicitly moves definitely-unsent input back to the delivery queue.
+    /// Ambiguous mutations are never placed in the recoverable queue.
+    pub(crate) fn replay_recoverable(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.recoverable.is_empty() {
+            return false;
+        }
+        let mut replay = std::mem::take(&mut state.recoverable);
+        replay.append(&mut state.queued);
+        state.queued = replay;
+        drop(state);
+        let _ = self.wake.lock().try_send(());
+        true
+    }
+
+    #[cfg(test)]
+    fn drain_for_test(&self) -> Vec<(Uuid, Vec<u8>)> {
+        let mut state = self.state.lock();
+        let drained = state.queued.drain(..).collect::<Vec<_>>();
+        state.buffered_bytes -= drained.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
+        drained
+    }
+
+    #[cfg(test)]
+    fn recoverable_for_test(&self) -> Vec<(Uuid, Vec<u8>)> {
+        self.state.lock().recoverable.iter().cloned().collect()
+    }
+}
+
+fn begin_terminal_input(state: &Mutex<TerminalInputBuffer>) -> Option<(Uuid, Vec<u8>)> {
+    let mut state = state.lock();
+    debug_assert!(state.in_flight.is_none());
+    let next = state.queued.pop_front()?;
+    state.in_flight = Some(next.clone());
+    Some(next)
+}
+
+fn finish_terminal_input(
+    state: &Mutex<TerminalInputBuffer>,
+    input: (Uuid, Vec<u8>),
+    delivery: TerminalInputDelivery,
+) {
+    let mut state = state.lock();
+    debug_assert_eq!(state.in_flight.as_ref(), Some(&input));
+    state.in_flight = None;
+    match delivery {
+        TerminalInputDelivery::DefinitelyUnsent => state.recoverable.push_back(input),
+        TerminalInputDelivery::Delivered | TerminalInputDelivery::Indeterminate => {
+            state.buffered_bytes -= input.1.len();
+        }
+    }
+}
+
+fn terminal_input_delivery(
+    result: &std::result::Result<ServiceResponse, hh_session_client::DeliveryCallError>,
+) -> TerminalInputDelivery {
+    match result {
+        Ok(ServiceResponse::Ack) => TerminalInputDelivery::Delivered,
+        Err(error) if error.disposition() == hh_protocol::DeliveryDisposition::DefinitelyUnsent => {
+            TerminalInputDelivery::DefinitelyUnsent
+        }
+        Ok(_) | Err(_) => TerminalInputDelivery::Indeterminate,
+    }
+}
+
+pub(crate) fn spawn_terminal_input_lane(
+    cx: &mut Context<HhApp>,
+    lane: TerminalInputLane,
+    client_of: fn(&HhApp) -> &SharedSessionClient,
+) {
+    cx.spawn(async move |this, cx: &mut AsyncApp| {
+        let mut wake_rx = lane.wake_rx;
+        while wake_rx.next().await.is_some() {
+            while let Some((pane_id, bytes)) = begin_terminal_input(&lane.state) {
+                let Ok(client) = this.update(cx, |this, _| Arc::clone(client_of(this))) else {
+                    finish_terminal_input(
+                        &lane.state,
+                        (pane_id, bytes),
+                        TerminalInputDelivery::DefinitelyUnsent,
+                    );
+                    return;
+                };
+                let request = ClientRequest::WriteInput {
+                    pane_id,
+                    bytes: bytes.clone(),
+                };
+                let result = cx
+                    .background_spawn(async move { session_call_with_delivery(&client, &request) })
+                    .await;
+                let delivery = terminal_input_delivery(&result);
+                finish_terminal_input(&lane.state, (pane_id, bytes), delivery);
+                let Ok(()) = this.update(cx, |this, _| match result {
+                    Ok(ServiceResponse::Ack) => {}
+                    Ok(response) => this.report_unexpected(&response),
+                    Err(error) => this.report(&anyhow::Error::new(error)),
+                }) else {
+                    return;
+                };
+            }
+        }
+    })
+    .detach();
 }
 /// lane's shared client under a UI update so the Arc stays current.
 pub(crate) fn spawn_lane(
@@ -122,4 +330,63 @@ pub(crate) async fn poll_once(this: &WeakEntity<HhApp>, cx: &mut AsyncApp) -> Op
         return None;
     };
     Some(state_changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job() -> PipelineJob {
+        PipelineJob {
+            request: ClientRequest::ShutdownService,
+            one_way: false,
+            followup_refresh: false,
+            apply: None,
+        }
+    }
+
+    #[test]
+    fn bounded_lane_rejects_jobs_beyond_its_declared_capacity() {
+        let (mut tx, _lane) = bounded_lane(2);
+        tx.try_send(job()).unwrap();
+        tx.try_send(job()).unwrap();
+
+        assert!(tx.try_send(job()).is_err());
+    }
+
+    #[test]
+    fn definite_terminal_delivery_failure_is_retained_until_explicit_replay() {
+        let (tx, lane) = terminal_input_channel(16);
+        let pane_id = uuid::Uuid::nil();
+        tx.try_send(pane_id, b"typed").unwrap();
+
+        let in_flight =
+            begin_terminal_input(&lane.state).expect("accepted input becomes in flight");
+        finish_terminal_input(
+            &lane.state,
+            in_flight,
+            TerminalInputDelivery::DefinitelyUnsent,
+        );
+
+        assert_eq!(
+            tx.recoverable_for_test(),
+            vec![(pane_id, b"typed".to_vec())]
+        );
+        assert_eq!(tx.drain_for_test(), Vec::<(Uuid, Vec<u8>)>::new());
+        assert!(tx.replay_recoverable());
+        assert_eq!(tx.drain_for_test(), vec![(pane_id, b"typed".to_vec())]);
+    }
+
+    #[test]
+    fn terminal_input_saturation_rejects_new_bytes_without_losing_accepted_bytes() {
+        let (tx, _lane) = terminal_input_channel(4);
+        let pane_id = uuid::Uuid::nil();
+
+        assert!(tx.try_send(pane_id, b"ab").is_ok());
+        assert!(tx.try_send(pane_id, b"cd").is_ok());
+        assert!(tx.try_send(pane_id, b"e").is_err());
+
+        let queued = tx.drain_for_test();
+        assert_eq!(queued, vec![(pane_id, b"abcd".to_vec())]);
+    }
 }

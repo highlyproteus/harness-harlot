@@ -82,7 +82,7 @@ Clicking the button performs this sequence:
 1. If the signed manifest changes the session-service protocol, refuse the
    update while any local, SSH, or tmux terminal remains live.
 2. Launch the bundled updater and close the desktop process.
-3. Fetch `manifest-linux-ARCH.update.json` and its detached Ed25519 signature from GitHub Releases.
+3. Fetch `manifest-linux-ARCH-v2.update.json` and its detached Ed25519 signature from GitHub Releases.
 4. Verify the compiled release key, stable channel, expiry, platform, architecture, glibc floor, immutable HTTPS host, artifact name, exact byte count, and SHA-256.
 5. Reject archive traversal, links, special files, duplicate files, unexpected files, unsafe ownership, and unsafe permissions.
 6. For a protocol change only, ask the quiescent session service to persist and
@@ -113,10 +113,10 @@ The release manifest and archive are signed with the same offline Ed25519 update
 The script refuses a dirty tree and test-only keys/hosts in production. It builds
 the desktop with the `browser` feature, packages the CEF runtime flat beside the
 binaries, and emits immutable versioned assets plus
-`manifest-linux-ARCH.update.json` and `.sig` stable aliases under
+`manifest-linux-ARCH-v2.update.json` and `.sig` stable aliases under
 `target/release-dist/linux-ARCH/`.
 
-`.github/workflows/release.yml` downloads and SHA-1-verifies the CEF 151 minimal
+`.github/workflows/release.yml` downloads and SHA-256-verifies the CEF 151 minimal
 archive pinned to `cef = 151.6.0`, then runs the package job for x86_64 and arm64
 inside Ubuntu 22.04 containers, attests the outputs, and publishes them with the
 macOS assets. CI compiles the Linux browser feature against the same pinned

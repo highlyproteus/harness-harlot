@@ -841,6 +841,7 @@ fn linux_install_files() -> HashSet<&'static str> {
         "share/applications/com.harnessharlot.desktop.desktop",
         "share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png",
         "share/licenses/harness-harlot/LICENSE",
+        "share/licenses/harness-harlot/PRIVACY.md",
         "share/licenses/harness-harlot/THIRD_PARTY_NOTICES.md",
         "share/licenses/harness-harlot/ASSET_NOTICES.md",
         "share/harness-harlot/install-id",

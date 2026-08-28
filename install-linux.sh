@@ -86,8 +86,8 @@ if not isinstance(entry, dict):
     raise SystemExit(f"release has no Linux {architecture} package")
 expected = {
     "archive": f"Harness-Harlot-{version}-b{build}-linux-{architecture}.tar.gz",
-    "manifest": f"manifest-linux-{architecture}.update.json",
-    "signature": f"manifest-linux-{architecture}.update.json.sig",
+    "manifest": f"manifest-linux-{architecture}-v2.update.json",
+    "signature": f"manifest-linux-{architecture}-v2.update.json.sig",
 }
 values = [tag, version, str(build)]
 maximum_sizes = {
