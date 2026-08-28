@@ -80,6 +80,7 @@ impl HonchoBackend {
             .timeout_connect(HONCHO_TIMEOUT)
             .timeout(HONCHO_TIMEOUT)
             .https_only(redirect_policy == RedirectPolicy::HttpsOnly)
+            .redirects(0)
             .build();
         let mut backend = Self {
             agent,
@@ -312,6 +313,63 @@ mod tests {
             honcho_redirect_policy("http://localhost:8000").unwrap(),
             RedirectPolicy::ValidatedLoopbackHttp
         );
+    }
+
+    #[test]
+    fn honcho_client_never_follows_a_cross_origin_redirect() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
+        redirect_target.set_nonblocking(true).unwrap();
+        let redirect_target_address = redirect_target.local_addr().unwrap();
+        let target_hit = Arc::new(AtomicBool::new(false));
+        let target_hit_for_thread = Arc::clone(&target_hit);
+        let target_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match redirect_target.accept() {
+                    Ok((mut stream, _)) => {
+                        target_hit_for_thread.store(true, Ordering::SeqCst);
+                        let mut request = [0_u8; 4_096];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept redirect target: {error}"),
+                }
+            }
+        });
+
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_thread = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            let mut request = [0_u8; 4_096];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{redirect_target_address}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let result = HonchoBackend::new(HonchoSettings {
+            base_url: format!("http://{origin_address}"),
+            workspace: "redirect-test".to_owned(),
+            bearer: Some("not-a-real-secret".to_owned()),
+        });
+        assert!(result.is_err());
+        origin_thread.join().unwrap();
+        target_thread.join().unwrap();
+        assert!(!target_hit.load(Ordering::SeqCst));
     }
 
     #[test]

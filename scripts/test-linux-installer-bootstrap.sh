@@ -21,7 +21,7 @@ chmod 755 "$work/package/Harness-Harlot/bin/hh-update-tool" "$work/package/Harne
 archive_name='Harness-Harlot-9.8.7-b42-linux-x86_64.tar.gz'
 archive="$work/$archive_name"
 COPYFILE_DISABLE=1 tar -czf "$archive" -C "$work/package" Harness-Harlot
-manifest_name='manifest-linux-x86_64.update.json'
+manifest_name='manifest-linux-x86_64-v2.update.json'
 signature_name="$manifest_name.sig"
 printf '{"fixture":true}\n' > "$work/$manifest_name"
 printf 'fixture-signature\n' > "$work/$signature_name"

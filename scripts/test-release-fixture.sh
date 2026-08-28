@@ -69,8 +69,8 @@ grep -F "fixture support is not compiled into this updater" \
   "$work/embedded-updater.out" >/dev/null
 
 
-[ -f "$distribution/manifest-macos-${architecture}.update.json" ]
-[ -f "$distribution/manifest-macos-${architecture}.update.json.sig" ]
-grep -F '"channel": "edge"' "$distribution/manifest-macos-${architecture}.update.json" >/dev/null
+[ -f "$distribution/manifest-macos-${architecture}-v2.update.json" ]
+[ -f "$distribution/manifest-macos-${architecture}-v2.update.json.sig" ]
+grep -F '"channel": "edge"' "$distribution/manifest-macos-${architecture}-v2.update.json" >/dev/null
 
 echo "release fixture signs inside-out, publishes channel manifests, and bundles hh, hh-service, and hh-update-tool"

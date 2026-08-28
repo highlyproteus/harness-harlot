@@ -25,17 +25,27 @@ chmod 600 "$key"
 cargo build --locked --release -p hh-release-signer --bin hh-release-sign
 public_key=$("$target_directory/release/hh-release-sign" public-key --private-key "$key")
 
+case "$(uname -m)" in
+  aarch64 | arm64) architecture=arm64 ;;
+  x86_64) architecture=x86_64 ;;
+  *) echo "unsupported Linux test architecture" >&2; exit 1 ;;
+esac
+
+HH_RELEASE_TEST_MODE=1 \
+HH_ALLOW_DIRTY_TEST_PACKAGE=1 \
+HH_RELEASE_UNSIGNED=1 \
+  "$repository_root/scripts/package-linux-release.sh" "$version" 97 >/dev/null
+unsigned_distribution="$target_directory/release-dist/linux-$architecture"
+unsigned_manifest="$unsigned_distribution/manifest-linux-$architecture-v2.update.json"
+[ -f "$unsigned_manifest" ]
+[ ! -e "$unsigned_manifest.sig" ]
+
 HH_RELEASE_TEST_MODE=1 \
 HH_ALLOW_DIRTY_TEST_PACKAGE=1 \
 HH_UPDATE_SIGNING_KEY_FILE="$key" \
 HH_UPDATE_PUBLIC_KEY="$public_key" \
   "$repository_root/scripts/package-linux-release.sh" "$version" 97 >/dev/null
 
-case "$(uname -m)" in
-  aarch64 | arm64) architecture=arm64 ;;
-  x86_64) architecture=x86_64 ;;
-  *) echo "unsupported Linux test architecture" >&2; exit 1 ;;
-esac
 distribution="$target_directory/release-dist/linux-$architecture"
 artifact="$distribution/Harness-Harlot-${version}-b97-linux-$architecture.tar.gz"
 manifest="$distribution/Harness-Harlot-${version}-b97-linux-$architecture.update.json"
@@ -43,8 +53,8 @@ signature="$manifest.sig"
 [ -f "$artifact" ]
 [ -f "$manifest" ]
 [ -f "$signature" ]
-[ -f "$distribution/manifest-linux-$architecture.update.json" ]
-[ -f "$distribution/manifest-linux-$architecture.update.json.sig" ]
+[ -f "$distribution/manifest-linux-$architecture-v2.update.json" ]
+[ -f "$distribution/manifest-linux-$architecture-v2.update.json.sig" ]
 
 python3 - "$manifest" "$architecture" "$(basename "$artifact")" <<'PY'
 import json, sys

@@ -1260,6 +1260,13 @@ impl HhApp {
                     .child("Honcho memory")
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_honcho(cx))),
             )
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.dim))
+                    .child("When enabled, text turns and bounded memory context use the configured remote Honcho server. Local thread deletion does not delete remote memory."),
+            )
             .when(honcho_enabled, |element| {
                 element
                     .child(self.render_voice_setting_field(

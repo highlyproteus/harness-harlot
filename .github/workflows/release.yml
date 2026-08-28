@@ -65,13 +65,18 @@ jobs:
           cargo about generate --locked --workspace --fail about.hbs -o THIRD_PARTY_NOTICES.generated.md
           diff -u THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES.generated.md
       - run: shellcheck scripts/*.sh install*.sh packaging/**/*.sh
+      - run: python3 scripts/test-release-security-policy.py
+      - run: scripts/test-isolated-ed25519-signing.sh
       - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   package:
-    name: Package macOS ${{ matrix.release_mode }} ${{ matrix.architecture }}
-    environment: release
+    name: Package macOS community ${{ matrix.architecture }}
+    needs:
+      - verify-release-quality
+      - verify-release-security
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       id-token: write
@@ -82,88 +87,51 @@ jobs:
         include:
           - runner: macos-15
             architecture: arm64
-            release_mode: community
             cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_macosarm64_minimal.tar.bz2
-            cef_sha1: 8245a003c52c01811310b9b7d026e92dff859626
+            cef_sha256: 70c8b97c4dead81b67a8fb29b80da12681e008d4ae9a9778f59e5a2f2adc4e08
           - runner: macos-15-intel
             architecture: x86_64
-            release_mode: community
             cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_macosx64_minimal.tar.bz2
-            cef_sha1: e5bfaa9bd08239d2588b902491dede30cab7d2f5
-          - runner: macos-15
-            architecture: arm64
-            release_mode: developer-id
-            cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_macosarm64_minimal.tar.bz2
-            cef_sha1: 8245a003c52c01811310b9b7d026e92dff859626
-          - runner: macos-15-intel
-            architecture: x86_64
-            release_mode: developer-id
-            cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_macosx64_minimal.tar.bz2
-            cef_sha1: e5bfaa9bd08239d2588b902491dede30cab7d2f5
-    runs-on: ${{ matrix.runner }}
+            cef_sha256: 7ab55b3e45d7a89088d498a5fb6b231c3d3bd17fc1a3eb2aee6c8875f7bd842d
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Validate protected tag, commit identity, and runner architecture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          test "$(uname -m)" = "${{ matrix.architecture }}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          commit_verified=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq .commit.verification.verified)
+          commit_author=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq .author.login)
+          test "$commit_verified" = true
+          test "$commit_author" = highlyproteus
+          tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)
+          tag_type=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.type)
+          test "$tag_type" = tag
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .verification.verified)" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.sha)" = "$GITHUB_SHA"
+          remote_sha=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$GITHUB_REF_NAME^{}" | cut -f1)
+          test "$remote_sha" = "$GITHUB_SHA"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.96"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: release-macos-${{ matrix.architecture }}-${{ matrix.release_mode }}
+          shared-key: release-macos-${{ matrix.architecture }}-community
           cache-targets: true
-      - name: Validate signed tag and runner architecture
-        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
-        run: |
-          set -eu
-          test "$(uname -m)" = "${{ matrix.architecture }}"
-          git fetch --force --no-tags origin \
-            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
-          git config gpg.format ssh
-          git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-tag-allowed-signers"
-          git verify-tag "$GITHUB_REF_NAME"
-          version=${GITHUB_REF_NAME#v}
-          test -n "$version"
-          test "v$version" = "$GITHUB_REF_NAME"
-      - name: Configure ephemeral Apple signing keychain
-        if: matrix.release_mode == 'developer-id' && vars.HH_ENABLE_APPLE_SIGNING == 'true'
-        env:
-          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
-          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-        run: |
-          set -eu
-          keychain="$RUNNER_TEMP/hh-release.keychain-db"
-          keychain_password=$(openssl rand -hex 32)
-          printf '%s' "$MACOS_CERTIFICATE_P12" | openssl base64 -d -A -out "$RUNNER_TEMP/certificate.p12"
-          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/notary-api-key.p8"
-          chmod 600 "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary-api-key.p8"
-          security create-keychain -p "$keychain_password" "$keychain"
-          security default-keychain -s "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
-          xcrun notarytool store-credentials hh-ci \
-            --key "$RUNNER_TEMP/notary-api-key.p8" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID"
-      # Keep the CEF package pinned to the build paired with cef = 151.6.0.
-      # Both SHA-1 values are published by cef-builds.spotifycdn.com.
       - name: Cache pinned CEF archive
-        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/cef-downloads/${{ matrix.cef_archive }}
-          key: cef-${{ matrix.cef_sha1 }}-${{ matrix.cef_archive }}
-      - name: Download, verify, and extract pinned CEF
-        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
+          key: cef-${{ matrix.cef_sha256 }}-${{ matrix.cef_archive }}
+      - name: Download, SHA-256 verify, and extract pinned CEF
         env:
           CEF_ARCHIVE: ${{ matrix.cef_archive }}
-          CEF_SHA1: ${{ matrix.cef_sha1 }}
+          CEF_SHA256: ${{ matrix.cef_sha256 }}
         run: |
           set -eu
           download_directory="$RUNNER_TEMP/cef-downloads"
@@ -174,60 +142,47 @@ jobs:
             curl --proto '=https' --tlsv1.2 -fL \
               "https://cef-builds.spotifycdn.com/$CEF_ARCHIVE" \
               -o "$archive.tmp"
-            printf '%s  %s\n' "$CEF_SHA1" "$archive.tmp" | shasum -a 1 -c -
+            printf '%s  %s\n' "$CEF_SHA256" "$archive.tmp" | shasum -a 256 -c -
             mv "$archive.tmp" "$archive"
           fi
-          printf '%s  %s\n' "$CEF_SHA1" "$archive" | shasum -a 1 -c -
+          printf '%s  %s\n' "$CEF_SHA256" "$archive" | shasum -a 256 -c -
           tar -xjf "$archive" -C "$extract_directory"
           cef_path="$extract_directory/${CEF_ARCHIVE%.tar.bz2}"
           test -f "$cef_path/CREDITS.html"
           test -d "$cef_path/Release/Chromium Embedded Framework.framework"
           printf 'CEF_PATH=%s\n' "$cef_path" >> "$GITHUB_ENV"
-      - name: Build, package, and verify
-        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
+      - name: Build and verify unsigned community package
         env:
-          HH_CODESIGN_IDENTITY: ${{ vars.HH_CODESIGN_IDENTITY }}
-          HH_EXPECTED_TEAM_ID: ${{ vars.HH_EXPECTED_TEAM_ID }}
-          HH_NOTARY_PROFILE: hh-ci
           HH_RELEASE_TAG: ${{ github.ref_name }}
+          HH_RELEASE_UNSIGNED: 1
           HH_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
-          HH_UPDATE_KEY_ID: ${{ vars.HH_UPDATE_KEY_ID }}
-          HH_UPDATE_PUBLIC_KEY: ${{ secrets.HH_UPDATE_PUBLIC_KEY }}
-          HH_UPDATE_SIGNING_SEED: ${{ secrets.HH_UPDATE_SIGNING_SEED }}
+          HH_UPDATE_KEY_ID: hh-stable-2026-v2
         run: |
           set -eu
-          key_file="$RUNNER_TEMP/update-signing-seed"
-          printf '%s\n' "$HH_UPDATE_SIGNING_SEED" > "$key_file"
-          chmod 600 "$key_file"
-          export HH_UPDATE_SIGNING_KEY_FILE="$key_file"
+          version=${GITHUB_REF_NAME#v}
+          test -n "$version"
+          test "v$version" = "$GITHUB_REF_NAME"
           build=$(git rev-list --count HEAD)
-          if [ "${{ matrix.release_mode }}" = community ]; then
-            scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$build" --community
-          else
-            scripts/package-macos-release.sh "${GITHUB_REF_NAME#v}" "$build"
-          fi
-      - name: Attest packaged release files
-        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
+          scripts/package-macos-release.sh "$version" "$build" --community
+      - name: Attest unsigned packaged release files
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: target/release-dist/**/*
-      - name: Upload packaged release files
-        if: matrix.release_mode == 'community' || vars.HH_ENABLE_APPLE_SIGNING == 'true'
+      - name: Upload unsigned packaged release files
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-macos-${{ matrix.release_mode }}-${{ matrix.architecture }}
+          name: release-macos-community-${{ matrix.architecture }}
           path: target/release-dist/**/*
           if-no-files-found: error
           retention-days: 14
-      - name: Destroy ephemeral key material
-        if: always()
-        run: |
-          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary-api-key.p8" "$RUNNER_TEMP/update-signing-seed"
-          security delete-keychain "$RUNNER_TEMP/hh-release.keychain-db" || true
 
   package-linux:
     name: Package Linux ${{ matrix.architecture }}
-    environment: release
+    needs:
+      - verify-release-quality
+      - verify-release-security
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
     permissions:
       contents: read
       id-token: write
@@ -239,20 +194,18 @@ jobs:
           - runner: ubuntu-22.04
             architecture: x86_64
             cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_linux64_minimal.tar.bz2
-            cef_sha1: 5fc23dcccfead1044b2c3bf02e4ad27e86c29c0f
+            cef_sha256: 554c2c107a4ca8d555273c0c0d0c1efdfbbb5a2d9ba3a2387dbdf3b622bdb24c
           - runner: ubuntu-24.04-arm
             architecture: arm64
             cef_archive: cef_binary_151.3.18+gbeff58d+chromium-151.0.7922.138_linuxarm64_minimal.tar.bz2
-            cef_sha1: dc9c61bd99ff7074f5a46d020dce58fd3844809f
-    runs-on: ${{ matrix.runner }}
-    container: ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+            cef_sha256: c3acf4f408759cf39c274fc80dc4dee8054e1f4de46bfe15e71b4ada1aa4c664
     steps:
       - name: Install checkout trust dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates git openssh-client
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -264,6 +217,28 @@ jobs:
             libfontconfig1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libx11-xcb-dev libssl-dev libgtk-3-dev libnss3-dev libasound2-dev libgbm-dev
+      - name: Validate protected tag, commit identity, and runner architecture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          case "${{ matrix.architecture }}" in
+            arm64) test "$(uname -m)" = aarch64 ;;
+            x86_64) test "$(uname -m)" = x86_64 ;;
+          esac
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          commit_verified=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq .commit.verification.verified)
+          commit_author=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq .author.login)
+          test "$commit_verified" = true
+          test "$commit_author" = highlyproteus
+          tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)
+          tag_type=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.type)
+          test "$tag_type" = tag
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .verification.verified)" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.sha)" = "$GITHUB_SHA"
+          remote_sha=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$GITHUB_REF_NAME^{}" | cut -f1)
+          test "$remote_sha" = "$GITHUB_SHA"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.96"
@@ -271,17 +246,15 @@ jobs:
         with:
           shared-key: release-linux-${{ matrix.architecture }}
           cache-targets: true
-      # Keep Linux CEF pinned to the build paired with cef = 151.6.0.
-      # Both SHA-1 values are published by cef-builds.spotifycdn.com.
       - name: Cache pinned Linux CEF archive
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/cef-downloads/${{ matrix.cef_archive }}
-          key: cef-${{ matrix.cef_sha1 }}-${{ matrix.cef_archive }}
-      - name: Download, verify, and prepare pinned Linux CEF
+          key: cef-${{ matrix.cef_sha256 }}-${{ matrix.cef_archive }}
+      - name: Download, SHA-256 verify, and prepare pinned Linux CEF
         env:
           CEF_ARCHIVE: ${{ matrix.cef_archive }}
-          CEF_SHA1: ${{ matrix.cef_sha1 }}
+          CEF_SHA256: ${{ matrix.cef_sha256 }}
         run: |
           set -eu
           download_directory="$RUNNER_TEMP/cef-downloads"
@@ -292,10 +265,10 @@ jobs:
             curl --proto '=https' --tlsv1.2 -fL \
               "https://cef-builds.spotifycdn.com/$CEF_ARCHIVE" \
               -o "$archive.tmp"
-            printf '%s  %s\n' "$CEF_SHA1" "$archive.tmp" | sha1sum -c -
+            printf '%s  %s\n' "$CEF_SHA256" "$archive.tmp" | sha256sum -c -
             mv "$archive.tmp" "$archive"
           fi
-          printf '%s  %s\n' "$CEF_SHA1" "$archive" | sha1sum -c -
+          printf '%s  %s\n' "$CEF_SHA256" "$archive" | sha256sum -c -
           rm -rf "$extract_directory"
           mkdir -p "$extract_directory"
           tar -xjf "$archive" -C "$extract_directory"
@@ -306,67 +279,549 @@ jobs:
           mkdir -p "$cef_runtime"
           cp -a "$cef_source/Release/." "$cef_runtime/"
           cp -a "$cef_source/Resources/." "$cef_runtime/"
-          printf '{"type":"minimal","name":"%s","sha1":"%s"}\n' \
-            "$CEF_ARCHIVE" "$CEF_SHA1" > "$cef_runtime/archive.json"
+          printf '{"type":"minimal","name":"%s","sha256":"%s"}\n' \
+            "$CEF_ARCHIVE" "$CEF_SHA256" > "$cef_runtime/archive.json"
           test -f "$cef_runtime/libcef.so"
           test -f "$cef_runtime/icudtl.dat"
           test -d "$cef_runtime/locales"
           printf 'CEF_PATH=%s\n' "$cef_runtime" >> "$GITHUB_ENV"
-      - name: Validate signed tag and runner architecture
-        run: |
-          set -eu
-          case "${{ matrix.architecture }}" in
-            arm64) test "$(uname -m)" = aarch64 ;;
-            x86_64) test "$(uname -m)" = x86_64 ;;
-          esac
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git fetch --force --no-tags origin \
-            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
-          git config gpg.format ssh
-          git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-tag-allowed-signers"
-          git verify-tag "$GITHUB_REF_NAME"
-      - name: Build, sign, package, and verify
+      - name: Build and verify unsigned Linux package
         env:
           HH_RELEASE_TAG: ${{ github.ref_name }}
+          HH_RELEASE_UNSIGNED: 1
           HH_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
-          HH_UPDATE_KEY_ID: ${{ vars.HH_UPDATE_KEY_ID }}
-          HH_UPDATE_PUBLIC_KEY: ${{ secrets.HH_UPDATE_PUBLIC_KEY }}
-          HH_UPDATE_SIGNING_SEED: ${{ secrets.HH_UPDATE_SIGNING_SEED }}
+          HH_UPDATE_KEY_ID: hh-stable-2026-v2
         run: |
           set -eu
           version=${GITHUB_REF_NAME#v}
           test -n "$version"
           test "v$version" = "$GITHUB_REF_NAME"
-          key_file="$RUNNER_TEMP/update-signing-seed"
-          printf '%s\n' "$HH_UPDATE_SIGNING_SEED" > "$key_file"
-          chmod 600 "$key_file"
-          export HH_UPDATE_SIGNING_KEY_FILE="$key_file"
           build=$(git rev-list --count HEAD)
           scripts/package-linux-release.sh "$version" "$build"
-      - name: Attest packaged Linux release files
+      - name: Attest unsigned packaged Linux release files
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: target/release-dist/**/*
-      - name: Upload packaged Linux release files
+      - name: Upload unsigned packaged Linux release files
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-linux-${{ matrix.architecture }}
           path: target/release-dist/**/*
           if-no-files-found: error
           retention-days: 14
-      - name: Destroy update signing seed
+
+  sign-stable-v2:
+    name: Sign stable-v2 manifests in isolated job
+    needs:
+      - package
+      - package-linux
+    environment: stable-signing-v2
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-macos-*
+          path: ${{ runner.temp }}/unsigned
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-linux-*
+          path: ${{ runner.temp }}/unsigned
+          merge-multiple: true
+      - name: Verify package-job provenance before exposing a signing seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' links < <(find "$RUNNER_TEMP/unsigned" -type l -print0)
+          (( ${#links[@]} == 0 ))
+          mapfile -d '' files < <(find "$RUNNER_TEMP/unsigned" -type f -print0 | sort -z)
+          (( ${#files[@]} > 0 ))
+          for file in "${files[@]}"; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" >/dev/null
+          done
+      - name: Validate unsigned manifests and artifact bindings
+        env:
+          HH_UPDATE_KEY_ID: ${{ vars.HH_UPDATE_KEY_ID }}
+        run: |
+          set -eu
+          python3 - "$RUNNER_TEMP/unsigned" "$HH_UPDATE_KEY_ID" "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$RUNNER_TEMP/manifests.list" <<'PY'
+          import datetime as dt
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1]).resolve()
+          key_id, tag, repository, list_path = sys.argv[2:]
+          assert key_id == "hh-stable-2026-v2"
+          assert tag.startswith("v") and tag[1:]
+          all_paths = list(root.rglob("*"))
+          assert len(all_paths) <= 128
+          assert not any(path.is_symlink() for path in all_paths)
+          regular = [path for path in all_paths if path.is_file()]
+          by_name = {}
+          for path in regular:
+              assert path.name not in by_name, f"duplicate release basename: {path.name}"
+              by_name[path.name] = path
+          manifests = sorted(path for path in regular if path.name.endswith(".update.json"))
+          assert len(manifests) == 8, [path.name for path in manifests]
+          assert not any(path.name.endswith(".sig") for path in regular)
+          expected_aliases = {
+              "manifest-macos-community-arm64-v2.update.json",
+              "manifest-macos-community-x86_64-v2.update.json",
+              "manifest-linux-arm64-v2.update.json",
+              "manifest-linux-x86_64-v2.update.json",
+          }
+          assert expected_aliases <= set(by_name)
+          targets = {}
+          expected_files = set()
+          exact_manifest_keys = {
+              "schema", "product", "channel", "key_id", "version", "build",
+              "published_at", "valid_until", "platform", "session_service", "artifacts",
+          }
+          artifact_keys = {"platform", "architecture", "format", "file_name", "url", "sha256", "size"}
+          for path in manifests:
+              expected_files.add(path.name)
+              raw = path.read_bytes()
+              manifest = json.loads(raw)
+              keys = set(manifest)
+              optional = {"minimum_macos", "minimum_glibc"}
+              assert exact_manifest_keys <= keys <= exact_manifest_keys | optional
+              assert manifest["schema"] == "hh-update-manifest-v2"
+              assert manifest["product"] == "Harness Harlot"
+              assert manifest["channel"] == "stable"
+              assert manifest["key_id"] == key_id
+              assert manifest["version"] == tag[1:]
+              assert isinstance(manifest["build"], int) and manifest["build"] > 0
+              published = dt.datetime.fromisoformat(manifest["published_at"].replace("Z", "+00:00"))
+              valid_until = dt.datetime.fromisoformat(manifest["valid_until"].replace("Z", "+00:00"))
+              assert published < valid_until <= published + dt.timedelta(days=31)
+              policy = manifest["session_service"]
+              assert set(policy) == {"protocol_version", "requires_quiescent_service"}
+              assert isinstance(policy["protocol_version"], int) and policy["protocol_version"] > 0
+              assert policy["requires_quiescent_service"] is True
+              assert len(manifest["artifacts"]) == 1
+              artifact = manifest["artifacts"][0]
+              assert set(artifact) == artifact_keys
+              assert artifact["platform"] == manifest["platform"]
+              target = (artifact["platform"], artifact["architecture"])
+              assert target in {("macos", "arm64"), ("macos", "x86_64"), ("linux", "arm64"), ("linux", "x86_64")}
+              if target[0] == "macos":
+                  assert artifact["format"] == "dmg"
+                  assert keys == exact_manifest_keys | {"minimum_macos"}
+                  versioned_name = artifact["file_name"][:-4] + ".update.json"
+                  alias_name = f"manifest-macos-community-{target[1]}-v2.update.json"
+              else:
+                  assert artifact["format"] == "tar.gz"
+                  assert keys == exact_manifest_keys | {"minimum_glibc"}
+                  versioned_name = artifact["file_name"][:-7] + ".update.json"
+                  alias_name = f"manifest-linux-{target[1]}-v2.update.json"
+              assert path.name in {versioned_name, alias_name}
+              artifact_path = by_name[artifact["file_name"]]
+              expected_files.add(artifact_path.name)
+              assert artifact_path.stat().st_size == artifact["size"]
+              assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == artifact["sha256"]
+              expected_url = f"https://github.com/{repository}/releases/download/{tag}/{artifact_path.name}"
+              assert artifact["url"] == expected_url
+              targets.setdefault(target, {})[path.name] = raw
+          assert len(targets) == 4
+          for target, copies in targets.items():
+              assert len(copies) == 2, (target, copies.keys())
+              assert len(set(copies.values())) == 1, f"manifest aliases differ for {target}"
+          assert set(by_name) == expected_files, sorted(set(by_name) - expected_files)
+          pathlib.Path(list_path).write_text("".join(str(path) + "\n" for path in manifests), encoding="utf-8")
+          PY
+      - name: Prepare pinned isolated signer
+        run: |
+          set -eu
+          # BEGIN ISOLATED SIGNER V1
+          cat > "$RUNNER_TEMP/isolated-sign.sh" <<'SIGNER'
+          #!/bin/sh
+          set -eu
+
+          usage() {
+            echo "usage: $0 BASE64_SEED_FILE EXPECTED_PUBLIC_KEY MANIFEST SIGNATURE" >&2
+            exit 2
+          }
+
+          [ "$#" -eq 4 ] || usage
+          seed_file=$1
+          expected_public_key=$2
+          manifest=$3
+          signature=$4
+          openssl_command=${HH_OPENSSL:-openssl}
+          command -v "$openssl_command" >/dev/null 2>&1 || {
+            echo "OpenSSL command is unavailable: $openssl_command" >&2
+            exit 2
+          }
+
+          [ -f "$seed_file" ] && [ ! -L "$seed_file" ] || {
+            echo "signing seed must be a regular non-symlink file" >&2
+            exit 2
+          }
+          [ -f "$manifest" ] && [ ! -L "$manifest" ] || {
+            echo "manifest must be a regular non-symlink file" >&2
+            exit 2
+          }
+          [ -n "$expected_public_key" ] || {
+            echo "expected public key is empty" >&2
+            exit 2
+          }
+
+          work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/hh-isolated-sign.XXXXXX")
+          cleanup() {
+            rm -rf "$work"
+          }
+          trap cleanup EXIT HUP INT TERM
+          umask 077
+
+          "$openssl_command" base64 -d -A -in "$seed_file" -out "$work/seed.bin"
+          [ "$(wc -c < "$work/seed.bin" | tr -d ' ')" = 32 ] || {
+            echo "Ed25519 seed must decode to exactly 32 bytes" >&2
+            exit 2
+          }
+          printf '\060\056\002\001\000\060\005\006\003\053\145\160\004\042\004\040' > "$work/private.der"
+          cat "$work/seed.bin" >> "$work/private.der"
+          rm -f "$work/seed.bin"
+
+          "$openssl_command" pkey -inform DER -in "$work/private.der" -out "$work/private.pem" >/dev/null 2>&1
+          "$openssl_command" pkey -in "$work/private.pem" -pubout -out "$work/public.pem" >/dev/null 2>&1
+          derived_public_key=$(
+            "$openssl_command" pkey -in "$work/private.pem" -pubout -outform DER 2>/dev/null |
+              tail -c 32 |
+              "$openssl_command" base64 -A
+          )
+          [ "$derived_public_key" = "$expected_public_key" ] || {
+            echo "signing seed does not match the expected public key" >&2
+            exit 2
+          }
+
+          "$openssl_command" pkeyutl -sign -inkey "$work/private.pem" -rawin \
+            -in "$manifest" -out "$work/signature.bin"
+          "$openssl_command" pkeyutl -verify -pubin -inkey "$work/public.pem" -rawin \
+            -in "$manifest" -sigfile "$work/signature.bin" >/dev/null
+          "$openssl_command" base64 -A -in "$work/signature.bin" -out "$signature"
+          printf '\n' >> "$signature"
+          chmod 0644 "$signature"
+          SIGNER
+          # END ISOLATED SIGNER V1
+          chmod 0755 "$RUNNER_TEMP/isolated-sign.sh"
+      - name: Materialize stable-v2 seed after all untrusted inputs are validated
+        env:
+          HH_UPDATE_SIGNING_SEED: ${{ secrets.HH_UPDATE_SIGNING_SEED }}
+        run: |
+          set -eu
+          umask 077
+          test -n "$HH_UPDATE_SIGNING_SEED"
+          printf '%s' "$HH_UPDATE_SIGNING_SEED" > "$RUNNER_TEMP/signing-seed.b64"
+          unset HH_UPDATE_SIGNING_SEED
+      - name: Sign validated stable-v2 manifests without checkout or network credentials
+        env:
+          HH_UPDATE_PUBLIC_KEY: ${{ vars.HH_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -eu
+          test -n "$HH_UPDATE_PUBLIC_KEY"
+          mkdir -p "$RUNNER_TEMP/stable-signatures"
+          while IFS= read -r manifest; do
+            test -f "$manifest"
+            "$RUNNER_TEMP/isolated-sign.sh" \
+              "$RUNNER_TEMP/signing-seed.b64" "$HH_UPDATE_PUBLIC_KEY" \
+              "$manifest" "$RUNNER_TEMP/stable-signatures/$(basename "$manifest").sig"
+          done < "$RUNNER_TEMP/manifests.list"
+      - name: Destroy stable-v2 private material
         if: always()
-        run: rm -f "$RUNNER_TEMP/update-signing-seed"
+        run: |
+          shred -u "$RUNNER_TEMP/signing-seed.b64" 2>/dev/null || rm -f "$RUNNER_TEMP/signing-seed.b64"
+      - name: Attest stable-v2 signatures
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ runner.temp }}/stable-signatures/*.sig
+      - name: Upload stable-v2 signatures
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-stable-v2-signatures
+          path: ${{ runner.temp }}/stable-signatures/*.sig
+          if-no-files-found: error
+          retention-days: 14
+
+  sign-legacy-bridge:
+    name: Preserve old-client v0.1.14 bridge manifests
+    needs:
+      - package
+      - package-linux
+      - sign-stable-v2
+    environment: release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: github.ref_name == 'v0.1.14'
+        with:
+          pattern: release-macos-*
+          path: ${{ runner.temp }}/unsigned
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: github.ref_name == 'v0.1.14'
+        with:
+          pattern: release-linux-*
+          path: ${{ runner.temp }}/unsigned
+          merge-multiple: true
+      - name: Verify package-job provenance before exposing the legacy seed
+        if: github.ref_name == 'v0.1.14'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' links < <(find "$RUNNER_TEMP/unsigned" -type l -print0)
+          (( ${#links[@]} == 0 ))
+          mapfile -d '' files < <(find "$RUNNER_TEMP/unsigned" -type f -print0 | sort -z)
+          (( ${#files[@]} > 0 ))
+          for file in "${files[@]}"; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" >/dev/null
+          done
+      - name: Create bounded legacy bridge manifests
+        if: github.ref_name == 'v0.1.14'
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/legacy"
+          python3 - "$RUNNER_TEMP/unsigned" "$RUNNER_TEMP/legacy" "$GITHUB_REF_NAME" <<'PY'
+          import datetime as dt
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1]).resolve()
+          output = pathlib.Path(sys.argv[2]).resolve()
+          tag = sys.argv[3]
+          assert tag == "v0.1.14"
+          aliases = sorted(root.rglob("manifest-*-v2.update.json"))
+          assert len(aliases) == 4
+          assert not any(path.is_symlink() for path in root.rglob("*"))
+          all_files = [path for path in root.rglob("*") if path.is_file()]
+          by_name = {path.name: path for path in all_files}
+          assert len(by_name) == len(all_files)
+          for source in aliases:
+              manifest = json.loads(source.read_text(encoding="utf-8"))
+              assert manifest["schema"] == "hh-update-manifest-v2"
+              assert manifest["channel"] == "stable"
+              assert manifest["key_id"] == "hh-stable-2026-v2"
+              assert manifest["version"] == "0.1.14"
+              published = dt.datetime.fromisoformat(manifest["published_at"].replace("Z", "+00:00"))
+              manifest["valid_until"] = published.replace(year=published.year + 10).isoformat().replace("+00:00", "Z")
+              assert len(manifest["artifacts"]) == 1
+              artifact = manifest["artifacts"][0]
+              artifact_path = by_name[artifact["file_name"]]
+              assert artifact_path.stat().st_size == artifact["size"]
+              assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == artifact["sha256"]
+              manifest["key_id"] = "hh-stable-2026"
+              destination = output / source.name.replace("-v2.update.json", ".update.json")
+              destination.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+      - name: Prepare pinned isolated signer
+        if: github.ref_name == 'v0.1.14'
+        run: |
+          set -eu
+          # BEGIN ISOLATED SIGNER V1
+          cat > "$RUNNER_TEMP/isolated-sign.sh" <<'SIGNER'
+          #!/bin/sh
+          set -eu
+
+          usage() {
+            echo "usage: $0 BASE64_SEED_FILE EXPECTED_PUBLIC_KEY MANIFEST SIGNATURE" >&2
+            exit 2
+          }
+
+          [ "$#" -eq 4 ] || usage
+          seed_file=$1
+          expected_public_key=$2
+          manifest=$3
+          signature=$4
+          openssl_command=${HH_OPENSSL:-openssl}
+          command -v "$openssl_command" >/dev/null 2>&1 || {
+            echo "OpenSSL command is unavailable: $openssl_command" >&2
+            exit 2
+          }
+
+          [ -f "$seed_file" ] && [ ! -L "$seed_file" ] || {
+            echo "signing seed must be a regular non-symlink file" >&2
+            exit 2
+          }
+          [ -f "$manifest" ] && [ ! -L "$manifest" ] || {
+            echo "manifest must be a regular non-symlink file" >&2
+            exit 2
+          }
+          [ -n "$expected_public_key" ] || {
+            echo "expected public key is empty" >&2
+            exit 2
+          }
+
+          work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/hh-isolated-sign.XXXXXX")
+          cleanup() {
+            rm -rf "$work"
+          }
+          trap cleanup EXIT HUP INT TERM
+          umask 077
+
+          "$openssl_command" base64 -d -A -in "$seed_file" -out "$work/seed.bin"
+          [ "$(wc -c < "$work/seed.bin" | tr -d ' ')" = 32 ] || {
+            echo "Ed25519 seed must decode to exactly 32 bytes" >&2
+            exit 2
+          }
+          printf '\060\056\002\001\000\060\005\006\003\053\145\160\004\042\004\040' > "$work/private.der"
+          cat "$work/seed.bin" >> "$work/private.der"
+          rm -f "$work/seed.bin"
+
+          "$openssl_command" pkey -inform DER -in "$work/private.der" -out "$work/private.pem" >/dev/null 2>&1
+          "$openssl_command" pkey -in "$work/private.pem" -pubout -out "$work/public.pem" >/dev/null 2>&1
+          derived_public_key=$(
+            "$openssl_command" pkey -in "$work/private.pem" -pubout -outform DER 2>/dev/null |
+              tail -c 32 |
+              "$openssl_command" base64 -A
+          )
+          [ "$derived_public_key" = "$expected_public_key" ] || {
+            echo "signing seed does not match the expected public key" >&2
+            exit 2
+          }
+
+          "$openssl_command" pkeyutl -sign -inkey "$work/private.pem" -rawin \
+            -in "$manifest" -out "$work/signature.bin"
+          "$openssl_command" pkeyutl -verify -pubin -inkey "$work/public.pem" -rawin \
+            -in "$manifest" -sigfile "$work/signature.bin" >/dev/null
+          "$openssl_command" base64 -A -in "$work/signature.bin" -out "$signature"
+          printf '\n' >> "$signature"
+          chmod 0644 "$signature"
+          SIGNER
+          # END ISOLATED SIGNER V1
+          chmod 0755 "$RUNNER_TEMP/isolated-sign.sh"
+      - name: Materialize legacy bridge seed after package validation
+        if: github.ref_name == 'v0.1.14'
+        env:
+          HH_UPDATE_SIGNING_SEED: ${{ secrets.HH_UPDATE_SIGNING_SEED }}
+        run: |
+          set -eu
+          umask 077
+          test -n "$HH_UPDATE_SIGNING_SEED"
+          printf '%s' "$HH_UPDATE_SIGNING_SEED" > "$RUNNER_TEMP/signing-seed.b64"
+          unset HH_UPDATE_SIGNING_SEED
+      - name: Sign only the four legacy bridge aliases
+        if: github.ref_name == 'v0.1.14'
+        env:
+          HH_UPDATE_PUBLIC_KEY: ${{ secrets.HH_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -eu
+          test -n "$HH_UPDATE_PUBLIC_KEY"
+          count=0
+          for manifest in "$RUNNER_TEMP"/legacy/*.update.json; do
+            "$RUNNER_TEMP/isolated-sign.sh" \
+              "$RUNNER_TEMP/signing-seed.b64" "$HH_UPDATE_PUBLIC_KEY" \
+              "$manifest" "$manifest.sig"
+            count=$((count + 1))
+          done
+          test "$count" -eq 4
+      - name: Destroy legacy private material
+        if: always() && github.ref_name == 'v0.1.14'
+        run: |
+          shred -u "$RUNNER_TEMP/signing-seed.b64" 2>/dev/null || rm -f "$RUNNER_TEMP/signing-seed.b64"
+      - name: Download immutable v0.1.14 legacy bridge
+        if: github.ref_name != 'v0.1.14'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HH_UPDATE_LEGACY_PUBLIC_KEY_V1: ${{ vars.HH_UPDATE_LEGACY_PUBLIC_KEY_V1 }}
+        run: |
+          set -euo pipefail
+          test -n "$HH_UPDATE_LEGACY_PUBLIC_KEY_V1"
+          mkdir -p "$RUNNER_TEMP/legacy"
+          gh release download v0.1.14 --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/legacy" \
+            --pattern 'manifest-macos-arm64.update.json' \
+            --pattern 'manifest-macos-arm64.update.json.sig' \
+            --pattern 'manifest-macos-x86_64.update.json' \
+            --pattern 'manifest-macos-x86_64.update.json.sig' \
+            --pattern 'manifest-linux-arm64.update.json' \
+            --pattern 'manifest-linux-arm64.update.json.sig' \
+            --pattern 'manifest-linux-x86_64.update.json' \
+            --pattern 'manifest-linux-x86_64.update.json.sig'
+          mapfile -d '' files < <(find "$RUNNER_TEMP/legacy" -type f -print0 | sort -z)
+          test "${#files[@]}" -eq 8
+          for file in "${files[@]}"; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" >/dev/null
+          done
+          python3 - "$RUNNER_TEMP/legacy" "$HH_UPDATE_LEGACY_PUBLIC_KEY_V1" <<'PY'
+          import base64
+          import datetime as dt
+          import json
+          import pathlib
+          import subprocess
+          import sys
+          import tempfile
+
+          root = pathlib.Path(sys.argv[1])
+          public_key = base64.b64decode(sys.argv[2], validate=True)
+          assert len(public_key) == 32
+          manifests = sorted(root.glob("*.update.json"))
+          expected = {
+              "manifest-macos-arm64.update.json",
+              "manifest-macos-x86_64.update.json",
+              "manifest-linux-arm64.update.json",
+              "manifest-linux-x86_64.update.json",
+          }
+          assert {path.name for path in manifests} == expected
+          with tempfile.TemporaryDirectory() as temporary:
+              public_der = pathlib.Path(temporary) / "public.der"
+              public_der.write_bytes(bytes.fromhex("302a300506032b6570032100") + public_key)
+              for manifest_path in manifests:
+                  manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                  assert manifest["schema"] == "hh-update-manifest-v2"
+                  assert manifest["channel"] == "stable"
+                  assert manifest["key_id"] == "hh-stable-2026"
+                  assert manifest["version"] == "0.1.14"
+                  valid_until = dt.datetime.fromisoformat(manifest["valid_until"].replace("Z", "+00:00"))
+                  assert valid_until.year >= 2036
+                  signature_path = manifest_path.with_name(manifest_path.name + ".sig")
+                  signature = pathlib.Path(temporary) / "signature.bin"
+                  signature.write_bytes(base64.b64decode(signature_path.read_text().strip(), validate=True))
+                  subprocess.run(
+                      ["openssl", "pkeyutl", "-verify", "-pubin", "-keyform", "DER",
+                       "-inkey", str(public_der), "-rawin", "-in", str(manifest_path),
+                       "-sigfile", str(signature)],
+                      check=True,
+                      stdout=subprocess.DEVNULL,
+                  )
+          PY
+      - name: Attest legacy bridge manifests and signatures
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ runner.temp }}/legacy/*
+      - name: Upload legacy bridge manifests and signatures
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-legacy-v014-bridge
+          path: ${{ runner.temp }}/legacy/*
+          if-no-files-found: error
+          retention-days: 14
 
   sbom:
     name: Generate SBOM
+    needs:
+      - verify-release-quality
+      - verify-release-security
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -388,14 +843,12 @@ jobs:
           path: Harness-Harlot-*-sbom.cdx.tar.gz
           if-no-files-found: error
           retention-days: 14
-      - name: Attest community bootstrap installer
+      - name: Attest bootstrap installers
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          subject-path: install-community-macos.sh
-      - name: Attest Linux bootstrap installer
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-path: install-linux.sh
+          subject-path: |
+            install-community-macos.sh
+            install-linux.sh
       - name: Upload bootstrap installers
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -407,56 +860,141 @@ jobs:
           retention-days: 14
 
   publish:
-    name: Publish immutable release assets
+    name: Verify and publish immutable release assets
+    if: >-
+      ${{ always() &&
+          needs.verify-release-quality.result == 'success' &&
+          needs.verify-release-security.result == 'success' &&
+          needs.package.result == 'success' &&
+          needs.package-linux.result == 'success' &&
+          needs.sign-stable-v2.result == 'success' &&
+          needs.sign-legacy-bridge.result == 'success' &&
+          needs.sbom.result == 'success' }}
     needs:
       - verify-release-quality
       - verify-release-security
       - package
       - package-linux
+      - sign-stable-v2
+      - sign-legacy-bridge
       - sbom
     environment: release
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: read
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           path: release-assets
           merge-multiple: true
+      - name: Verify provenance for every publishable asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' links < <(find release-assets -type l -print0)
+          (( ${#links[@]} == 0 ))
+          mapfile -d '' files < <(find release-assets -type f -print0 | sort -z)
+          (( ${#files[@]} > 0 ))
+          for file in "${files[@]}"; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" >/dev/null
+          done
+      - name: Revalidate protected tag and every release signature
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_PUBLIC_KEY: ${{ vars.HH_UPDATE_STABLE_PUBLIC_KEY_V2 }}
+          LEGACY_PUBLIC_KEY: ${{ vars.HH_UPDATE_LEGACY_PUBLIC_KEY_V1 }}
+        run: |
+          set -euo pipefail
+          remote_sha=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$GITHUB_REF_NAME^{}" | cut -f1)
+          test "$remote_sha" = "$GITHUB_SHA"
+          tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .verification.verified)" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.sha)" = "$GITHUB_SHA"
+          test -n "$STABLE_PUBLIC_KEY"
+          test -n "$LEGACY_PUBLIC_KEY"
+          python3 - release-assets "$STABLE_PUBLIC_KEY" "$LEGACY_PUBLIC_KEY" <<'PY'
+          import base64
+          import datetime as dt
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import tempfile
+
+          root = pathlib.Path(sys.argv[1]).resolve()
+          public_keys = {
+              "hh-stable-2026-v2": sys.argv[2],
+              "hh-stable-2026": sys.argv[3],
+          }
+          paths = list(root.rglob("*"))
+          assert len(paths) <= 256
+          assert not any(path.is_symlink() for path in paths)
+          files = [path for path in paths if path.is_file()]
+          by_name = {}
+          for path in files:
+              assert path.name not in by_name, f"duplicate release basename: {path.name}"
+              by_name[path.name] = path
+          manifests = sorted(path for path in files if path.name.endswith(".update.json"))
+          assert len(manifests) == 12
+          expected_files = {
+              "install-community-macos.sh",
+              "install-linux.sh",
+              f"Harness-Harlot-{os.environ['GITHUB_REF_NAME']}-sbom.cdx.tar.gz",
+          }
+          spki_prefix = bytes.fromhex("302a300506032b6570032100")
+          with tempfile.TemporaryDirectory() as temporary:
+              temporary = pathlib.Path(temporary)
+              for index, manifest_path in enumerate(manifests):
+                  expected_files.update({manifest_path.name, manifest_path.name + ".sig"})
+                  manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                  key_id = manifest["key_id"]
+                  assert key_id in public_keys and public_keys[key_id]
+                  if key_id == "hh-stable-2026":
+                      assert manifest["version"] == "0.1.14"
+                      valid_until = dt.datetime.fromisoformat(manifest["valid_until"].replace("Z", "+00:00"))
+                      assert valid_until.year >= 2036
+                  signature_path = by_name[manifest_path.name + ".sig"]
+                  public_der = temporary / f"public-{index}.der"
+                  public_pem = temporary / f"public-{index}.pem"
+                  signature_raw = temporary / f"signature-{index}.bin"
+                  public_der.write_bytes(spki_prefix + base64.b64decode(public_keys[key_id], validate=True))
+                  signature_raw.write_bytes(base64.b64decode(signature_path.read_text().strip(), validate=True))
+                  subprocess.run(["openssl", "pkey", "-pubin", "-inform", "DER", "-in", str(public_der), "-out", str(public_pem)], check=True)
+                  subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(public_pem), "-rawin", "-in", str(manifest_path), "-sigfile", str(signature_raw)], check=True)
+                  artifact = manifest["artifacts"][0]
+                  artifact_path = by_name[artifact["file_name"]]
+                  expected_files.add(artifact_path.name)
+                  assert artifact_path.stat().st_size == artifact["size"]
+                  assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == artifact["sha256"]
+          assert set(by_name) == expected_files, sorted(set(by_name) - expected_files)
+          PY
       - name: Publish signed-tag release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
+          set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --json isDraft --jq .isDraft)
-            if [ "$is_draft" != true ]; then
-              echo "refusing to replace published release $GITHUB_REF_NAME" >&2
-              exit 1
-            fi
-            gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes
-          fi
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --generate-notes --draft
-          cleanup_draft() {
-            is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --json isDraft --jq .isDraft 2>/dev/null || true)
-            if [ "$is_draft" = true ]; then
-              gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes || true
-            fi
-          }
-          trap cleanup_draft EXIT HUP INT TERM
-          mapfile -d '' release_assets < <(
-            find release-assets -type f -print0 | sort -z
-          )
-          if (( ${#release_assets[@]} == 0 )); then
-            echo "no release assets were downloaded" >&2
+            echo "refusing to replace existing release $GITHUB_REF_NAME" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" \
-            "${release_assets[@]}" --repo "$GITHUB_REPOSITORY"
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
-          trap - EXIT HUP INT TERM
+          mapfile -d '' release_assets < <(find release-assets -type f -print0 | sort -z)
+          (( ${#release_assets[@]} > 0 ))
+          printf '%s\n' \
+            'Conversational-only Voice release. The provider receives no tools and has no authority over terminals, panes, workspaces, files, Git, agents, or memory retrieval.' \
+            '' \
+            'This community macOS build is ad-hoc signed (not Apple notarized), so macOS may ask you to grant Microphone or Screen Recording access again.' \
+            > release-notes.md
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "Harness Harlot ${GITHUB_REF_NAME#v}" \
+            --notes-file release-notes.md --draft --latest=false \
+            "${release_assets[@]}"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --latest

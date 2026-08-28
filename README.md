@@ -112,8 +112,9 @@ Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profil
 Assistant panes support typed messages, image attachments, and optional spoken
 conversation through the OpenAI Realtime API. Text and image actions can start
 an Assistant connection, but the microphone remains off until you use the
-visible start-voice control. Terminal-changing actions require separate approval
-in the Harness Harlot UI.
+visible start-voice control. Voice is conversation-only: it receives no provider
+tools or approval path and cannot inspect or control terminals, panes,
+workstations, files, Git, agents, or memory retrieval.
 
 OpenAI and optional Honcho credentials are not saved to the settings file. Set
 `HH_OPENAI_API_KEY` and, when needed, `HH_HONCHO_BEARER` in the launch

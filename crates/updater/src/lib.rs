@@ -58,9 +58,9 @@ pub fn current_build() -> u64 {
 #[must_use]
 pub fn update_manifest_name(platform: &str, architecture: &str) -> String {
     if cfg!(feature = "community-macos") && platform == "macos" {
-        format!("manifest-{platform}-community-{architecture}.update.json")
+        format!("manifest-{platform}-community-{architecture}-v2.update.json")
     } else {
-        format!("manifest-{platform}-{architecture}.update.json")
+        format!("manifest-{platform}-{architecture}-v2.update.json")
     }
 }
 
@@ -76,26 +76,36 @@ pub const fn explicit_install_supported(_platform: &str) -> bool {
     true
 }
 
-/// One key compiled into a production client. Key IDs are part of the signed
-/// manifest and select exactly one corresponding verifying key.
+/// One channel-scoped key compiled into a production client. Key IDs are part
+/// of the signed manifest and select exactly one corresponding verifying key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrustedKey {
     pub key_id: &'static str,
     pub public_key_base64: &'static str,
+    pub channel: UpdateChannel,
 }
 
-/// Populate only after the owner selects the real offline release key.
-/// hh-stable-2026 is the owner-held stable-channel key; its seed never
-/// enters the repository or CI as a file.
-pub const TRUSTED_UPDATE_KEYS: &[TrustedKey] = &[TrustedKey {
-    key_id: "hh-stable-2026",
-    public_key_base64: "Cy/alHdZ5R7fSJEeuvqu1UXH9j5O0f34hWv4Rv8TFwo=",
-}];
+/// Rotated stable and edge authorities. Their seeds are isolated in separate
+/// GitHub environments and are never available to build or package jobs.
+pub const TRUSTED_UPDATE_KEYS: &[TrustedKey] = &[
+    TrustedKey {
+        key_id: "hh-stable-2026-v2",
+        public_key_base64: "OFEgEmfSbN3rfQlA9Z59QT4Ci27E+YXB95qWNQOAHCA=",
+        channel: UpdateChannel::Stable,
+    },
+    TrustedKey {
+        key_id: "hh-edge-2026-v1",
+        public_key_base64: "jaseSRfKXRjmPaLRQA/ka2U3BwpSLPltBKGA2VIZsPU=",
+        channel: UpdateChannel::Edge,
+    },
+];
 /// The immutable production update host. Only artifact URLs on this host
 /// are accepted by the verifier.
 pub const UPDATE_HOST: Option<&str> = Some("github.com");
-/// Stable manifest location; `releases/latest/download` resolves to the
-/// newest non-prerelease GitHub release without knowing its tag.
+/// Stable releases use GitHub's authenticated latest-release pointer. Feed
+/// generations are isolated by manifest filename, so the bridge release can
+/// carry both legacy and v2 aliases without retaining the legacy key in this
+/// binary.
 pub const UPDATE_MANIFEST_BASE: Option<&str> =
     Some("https://github.com/highlyproteus/harness-harlot/releases/latest/download");
 pub const EDGE_UPDATE_RELEASE_PREFIX: Option<&str> =
@@ -223,8 +233,8 @@ pub fn verify_manifest_with_trusted_keys_for_channel(
         serde_json::from_slice(manifest_bytes).context("read update manifest key selector")?;
     let trusted = TRUSTED_UPDATE_KEYS
         .iter()
-        .find(|key| key.key_id == selector.key_id)
-        .context("update manifest key ID is not trusted")?;
+        .find(|key| key.key_id == selector.key_id && key.channel == channel)
+        .context("update manifest key ID is not trusted for the requested channel")?;
     let public_key = public_key_from_base64(trusted.public_key_base64)?;
     verify_manifest_with_key_for_channel(
         manifest_bytes,
@@ -968,25 +978,49 @@ mod tests {
     fn community_macos_feed_is_isolated_and_explicit_install_is_supported() {
         assert_eq!(
             update_manifest_name("linux", "arm64"),
-            "manifest-linux-arm64.update.json"
+            "manifest-linux-arm64-v2.update.json"
         );
         assert!(automatic_install_supported("linux"));
         assert!(explicit_install_supported("linux"));
         if cfg!(feature = "community-macos") {
             assert_eq!(
                 update_manifest_name("macos", "arm64"),
-                "manifest-macos-community-arm64.update.json"
+                "manifest-macos-community-arm64-v2.update.json"
             );
             assert!(!automatic_install_supported("macos"));
             assert!(explicit_install_supported("macos"));
         } else {
             assert_eq!(
                 update_manifest_name("macos", "arm64"),
-                "manifest-macos-arm64.update.json"
+                "manifest-macos-arm64-v2.update.json"
             );
             assert!(automatic_install_supported("macos"));
             assert!(explicit_install_supported("macos"));
         }
+    }
+
+    #[test]
+    fn production_update_keys_are_rotated_and_channel_scoped() {
+        assert_eq!(
+            UPDATE_MANIFEST_BASE,
+            Some("https://github.com/highlyproteus/harness-harlot/releases/latest/download")
+        );
+        assert!(
+            TRUSTED_UPDATE_KEYS
+                .iter()
+                .all(|key| key.key_id != "hh-stable-2026")
+        );
+        let stable = TRUSTED_UPDATE_KEYS
+            .iter()
+            .find(|key| key.key_id == "hh-stable-2026-v2")
+            .expect("rotated stable key");
+        let edge = TRUSTED_UPDATE_KEYS
+            .iter()
+            .find(|key| key.key_id == "hh-edge-2026-v1")
+            .expect("dedicated edge key");
+        assert_eq!(stable.channel, UpdateChannel::Stable);
+        assert_eq!(edge.channel, UpdateChannel::Edge);
+        assert_ne!(stable.public_key_base64, edge.public_key_base64);
     }
 
     #[test]

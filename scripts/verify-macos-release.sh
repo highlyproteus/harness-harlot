@@ -5,6 +5,8 @@ usage() {
   echo "usage: $0 TEAM_ID BUNDLE_ID UPDATE_JSON UPDATE_SIGNATURE" >&2
   echo "       $0 --community BUNDLE_ID UPDATE_JSON UPDATE_SIGNATURE" >&2
   echo "       $0 --fixture BUNDLE_ID UPDATE_HOST UPDATE_KEY_ID UPDATE_PUBLIC_KEY UPDATE_JSON UPDATE_SIGNATURE" >&2
+  echo "       $0 --unsigned-community BUNDLE_ID UPDATE_JSON" >&2
+  echo "       $0 --unsigned-fixture BUNDLE_ID UPDATE_JSON" >&2
   echo "       $0 --app-only-community APP_DIR BUNDLE_ID" >&2
   echo "       $0 --app-only-fixture APP_DIR BUNDLE_ID" >&2
   exit 2
@@ -16,6 +18,7 @@ fixture=0
 community=0
 adhoc=0
 app_only=0
+unsigned=0
 expected_team_id=
 
 if [ "${1:-}" = "--app-only-community" ]; then
@@ -32,6 +35,20 @@ elif [ "${1:-}" = "--app-only-fixture" ]; then
   app_only=1
   app=$2
   expected_bundle_id=$3
+elif [ "${1:-}" = "--unsigned-community" ]; then
+  [ "$#" -eq 3 ] || usage
+  community=1
+  adhoc=1
+  unsigned=1
+  expected_bundle_id=$2
+  manifest=$3
+elif [ "${1:-}" = "--unsigned-fixture" ]; then
+  [ "$#" -eq 3 ] || usage
+  fixture=1
+  adhoc=1
+  unsigned=1
+  expected_bundle_id=$2
+  manifest=$3
 elif [ "${1:-}" = "--community" ]; then
   [ "$#" -eq 4 ] || usage
   community=1
@@ -170,7 +187,7 @@ if [ "$app_only" = 1 ]; then
   exit 0
 fi
 
-if [ "$fixture" = 1 ]; then
+if [ "$fixture" = 1 ] && [ "$unsigned" = 0 ]; then
   case "$expected_update_host" in
     '' | */* | *:* | *@*) echo "UPDATE_HOST must be a bare hostname" >&2; exit 2 ;;
   esac
@@ -179,7 +196,9 @@ if [ "$fixture" = 1 ]; then
   esac
 fi
 [ -f "$manifest" ] || { echo "update manifest not found: $manifest" >&2; exit 1; }
-[ -f "$signature" ] || { echo "update signature not found: $signature" >&2; exit 1; }
+if [ "$unsigned" = 0 ]; then
+  [ -f "$signature" ] || { echo "update signature not found: $signature" >&2; exit 1; }
+fi
 case "$manifest" in
   *.update.json) dmg=${manifest%.update.json}.dmg ;;
   *) echo "update manifest must use the architecture-qualified *.update.json name" >&2; exit 1 ;;
@@ -228,7 +247,9 @@ fi
 # Production trusts the verifier through the already-verified DMG. Fixture mode
 # may use the explicit local test verifier above; neither path inspects an
 # attacker-controlled artifact name before authenticating the manifest.
-if [ "$fixture" = 1 ]; then
+if [ "$unsigned" = 1 ]; then
+  :
+elif [ "$fixture" = 1 ]; then
   "$verification_tool" verify --key-id "$expected_key_id" --public-key "$public_key" \
     --host "$expected_update_host" --manifest "$manifest" \
     --signature "$signature" --channel "${HH_UPDATE_CHANNEL:-stable}" --fixture
@@ -239,10 +260,23 @@ fi
 
 artifact=$(plutil -extract artifacts.0.file_name raw -o - "$manifest")
 if [ "$artifact" != "$(basename "$dmg")" ]; then
-  echo "signed manifest artifact does not match its architecture-qualified DMG" >&2
+  echo "manifest artifact does not match its architecture-qualified DMG" >&2
   exit 1
 fi
-if [ "$fixture" = 1 ]; then
+if [ "$unsigned" = 1 ]; then
+  expected_sha256=$(plutil -extract artifacts.0.sha256 raw -o - "$manifest")
+  expected_size=$(plutil -extract artifacts.0.size raw -o - "$manifest")
+  actual_sha256=$(shasum -a 256 "$dmg" | sed 's/[[:space:]].*$//')
+  actual_size=$(stat -f %z "$dmg")
+  [ "$actual_sha256" = "$expected_sha256" ] || {
+    echo "unsigned manifest digest does not match its DMG" >&2
+    exit 1
+  }
+  [ "$actual_size" = "$expected_size" ] || {
+    echo "unsigned manifest size does not match its DMG" >&2
+    exit 1
+  }
+elif [ "$fixture" = 1 ]; then
   "$verification_tool" verify --key-id "$expected_key_id" --public-key "$public_key" \
     --host "$expected_update_host" --manifest "$manifest" \
     --signature "$signature" --artifact "$dmg" \

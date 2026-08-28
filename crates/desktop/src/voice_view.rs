@@ -1,5 +1,10 @@
 use super::*;
 
+const DELETE_LOCAL_THREAD_LABEL: &str = "Delete local";
+const CLEAR_LOCAL_THREADS_LABEL: &str = "Clear local";
+const LOCAL_HISTORY_SCOPE_NOTICE: &str =
+    "Deleting or clearing here is local only and does not delete remote Honcho memory.";
+
 impl HhApp {
     pub(crate) fn render_assistant_workspace(
         &self,
@@ -156,7 +161,7 @@ impl HhApp {
                                 .font_family(".SystemUIFont")
                                 .text_xs()
                                 .text_color(rgb(THEME.danger))
-                                .child("Delete")
+                                .child(DELETE_LOCAL_THREAD_LABEL)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.delete_saved_thread(thread_id, cx);
                                     cx.stop_propagation();
@@ -204,12 +209,19 @@ impl HhApp {
                                 .font_family(".SystemUIFont")
                                 .text_xs()
                                 .text_color(rgb(THEME.danger))
-                                .child("Clear all")
+                                .child(CLEAR_LOCAL_THREADS_LABEL)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.clear_saved_threads(cx);
                                     cx.stop_propagation();
                                 })),
                         ),
+                )
+                .child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .text_size(px(9.0))
+                        .text_color(rgb(THEME.dim))
+                        .child(LOCAL_HISTORY_SCOPE_NOTICE),
                 )
                 .children(rows)
                 .into_any_element(),
@@ -757,5 +769,17 @@ impl HhApp {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_controls_disclose_local_only_scope() {
+        assert_eq!(DELETE_LOCAL_THREAD_LABEL, "Delete local");
+        assert_eq!(CLEAR_LOCAL_THREADS_LABEL, "Clear local");
+        assert!(LOCAL_HISTORY_SCOPE_NOTICE.contains("does not delete remote Honcho memory"));
     }
 }

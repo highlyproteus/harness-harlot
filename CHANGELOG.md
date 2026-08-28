@@ -6,21 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.1.14] - 2026-08-27
+## [0.1.14] - 2026-08-28
 
 ### Added
 
-- Added Voice Mode with OpenAI Realtime audio and transcripts, Assistant panes,
-  typed text and image attachments, persistent conversation threads, and
-  optional Honcho-backed memory.
+- Added conversational-only Voice Mode with OpenAI Realtime audio and
+  transcripts, Assistant panes, typed text and image attachments, persistent
+  conversation threads, cancellation, and optional Honcho-backed memory.
 - Added service-projected agent status badges for workspace tabs and pane tabs,
   including stable OSC status events and omp/Codex heuristics.
-- Added persistent Voice settings and dock state, coding-agent launch adapters,
-  and reusable session-client support for the desktop and voice engine.
+- Added persistent Voice settings and dock state plus reusable session-client
+  support for the desktop and voice engine.
 - Added clipboard-image paste and file/image drop transfer for focused local and
   SSH terminal panes with private staging, bounded transfer, and rollback.
-- Added native modifier-arrow terminal navigation and URL click routing, including
-  macOS Command-click embedded browser splits.
+- Added native modifier-arrow terminal navigation and URL click routing,
+  including macOS Command-click embedded browser splits.
 - Added bounded, noninteractive tmux discovery for saved SSH workstations that
   are not currently connected.
 
@@ -30,37 +30,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   feedback, and prevented idle suspension during active voice exchanges.
 - Made Assistant tab rename, color, and custom-icon controls behave consistently
   with other pane types.
-- Made terminal input use acknowledged RPC responses, invalidated timed-out
-  client connections, retained Realtime events across bounded reconnects, and
-  surfaced failed, cancelled, or incomplete provider responses.
-- Added spoken barge-in, bounded playback and provider queues, persistence
+- Preserved every accepted typed turn across bounded queues and reconnects,
+  surfaced failed or incomplete provider responses, and prevented silent replay
+  or loss during cancellation.
+- Added spoken barge-in, bounded playback/provider queues and waits, persistence
   rollback, composer draft preservation, and bounded subprocess shutdown.
+- Made local thread delete, clear-all, and retention revocation crash-durable by
+  revoking active writers before unlink and syncing the containing directory
+  before success is reported.
 
 ### Security
 
-- Removed model-controlled approval resolution. Terminal mutations, terminal and
-  workstation creation or closure, tab changes, worktree creation, and agent
-  launches now require independent approval in the Harness Harlot UI.
-- Scoped pane, thread, project, and directory reads to the Assistant's authorized
-  workspace and canonical directory boundary.
-- Removed terminal-controlled OSC payloads from model context and reduced
-  notifications to fixed-vocabulary local cues.
+- Removed all provider/model tools, tool-choice capability, Voice approval cards,
+  and model execution paths. Voice cannot inspect or control terminals, panes,
+  workstations, tabs, projects, threads, directories, filesystems, Git, agents,
+  or memory retrieval.
+- Made historical or unsolicited provider function calls fail locally before any
+  RPC or effect, and appended a final capability boundary after all configured
+  instructions and restored context.
+- Kept terminal output, pane content, and OSC payloads out of provider context;
+  terminal notifications remain fixed-vocabulary local cues only.
 - Deferred microphone device discovery and stream creation until the visible
   start-voice action; text, image, and history paths remain microphone-free.
-- Restricted remote Honcho memory and redirects to HTTPS while allowing plaintext
-  only for validated loopback hosts, and no longer serializes provider credentials.
+- Kept OpenAI and Honcho credentials process/environment-backed and omitted from
+  persisted settings. Honcho requests require HTTPS (except parsed loopback HTTP)
+  and do not follow redirects.
 - Hardened saved threads and image attachments with owner-only descriptor checks,
-  no-follow file access, format and size validation, bounded retention, and local
-  delete-one or clear-all controls that include retained session summaries.
+  no-follow file access, format/size validation, bounded retention, and explicit
+  local-only deletion labels that distinguish remote Honcho retention.
+- Rotated stable and edge update authorities, separated build and signing jobs,
+  removed signing secrets from Cargo/package execution, protected immutable
+  signed `v*` tags, and replaced CEF SHA-1 archive pins with SHA-256.
 - Required tagged release publication to pass exact-commit tests, strict Clippy,
-  audit, deny, notice-drift, ShellCheck, and secret-scanning gates.
+  audit, deny, notice-drift, ShellCheck, release-policy, signer-interoperability,
+  and secret-scanning gates before secret-free publication.
 
 ### Documentation
 
-- Added a public Voice Mode privacy and data-handling disclosure, corrected the
-  in-app credential-storage description, and clarified Linux Voice dependencies
-  and the macOS microphone permission prompt. The disclosure ships in macOS and
-  Linux artifacts and is linked from Voice settings.
+- Replaced the Voice privacy disclosure with the exact conversation-only data
+  boundary and clarified local thread deletion versus optional remote Honcho
+  retention.
+- Clarified that the distributed macOS community build is ad-hoc signed and not
+  Apple Developer ID notarized, so macOS may request privacy permissions again.
+- The disclosure ships in macOS and Linux artifacts and is linked from Voice
+  settings.
 
 ## [0.1.13] - 2026-08-23
 

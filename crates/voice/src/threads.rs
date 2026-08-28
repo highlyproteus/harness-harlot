@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -20,6 +22,29 @@ pub const MAX_THREAD_TITLE_CHARS: usize = 60;
 
 static STORAGE_LOCK: LazyLock<parking_lot::Mutex<()>> =
     LazyLock::new(|| parking_lot::Mutex::new(()));
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_THREAD_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_thread_directory_sync() {
+    FAIL_NEXT_THREAD_DIRECTORY_SYNC.set(true);
+}
+
+fn sync_thread_directory(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_THREAD_DIRECTORY_SYNC.replace(false) {
+        anyhow::bail!(
+            "sync assistant thread directory {}: injected failure",
+            dir.display()
+        );
+    }
+    fs::File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("sync assistant thread directory {}", dir.display()))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadGeneration {
@@ -512,7 +537,7 @@ fn delete_thread_in(dir: &Path, thread_id: Uuid) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("revoke assistant thread writer"),
     }
-    match fs::symlink_metadata(&path) {
+    let deleted = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             anyhow::bail!("assistant thread delete target is not a regular file")
         }
@@ -520,11 +545,15 @@ fn delete_thread_in(dir: &Path, thread_id: Uuid) -> Result<bool> {
             // Descriptor validation prevents deleting a foreign-owned/open file.
             let _ = hh_protocol::read_private_file(&path, MAX_THREAD_FILE_BYTES)?;
             fs::remove_file(path).context("delete assistant thread")?;
-            Ok(true)
+            true
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).context("inspect assistant thread delete target"),
-    }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("inspect assistant thread delete target"),
+    };
+    // Sync even for an idempotent retry: a prior unlink may have completed
+    // before its directory sync failed, leaving no entry to remove this time.
+    sync_thread_directory(dir)?;
+    Ok(deleted)
 }
 
 fn clear_all_threads_in(dir: &Path) -> Result<usize> {
@@ -564,6 +593,8 @@ fn clear_all_threads_in(dir: &Path) -> Result<usize> {
         };
         deleted += usize::from(delete_thread_in(dir, thread_id)?);
     }
+    // Also resync on an idempotent retry after an earlier unlink/sync error.
+    sync_thread_directory(dir)?;
     Ok(deleted)
 }
 
@@ -1098,6 +1129,40 @@ mod tests {
     }
 
     #[test]
+    fn delete_is_not_reported_successful_when_directory_sync_fails() {
+        let dir = test_dir();
+        let thread_id = Uuid::new_v4();
+        append_record_in(&dir, thread_id, &meta(thread_id, 10)).unwrap();
+
+        fail_next_thread_directory_sync();
+        let error = delete_thread_in(&dir, thread_id).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("sync assistant thread directory"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delete_retry_resyncs_after_an_unlink_sync_failure() {
+        let dir = test_dir();
+        let thread_id = Uuid::new_v4();
+        append_record_in(&dir, thread_id, &meta(thread_id, 10)).unwrap();
+
+        fail_next_thread_directory_sync();
+        assert!(delete_thread_in(&dir, thread_id).is_err());
+        fail_next_thread_directory_sync();
+        assert!(
+            delete_thread_in(&dir, thread_id).is_err(),
+            "an idempotent retry must attempt the parent-directory sync again"
+        );
+        assert!(!delete_thread_in(&dir, thread_id).unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn clear_all_removes_pre_file_writer_authorities_without_blocking_new_writers() {
         let dir = test_dir();
         let thread_id = Uuid::new_v4();
@@ -1127,6 +1192,23 @@ mod tests {
                 &meta(thread_id, 20),
             )
             .unwrap()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_all_is_not_reported_successful_when_authority_unlink_sync_fails() {
+        let dir = test_dir();
+        let thread_id = Uuid::new_v4();
+        let _generation = current_generation_in(&dir, thread_id).unwrap();
+        assert!(authority_path(&dir, thread_id).is_file());
+
+        fail_next_thread_directory_sync();
+        let error = clear_all_threads_in(&dir).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("sync assistant thread directory"),
+            "unexpected error: {error:#}"
         );
         fs::remove_dir_all(dir).unwrap();
     }
