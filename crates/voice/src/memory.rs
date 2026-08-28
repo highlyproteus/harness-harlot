@@ -34,7 +34,6 @@ impl Role {
 
 pub(crate) trait MemoryBackend: Send {
     fn record_turn(&mut self, role: Role, text: &str);
-    fn recall(&mut self, query: &str) -> Result<String>;
     fn session_preamble(&mut self) -> Option<String>;
     fn flush(&mut self) {}
 }
@@ -44,10 +43,6 @@ pub(crate) struct NullBackend;
 
 impl MemoryBackend for NullBackend {
     fn record_turn(&mut self, _role: Role, _text: &str) {}
-
-    fn recall(&mut self, _query: &str) -> Result<String> {
-        Ok(json!({ "error": "memory disabled" }).to_string())
-    }
 
     fn session_preamble(&mut self) -> Option<String> {
         None
@@ -227,21 +222,6 @@ impl MemoryBackend for HonchoBackend {
         }
     }
 
-    fn recall(&mut self, query: &str) -> Result<String> {
-        if let Err(error) = self.flush_buffer() {
-            eprintln!("Honcho pre-recall flush failed: {error:#}");
-        }
-        let response = self.post(
-            &format!("{}/peers/user/chat", self.workspace_path),
-            &json!({ "query": query, "reasoning_level": "low" }),
-        )?;
-        response
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .context("Honcho chat response has no content")
-    }
-
     fn session_preamble(&mut self) -> Option<String> {
         match self.post(
             &format!("{}/peers/user/representation", self.workspace_path),
@@ -346,7 +326,6 @@ mod tests {
     fn null_memory_reports_disabled_without_side_effects() {
         let mut memory = NullBackend;
         memory.record_turn(Role::User, "hello");
-        assert!(memory.recall("hello").unwrap().contains("memory disabled"));
         assert_eq!(memory.session_preamble(), None);
     }
 

@@ -13,7 +13,7 @@ base64.workspace = true
 cpal = "0.18.2"
 futures.workspace = true
 hh-protocol = { path = "../protocol" }
-hh-session-client.workspace = true
+
 libc.workspace = true
 parking_lot.workspace = true
 rubato = "5.0.0"

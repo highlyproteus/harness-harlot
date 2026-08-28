@@ -85,7 +85,6 @@ pub(crate) struct SessionConfig {
     reasoning: ReasoningConfig,
     truncation: TruncationConfig,
     audio: AudioConfig,
-    tools: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -141,7 +140,7 @@ struct TurnDetectionConfig {
 }
 
 impl SessionConfig {
-    pub(crate) fn new(instructions: String, voice: String, tools: Vec<Value>) -> Self {
+    pub(crate) fn new(instructions: String, voice: String) -> Self {
         Self {
             session_type: "realtime".to_owned(),
             output_modalities: ["audio".to_owned()],
@@ -177,7 +176,6 @@ impl SessionConfig {
                     voice,
                 },
             },
-            tools,
         }
     }
 }
@@ -857,17 +855,26 @@ mod tests {
     #[ignore = "writes the live session.update payload for manual debugging"]
     fn dump_session_update_payload() {
         let event = ClientEvent::SessionUpdate {
-            session: Box::new(SessionConfig::new(
-                "debug".to_owned(),
-                "alloy".to_owned(),
-                crate::tools::tool_schemas(),
-            )),
+            session: Box::new(SessionConfig::new("debug".to_owned(), "alloy".to_owned())),
         };
         std::fs::write(
             "/tmp/hh-session-update.json",
             serde_json::to_string_pretty(&event).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn realtime_session_advertises_no_provider_tools() {
+        let session = SessionConfig::new("conversation only".to_owned(), "alloy".to_owned());
+        let payload = serde_json::to_value(session).unwrap();
+        assert!(payload.get("tools").is_none());
+        assert!(
+            payload
+                .get("tool_choice")
+                .is_none_or(|value| value == "none"),
+            "tool choice must be absent or none"
+        );
     }
 
     #[test]
@@ -1117,8 +1124,7 @@ mod tests {
                             "format": {"type": "audio/pcm", "rate": 24000},
                             "voice": "marin"
                         }
-                    },
-                    "tools": []
+                    }
                 }
             }),
             json!({"type":"input_audio_buffer.append","audio":"AAE="}),

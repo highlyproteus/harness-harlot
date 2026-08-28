@@ -128,15 +128,9 @@ pub(crate) struct VoiceTranscriptEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VoiceLedgerEntry {
-    pub name: String,
-    pub summary: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct VoiceApproval {
-    pub id: u64,
-    pub description: String,
+pub(crate) struct VoiceNoticeEntry {
+    pub category: String,
+    pub message: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,10 +181,9 @@ enum PersistedSummaryState {
 pub(crate) struct AssistantSession {
     pub engine: Option<VoiceEngineHandle>,
     pub engine_state: EngineState,
-    pub active_tool: Option<String>,
     pub transcript: Vec<VoiceTranscriptEntry>,
-    pub ledger: Vec<VoiceLedgerEntry>,
-    pub approvals: Vec<VoiceApproval>,
+    pub notices: Vec<VoiceNoticeEntry>,
+
     pub mic_muted: bool,
     pub speaker_muted: bool,
     pub mic_level: f32,
@@ -206,10 +199,9 @@ impl AssistantSession {
         Self {
             engine: None,
             engine_state: EngineState::Suspended,
-            active_tool: None,
             transcript: Vec::new(),
-            ledger: Vec::new(),
-            approvals: Vec::new(),
+            notices: Vec::new(),
+
             mic_muted: true,
             speaker_muted: false,
             mic_level: 0.0,
@@ -662,12 +654,12 @@ impl HhApp {
                         .sessions
                         .entry(pane_id)
                         .or_insert_with(|| AssistantSession::load(pane_id));
-                    session.ledger.push(VoiceLedgerEntry {
-                        name: "image.error".to_owned(),
-                        summary: format!("{error:#}"),
+                    session.notices.push(VoiceNoticeEntry {
+                        category: "image.error".to_owned(),
+                        message: format!("{error:#}"),
                     });
-                    if session.ledger.len() > 100 {
-                        session.ledger.remove(0);
+                    if session.notices.len() > 100 {
+                        session.notices.remove(0);
                     }
                     cx.notify();
                 }
@@ -755,16 +747,13 @@ impl HhApp {
         };
         match event {
             VoiceUiEvent::State(state) => {
-                if !matches!(&state, EngineState::ToolRunning) {
-                    session.active_tool = None;
-                }
                 if let EngineState::Error(message) = &state {
-                    session.ledger.push(VoiceLedgerEntry {
-                        name: "engine.error".to_owned(),
-                        summary: message.clone(),
+                    session.notices.push(VoiceNoticeEntry {
+                        category: "engine.error".to_owned(),
+                        message: message.clone(),
                     });
-                    if session.ledger.len() > 100 {
-                        session.ledger.remove(0);
+                    if session.notices.len() > 100 {
+                        session.notices.remove(0);
                     }
                 }
                 if state == EngineState::Suspended {
@@ -799,22 +788,13 @@ impl HhApp {
                     session.assistant_reveal_chars = session.assistant_reveal_chars.max(target);
                 }
             }
-            VoiceUiEvent::ToolCallStarted { name } => {
-                session.active_tool = Some(name);
-            }
-            VoiceUiEvent::ToolCall { name, summary } => {
-                session.active_tool = None;
-                session.ledger.push(VoiceLedgerEntry { name, summary });
-                if session.ledger.len() > 100 {
-                    session.ledger.remove(0);
+            VoiceUiEvent::Notice { category, message } => {
+                session.notices.push(VoiceNoticeEntry { category, message });
+                if session.notices.len() > 100 {
+                    session.notices.remove(0);
                 }
             }
-            VoiceUiEvent::ApprovalRequested { id, description } => {
-                session.approvals.push(VoiceApproval { id, description });
-            }
-            VoiceUiEvent::ApprovalResolved { id, .. } => {
-                session.approvals.retain(|approval| approval.id != id);
-            }
+
             VoiceUiEvent::Usage { .. } => {}
             VoiceUiEvent::MicLevel(level) => session.mic_level = level.clamp(0.0, 1.0),
             VoiceUiEvent::SessionSummary { text: _ } => {
@@ -937,10 +917,7 @@ fn activate_assistant_composer(composer: &mut Option<AssistantComposer>, pane_id
 fn assistant_activity_row(pane_id: Uuid, session: &AssistantSession) -> Option<AnyElement> {
     let label = match &session.engine_state {
         EngineState::Thinking => Some("thinking…".to_owned()),
-        EngineState::ToolRunning => Some(format!(
-            "running {}…",
-            session.active_tool.as_deref().unwrap_or("tool")
-        )),
+
         _ => None,
     }?;
     Some(

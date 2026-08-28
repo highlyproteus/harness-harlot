@@ -1,11 +1,9 @@
 mod audio;
 mod engine;
-mod harness;
 mod memory;
 mod realtime;
 mod settings;
 pub mod threads;
-mod tools;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,7 +29,6 @@ pub enum EngineState {
     Listening,
     Thinking,
     Speaking,
-    ToolRunning,
     Suspended,
     Error(String),
 }
@@ -41,8 +38,6 @@ pub enum VoiceCommand {
     SetMicEnabled(bool),
     SetSpeakerMuted(bool),
     BargeIn,
-    Approve { approval_id: u64 },
-    Deny { approval_id: u64 },
     Suspend,
     Resume,
     SendUserText(String),
@@ -68,21 +63,11 @@ pub enum VoiceUiEvent {
         played_ms: u64,
         total_ms: u64,
     },
-    ToolCallStarted {
-        name: String,
+    Notice {
+        category: String,
+        message: String,
     },
-    ToolCall {
-        name: String,
-        summary: String,
-    },
-    ApprovalRequested {
-        id: u64,
-        description: String,
-    },
-    ApprovalResolved {
-        id: u64,
-        approved: bool,
-    },
+
     Usage {
         input_tokens: u64,
         output_tokens: u64,

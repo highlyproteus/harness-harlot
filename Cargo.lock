@@ -3055,7 +3055,6 @@ dependencies = [
  "cpal",
  "futures",
  "hh-protocol",
- "hh-session-client",
  "libc",
  "parking_lot",
  "rubato",

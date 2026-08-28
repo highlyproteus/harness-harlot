@@ -38,7 +38,7 @@ impl HhApp {
             EngineState::Listening => ("Listening", THEME.ansi[2]),
             EngineState::Thinking => ("Thinking", THEME.accent),
             EngineState::Speaking => ("Speaking", THEME.accent),
-            EngineState::ToolRunning => ("Running tool", THEME.dim),
+
             EngineState::Suspended => ("Suspended", THEME.dim),
             EngineState::Error(_) => ("Error", THEME.danger),
         };
@@ -439,94 +439,25 @@ impl HhApp {
                     .into_any_element(),
             );
         }
-        let ledger = session
-            .ledger
+        let notices = session
+            .notices
             .iter()
             .enumerate()
             .map(|(index, entry)| {
                 div()
-                    .id(("voice-ledger", index))
+                    .id(("voice-notice", index))
                     .w_full()
                     .min_w(px(0.0))
                     .truncate()
                     .font_family("SF Mono")
                     .text_xs()
                     .text_color(rgb(THEME.dim))
-                    .child(format!("{} — {}", entry.name, entry.summary))
+                    .child(format!("{} — {}", entry.category, entry.message))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
         let activity = assistant_activity_row(pane_id, session);
-        let approvals = session
-            .approvals
-            .iter()
-            .map(|approval| {
-                let approval_id = approval.id;
-                div()
-                    .id(("voice-approval", approval_id))
-                    .mx(px(10.0))
-                    .mb(px(8.0))
-                    .p(px(10.0))
-                    .rounded(px(7.0))
-                    .border_1()
-                    .border_color(rgb(THEME.danger))
-                    .bg(rgb(THEME.elevated))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .child(approval.description.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .id(("voice-approve", approval_id))
-                                    .px(px(10.0))
-                                    .py(px(5.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .bg(rgb(THEME.accent))
-                                    .text_color(rgb(THEME.window))
-                                    .child("Approve")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.send_assistant_command(
-                                            pane_id,
-                                            VoiceCommand::Approve { approval_id },
-                                        );
-                                        cx.stop_propagation();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id(("voice-deny", approval_id))
-                                    .px(px(10.0))
-                                    .py(px(5.0))
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .border_1()
-                                    .border_color(rgb(THEME.border_strong))
-                                    .text_color(rgb(THEME.muted))
-                                    .child("Deny")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.send_assistant_command(
-                                            pane_id,
-                                            VoiceCommand::Deny { approval_id },
-                                        );
-                                        cx.stop_propagation();
-                                    })),
-                            ),
-                    )
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+
         div()
             .id(("assistant-live", element_key(pane_id)))
             .min_h(px(0.0))
@@ -547,10 +478,9 @@ impl HhApp {
                     .flex_col()
                     .gap(px(8.0))
                     .children(transcript)
-                    .children(ledger)
+                    .children(notices)
                     .when_some(activity, |element, activity| element.child(activity)),
             )
-            .children(approvals)
             .child(self.render_assistant_composer_row(pane_id, session, cx))
             .into_any_element()
     }
