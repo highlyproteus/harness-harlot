@@ -57,6 +57,28 @@ for package_name in ("package", "package-linux"):
         assert token not in block, f"{package_name} receives release authority: {token}"
     assert "HH_RELEASE_UNSIGNED: 1" in block, f"{package_name} is not explicitly unsigned"
 
+linux_package = job(RELEASE, "package-linux")
+checkout_trust_match = re.search(
+    r"^      - name: Install checkout trust dependencies\n"
+    r"(?P<body>.*?)(?=^      - )",
+    linux_package,
+    flags=re.MULTILINE | re.DOTALL,
+)
+assert checkout_trust_match is not None, "missing Linux checkout trust dependency step"
+checkout_trust_step = checkout_trust_match.group("body")
+hosted_tag_check_start = linux_package.index(
+    "- name: Validate protected tag, commit identity, and runner architecture"
+)
+first_hosted_api_use = linux_package.index("gh api")
+assert checkout_trust_match.end() < hosted_tag_check_start < first_hosted_api_use, (
+    "Linux release container must finish installing trust tools before hosted tag verification"
+)
+assert re.search(
+    r"apt-get install.*?ca-certificates git gh openssh-client",
+    checkout_trust_step,
+    flags=re.DOTALL,
+), "Linux release container must install gh in its checkout trust step"
+
 stable = job(RELEASE, "sign-stable-v2")
 assert "environment: stable-signing-v2" in stable
 assert "HH_UPDATE_SIGNING_SEED" in stable
@@ -71,20 +93,20 @@ assert "assert set(by_name) == expected_files" in stable, (
 
 legacy = job(RELEASE, "sign-legacy-bridge")
 assert "environment: release" in legacy
-assert "github.ref_name == 'v0.1.15'" in legacy
-assert "github.ref_name != 'v0.1.15'" in legacy
+assert "github.ref_name == 'v0.1.16'" in legacy
+assert "github.ref_name != 'v0.1.16'" in legacy
 assert "HH_UPDATE_SIGNING_SEED" in legacy
 assert "contents: write" not in legacy
 has_no_build_surface(legacy, "sign-legacy-bridge")
 assert "published.replace(year=published.year + 10)" in legacy, (
     "the one-time legacy bridge must outlive the seven-day normal feed"
 )
-assert "Download immutable v0.1.15 legacy bridge" in legacy, (
+assert "Download immutable v0.1.16 legacy bridge" in legacy, (
     "future latest releases must carry the old-client bridge without retaining its seed"
 )
-assert 'assert manifest["version"] == "0.1.15"' in legacy
-assert "release-legacy-v015-bridge" in legacy
-assert "0.1.14" not in legacy
+assert 'assert manifest["version"] == "0.1.16"' in legacy
+assert "release-legacy-v016-bridge" in legacy
+assert "0.1.14" not in legacy and "0.1.15" not in legacy
 
 publish = job(RELEASE, "publish")
 assert "SIGNING_SEED" not in publish

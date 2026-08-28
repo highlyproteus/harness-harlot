@@ -707,6 +707,11 @@ impl PtySession {
             .context("observe PTY child exit")
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminate_child_for_test(&self) -> Result<()> {
+        terminate_child_bounded(self.child.lock().as_mut())
+    }
+
     /// A successful `spawn` only means the executable started. tmux reports a
     /// missing/dead target by exiting immediately, so do not register a tab
     /// until it survived a short bounded startup window.

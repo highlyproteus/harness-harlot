@@ -196,16 +196,16 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [heck 0.4.1](https://github.com/withoutboats/heck) — MIT OR Apache-2.0
 - [heck 0.5.0](https://github.com/withoutboats/heck) — MIT OR Apache-2.0
 - [hexf-parse 0.2.1](https://github.com/lifthrasiir/hexf) — CC0-1.0
-- [hh-cef-view 0.1.15](https://crates.io/crates/hh-cef-view) — MIT
-- [hh-desktop 0.1.15](https://crates.io/crates/hh-desktop) — MIT
-- [hh-macos-icon 0.1.15](https://crates.io/crates/hh-macos-icon) — MIT
-- [hh-protocol 0.1.15](https://crates.io/crates/hh-protocol) — MIT
-- [hh-release-signer 0.1.15](https://crates.io/crates/hh-release-signer) — MIT
-- [hh-session-client 0.1.15](https://crates.io/crates/hh-session-client) — MIT
-- [hh-session-service 0.1.15](https://crates.io/crates/hh-session-service) — MIT
-- [hh-terminal-model 0.1.15](https://crates.io/crates/hh-terminal-model) — MIT
-- [hh-updater 0.1.15](https://crates.io/crates/hh-updater) — MIT
-- [hh-voice 0.1.15](https://crates.io/crates/hh-voice) — MIT
+- [hh-cef-view 0.1.16](https://crates.io/crates/hh-cef-view) — MIT
+- [hh-desktop 0.1.16](https://crates.io/crates/hh-desktop) — MIT
+- [hh-macos-icon 0.1.16](https://crates.io/crates/hh-macos-icon) — MIT
+- [hh-protocol 0.1.16](https://crates.io/crates/hh-protocol) — MIT
+- [hh-release-signer 0.1.16](https://crates.io/crates/hh-release-signer) — MIT
+- [hh-session-client 0.1.16](https://crates.io/crates/hh-session-client) — MIT
+- [hh-session-service 0.1.16](https://crates.io/crates/hh-session-service) — MIT
+- [hh-terminal-model 0.1.16](https://crates.io/crates/hh-terminal-model) — MIT
+- [hh-updater 0.1.16](https://crates.io/crates/hh-updater) — MIT
+- [hh-voice 0.1.16](https://crates.io/crates/hh-voice) — MIT
 - [hidden-trait 0.1.2](https://github.com/kvark/hidden-trait) — MIT
 - [home 0.5.12](https://github.com/rust-lang/cargo) — MIT OR Apache-2.0
 - [http 1.5.0](https://github.com/hyperium/http) — MIT OR Apache-2.0
