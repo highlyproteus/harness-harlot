@@ -565,7 +565,7 @@ jobs:
           retention-days: 14
 
   sign-legacy-bridge:
-    name: Preserve old-client v0.1.14 bridge manifests
+    name: Preserve old-client v0.1.15 bridge manifests
     needs:
       - package
       - package-linux
@@ -578,19 +578,19 @@ jobs:
       id-token: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: github.ref_name == 'v0.1.14'
+        if: github.ref_name == 'v0.1.15'
         with:
           pattern: release-macos-*
           path: ${{ runner.temp }}/unsigned
           merge-multiple: true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: github.ref_name == 'v0.1.14'
+        if: github.ref_name == 'v0.1.15'
         with:
           pattern: release-linux-*
           path: ${{ runner.temp }}/unsigned
           merge-multiple: true
       - name: Verify package-job provenance before exposing the legacy seed
-        if: github.ref_name == 'v0.1.14'
+        if: github.ref_name == 'v0.1.15'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -604,7 +604,7 @@ jobs:
             gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" >/dev/null
           done
       - name: Create bounded legacy bridge manifests
-        if: github.ref_name == 'v0.1.14'
+        if: github.ref_name == 'v0.1.15'
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/legacy"
@@ -618,7 +618,7 @@ jobs:
           root = pathlib.Path(sys.argv[1]).resolve()
           output = pathlib.Path(sys.argv[2]).resolve()
           tag = sys.argv[3]
-          assert tag == "v0.1.14"
+          assert tag == "v0.1.15"
           aliases = sorted(root.rglob("manifest-*-v2.update.json"))
           assert len(aliases) == 4
           assert not any(path.is_symlink() for path in root.rglob("*"))
@@ -630,7 +630,7 @@ jobs:
               assert manifest["schema"] == "hh-update-manifest-v2"
               assert manifest["channel"] == "stable"
               assert manifest["key_id"] == "hh-stable-2026-v2"
-              assert manifest["version"] == "0.1.14"
+              assert manifest["version"] == "0.1.15"
               published = dt.datetime.fromisoformat(manifest["published_at"].replace("Z", "+00:00"))
               manifest["valid_until"] = published.replace(year=published.year + 10).isoformat().replace("+00:00", "Z")
               assert len(manifest["artifacts"]) == 1
@@ -643,7 +643,7 @@ jobs:
               destination.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
           PY
       - name: Prepare pinned isolated signer
-        if: github.ref_name == 'v0.1.14'
+        if: github.ref_name == 'v0.1.15'
         run: |
           set -eu
           # BEGIN ISOLATED SIGNER V1
@@ -719,7 +719,7 @@ jobs:
           # END ISOLATED SIGNER V1
           chmod 0755 "$RUNNER_TEMP/isolated-sign.sh"
       - name: Materialize legacy bridge seed after package validation
-        if: github.ref_name == 'v0.1.14'
+        if: github.ref_name == 'v0.1.15'
         env:
           HH_UPDATE_SIGNING_SEED: ${{ secrets.HH_UPDATE_SIGNING_SEED }}
         run: |
@@ -729,7 +729,7 @@ jobs:
           printf '%s' "$HH_UPDATE_SIGNING_SEED" > "$RUNNER_TEMP/signing-seed.b64"
           unset HH_UPDATE_SIGNING_SEED
       - name: Sign only the four legacy bridge aliases
-        if: github.ref_name == 'v0.1.14'
+        if: github.ref_name == 'v0.1.15'
         env:
           HH_UPDATE_PUBLIC_KEY: ${{ secrets.HH_UPDATE_PUBLIC_KEY }}
         run: |
@@ -744,11 +744,11 @@ jobs:
           done
           test "$count" -eq 4
       - name: Destroy legacy private material
-        if: always() && github.ref_name == 'v0.1.14'
+        if: always() && github.ref_name == 'v0.1.15'
         run: |
           shred -u "$RUNNER_TEMP/signing-seed.b64" 2>/dev/null || rm -f "$RUNNER_TEMP/signing-seed.b64"
-      - name: Download immutable v0.1.14 legacy bridge
-        if: github.ref_name != 'v0.1.14'
+      - name: Download immutable v0.1.15 legacy bridge
+        if: github.ref_name != 'v0.1.15'
         env:
           GH_TOKEN: ${{ github.token }}
           HH_UPDATE_LEGACY_PUBLIC_KEY_V1: ${{ vars.HH_UPDATE_LEGACY_PUBLIC_KEY_V1 }}
@@ -756,7 +756,7 @@ jobs:
           set -euo pipefail
           test -n "$HH_UPDATE_LEGACY_PUBLIC_KEY_V1"
           mkdir -p "$RUNNER_TEMP/legacy"
-          gh release download v0.1.14 --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/legacy" \
+          gh release download v0.1.15 --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/legacy" \
             --pattern 'manifest-macos-arm64.update.json' \
             --pattern 'manifest-macos-arm64.update.json.sig' \
             --pattern 'manifest-macos-x86_64.update.json' \
@@ -798,7 +798,7 @@ jobs:
                   assert manifest["schema"] == "hh-update-manifest-v2"
                   assert manifest["channel"] == "stable"
                   assert manifest["key_id"] == "hh-stable-2026"
-                  assert manifest["version"] == "0.1.14"
+                  assert manifest["version"] == "0.1.15"
                   valid_until = dt.datetime.fromisoformat(manifest["valid_until"].replace("Z", "+00:00"))
                   assert valid_until.year >= 2036
                   signature_path = manifest_path.with_name(manifest_path.name + ".sig")
@@ -819,7 +819,7 @@ jobs:
       - name: Upload legacy bridge manifests and signatures
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-legacy-v014-bridge
+          name: release-legacy-v015-bridge
           path: ${{ runner.temp }}/legacy/*
           if-no-files-found: error
           retention-days: 14
@@ -971,7 +971,7 @@ jobs:
                   key_id = manifest["key_id"]
                   assert key_id in public_keys and public_keys[key_id]
                   if key_id == "hh-stable-2026":
-                      assert manifest["version"] == "0.1.14"
+                      assert manifest["version"] == "0.1.15"
                       valid_until = dt.datetime.fromisoformat(manifest["valid_until"].replace("Z", "+00:00"))
                       assert valid_until.year >= 2036
                   signature_path = by_name[manifest_path.name + ".sig"]

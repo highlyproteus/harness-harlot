@@ -17,7 +17,7 @@ chmod 0600 "$seed"
 artifact="$work/artifact.tar.gz"
 printf 'isolated signer fixture\n' > "$artifact"
 sha256=$(shasum -a 256 "$artifact" | sed 's/[[:space:]].*$//')
-size=$(stat -f %z "$artifact" 2>/dev/null || stat -c %s "$artifact")
+size=$(wc -c < "$artifact" | tr -d '[:space:]')
 manifest="$work/manifest.update.json"
 cat > "$manifest" <<EOF
 {

@@ -71,17 +71,20 @@ assert "assert set(by_name) == expected_files" in stable, (
 
 legacy = job(RELEASE, "sign-legacy-bridge")
 assert "environment: release" in legacy
-assert "github.ref_name == 'v0.1.14'" in legacy
-assert "github.ref_name != 'v0.1.14'" in legacy
+assert "github.ref_name == 'v0.1.15'" in legacy
+assert "github.ref_name != 'v0.1.15'" in legacy
 assert "HH_UPDATE_SIGNING_SEED" in legacy
 assert "contents: write" not in legacy
 has_no_build_surface(legacy, "sign-legacy-bridge")
 assert "published.replace(year=published.year + 10)" in legacy, (
     "the one-time legacy bridge must outlive the seven-day normal feed"
 )
-assert "Download immutable v0.1.14 legacy bridge" in legacy, (
+assert "Download immutable v0.1.15 legacy bridge" in legacy, (
     "future latest releases must carry the old-client bridge without retaining its seed"
 )
+assert 'assert manifest["version"] == "0.1.15"' in legacy
+assert "release-legacy-v015-bridge" in legacy
+assert "0.1.14" not in legacy
 
 publish = job(RELEASE, "publish")
 assert "SIGNING_SEED" not in publish
