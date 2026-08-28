@@ -1436,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn write_input_reports_writer_failure_instead_of_acknowledging_delivery() {
+    fn write_input_rejects_an_exited_terminal_instead_of_acknowledging_delivery() {
         let registry = SessionRegistry::new().unwrap();
         let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
         registry.write_input(pane_id, b"exit\r").unwrap();
@@ -1469,8 +1469,8 @@ mod tests {
             response,
             ServiceResponse::DeliveryError {
                 message,
-                disposition: hh_protocol::DeliveryDisposition::Indeterminate,
-            } if message.contains("write terminal input")
+                disposition: hh_protocol::DeliveryDisposition::DefinitelyUnsent,
+            } if message.contains("terminal process has exited")
         ));
     }
 }

@@ -72,6 +72,7 @@ EOF
   printf '[Desktop Entry]\nName=Harness Harlot\n' > "$root/share/applications/com.harnessharlot.desktop.desktop"
   printf 'fixture icon\n' > "$root/share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png"
   printf 'license\n' > "$root/share/licenses/harness-harlot/LICENSE"
+  printf 'privacy\n' > "$root/share/licenses/harness-harlot/PRIVACY.md"
   printf 'notices\n' > "$root/share/licenses/harness-harlot/THIRD_PARTY_NOTICES.md"
   printf 'asset notices\n' > "$root/share/licenses/harness-harlot/ASSET_NOTICES.md"
   printf 'com.harnessharlot.desktop\n' > "$root/share/harness-harlot/install-id"
@@ -79,6 +80,7 @@ EOF
     "$root/share/applications/com.harnessharlot.desktop.desktop" \
     "$root/share/icons/hicolor/512x512/apps/com.harnessharlot.desktop.png" \
     "$root/share/licenses/harness-harlot/LICENSE" \
+    "$root/share/licenses/harness-harlot/PRIVACY.md" \
     "$root/share/licenses/harness-harlot/THIRD_PARTY_NOTICES.md" \
     "$root/share/licenses/harness-harlot/ASSET_NOTICES.md" \
     "$root/share/harness-harlot/install-id"

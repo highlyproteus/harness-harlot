@@ -202,14 +202,14 @@ jobs:
             exit 2
           }
 
-          [ -f "$seed_file" ] && [ ! -L "$seed_file" ] || {
+          if [ ! -f "$seed_file" ] || [ -L "$seed_file" ]; then
             echo "signing seed must be a regular non-symlink file" >&2
             exit 2
-          }
-          [ -f "$manifest" ] && [ ! -L "$manifest" ] || {
+          fi
+          if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
             echo "manifest must be a regular non-symlink file" >&2
             exit 2
-          }
+          fi
           [ -n "$expected_public_key" ] || {
             echo "expected public key is empty" >&2
             exit 2

@@ -515,6 +515,19 @@ impl PtySession {
                 "terminal input exceeds {MAX_INPUT_FRAME}-byte frame limit"
             )));
         }
+        match self.child.lock().try_wait() {
+            Ok(Some(_)) => {
+                return Err(InputDeliveryError::definitely_unsent(
+                    "terminal process has exited",
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(InputDeliveryError::indeterminate(format!(
+                    "observe terminal process before input delivery: {error}"
+                )));
+            }
+        }
         // Typing snaps the viewport back to the live bottom (stock terminal
         // behavior). While `display_offset` is nonzero, `Grid::scroll_up`
         // anchors streaming output to old content and the typed line recedes
