@@ -166,6 +166,7 @@ assert "554c2c107a4ca8d555273c0c0d0c1efdfbbb5a2d9ba3a2387dbdf3b622bdb24c" in CI,
 )
 
 assert "cron: '" in REFRESH and "workflow_dispatch:" in REFRESH
+assert "HH_UPDATE_PUBLIC_KEY: ${{ vars.HH_UPDATE_STABLE_PUBLIC_KEY_V2 }}" in job(REFRESH, "prepare-refresh")
 assert "contents: write" not in REFRESH.split("\njobs:", 1)[0]
 refresh_sign = job(REFRESH, "sign-refresh")
 assert "environment: stable-signing-v2" in refresh_sign
