@@ -173,6 +173,9 @@ assert "environment: stable-signing-v2" in refresh_sign
 assert "actions/checkout" not in refresh_sign
 assert "HH_UPDATE_SIGNING_SEED" in refresh_sign
 assert "Recheck hosted release, exact manifest policy, and tag before seed materialization" in refresh_sign
+assert "assert descriptor_bytes == (json.dumps(descriptor, indent=2, ensure_ascii=False)" in refresh_sign
+assert "assert 0 < descriptor[\"run_attempt\"] <= run_attempt" in refresh_sign
+assert "descriptor[\"run_attempt\"] = run_attempt" in refresh_sign
 assert "Materialize stable-v2 seed" in refresh_sign
 assert refresh_sign.index("Recheck hosted release, exact manifest policy, and tag before seed materialization") < refresh_sign.index("Materialize stable-v2 seed")
 assert "contents: write" not in refresh_sign
