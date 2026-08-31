@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-08-31
+
+### Fixed
+
+- Added a renewable, short-lived stable-v2 update feed with isolated daily
+  signing, attested publication, and exact first-party URL validation so
+  installers and installed clients do not expire between application releases.
+- Preserved the GitHub-hosted v0.1.16 migration path while moving new clients
+  to the renewable feed.
+
 ## [0.1.16] - 2026-08-28
 
 ### Added
