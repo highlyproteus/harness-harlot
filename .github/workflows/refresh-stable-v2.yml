@@ -150,18 +150,23 @@ jobs:
           descriptor = json.loads(descriptor_bytes)
           assert descriptor_bytes == (json.dumps(descriptor, indent=2, ensure_ascii=False) + "\n").encode()
           assert set(descriptor) == {"schema", "repository", "workflow", "source_ref", "run_id", "run_attempt", "head_sha", "release_id", "release_tag", "generated_at"}
+          assert 0 < descriptor["run_attempt"] <= run_attempt
           assert descriptor == {
               "schema": "hh-stable-v2-refresh-v1",
               "repository": "highlyproteus/harness-harlot",
               "workflow": ".github/workflows/refresh-stable-v2.yml",
               "source_ref": "refs/heads/main",
               "run_id": run_id,
-              "run_attempt": run_attempt,
+              "run_attempt": descriptor["run_attempt"],
               "head_sha": head_sha,
               "release_id": release_id,
               "release_tag": tag,
               "generated_at": descriptor["generated_at"],
           }
+          descriptor["run_attempt"] = run_attempt
+          by_name["stable-v2-refresh.json"].write_text(
+              json.dumps(descriptor, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+          )
           PY
       - name: Prepare pinned isolated signer
         run: |
