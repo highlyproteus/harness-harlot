@@ -77,7 +77,7 @@ jobs:
       - name: Verify release provenance, existing signatures, artifact identity, digests, and sizes
         env:
           GH_TOKEN: ${{ github.token }}
-          HH_UPDATE_PUBLIC_KEY: ${{ vars.HH_UPDATE_PUBLIC_KEY }}
+          HH_UPDATE_PUBLIC_KEY: ${{ vars.HH_UPDATE_STABLE_PUBLIC_KEY_V2 }}
           TAG: ${{ steps.release.outputs.tag }}
           COMMIT: ${{ steps.release.outputs.commit }}
         run: |
