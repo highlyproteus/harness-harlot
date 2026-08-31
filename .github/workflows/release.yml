@@ -66,6 +66,7 @@ jobs:
           diff -u THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES.generated.md
       - run: shellcheck scripts/*.sh install*.sh packaging/**/*.sh
       - run: python3 scripts/test-release-security-policy.py
+      - run: python3 scripts/test-stable-v2-refresh.py
       - run: scripts/test-isolated-ed25519-signing.sh
       - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:

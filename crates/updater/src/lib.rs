@@ -102,12 +102,10 @@ pub const TRUSTED_UPDATE_KEYS: &[TrustedKey] = &[
 /// The immutable production update host. Only artifact URLs on this host
 /// are accepted by the verifier.
 pub const UPDATE_HOST: Option<&str> = Some("github.com");
-/// Stable releases use GitHub's authenticated latest-release pointer. Feed
-/// generations are isolated by manifest filename, so the bridge release can
-/// carry both legacy and v2 aliases without retaining the legacy key in this
-/// binary.
-pub const UPDATE_MANIFEST_BASE: Option<&str> =
-    Some("https://github.com/highlyproteus/harness-harlot/releases/latest/download");
+/// Renewable stable aliases are published on the first-party website. Signed
+/// artifact URLs remain exact immutable GitHub release URLs and are still
+/// validated against [`UPDATE_HOST`].
+pub const UPDATE_MANIFEST_BASE: Option<&str> = Some("https://harnessharlot.com/releases/stable-v2");
 pub const EDGE_UPDATE_RELEASE_PREFIX: Option<&str> =
     Some("https://github.com/highlyproteus/harness-harlot/releases/download/edge");
 /// Apple Developer Team ID, required by the in-app installer gate. Stays
@@ -1003,7 +1001,7 @@ mod tests {
     fn production_update_keys_are_rotated_and_channel_scoped() {
         assert_eq!(
             UPDATE_MANIFEST_BASE,
-            Some("https://github.com/highlyproteus/harness-harlot/releases/latest/download")
+            Some("https://harnessharlot.com/releases/stable-v2")
         );
         assert!(
             TRUSTED_UPDATE_KEYS

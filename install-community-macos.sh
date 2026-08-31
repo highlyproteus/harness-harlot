@@ -221,14 +221,18 @@ signature_name="$manifest_name.sig"
   echo "release index contains an untrusted or noncanonical DMG URL" >&2
   exit 1
 }
-[ "$manifest_url" = "https://github.com/$REPOSITORY/releases/download/$tag/$manifest_name" ] || {
+github_manifest_url="https://github.com/$REPOSITORY/releases/download/$tag/$manifest_name"
+stable_v2_manifest_url="https://harnessharlot.com/releases/stable-v2/$manifest_name"
+if [ "$manifest_url" != "$github_manifest_url" ] && [ "$manifest_url" != "$stable_v2_manifest_url" ]; then
   echo "release index contains an untrusted or noncanonical manifest URL" >&2
   exit 1
-}
-[ "$signature_url" = "https://github.com/$REPOSITORY/releases/download/$tag/$signature_name" ] || {
+fi
+github_signature_url="https://github.com/$REPOSITORY/releases/download/$tag/$signature_name"
+stable_v2_signature_url="https://harnessharlot.com/releases/stable-v2/$signature_name"
+if [ "$signature_url" != "$github_signature_url" ] && [ "$signature_url" != "$stable_v2_signature_url" ]; then
   echo "release index contains an untrusted or noncanonical signature URL" >&2
   exit 1
-}
+fi
 for digest in "$dmg_sha256" "$manifest_sha256" "$signature_sha256"; do
   case "$digest" in
     *[!0-9a-f]*|'') echo "release index contains an invalid SHA-256 digest" >&2; exit 1 ;;

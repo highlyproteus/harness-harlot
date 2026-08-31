@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RELEASE = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
 EDGE = (ROOT / ".github/workflows/edge.yml").read_text(encoding="utf-8")
 CI = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+REFRESH = (ROOT / ".github/workflows/refresh-stable-v2.yml").read_text(encoding="utf-8")
 MAC_PACKAGE = (ROOT / "scripts/package-macos-release.sh").read_text(encoding="utf-8")
 LINUX_PACKAGE = (ROOT / "scripts/package-linux-release.sh").read_text(encoding="utf-8")
 CANONICAL_SIGNER = (ROOT / "scripts/isolated-ed25519-sign.sh").read_text(encoding="utf-8").rstrip("\n")
@@ -163,5 +164,46 @@ assert expected_sha256 <= set(re.findall(r"[0-9a-f]{64}", RELEASE + EDGE)), (
 assert "554c2c107a4ca8d555273c0c0d0c1efdfbbb5a2d9ba3a2387dbdf3b622bdb24c" in CI, (
     "CI must pin the independently verified Linux x86_64 CEF SHA-256"
 )
+
+assert "cron: '" in REFRESH and "workflow_dispatch:" in REFRESH
+assert "contents: write" not in REFRESH.split("\njobs:", 1)[0]
+refresh_sign = job(REFRESH, "sign-refresh")
+assert "environment: stable-signing-v2" in refresh_sign
+assert "actions/checkout" not in refresh_sign
+assert "HH_UPDATE_SIGNING_SEED" in refresh_sign
+assert "Recheck hosted release, exact manifest policy, and tag before seed materialization" in refresh_sign
+assert "Materialize stable-v2 seed" in refresh_sign
+assert refresh_sign.index("Recheck hosted release, exact manifest policy, and tag before seed materialization") < refresh_sign.index("Materialize stable-v2 seed")
+assert "contents: write" not in refresh_sign
+has_no_build_surface(refresh_sign, "stable-v2 refresh signer")
+assert "stable-v2-refresh" in refresh_sign
+assert "retention-days: 3" in refresh_sign or "retention-days: 4" in refresh_sign
+assert "assert set(by_name) == expected_files" in refresh_sign
+assert "assert set(manifest) == common_keys | {platform_key}" in refresh_sign
+assert "hosted[\"digest\"] == f\"sha256:{artifact['sha256']}\"" in refresh_sign
+assert "valid_until - published == dt.timedelta(days=7)" in refresh_sign
+assert "key not in {\"published_at\", \"valid_until\"}" in refresh_sign
+assert "openssl pkeyutl -verify" in refresh_sign
+assert "stable-v2-refresh.json" in refresh_sign
+assert "releases/download/{tag}" in REFRESH
+assert "timedelta(days=7)" in REFRESH
+assert "draft" in REFRESH and "prerelease" in REFRESH
+assert "attest-build-provenance" in refresh_sign
+refresh_publish = job(REFRESH, "publish-refresh")
+assert "contents: write" in refresh_publish
+assert "HH_UPDATE_SIGNING_SEED" not in refresh_publish
+assert "environment: stable-signing-v2" not in refresh_publish
+assert "needs: sign-refresh" in refresh_publish
+assert "stable-v2-refresh" in refresh_publish
+assert refresh_publish.count("releases/latest") >= 2
+assert "latest-before.json" in refresh_publish and "latest-after.json" in refresh_publish
+assert refresh_sign.count("releases/latest") >= 1
+assert "--signer-workflow \"$GITHUB_REPOSITORY/.github/workflows/release.yml\"" in REFRESH
+assert "--source-ref \"refs/tags/$TAG\"" in REFRESH
+assert "--deny-self-hosted-runners" in REFRESH
+
+refresh_signers = embedded_signers(REFRESH)
+assert len(refresh_signers) == 1, f"expected one refresh signer copy, found {len(refresh_signers)}"
+assert refresh_signers[0] == CANONICAL_SIGNER, "refresh signer drifted from canonical signer"
 
 print("release secret isolation, tag binding, channel separation, and SHA-256 pins are enforced")

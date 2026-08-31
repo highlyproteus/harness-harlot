@@ -28,6 +28,10 @@ if grep -Eq 'command -v gh|gh release|gh attestation|--tag' "$linux_installer"; 
   exit 1
 fi
 grep -F "RELEASE_INDEX_URL='https://harnessharlot.com/releases/stable-linux.json'" "$linux_installer" >/dev/null
+grep -F 'https://harnessharlot.com/releases/stable-v2/' "$linux_installer" >/dev/null
+grep -F 'https://harnessharlot.com/releases/stable-v2/' "$macos_installer" >/dev/null
+grep -F 'https://github.com/highlyproteus/harness-harlot/releases/download/' "$linux_installer" >/dev/null
+grep -F "https://github.com/\$REPOSITORY/releases/download/" "$macos_installer" >/dev/null
 grep -F "python3 -I - \"\$index\" \"\$architecture\"" "$linux_installer" >/dev/null
 grep -F 'unset TAR_OPTIONS GZIP BZIP2 XZ_OPT' "$linux_installer" >/dev/null
 grep -F "\"\$update_tool\" verify-trusted" "$linux_installer" >/dev/null
