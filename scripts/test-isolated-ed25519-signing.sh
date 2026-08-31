@@ -18,6 +18,16 @@ artifact="$work/artifact.tar.gz"
 printf 'isolated signer fixture\n' > "$artifact"
 sha256=$(shasum -a 256 "$artifact" | sed 's/[[:space:]].*$//')
 size=$(wc -c < "$artifact" | tr -d '[:space:]')
+case "$(uname -s)" in
+  Darwin)
+    published_at=$(date -u -v-1H '+%Y-%m-%dT%H:%M:%SZ')
+    valid_until=$(date -u -v+1d '+%Y-%m-%dT%H:%M:%SZ')
+    ;;
+  *)
+    published_at=$(date -u -d '-1 hour' '+%Y-%m-%dT%H:%M:%SZ')
+    valid_until=$(date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
+    ;;
+esac
 manifest="$work/manifest.update.json"
 cat > "$manifest" <<EOF
 {
@@ -27,8 +37,8 @@ cat > "$manifest" <<EOF
   "key_id": "test-only-v1",
   "version": "99.0.0",
   "build": 1,
-  "published_at": "2026-08-28T00:00:00Z",
-  "valid_until": "2026-08-29T00:00:00Z",
+  "published_at": "$published_at",
+  "valid_until": "$valid_until",
   "platform": "linux",
   "minimum_glibc": "2.35",
   "session_service": {

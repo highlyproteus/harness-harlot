@@ -1,0 +1,490 @@
+name: Refresh stable-v2 manifests
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: stable-v2-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-refresh:
+    name: Verify latest release and prepare renewed aliases
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+      release_id: ${{ steps.release.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+      - name: Select latest published non-prerelease release and bind its signed tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest")
+          tag=$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name' <<<"$release")
+          release_id=$(jq -er .id <<<"$release")
+          tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.type)" = tag
+          tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object")
+          test "$(jq -r .verification.verified <<<"$tag_json")" = true
+          commit=$(jq -er .object.sha <<<"$tag_json")
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$commit" --jq .commit.verification.verified)" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$commit" --jq .author.login)" = highlyproteus
+          printf 'tag=%s\ncommit=%s\nrelease_id=%s\n' "$tag" "$commit" "$release_id" >> "$GITHUB_OUTPUT"
+      - name: Download bounded stable-v2 release inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/release"
+          for platform in linux-arm64 linux-x86_64 macos-community-arm64 macos-community-x86_64; do
+            alias="manifest-${platform}-v2.update.json"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release" --pattern "$alias"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release" --pattern "$alias.sig"
+          done
+          python3 - "$RUNNER_TEMP/release" "$TAG" "$GITHUB_REPOSITORY" <<'PY'
+          import json, pathlib, re, subprocess, sys
+          root, tag, repository = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          aliases = sorted(root.glob("manifest-*-v2.update.json"))
+          assert len(aliases) == 4
+          names = []
+          for path in aliases:
+              manifest = json.loads(path.read_text(encoding="utf-8"))
+              assert len(manifest["artifacts"]) == 1
+              artifact = manifest["artifacts"][0]
+              name = artifact["file_name"]
+              assert re.fullmatch(r"Harness-Harlot-[A-Za-z0-9._-]+", name)
+              assert artifact["url"] == f"https://github.com/{repository}/releases/download/{tag}/{name}"
+              names.append(name)
+          assert len(set(names)) == 4
+          for name in names:
+              subprocess.run(["gh", "release", "download", tag, "--repo", repository, "--dir", str(root), "--pattern", name], check=True)
+          assert len(list(root.iterdir())) == 12
+          PY
+      - name: Verify release provenance, existing signatures, artifact identity, digests, and sizes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HH_UPDATE_PUBLIC_KEY: ${{ vars.HH_UPDATE_PUBLIC_KEY }}
+          TAG: ${{ steps.release.outputs.tag }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test -n "$HH_UPDATE_PUBLIC_KEY"
+          for file in "$RUNNER_TEMP"/release/*; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$TAG" --deny-self-hosted-runners >/dev/null
+          done
+          read -r published_at valid_until <<EOF
+          $(python3 - <<'PY'
+          import datetime as dt
+          published = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+          valid_until = published + dt.timedelta(days=7)
+          print(published.strftime("%Y-%m-%dT%H:%M:%SZ"), valid_until.strftime("%Y-%m-%dT%H:%M:%SZ"))
+          PY
+          )
+          EOF
+          python3 scripts/prepare-stable-v2-refresh.py \
+            --release-dir "$RUNNER_TEMP/release" --output-dir "$RUNNER_TEMP/renewed" \
+            --tag "$TAG" --commit "$COMMIT" --published-at "$published_at" \
+            --valid-until "$valid_until" --public-key "$HH_UPDATE_PUBLIC_KEY" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow ".github/workflows/refresh-stable-v2.yml" \
+            --source-ref "refs/heads/main" --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" --head-sha "$GITHUB_SHA" \
+            --release-id "${{ steps.release.outputs.release_id }}"
+          # The producer enforces https://github.com/{repository}/releases/download/{tag}/ artifacts.
+      - name: Upload verified unsigned refresh input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stable-v2-refresh-input
+          path: ${{ runner.temp }}/renewed/*
+          if-no-files-found: error
+          retention-days: 3
+
+  sign-refresh:
+    name: Sign and attest renewable stable-v2 aliases
+    needs: prepare-refresh
+    environment: stable-signing-v2
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download verified unsigned refresh input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-v2-refresh-input
+          path: ${{ runner.temp }}/renewed
+      - name: Validate exact renewed input before signing
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/renewed" "${{ needs.prepare-refresh.outputs.tag }}" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "${{ needs.prepare-refresh.outputs.release_id }}" <<'PY'
+          import hashlib, json, pathlib, sys
+          root, tag = pathlib.Path(sys.argv[1]), sys.argv[2]
+          run_id, run_attempt, head_sha, release_id = int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
+          aliases = {
+              "manifest-linux-arm64-v2.update.json",
+              "manifest-linux-x86_64-v2.update.json",
+              "manifest-macos-community-arm64-v2.update.json",
+              "manifest-macos-community-x86_64-v2.update.json",
+          }
+          expected_files = aliases | {"stable-v2-refresh.json"}
+          by_name = {path.name: path for path in root.iterdir() if path.is_file() and not path.is_symlink()}
+          assert set(by_name) == expected_files
+          descriptor_bytes = by_name["stable-v2-refresh.json"].read_bytes()
+          descriptor = json.loads(descriptor_bytes)
+          assert descriptor_bytes == (json.dumps(descriptor, indent=2, ensure_ascii=False) + "\n").encode()
+          assert set(descriptor) == {"schema", "repository", "workflow", "source_ref", "run_id", "run_attempt", "head_sha", "release_id", "release_tag", "generated_at"}
+          assert descriptor == {
+              "schema": "hh-stable-v2-refresh-v1",
+              "repository": "highlyproteus/harness-harlot",
+              "workflow": ".github/workflows/refresh-stable-v2.yml",
+              "source_ref": "refs/heads/main",
+              "run_id": run_id,
+              "run_attempt": run_attempt,
+              "head_sha": head_sha,
+              "release_id": release_id,
+              "release_tag": tag,
+              "generated_at": descriptor["generated_at"],
+          }
+          PY
+      - name: Prepare pinned isolated signer
+        run: |
+          set -eu
+          # BEGIN ISOLATED SIGNER V1
+          cat > "$RUNNER_TEMP/isolated-sign.sh" <<'SIGNER'
+          #!/bin/sh
+          set -eu
+          
+          usage() {
+            echo "usage: $0 BASE64_SEED_FILE EXPECTED_PUBLIC_KEY MANIFEST SIGNATURE" >&2
+            exit 2
+          }
+          
+          [ "$#" -eq 4 ] || usage
+          seed_file=$1
+          expected_public_key=$2
+          manifest=$3
+          signature=$4
+          openssl_command=${HH_OPENSSL:-openssl}
+          command -v "$openssl_command" >/dev/null 2>&1 || {
+            echo "OpenSSL command is unavailable: $openssl_command" >&2
+            exit 2
+          }
+          
+          if [ ! -f "$seed_file" ] || [ -L "$seed_file" ]; then
+            echo "signing seed must be a regular non-symlink file" >&2
+            exit 2
+          fi
+          if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
+            echo "manifest must be a regular non-symlink file" >&2
+            exit 2
+          fi
+          [ -n "$expected_public_key" ] || {
+            echo "expected public key is empty" >&2
+            exit 2
+          }
+          
+          work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/hh-isolated-sign.XXXXXX")
+          cleanup() {
+            rm -rf "$work"
+          }
+          trap cleanup EXIT HUP INT TERM
+          umask 077
+          
+          "$openssl_command" base64 -d -A -in "$seed_file" -out "$work/seed.bin"
+          [ "$(wc -c < "$work/seed.bin" | tr -d ' ')" = 32 ] || {
+            echo "Ed25519 seed must decode to exactly 32 bytes" >&2
+            exit 2
+          }
+          printf '\060\056\002\001\000\060\005\006\003\053\145\160\004\042\004\040' > "$work/private.der"
+          cat "$work/seed.bin" >> "$work/private.der"
+          rm -f "$work/seed.bin"
+          
+          "$openssl_command" pkey -inform DER -in "$work/private.der" -out "$work/private.pem" >/dev/null 2>&1
+          "$openssl_command" pkey -in "$work/private.pem" -pubout -out "$work/public.pem" >/dev/null 2>&1
+          derived_public_key=$(
+            "$openssl_command" pkey -in "$work/private.pem" -pubout -outform DER 2>/dev/null |
+              tail -c 32 |
+              "$openssl_command" base64 -A
+          )
+          [ "$derived_public_key" = "$expected_public_key" ] || {
+            echo "signing seed does not match the expected public key" >&2
+            exit 2
+          }
+          
+          "$openssl_command" pkeyutl -sign -inkey "$work/private.pem" -rawin \
+            -in "$manifest" -out "$work/signature.bin"
+          "$openssl_command" pkeyutl -verify -pubin -inkey "$work/public.pem" -rawin \
+            -in "$manifest" -sigfile "$work/signature.bin" >/dev/null
+          "$openssl_command" base64 -A -in "$work/signature.bin" -out "$signature"
+          printf '\n' >> "$signature"
+          chmod 0644 "$signature"
+          SIGNER
+          # END ISOLATED SIGNER V1
+          chmod 0755 "$RUNNER_TEMP/isolated-sign.sh"
+      - name: Recheck hosted release, exact manifest policy, and tag before seed materialization
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare-refresh.outputs.tag }}
+          COMMIT: ${{ needs.prepare-refresh.outputs.commit }}
+          RELEASE_ID: ${{ needs.prepare-refresh.outputs.release_id }}
+          HH_UPDATE_PUBLIC_KEY: ${{ vars.HH_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$HH_UPDATE_PUBLIC_KEY"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/release.json"
+          test "$(jq -r .draft "$RUNNER_TEMP/release.json")" = false
+          test "$(jq -r .prerelease "$RUNNER_TEMP/release.json")" = false
+          test "$(jq -r .id "$RUNNER_TEMP/release.json")" = "$RELEASE_ID"
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest.json"
+          test "$(jq -r .id "$RUNNER_TEMP/latest.json")" = "$RELEASE_ID"
+          test "$(jq -r .tag_name "$RUNNER_TEMP/latest.json")" = "$TAG"
+          tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.type)" = tag
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .verification.verified)" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.sha)" = "$COMMIT"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$COMMIT" --jq .commit.verification.verified)" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$COMMIT" --jq .author.login)" = highlyproteus
+          mkdir "$RUNNER_TEMP/original"
+          for platform in linux-arm64 linux-x86_64 macos-community-arm64 macos-community-x86_64; do
+            alias="manifest-${platform}-v2.update.json"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/original" --pattern "$alias" --pattern "$alias.sig"
+            for file in "$RUNNER_TEMP/original/$alias" "$RUNNER_TEMP/original/$alias.sig"; do
+              gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-ref "refs/tags/$TAG" --deny-self-hosted-runners >/dev/null
+            done
+          done
+          printf '\060\052\060\005\006\003\053\145\160\003\041\000' > "$RUNNER_TEMP/public.der"
+          printf '%s' "$HH_UPDATE_PUBLIC_KEY" | base64 -d >> "$RUNNER_TEMP/public.der"
+          test "$(wc -c < "$RUNNER_TEMP/public.der" | tr -d ' ')" = 44
+          openssl pkey -pubin -inform DER -in "$RUNNER_TEMP/public.der" -out "$RUNNER_TEMP/public.pem" >/dev/null 2>&1
+          for manifest in "$RUNNER_TEMP"/original/manifest-*-v2.update.json; do
+            base64 -d < "$manifest.sig" > "$RUNNER_TEMP/signature.bin"
+            test "$(wc -c < "$RUNNER_TEMP/signature.bin" | tr -d ' ')" = 64
+            openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public.pem" -rawin \
+              -in "$manifest" -sigfile "$RUNNER_TEMP/signature.bin" >/dev/null
+          done
+          python3 - "$RUNNER_TEMP/renewed" "$RUNNER_TEMP/original" "$RUNNER_TEMP/release.json" "$TAG" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "$RELEASE_ID" <<'PY'
+          import datetime as dt
+          import json
+          import pathlib
+          import re
+          import sys
+
+          root, original_root, release_path, tag = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]
+          run_id, run_attempt, head_sha, release_id = int(sys.argv[5]), int(sys.argv[6]), sys.argv[7], int(sys.argv[8])
+          aliases = {
+              "manifest-linux-arm64-v2.update.json": ("linux", "arm64", "tar.gz"),
+              "manifest-linux-x86_64-v2.update.json": ("linux", "x86_64", "tar.gz"),
+              "manifest-macos-community-arm64-v2.update.json": ("macos", "arm64", "dmg"),
+              "manifest-macos-community-x86_64-v2.update.json": ("macos", "x86_64", "dmg"),
+          }
+          expected_files = set(aliases) | {"stable-v2-refresh.json"}
+          by_name = {path.name: path for path in root.iterdir() if path.is_file() and not path.is_symlink()}
+          assert set(by_name) == expected_files
+          release = json.loads(release_path.read_text(encoding="utf-8"))
+          assert release["id"] == release_id and release["tag_name"] == tag
+          assert release["draft"] is False and release["prerelease"] is False
+          assets = {asset["name"]: asset for asset in release["assets"]}
+          assert len(assets) == len(release["assets"])
+          descriptor_bytes = by_name["stable-v2-refresh.json"].read_bytes()
+          descriptor = json.loads(descriptor_bytes)
+          assert descriptor_bytes == (json.dumps(descriptor, indent=2, ensure_ascii=False) + "\n").encode()
+          assert set(descriptor) == {"schema", "repository", "workflow", "source_ref", "run_id", "run_attempt", "head_sha", "release_id", "release_tag", "generated_at"}
+          assert descriptor == {
+              "schema": "hh-stable-v2-refresh-v1",
+              "repository": "highlyproteus/harness-harlot",
+              "workflow": ".github/workflows/refresh-stable-v2.yml",
+              "source_ref": "refs/heads/main",
+              "run_id": run_id,
+              "run_attempt": run_attempt,
+              "head_sha": head_sha,
+              "release_id": release_id,
+              "release_tag": tag,
+              "generated_at": descriptor["generated_at"],
+          }
+          generated = dt.datetime.strptime(descriptor["generated_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+          now = dt.datetime.now(dt.timezone.utc)
+          assert now - dt.timedelta(hours=1) <= generated <= now + dt.timedelta(minutes=5)
+          common_keys = {"schema", "product", "channel", "key_id", "version", "build", "published_at", "valid_until", "platform", "session_service", "artifacts"}
+          identities = set()
+          for alias, (platform, architecture, artifact_format) in aliases.items():
+              manifest_bytes = by_name[alias].read_bytes()
+              manifest = json.loads(manifest_bytes)
+              assert manifest_bytes == (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode()
+              original = json.loads((original_root / alias).read_text(encoding="utf-8"))
+              assert {key: value for key, value in manifest.items() if key not in {"published_at", "valid_until"}} == {key: value for key, value in original.items() if key not in {"published_at", "valid_until"}}
+              platform_key = "minimum_macos" if platform == "macos" else "minimum_glibc"
+              assert set(manifest) == common_keys | {platform_key}
+              assert manifest["schema"] == "hh-update-manifest-v2"
+              assert manifest["product"] == "Harness Harlot"
+              assert manifest["channel"] == "stable"
+              assert manifest["key_id"] == "hh-stable-2026-v2"
+              assert manifest["version"] == tag[1:]
+              assert isinstance(manifest["build"], int) and not isinstance(manifest["build"], bool) and manifest["build"] > 0
+              assert manifest["platform"] == platform
+              assert isinstance(manifest[platform_key], str) and re.fullmatch(r"[0-9]+\.[0-9]+", manifest[platform_key])
+              assert set(manifest["session_service"]) == {"protocol_version", "requires_quiescent_service"}
+              assert isinstance(manifest["session_service"]["protocol_version"], int) and manifest["session_service"]["protocol_version"] > 0
+              assert manifest["session_service"]["requires_quiescent_service"] is True
+              published = dt.datetime.strptime(manifest["published_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+              valid_until = dt.datetime.strptime(manifest["valid_until"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+              assert published == generated and valid_until - published == dt.timedelta(days=7)
+              assert len(manifest["artifacts"]) == 1 and isinstance(manifest["artifacts"][0], dict)
+              artifact = manifest["artifacts"][0]
+              assert set(artifact) == {"platform", "architecture", "format", "file_name", "url", "sha256", "size"}
+              assert artifact["platform"] == platform and artifact["architecture"] == architecture and artifact["format"] == artifact_format
+              expected_name = (f"Harness-Harlot-{manifest['version']}-b{manifest['build']}-macos-{architecture}-community.dmg" if platform == "macos" else f"Harness-Harlot-{manifest['version']}-b{manifest['build']}-linux-{architecture}.tar.gz")
+              assert artifact["file_name"] == expected_name
+              assert artifact["url"] == f"https://github.com/highlyproteus/harness-harlot/releases/download/{tag}/{expected_name}"
+              hosted = assets[expected_name]
+              assert hosted["browser_download_url"] == artifact["url"]
+              assert hosted["size"] == artifact["size"]
+              assert hosted["digest"] == f"sha256:{artifact['sha256']}"
+              identities.add((manifest["version"], manifest["build"], manifest["session_service"]["protocol_version"], manifest["published_at"], manifest["valid_until"]))
+          assert len(identities) == 1
+          PY
+      - name: Materialize stable-v2 seed
+        env:
+          HH_UPDATE_SIGNING_SEED: ${{ secrets.HH_UPDATE_SIGNING_SEED }}
+        run: |
+          set -eu
+          umask 077
+          test -n "$HH_UPDATE_SIGNING_SEED"
+          printf '%s' "$HH_UPDATE_SIGNING_SEED" > "$RUNNER_TEMP/signing-seed.b64"
+          unset HH_UPDATE_SIGNING_SEED
+      - name: Sign renewed manifests with no checkout or publication credential
+        env:
+          HH_UPDATE_PUBLIC_KEY: ${{ vars.HH_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -eu
+          mkdir "$RUNNER_TEMP/stable-v2-refresh"
+          cp "$RUNNER_TEMP/renewed"/* "$RUNNER_TEMP/stable-v2-refresh/"
+          for manifest in "$RUNNER_TEMP"/renewed/manifest-*-v2.update.json; do
+            "$RUNNER_TEMP/isolated-sign.sh" \
+              "$RUNNER_TEMP/signing-seed.b64" "$HH_UPDATE_PUBLIC_KEY" \
+              "$manifest" "$RUNNER_TEMP/stable-v2-refresh/$(basename "$manifest").sig"
+          done
+      - name: Destroy stable-v2 private material
+        if: always()
+        run: |
+          shred -u "$RUNNER_TEMP/signing-seed.b64" 2>/dev/null || rm -f "$RUNNER_TEMP/signing-seed.b64"
+      - name: Validate exact refresh payload
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/stable-v2-refresh" <<'PY'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          aliases = {
+              "manifest-linux-arm64-v2.update.json",
+              "manifest-linux-x86_64-v2.update.json",
+              "manifest-macos-community-arm64-v2.update.json",
+              "manifest-macos-community-x86_64-v2.update.json",
+          }
+          expected_files = aliases | {name + ".sig" for name in aliases} | {"stable-v2-refresh.json"}
+          by_name = {path.name: path for path in root.iterdir() if path.is_file() and not path.is_symlink()}
+          assert set(by_name) == expected_files
+          assert len(by_name) == 9
+          PY
+      - name: Attest stable-v2 refresh payload
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ runner.temp }}/stable-v2-refresh/*
+      - name: Upload stable-v2 refresh
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stable-v2-refresh
+          path: ${{ runner.temp }}/stable-v2-refresh/*
+          if-no-files-found: error
+          retention-days: 3
+
+  publish-refresh:
+    name: Publish verified renewable aliases without signing authority
+    needs: sign-refresh
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download signed and attested refresh payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-v2-refresh
+          path: ${{ runner.temp }}/stable-v2-refresh
+      - name: Validate exact publication payload
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/stable-v2-refresh" <<'PY'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          aliases = {
+              "manifest-linux-arm64-v2.update.json",
+              "manifest-linux-x86_64-v2.update.json",
+              "manifest-macos-community-arm64-v2.update.json",
+              "manifest-macos-community-x86_64-v2.update.json",
+          }
+          expected = aliases | {name + ".sig" for name in aliases} | {"stable-v2-refresh.json"}
+          paths = list(root.iterdir())
+          assert {path.name for path in paths} == expected
+          assert len(paths) == 9
+          assert all(path.is_file() and not path.is_symlink() for path in paths)
+          PY
+      - name: Publish rolling refresh assets after signing material is gone
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          refresh_tag=stable-v2-refresh
+          bound_tag=$(jq -er .release_tag "$RUNNER_TEMP/stable-v2-refresh/stable-v2-refresh.json")
+          bound_release_id=$(jq -er .release_id "$RUNNER_TEMP/stable-v2-refresh/stable-v2-refresh.json")
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-before.json"
+          test "$(jq -r .id "$RUNNER_TEMP/latest-before.json")" = "$bound_release_id"
+          test "$(jq -r .tag_name "$RUNNER_TEMP/latest-before.json")" = "$bound_tag"
+          if ! gh release view "$refresh_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$refresh_tag" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --prerelease \
+              --title "Renewable stable-v2 manifests" \
+              --notes "Machine-managed short-lived stable-v2 manifests. Do not install this release."
+          else
+            gh release view "$refresh_tag" --repo "$GITHUB_REPOSITORY" \
+              --json tagName,isDraft,isPrerelease > "$RUNNER_TEMP/existing.json"
+            test "$(jq -r .tagName "$RUNNER_TEMP/existing.json")" = "$refresh_tag"
+            test "$(jq -r .isDraft "$RUNNER_TEMP/existing.json")" = false
+            test "$(jq -r .isPrerelease "$RUNNER_TEMP/existing.json")" = true
+          fi
+          gh release upload "$refresh_tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$RUNNER_TEMP"/stable-v2-refresh/*
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-after.json"
+          test "$(jq -r .id "$RUNNER_TEMP/latest-after.json")" = "$bound_release_id"
+          test "$(jq -r .tag_name "$RUNNER_TEMP/latest-after.json")" = "$bound_tag"
+          gh release view "$refresh_tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,assets > "$RUNNER_TEMP/published.json"
+          python3 - "$RUNNER_TEMP/stable-v2-refresh" "$RUNNER_TEMP/published.json" <<'PY'
+          import hashlib, json, pathlib, sys
+          root, published_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          published = json.loads(published_path.read_text(encoding="utf-8"))
+          assert published["tagName"] == "stable-v2-refresh"
+          assert published["isDraft"] is False and published["isPrerelease"] is True
+          assets = {asset["name"]: asset for asset in published["assets"]}
+          files = {path.name: path for path in root.iterdir()}
+          assert set(assets) == set(files) and len(files) == 9
+          for name, path in files.items():
+              body = path.read_bytes()
+              assert assets[name]["size"] == len(body)
+              assert assets[name]["digest"] == f"sha256:{hashlib.sha256(body).hexdigest()}"
+          PY

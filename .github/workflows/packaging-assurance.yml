@@ -55,6 +55,7 @@ jobs:
           scripts/test-linux-installer-bootstrap.sh
           scripts/test-community-macos-release.sh
           scripts/test-update-tool.sh
+          python3 scripts/test-stable-v2-refresh.py
 
   linux-fixtures:
     name: Linux release and updater fixtures
@@ -81,3 +82,4 @@ jobs:
       - run: |
           scripts/test-linux-update-tool.sh
           scripts/test-linux-release-fixture.sh
+          python3 scripts/test-stable-v2-refresh.py

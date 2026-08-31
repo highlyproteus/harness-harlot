@@ -100,9 +100,9 @@ pub fn fetch_available_update_for_channel(
         .timeout(NETWORK_TIMEOUT)
         .https_only(true)
         .build();
-    let manifest_bytes = fetch_capped(&agent, &manifest_url, MAX_MANIFEST_BYTES)
+    let manifest_bytes = fetch_capped_feed(&agent, &manifest_url, MAX_MANIFEST_BYTES)
         .context("fetch stable update manifest")?;
-    let signature_bytes = fetch_capped(&agent, &signature_url, MAX_SIGNATURE_BYTES)
+    let signature_bytes = fetch_capped_feed(&agent, &signature_url, MAX_SIGNATURE_BYTES)
         .context("fetch stable update signature")?;
     let signature =
         std::str::from_utf8(&signature_bytes).context("update manifest signature is not UTF-8")?;
@@ -303,12 +303,32 @@ fn ensure_trusted_response_url(response_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn fetch_capped(agent: &ureq::Agent, url: &str, maximum: u64) -> Result<Vec<u8>> {
+fn ensure_trusted_feed_response_url(response_url: &str, requested_url: &str) -> Result<()> {
+    let requested = Url::parse(requested_url).context("parse requested update feed URL")?;
+    ensure!(
+        requested.scheme() == "https"
+            && requested.host_str() == Some("harnessharlot.com")
+            && requested.username().is_empty()
+            && requested.password().is_none()
+            && requested.port().is_none()
+            && requested.query().is_none()
+            && requested.fragment().is_none()
+            && requested.path().starts_with("/releases/stable-v2/"),
+        "requested update feed URL is not the canonical stable-v2 origin"
+    );
+    ensure!(
+        response_url == requested_url,
+        "update feed must not redirect away from its exact requested URL"
+    );
+    Ok(())
+}
+
+fn fetch_capped_feed(agent: &ureq::Agent, url: &str, maximum: u64) -> Result<Vec<u8>> {
     let response = agent
         .get(url)
         .call()
         .with_context(|| format!("GET {url}"))?;
-    ensure_trusted_response_url(response.get_url())?;
+    ensure_trusted_feed_response_url(response.get_url(), url)?;
     let mut reader = response.into_reader().take(maximum.saturating_add(1));
     let mut bytes = Vec::new();
     reader
@@ -326,8 +346,29 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::dotted_version_at_least;
-    use super::{DOWNLOAD_SEQUENCE, ensure_trusted_response_url, publish_verified_download};
+    use super::{
+        DOWNLOAD_SEQUENCE, ensure_trusted_feed_response_url, ensure_trusted_response_url,
+        publish_verified_download,
+    };
     use crate::{ReleaseArtifact, sha256_hex};
+
+    #[test]
+    fn stable_feed_accepts_only_the_exact_website_alias_origin() {
+        let manifest =
+            "https://harnessharlot.com/releases/stable-v2/manifest-linux-x86_64-v2.update.json";
+        assert!(ensure_trusted_feed_response_url(manifest, manifest).is_ok());
+        for response in [
+            "http://harnessharlot.com/releases/stable-v2/manifest-linux-x86_64-v2.update.json",
+            "https://www.harnessharlot.com/releases/stable-v2/manifest-linux-x86_64-v2.update.json",
+            "https://harnessharlot.com/releases/stable-v2/other.json",
+            "https://harnessharlot.com:443/releases/stable-v2/manifest-linux-x86_64-v2.update.json",
+        ] {
+            assert!(
+                ensure_trusted_feed_response_url(response, manifest).is_err(),
+                "accepted {response}"
+            );
+        }
+    }
     #[test]
     fn accepts_only_expected_https_redirect_hosts() {
         assert!(ensure_trusted_response_url("https://github.com/release").is_ok());

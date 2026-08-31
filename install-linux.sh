@@ -105,8 +105,10 @@ for kind in ("archive", "manifest", "signature"):
     if not isinstance(url, str):
         raise SystemExit(f"invalid {kind} URL")
     parsed = urlparse(url)
-    expected_prefix = f"/highlyproteus/harness-harlot/releases/download/{tag}/"
-    if parsed.scheme != "https" or parsed.netloc != "github.com" or not parsed.path.startswith(expected_prefix):
+    github_url = f"https://github.com/highlyproteus/harness-harlot/releases/download/{tag}/{expected[kind]}"
+    stable_v2_url = f"https://harnessharlot.com/releases/stable-v2/{expected[kind]}"
+    allowed_urls = {github_url} if kind == "archive" else {github_url, stable_v2_url}
+    if url not in allowed_urls:
         raise SystemExit(f"untrusted {kind} URL")
     if PurePosixPath(parsed.path).name != expected[kind]:
         raise SystemExit(f"unexpected {kind} filename")

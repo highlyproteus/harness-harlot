@@ -30,6 +30,7 @@ sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 size() { wc -c < "$1" | tr -d ' '; }
 write_index() {
   archive_digest=$1
+  manifest_base=${2:-https://github.com/highlyproteus/harness-harlot/releases/download/v9.8.7}
   cat > "$work/stable-linux.json" <<EOF
 {
   "schema": "hh-web-release-index-v1",
@@ -39,8 +40,8 @@ write_index() {
   "linux": {
     "x86_64": {
       "archive": {"url":"https://github.com/highlyproteus/harness-harlot/releases/download/v9.8.7/$archive_name","sha256":"$archive_digest","size":$(size "$archive")},
-      "manifest": {"url":"https://github.com/highlyproteus/harness-harlot/releases/download/v9.8.7/$manifest_name","sha256":"$(sha256 "$work/$manifest_name")","size":$(size "$work/$manifest_name")},
-      "signature": {"url":"https://github.com/highlyproteus/harness-harlot/releases/download/v9.8.7/$signature_name","sha256":"$(sha256 "$work/$signature_name")","size":$(size "$work/$signature_name")},
+      "manifest": {"url":"$manifest_base/$manifest_name","sha256":"$(sha256 "$work/$manifest_name")","size":$(size "$work/$manifest_name")},
+      "signature": {"url":"$manifest_base/$signature_name","sha256":"$(sha256 "$work/$signature_name")","size":$(size "$work/$signature_name")},
       "manifest_published_at":"2026-08-22T00:00:00Z",
       "manifest_valid_until":"2026-08-29T00:00:00Z"
     }
@@ -84,7 +85,7 @@ done
 [ -n "$output" ] && [ -n "$url" ]
 case "$url" in
   https://harnessharlot.com/releases/stable-linux.json) source=$HH_TEST_INDEX ;;
-  https://github.com/*) source="$HH_TEST_ASSET_DIR/${url##*/}" ;;
+  https://github.com/*|https://harnessharlot.com/releases/stable-v2/*) source="$HH_TEST_ASSET_DIR/${url##*/}" ;;
   *) exit 22 ;;
 esac
 cp "$source" "$output"
@@ -100,6 +101,16 @@ PATH="$work/mock-bin:$PATH" \
 grep -F 'verified Harness Harlot Linux release v9.8.7 for x86_64' "$work/output" >/dev/null
 grep -F 'verify-trusted --manifest' "$work/verified" >/dev/null
 [ ! -e "$work/installed" ]
+
+write_index "$(sha256 "$archive")" 'https://harnessharlot.com/releases/stable-v2'
+HH_TEST_INDEX="$work/stable-linux.json" \
+HH_TEST_ASSET_DIR="$work" \
+HH_TEST_VERIFY_LOG="$work/website-verified" \
+HH_TEST_INSTALL_LOG="$work/website-installed" \
+PATH="$work/mock-bin:$PATH" \
+  "$repository_root/install-linux.sh" --verify-only > "$work/website-output"
+grep -F 'verify-trusted --manifest' "$work/website-verified" >/dev/null
+[ ! -e "$work/website-installed" ]
 
 write_index "$(printf '0%.0s' $(seq 1 64))"
 if HH_TEST_INDEX="$work/stable-linux.json" \
