@@ -961,6 +961,7 @@ mod tests {
         AvailableUpdateBanner, BUNDLED_BANNER_PIXEL_HEIGHT, BUNDLED_BANNER_PIXEL_WIDTH,
         max_pane_status, pane_status_color, workstation_banner_path,
     };
+    use crate::sidebar::update_install_block_reason;
     use hh_protocol::PaneStatus;
 
     #[test]
@@ -980,6 +981,22 @@ mod tests {
         };
         assert_eq!(manual.label(), "0.2.0 available — install manually");
         assert!(!manual.can_install());
+    }
+
+    #[test]
+    fn update_install_requires_authoritative_quiescent_state() {
+        assert_eq!(
+            update_install_block_reason(true, None),
+            Some("Wait for Harness Harlot to reconnect before updating")
+        );
+        assert_eq!(
+            update_install_block_reason(true, Some(2)),
+            Some(
+                "Close all terminals, then update — live sessions must end before the service restarts"
+            )
+        );
+        assert_eq!(update_install_block_reason(true, Some(0)), None);
+        assert_eq!(update_install_block_reason(false, None), None);
     }
 
     #[test]
