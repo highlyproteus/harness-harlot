@@ -1,4 +1,6 @@
+#[cfg(target_os = "macos")]
 use std::ffi::OsStr;
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +20,7 @@ pub(super) fn install_prefix_for_executable(executable: &Path) -> Option<PathBuf
     app.parent().map(Path::to_path_buf)
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn desktop_update_handoff_identity(arguments: &[String]) -> Option<(u32, u64)> {
     if arguments.first().map(String::as_str) != Some("install") {
         return None;
@@ -33,6 +36,7 @@ pub(super) fn desktop_update_handoff_identity(arguments: &[String]) -> Option<(u
     Some((process_id, process_start_time))
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn desktop_update_relaunch_target(
     arguments: &[String],
     updater_executable: &Path,
@@ -76,10 +80,12 @@ pub(super) fn relaunch_after_failed_desktop_update(arguments: &[String]) {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) struct StagedDirectoryGuard {
     path: PathBuf,
 }
 
+#[cfg(target_os = "macos")]
 impl StagedDirectoryGuard {
     pub(super) fn new(path: &Path) -> Self {
         Self {
@@ -88,6 +94,7 @@ impl StagedDirectoryGuard {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for StagedDirectoryGuard {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.path)
@@ -101,10 +108,12 @@ impl Drop for StagedDirectoryGuard {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn relaunch_program(fixture: bool) -> &'static str {
     if fixture { "open" } else { "/usr/bin/open" }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn relaunch_arguments(app: &Path) -> Vec<&OsStr> {
     vec![OsStr::new("-n"), app.as_os_str()]
 }

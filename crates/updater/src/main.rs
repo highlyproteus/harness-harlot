@@ -41,11 +41,12 @@ use macos_install::{
     StagedDirectoryGuard, relaunch_after_failed_desktop_update,
     relaunch_arguments as macos_relaunch_arguments, relaunch_program as macos_relaunch_program,
 };
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use macos_install::{desktop_update_handoff_identity, desktop_update_relaunch_target};
 
 #[cfg(target_os = "macos")]
 const BUNDLE_ID: &str = "com.harnessharlot.desktop";
+#[cfg(target_os = "macos")]
 const MACOS_APP_NAME: &str = "Harness Harlot.app";
 #[cfg(target_os = "macos")]
 const MACOS_BACKUP_NAME: &str = ".Harness Harlot.previous.app";

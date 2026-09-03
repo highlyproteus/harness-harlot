@@ -111,6 +111,7 @@ fn linux_browser_runtime_requires_helper_data_and_locale() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn desktop_update_handoff_requires_complete_process_identity() {
     let complete = [
         "install",
