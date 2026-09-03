@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-09-03
+
+### Fixed
+
+- Prevented the desktop updater from closing when service state is unavailable,
+  and reopened the exact managed app after a failed GUI update handoff.
+- Forced a fresh macOS app instance after successful replacement and removed
+  abandoned staged bundles when installation fails before the atomic swap.
+- Corrected the immutable v0.1.16 legacy bridge asset names so signed stable
+  releases can complete publication for existing updater generations.
+
 ## [0.1.17] - 2026-08-31
 
 ### Fixed
