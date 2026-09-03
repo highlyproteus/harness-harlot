@@ -27,6 +27,22 @@ use uuid::Uuid;
 
 mod workstation_list;
 
+pub(super) fn update_install_block_reason(
+    requires_service_restart: bool,
+    active_terminal_count: Option<u32>,
+) -> Option<&'static str> {
+    if !requires_service_restart {
+        return None;
+    }
+    match active_terminal_count {
+        None => Some("Wait for Harness Harlot to reconnect before updating"),
+        Some(0) => None,
+        Some(_) => Some(
+            "Close all terminals, then update — live sessions must end before the service restarts",
+        ),
+    }
+}
+
 impl HhApp {
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar.sidebar_visible = !self.sidebar.sidebar_visible;
@@ -308,17 +324,17 @@ impl HhApp {
             cx.notify();
             return;
         }
-        let has_live_terminals = self.session.snapshot.as_ref().is_some_and(|snapshot| {
+        let active_terminal_count = self.session.snapshot.as_ref().map(|snapshot| {
             snapshot
                 .workspaces
                 .iter()
-                .any(|workspace| workspace.active_terminal_count > 0)
+                .map(|workspace| workspace.active_terminal_count)
+                .sum::<u32>()
         });
-        if update.requires_service_restart && has_live_terminals {
-            self.session.connection_error = Some(
-                "Close all terminals, then update — live sessions must end before the service restarts"
-                    .to_owned(),
-            );
+        if let Some(reason) =
+            update_install_block_reason(update.requires_service_restart, active_terminal_count)
+        {
+            self.session.connection_error = Some(reason.to_owned());
             cx.notify();
             return;
         }

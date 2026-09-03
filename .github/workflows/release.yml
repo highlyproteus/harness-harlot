@@ -758,10 +758,10 @@ jobs:
           test -n "$HH_UPDATE_LEGACY_PUBLIC_KEY_V1"
           mkdir -p "$RUNNER_TEMP/legacy"
           gh release download v0.1.16 --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/legacy" \
-            --pattern 'manifest-macos-arm64.update.json' \
-            --pattern 'manifest-macos-arm64.update.json.sig' \
-            --pattern 'manifest-macos-x86_64.update.json' \
-            --pattern 'manifest-macos-x86_64.update.json.sig' \
+            --pattern 'manifest-macos-community-arm64.update.json' \
+            --pattern 'manifest-macos-community-arm64.update.json.sig' \
+            --pattern 'manifest-macos-community-x86_64.update.json' \
+            --pattern 'manifest-macos-community-x86_64.update.json.sig' \
             --pattern 'manifest-linux-arm64.update.json' \
             --pattern 'manifest-linux-arm64.update.json.sig' \
             --pattern 'manifest-linux-x86_64.update.json' \
@@ -785,8 +785,8 @@ jobs:
           assert len(public_key) == 32
           manifests = sorted(root.glob("*.update.json"))
           expected = {
-              "manifest-macos-arm64.update.json",
-              "manifest-macos-x86_64.update.json",
+              "manifest-macos-community-arm64.update.json",
+              "manifest-macos-community-x86_64.update.json",
               "manifest-linux-arm64.update.json",
               "manifest-linux-x86_64.update.json",
           }

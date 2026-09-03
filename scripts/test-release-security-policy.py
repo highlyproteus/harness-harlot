@@ -105,6 +105,10 @@ assert "published.replace(year=published.year + 10)" in legacy, (
 assert "Download immutable v0.1.16 legacy bridge" in legacy, (
     "future latest releases must carry the old-client bridge without retaining its seed"
 )
+assert "'manifest-macos-community-arm64.update.json'" in legacy
+assert "'manifest-macos-community-x86_64.update.json'" in legacy
+assert "'manifest-macos-arm64.update.json'" not in legacy
+assert "'manifest-macos-x86_64.update.json'" not in legacy
 assert 'assert manifest["version"] == "0.1.16"' in legacy
 assert "release-legacy-v016-bridge" in legacy
 assert "0.1.14" not in legacy and "0.1.15" not in legacy

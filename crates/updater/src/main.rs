@@ -34,8 +34,19 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(feature = "fixture")]
 use time::OffsetDateTime;
 
+mod macos_install;
+use macos_install::install_prefix_for_executable as macos_install_prefix_for_executable;
+#[cfg(target_os = "macos")]
+use macos_install::{
+    StagedDirectoryGuard, relaunch_after_failed_desktop_update,
+    relaunch_arguments as macos_relaunch_arguments, relaunch_program as macos_relaunch_program,
+};
+#[cfg(all(test, target_os = "macos"))]
+use macos_install::{desktop_update_handoff_identity, desktop_update_relaunch_target};
+
 #[cfg(target_os = "macos")]
 const BUNDLE_ID: &str = "com.harnessharlot.desktop";
+#[cfg(target_os = "macos")]
 const MACOS_APP_NAME: &str = "Harness Harlot.app";
 #[cfg(target_os = "macos")]
 const MACOS_BACKUP_NAME: &str = ".Harness Harlot.previous.app";
@@ -204,22 +215,6 @@ fn ensure_production_target_matches(
         "production update {target_kind} must match the running system"
     );
     Ok(())
-}
-
-fn macos_install_prefix_for_executable(executable: &Path) -> Option<PathBuf> {
-    let macos = executable.parent()?;
-    if macos.file_name()? != "MacOS" {
-        return None;
-    }
-    let contents = macos.parent()?;
-    if contents.file_name()? != "Contents" {
-        return None;
-    }
-    let app = contents.parent()?;
-    if app.file_name()? != MACOS_APP_NAME {
-        return None;
-    }
-    app.parent().map(Path::to_path_buf)
 }
 
 fn run_check(arguments: &[String]) -> Result<()> {
@@ -417,7 +412,14 @@ fn run_install(arguments: &[String]) -> Result<()> {
                     );
                     MacAppTrust::DeveloperId(team_id)
                 };
-                install_dmg(&package, &prefix, &home, &trust, requires_service_restart)
+                install_dmg(
+                    &package,
+                    &prefix,
+                    &home,
+                    &trust,
+                    requires_service_restart,
+                    fixture,
+                )
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -1068,6 +1070,7 @@ fn install_dmg(
     home: &Path,
     trust: &MacAppTrust,
     restart_service: bool,
+    fixture: bool,
 ) -> Result<()> {
     fs::create_dir_all(prefix)
         .with_context(|| format!("create install prefix {}", prefix.display()))?;
@@ -1085,6 +1088,7 @@ fn install_dmg(
     let link = bin_directory.join("hh");
     let staging = prefix.join(format!(".{MACOS_APP_NAME}.new.{}", std::process::id()));
     ensure_absent(&staging, "staging app")?;
+    let _staging_cleanup = StagedDirectoryGuard::new(&staging);
     run_status(
         "ditto",
         [mounted_app.as_os_str(), staging.as_os_str()],
@@ -1198,7 +1202,11 @@ fn install_dmg(
         };
     }
     println!("installed {}", app.display());
-    if let Err(error) = run_status("open", [app.as_os_str()], "launch updated app") {
+    if let Err(error) = run_status(
+        macos_relaunch_program(fixture),
+        macos_relaunch_arguments(&app),
+        "launch updated app",
+    ) {
         eprintln!("update installed, but Harness Harlot could not be relaunched: {error:#}");
     }
     Ok(())
@@ -1507,27 +1515,29 @@ impl Drop for MountedDmg {
     }
 }
 
-fn run() -> Result<()> {
-    let arguments: Vec<_> = env::args().skip(1).collect();
+fn run(arguments: &[String]) -> Result<()> {
     match arguments.first().map(String::as_str) {
-        Some("verify-trusted") => run_verify_trusted(&arguments),
+        Some("verify-trusted") => run_verify_trusted(arguments),
         #[cfg(feature = "fixture")]
-        Some("verify") => run_verify_fixture(&arguments),
-        Some("check") => run_check(&arguments),
-        Some("install") => run_install(&arguments),
-        Some("install-local") => run_install_local(&arguments),
+        Some("verify") => run_verify_fixture(arguments),
+        Some("check") => run_check(arguments),
+        Some("install") => run_install(arguments),
+        Some("install-local") => run_install_local(arguments),
         #[cfg(feature = "community-macos")]
-        Some("prepare-community-install") => run_prepare_community_install(&arguments),
+        Some("prepare-community-install") => run_prepare_community_install(arguments),
         Some(command) => bail!("unknown command {command}"),
         None => usage(),
     }
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    match run(&arguments) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("hh-update-tool: {error:#}");
+            #[cfg(target_os = "macos")]
+            relaunch_after_failed_desktop_update(&arguments);
             ExitCode::FAILURE
         }
     }
