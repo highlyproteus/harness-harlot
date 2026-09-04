@@ -984,10 +984,14 @@ jobs:
                   subprocess.run(["openssl", "pkey", "-pubin", "-inform", "DER", "-in", str(public_der), "-out", str(public_pem)], check=True)
                   subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(public_pem), "-rawin", "-in", str(manifest_path), "-sigfile", str(signature_raw)], check=True)
                   artifact = manifest["artifacts"][0]
-                  artifact_path = by_name[artifact["file_name"]]
-                  expected_files.add(artifact_path.name)
-                  assert artifact_path.stat().st_size == artifact["size"]
-                  assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == artifact["sha256"]
+                  if key_id == "hh-stable-2026":
+                      assert artifact["url"] == f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/v0.1.16/{artifact['file_name']}"
+                      continue
+                  if key_id == "hh-stable-2026-v2":
+                      artifact_path = by_name[artifact["file_name"]]
+                      expected_files.add(artifact_path.name)
+                      assert artifact_path.stat().st_size == artifact["size"]
+                      assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == artifact["sha256"]
           assert set(by_name) == expected_files, sorted(set(by_name) - expected_files)
           PY
       - name: Publish signed-tag release

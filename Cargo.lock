@@ -2917,7 +2917,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hh-cef-view"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "cef",
@@ -2931,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "hh-desktop"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2959,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "hh-macos-icon"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -2968,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "hh-protocol"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "libc",
  "rustix 1.1.4",
@@ -2981,7 +2981,7 @@ dependencies = [
 
 [[package]]
 name = "hh-release-signer"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "hh-session-client"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "hh-protocol",
@@ -2999,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "hh-session-service"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "hh-protocol",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "hh-terminal-model"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "alacritty_terminal",
  "hh-protocol",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "hh-updater"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "hh-voice"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

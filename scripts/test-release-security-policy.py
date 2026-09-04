@@ -119,6 +119,13 @@ assert "refs/tags/$GITHUB_REF_NAME^{}" in publish
 assert "sign-stable-v2" in publish and "sign-legacy-bridge" in publish
 assert "--latest=false" in publish and "--latest" in publish
 assert "vars.HH_UPDATE_LEGACY_PUBLIC_KEY_V1" in publish
+assert 'if key_id == "hh-stable-2026"' in publish
+assert 'artifact["url"] == f"https://github.com/{os.environ[\'GITHUB_REPOSITORY\']}/releases/download/v0.1.16/{artifact[\'file_name\']}"' in publish, (
+    "legacy bridge manifests must remain bound to immutable v0.1.16 assets"
+)
+assert 'if key_id == "hh-stable-2026-v2"' in publish, (
+    "only current v2 artifacts may be required in the new release payload"
+)
 assert "assert set(by_name) == expected_files" in publish, (
     "stable publication must reject every extra release asset"
 )
