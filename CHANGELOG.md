@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-09-04
+
+### Fixed
+
+- Completed release publication by validating legacy v0.1.16 bridge references
+  without requiring the old binaries in the current release payload. Current
+  release signatures, artifact sizes, digests, and the exact asset allowlist
+  remain enforced.
+- Delivers the previously unpublished v0.1.17 and v0.1.18 update improvements:
+  renewable update feeds, safe desktop update handoff, failed-update recovery,
+  and a fresh app instance after successful replacement.
+
 ## [0.1.18] - 2026-09-03
 
 ### Fixed
