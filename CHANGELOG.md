@@ -30,6 +30,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   of rendering, detached closed browser views, and synchronized browser focus
   with terminal focus hand-back.
 - Avoided registry write-lock acquisition for ordinary terminal keystrokes.
+- Updated Rustls to 0.23.45 to reject TLS 1.3 handshake messages sent across
+  encryption-level boundaries (RUSTSEC-2026-0285).
 
 ### Changed
 
