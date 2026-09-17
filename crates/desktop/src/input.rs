@@ -789,6 +789,14 @@ impl HhApp {
                 }
             }
         }
+        if keystroke.key == "escape" && self.layout.selection_drag.is_some() {
+            self.layout.selection_drag = None;
+            self.layout.selection_autoscroll = None;
+            self.layout.autoscroll_generation = self.layout.autoscroll_generation.wrapping_add(1);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.layout.dragging_pane.is_some() && keystroke.key == "escape" {
             self.layout.dragging_pane = None;
             self.layout.drag_hover.clear();

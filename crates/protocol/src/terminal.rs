@@ -22,6 +22,9 @@ pub enum PaneStatus {
 pub struct TerminalScreen {
     pub pane_id: Uuid,
     pub revision: u64,
+    /// Advances only when visible text, dimensions, or viewport offset change;
+    /// selection changes advance `revision` alone. Renderers key glyph caches on this.
+    pub content_revision: u64,
     pub columns: u16,
     pub rows: u16,
     pub lines: Vec<TerminalLine>,

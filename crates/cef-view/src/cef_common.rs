@@ -19,6 +19,15 @@ use crate::cef_macos as platform;
 
 pub(crate) static INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub(crate) static TERMINATED: AtomicBool = AtomicBool::new(false);
+static PUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn pump_once() {
+    if PUMP_ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    do_message_loop_work();
+    PUMP_ACTIVE.store(false, Ordering::Release);
+}
 
 thread_local! {
     static CEF_APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -45,6 +54,20 @@ wrap_app! {
             // state directory.
             if let Some(command_line) = command_line {
                 command_line.append_switch(Some(&CefString::from("use-mock-keychain")));
+                // Chromium 151's observer dereferences a Chrome TabInterface
+                // on soft navigation. Alloy child views have no Chrome tab:
+                // https://github.com/chromiumembedded/cef/issues/4234
+                let switch = CefString::from("disable-features");
+                let mut disabled = CefString::from(&command_line.switch_value(Some(&switch))).to_string();
+                if !disabled.split(',').any(|feature| feature == "ImmersiveReadAnything") {
+                    if !disabled.is_empty() {
+                        disabled.push(',');
+                    }
+                    disabled.push_str("ImmersiveReadAnything");
+                    command_line.append_switch_with_value(
+                        Some(&switch), Some(&CefString::from(disabled.as_str())),
+                    );
+                }
             }
         }
     }
@@ -53,9 +76,11 @@ wrap_browser_process_handler! {
     struct HhBrowserProcessHandler;
 
     impl BrowserProcessHandler {
-        fn on_schedule_message_pump_work(&self, _delay_ms: i64) {
-            // A single dispatch timer below drives CEF from the GPUI run loop.
-            // Keeping scheduling in one place prevents overlapping pump calls.
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            #[cfg(target_os = "macos")]
+            platform::schedule_pump(delay_ms);
+            #[cfg(target_os = "linux")]
+            let _ = delay_ms; // Linux is driven by the GPUI timer.
         }
     }
 }
@@ -91,11 +116,64 @@ wrap_client! {
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(HhLifeSpanHandler::new(self.state.clone()))
+            Some(HhLifeSpanHandler::new(self.state.clone(), self.callbacks.clone()))
         }
 
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(HhLoadHandler::new(self.callbacks.clone()))
+        }
+
+        fn focus_handler(&self) -> Option<FocusHandler> {
+            Some(HhFocusHandler::new(self.callbacks.clone()))
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(HhRequestHandler::new(self.callbacks.clone()))
+        }
+    }
+}
+
+wrap_focus_handler! {
+    struct HhFocusHandler {
+        callbacks: StdRc<Callbacks>,
+    }
+
+    impl FocusHandler {
+        fn on_got_focus(&self, _browser: Option<&mut Browser>) {
+            (self.callbacks.on_got_focus)();
+        }
+    }
+}
+
+wrap_request_handler! {
+    struct HhRequestHandler {
+        callbacks: StdRc<Callbacks>,
+    }
+
+    impl RequestHandler {
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            _user_gesture: i32,
+        ) -> i32 {
+            if !matches!(
+                target_disposition,
+                WindowOpenDisposition::NEW_FOREGROUND_TAB
+                    | WindowOpenDisposition::NEW_BACKGROUND_TAB
+                    | WindowOpenDisposition::NEW_POPUP
+                    | WindowOpenDisposition::NEW_WINDOW
+            ) {
+                return 0;
+            }
+            // Modified clicks bypass OnBeforePopup; defer them through the
+            // same bounded queue rather than navigating the source frame.
+            if let Some(url) = target_url {
+                (self.callbacks.on_popup_request)(url.to_string());
+            }
+            1
         }
     }
 }
@@ -239,12 +317,13 @@ wrap_download_image_callback! {
 wrap_life_span_handler! {
     struct HhLifeSpanHandler {
         state: StdRc<RefCell<BrowserState>>,
+        callbacks: StdRc<Callbacks>,
     }
 
     impl LifeSpanHandler {
         fn on_before_popup(
             &self,
-            browser: Option<&mut Browser>,
+            _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             _popup_id: i32,
             target_url: Option<&CefString>,
@@ -258,10 +337,8 @@ wrap_life_span_handler! {
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
-            if let Some(url) = target_url
-                && let Some(frame) = browser.and_then(|browser| browser.main_frame())
-            {
-                frame.load_url(Some(url));
+            if let Some(url) = target_url {
+                (self.callbacks.on_popup_request)(url.to_string());
             }
             1
         }
@@ -305,8 +382,21 @@ wrap_life_span_handler! {
                 platform::focus_parent(parent);
             }
         }
-        fn do_close(&self, _browser: Option<&mut Browser>) -> i32 {
-            1
+        fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(browser) = browser {
+                    platform::detach_native_view(browser);
+                }
+                // The parent belongs to GPUI; CEF must not close its NSWindow.
+                1
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = browser;
+                // Let CEF destroy its own X11 child window.
+                0
+            }
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
@@ -433,6 +523,11 @@ impl BrowserPane {
     pub fn set_bounds(&self, rect: BrowserRect, parent_height: f32) {
         let browser = {
             let mut state = self.state.borrow_mut();
+            if state.presentation.close_requested
+                || state.pending_bounds == Some((rect, parent_height))
+            {
+                return;
+            }
             state.pending_bounds = Some((rect, parent_height));
             state.browser.clone()
         };
@@ -444,7 +539,7 @@ impl BrowserPane {
     pub fn set_visible(&self, visible: bool) {
         let browser = {
             let mut state = self.state.borrow_mut();
-            if state.presentation.visible == visible {
+            if state.presentation.close_requested || state.presentation.visible == visible {
                 return;
             }
             state.presentation.visible = visible;
@@ -493,6 +588,9 @@ impl BrowserPane {
     pub fn focus(&self, focused: bool) {
         let (browser, parent) = {
             let mut state = self.state.borrow_mut();
+            if state.presentation.close_requested {
+                return;
+            }
             state.presentation.focused = focused;
             (state.browser.clone(), state.parent)
         };
@@ -563,7 +661,7 @@ pub(crate) fn initialize_with_settings(settings: &Settings) -> anyhow::Result<()
 #[cfg(target_os = "linux")]
 pub fn pump_runtime() {
     if INITIALIZED.load(Ordering::Acquire) && platform::ensure_main_thread().is_ok() {
-        do_message_loop_work();
+        pump_once();
     }
 }
 
@@ -608,7 +706,7 @@ pub fn shutdown_runtime() {
         if Instant::now() >= deadline {
             break false;
         }
-        do_message_loop_work();
+        pump_once();
         std::thread::sleep(Duration::from_millis(1));
     };
     INITIALIZED.store(false, Ordering::Release);

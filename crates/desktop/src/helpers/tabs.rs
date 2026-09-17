@@ -189,10 +189,10 @@ pub(crate) fn workspace_tab_rank(tab: &hh_protocol::Tab) -> u8 {
 /// must render as a group: it holds several terminals, or the user named it.
 pub(crate) struct WorkstationTabEntry<'a> {
     pub(crate) tab_id: Uuid,
-    pub(crate) group_label: Option<String>,
-    pub(crate) project_dir: Option<String>,
+    pub(crate) group_label: Option<&'a str>,
+    pub(crate) project_dir: Option<&'a str>,
     pub(crate) color: Option<AppearanceColor>,
-    pub(crate) custom_icon: Option<String>,
+    pub(crate) custom_icon: Option<&'a str>,
     pub(crate) pinned: bool,
     pub(crate) panes: Vec<&'a Pane>,
     pub(crate) children: Vec<WorkstationTabEntry<'a>>,
@@ -202,20 +202,15 @@ pub(crate) fn workspace_tab_entries(workspace: &Workspace) -> Vec<WorkstationTab
     fn make_entry(tab: &hh_protocol::Tab) -> WorkstationTabEntry<'_> {
         let mut panes = Vec::new();
         collect_terminal_tabs(&tab.layout, &mut panes);
-        let group_label = (panes.len() >= 2
-            || tab.custom_title.is_some()
-            || tab.project_dir.is_some())
-        .then(|| {
-            tab.custom_title
-                .clone()
-                .unwrap_or_else(|| tab.title.clone())
-        });
+        let group_label =
+            (panes.len() >= 2 || tab.custom_title.is_some() || tab.project_dir.is_some())
+                .then(|| tab.custom_title.as_deref().unwrap_or(tab.title.as_str()));
         WorkstationTabEntry {
             tab_id: tab.id,
             group_label,
-            project_dir: tab.project_dir.clone(),
+            project_dir: tab.project_dir.as_deref(),
             color: tab.color,
-            custom_icon: tab.custom_icon.clone(),
+            custom_icon: tab.custom_icon.as_deref(),
             pinned: tab.pinned,
             panes,
             children: Vec::new(),
@@ -321,16 +316,18 @@ mod tests {
 
     #[test]
     fn sidebar_partitions_pinned_then_projects_then_floating() {
-        let entry = |tab_id: u128, project_dir: Option<&str>, pinned: bool| WorkstationTabEntry {
-            tab_id: Uuid::from_u128(tab_id),
-            group_label: None,
-            project_dir: project_dir.map(str::to_owned),
-            color: None,
-            custom_icon: None,
-            pinned,
-            panes: Vec::new(),
-            children: Vec::new(),
-        };
+        fn entry(tab_id: u128, project_dir: Option<&str>, pinned: bool) -> WorkstationTabEntry<'_> {
+            WorkstationTabEntry {
+                tab_id: Uuid::from_u128(tab_id),
+                group_label: None,
+                project_dir,
+                color: None,
+                custom_icon: None,
+                pinned,
+                panes: Vec::new(),
+                children: Vec::new(),
+            }
+        }
         let (pinned, projects, floating) = partition_workstation_entries(vec![
             entry(10, Some("/tmp/project-a"), false),
             entry(20, None, true),
@@ -438,7 +435,7 @@ mod tests {
         assert_eq!(
             entries
                 .iter()
-                .map(|entry| entry.group_label.as_deref())
+                .map(|entry| entry.group_label)
                 .collect::<Vec<_>>(),
             vec![Some("Group 1"), Some("Stacked"), Some("Split"), None]
         );

@@ -1,8 +1,8 @@
 use gpui::{IntoElement, ParentElement, Pixels, Point, Render, Styled, Window, div, px, rgb};
 use hh_protocol::{
     ClientRequest, DropPlacement, MAX_SSH_INPUT_LEN, MAX_WORKSPACE_DIR_BYTES, Pane, SplitAxis,
-    TerminalHistoryPage, TerminalPoint, TerminalProfile, TerminalSelection, TerminalSelectionKind,
-    TmuxScanScope, TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
+    TerminalHistoryPage, TerminalPoint, TerminalSelection, TerminalSelectionKind, TmuxScanScope,
+    TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -49,13 +49,6 @@ pub(super) struct TabDropPreview {
 pub(super) struct WorkspaceDropPreview {
     pub(super) target_workspace_id: Uuid,
     pub(super) after: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TabIdentityPresentation {
-    pub(super) label: String,
-    pub(super) profile: TerminalProfile,
-    pub(super) detail: String,
 }
 
 impl Render for PaneDrag {
@@ -307,7 +300,6 @@ pub(super) struct TerminalLineRender {
     pub(super) row: usize,
     pub(super) cursor: Option<hh_protocol::TerminalCursor>,
     pub(super) focused: bool,
-    pub(super) pane_id: Uuid,
     pub(super) pane_accent: u32,
     pub(super) columns: u16,
     pub(super) selection: Option<TerminalSelection>,
@@ -320,6 +312,15 @@ pub(super) struct SelectionDrag {
     pub(super) kind: TerminalSelectionKind,
     pub(super) deferred_mouse_click: bool,
     pub(super) preserve_single_cell: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectionAutoscroll {
+    pub(crate) pane_id: Uuid,
+    /// Lines per tick; negative scrolls toward live output.
+    pub(crate) lines: i32,
+    /// Clamped edge point extended to after every scroll.
+    pub(crate) edge: TerminalPoint,
 }
 
 #[derive(Clone, Debug)]

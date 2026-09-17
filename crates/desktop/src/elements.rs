@@ -14,7 +14,9 @@ use hh_protocol::{
 };
 use std::rc::Rc;
 
-use crate::helpers::{hsv_to_rgb, selection_span, terminal_point_at, terminal_run_display_text};
+use crate::helpers::{
+    hsv_to_rgb, selection_span, terminal_point_clamped, terminal_run_display_text,
+};
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{DialogTextEditor, WorkspaceCreationField, WorkspaceCreationStep};
 use crate::{HhApp, THEME};
@@ -394,6 +396,79 @@ impl Element for SidebarResizeCaptureElement {
     }
 }
 
+/// Keeps a terminal selection attached to the window outside its grid hitbox.
+pub(crate) struct TerminalSelectionCaptureElement {
+    pub(crate) input: Entity<HhApp>,
+}
+
+impl IntoElement for TerminalSelectionCaptureElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TerminalSelectionCaptureElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(Style::default(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        (): &mut Self::PrepaintState,
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture {
+                input.update(cx, |this, cx| this.drag_terminal_selection(event, cx));
+            }
+        });
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                input.update(cx, |this, cx| {
+                    this.end_terminal_selection_outside(event, cx)
+                });
+            }
+        });
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum HsvFieldKind {
     SquareSv,
@@ -632,9 +707,10 @@ impl Element for HsvFieldElement {
 pub(crate) struct TerminalPointerElement {
     pub(crate) input: Entity<HhApp>,
     pub(crate) pane_id: Uuid,
-    pub(crate) row: u16,
+    pub(crate) rows: u16,
     pub(crate) columns: u16,
     pub(crate) cell_width: f32,
+    pub(crate) line_height: f32,
 }
 
 impl IntoElement for TerminalPointerElement {
@@ -696,13 +772,22 @@ impl Element for TerminalPointerElement {
         let pointer_hitbox = hitbox.clone();
         let input = self.input.clone();
         let pane_id = self.pane_id;
-        let row = self.row;
+        let rows = self.rows;
         let columns = self.columns;
         let cell_width = self.cell_width;
+        let line_height = self.line_height;
         let hitbox = pointer_hitbox.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                let point = terminal_point_at(event.position, bounds, row, columns, cell_width);
+                let point = terminal_point_clamped(
+                    event.position,
+                    bounds,
+                    rows,
+                    columns,
+                    cell_width,
+                    line_height,
+                )
+                .0;
                 input.update(cx, |this, cx| {
                     this.begin_terminal_pointer(pane_id, point, event, window, cx);
                 });
@@ -713,7 +798,15 @@ impl Element for TerminalPointerElement {
         let hitbox = pointer_hitbox.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                let point = terminal_point_at(event.position, bounds, row, columns, cell_width);
+                let point = terminal_point_clamped(
+                    event.position,
+                    bounds,
+                    rows,
+                    columns,
+                    cell_width,
+                    line_height,
+                )
+                .0;
                 input.update(cx, |this, cx| {
                     this.move_terminal_pointer(pane_id, point, event, cx);
                 });
@@ -724,7 +817,15 @@ impl Element for TerminalPointerElement {
         let hitbox = pointer_hitbox.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                let point = terminal_point_at(event.position, bounds, row, columns, cell_width);
+                let point = terminal_point_clamped(
+                    event.position,
+                    bounds,
+                    rows,
+                    columns,
+                    cell_width,
+                    line_height,
+                )
+                .0;
                 input.update(cx, |this, cx| {
                     this.end_terminal_pointer(pane_id, point, event, cx);
                 });
@@ -735,7 +836,15 @@ impl Element for TerminalPointerElement {
         let hitbox = pointer_hitbox;
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
-                let point = terminal_point_at(event.position, bounds, row, columns, cell_width);
+                let point = terminal_point_clamped(
+                    event.position,
+                    bounds,
+                    rows,
+                    columns,
+                    cell_width,
+                    line_height,
+                )
+                .0;
                 input.update(cx, |this, cx| {
                     this.scroll_terminal(pane_id, point, event, cx);
                 });
@@ -746,7 +855,7 @@ impl Element for TerminalPointerElement {
 
 /// One shaped text run inside a cached terminal row.
 ///
-/// Content depends only on (screen revision, columns, font metrics); selection,
+/// Content depends only on (content revision, columns, font metrics); selection,
 /// cursor, and focus are painted as quads every frame and never cached.
 pub(crate) struct CachedRun {
     pub(crate) x: f32,
@@ -755,10 +864,10 @@ pub(crate) struct CachedRun {
     pub(crate) shaped: ShapedLine,
 }
 
-/// Shaped lines for one pane's current screen revision. Stored on `HhApp`
+/// Shaped lines for one pane's current content revision. Stored on `HhApp`
 /// behind a `RefCell` because element prepaint only observes `&HhApp`.
 pub(crate) struct PaneShapeCache {
-    pub(crate) revision: u64,
+    pub(crate) content_revision: u64,
     pub(crate) columns: u16,
     pub(crate) font_size: f32,
     pub(crate) cell_width: f32,
@@ -807,7 +916,7 @@ fn build_pane_shape_cache(
         })
         .collect::<Vec<_>>();
     PaneShapeCache {
-        revision: screen.revision,
+        content_revision: screen.content_revision,
         columns: screen.columns,
         font_size: metrics.font_size,
         cell_width: metrics.cell_width,
@@ -915,7 +1024,7 @@ impl Element for TerminalGridElement {
         let mut cache = app.terminal_shape_cache.borrow_mut();
         let stale = match cache.get(&self.pane_id) {
             Some(entry) => {
-                entry.revision != screen.revision
+                entry.content_revision != screen.content_revision
                     || entry.columns != screen.columns
                     || entry.font_size.to_bits() != self.metrics.font_size.to_bits()
                     || entry.cell_width.to_bits() != self.metrics.cell_width.to_bits()
@@ -947,6 +1056,11 @@ impl Element for TerminalGridElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.input
+            .read(cx)
+            .terminal_grid_bounds
+            .borrow_mut()
+            .insert(self.pane_id, (bounds, self.metrics));
         let Some(state) = state.as_mut() else {
             return;
         };

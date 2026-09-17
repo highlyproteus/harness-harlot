@@ -11,23 +11,39 @@ use hh_protocol::{
 };
 use unicode_width::UnicodeWidthChar;
 
-pub(crate) fn terminal_point_at(
+/// Returns a clamped grid point and vertical overflow (-1 above, 1 below).
+pub(crate) fn terminal_point_clamped(
     position: Point<Pixels>,
     bounds: Bounds<Pixels>,
-    row: u16,
+    rows: u16,
     columns: u16,
     cell_width: f32,
-) -> TerminalPoint {
+    line_height: f32,
+) -> (TerminalPoint, i8) {
     let relative_x = f32::from(position.x - bounds.origin.x).max(0.0);
     let column = if columns == 0 || cell_width <= f32::EPSILON {
         0
     } else {
         (relative_x / cell_width).floor() as u16
     };
-    TerminalPoint {
-        row,
-        column: column.min(columns.saturating_sub(1)),
-    }
+    let relative_y = f32::from(position.y - bounds.origin.y);
+    let overflow = if relative_y < 0.0 {
+        -1
+    } else {
+        i8::from(relative_y >= f32::from(rows) * line_height)
+    };
+    let row = if line_height <= f32::EPSILON {
+        0
+    } else {
+        (relative_y / line_height).floor() as u16
+    };
+    (
+        TerminalPoint {
+            row: row.min(rows.saturating_sub(1)),
+            column: column.min(columns.saturating_sub(1)),
+        },
+        overflow,
+    )
 }
 
 pub(crate) fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
@@ -376,7 +392,7 @@ mod tests {
         TERMINAL_VERTICAL_PADDING, TerminalAttributes, TerminalColor, TerminalLine, TerminalPoint,
         TerminalPointerAction, TerminalRun, TerminalSelection, TerminalUrlOpenTarget,
         prepare_paste, selection_span, terminal_grid_for_pane, terminal_input_bytes,
-        terminal_point_at, terminal_pointer_action, terminal_run_display_text,
+        terminal_point_clamped, terminal_pointer_action, terminal_run_display_text,
         terminal_url_open_target, typography, url_at_column,
     };
     use gpui::{Modifiers, MouseButton, point, px, size};
@@ -397,22 +413,22 @@ mod tests {
     }
 
     #[test]
-    fn one_row_hit_surface_maps_pointer_positions_to_terminal_cells() {
+    fn terminal_point_clamped_tracks_rows_and_viewport_edges() {
         let bounds = Bounds {
             origin: point(px(100.0), px(40.0)),
-            size: size(px(80.0), px(18.0)),
+            size: size(px(80.0), px(180.0)),
         };
         assert_eq!(
-            terminal_point_at(point(px(100.0), px(49.0)), bounds, 7, 10, 8.0),
-            TerminalPoint { row: 7, column: 0 }
+            terminal_point_clamped(point(px(90.0), px(39.0)), bounds, 10, 10, 8.0, 18.0),
+            (TerminalPoint { row: 0, column: 0 }, -1)
         );
         assert_eq!(
-            terminal_point_at(point(px(139.9), px(49.0)), bounds, 7, 10, 8.0),
-            TerminalPoint { row: 7, column: 4 }
+            terminal_point_clamped(point(px(139.9), px(103.0)), bounds, 10, 10, 8.0, 18.0),
+            (TerminalPoint { row: 3, column: 4 }, 0)
         );
         assert_eq!(
-            terminal_point_at(point(px(190.0), px(49.0)), bounds, 7, 10, 8.0),
-            TerminalPoint { row: 7, column: 9 }
+            terminal_point_clamped(point(px(190.0), px(220.0)), bounds, 10, 10, 8.0, 18.0),
+            (TerminalPoint { row: 9, column: 9 }, 1)
         );
     }
 

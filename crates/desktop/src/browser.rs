@@ -64,6 +64,8 @@ pub(crate) struct BrowserShared {
     pub(crate) can_go_back: bool,
     pub(crate) can_go_forward: bool,
     pub(crate) dirty: bool,
+    pub(crate) popup_requests: Vec<String>,
+    pub(crate) focus_requested: bool,
 }
 
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -77,6 +79,8 @@ pub(crate) struct BrowserPaneView {
     pub(crate) pending_state: Option<(String, Option<String>)>,
     pub(crate) in_flight_state: Option<(String, Option<String>)>,
     pub(crate) focused: bool,
+    pub(crate) visible: bool,
+    pub(crate) bounds: Rc<RefCell<Option<(hh_cef_view::BrowserRect, f32)>>>,
 }
 
 #[cfg(all(target_os = "macos", feature = "browser"))]
@@ -475,6 +479,84 @@ impl HhApp {
     }
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+    pub(crate) fn visible_browser_panes(&self) -> HashSet<Uuid> {
+        let Some(workspace) = self
+            .session
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| self.active_workspace_in(snapshot))
+        else {
+            return HashSet::new();
+        };
+        let Some(layout) =
+            crate::helpers::workspace_layout_for_focused_pane(workspace, self.layout.focused_pane)
+        else {
+            return HashSet::new();
+        };
+        if matches!(self.editor.modal, Modal::AppearanceSettings) {
+            return HashSet::new();
+        }
+        if let Some(pane) = self.layout.zoomed_pane.and_then(|id| find_pane(layout, id)) {
+            return pane
+                .kind
+                .is_browser()
+                .then_some(pane.id)
+                .into_iter()
+                .collect();
+        }
+        crate::helpers::visible_panes(layout)
+            .into_iter()
+            .filter(|id| find_pane(layout, *id).is_some_and(|pane| pane.kind.is_browser()))
+            .collect()
+    }
+
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+    pub(crate) fn ensure_visible_browser_views(&mut self, cx: &mut Context<Self>) {
+        for pane_id in self.visible_browser_panes() {
+            let Some(Pane {
+                kind: PaneKind::Browser { url },
+                ..
+            }) = self.pane_metadata(pane_id)
+            else {
+                continue;
+            };
+            let (width, height) = self.layout.workspace_pixels;
+            if let Err(error) = self.ensure_browser_view(pane_id, &url, width, height, cx) {
+                let error = format!("{error:#}");
+                if self.browser.browser_runtime_error.as_deref() != Some(&error) {
+                    self.browser.browser_runtime_error = Some(error);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+    pub(crate) fn schedule_browser_presentation(
+        &self,
+        window: &mut gpui::Window,
+        cx: &Context<Self>,
+    ) {
+        let visible = self.visible_browser_panes();
+        let content_visible =
+            matches!(self.editor.modal, Modal::None) && self.layout.dragging_pane.is_none();
+        let should_focus = content_visible
+            && self.session.window_active
+            && self.editor.browser_url_editor.is_none();
+        let changed = self.browser.browser_views.iter().any(|(id, view)| {
+            let visible_now = content_visible && visible.contains(id);
+            let focused_now = visible_now && should_focus && Some(*id) == self.layout.focused_pane;
+            view.visible != visible_now || view.focused != focused_now
+        });
+        if changed || self.browser.reassert_focus {
+            cx.on_next_frame(window, move |this, _, _| {
+                let visible = this.visible_browser_panes();
+                this.sync_browser_view_presentation(&visible);
+            });
+        }
+    }
+
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn ensure_browser_view(
         &mut self,
         pane_id: Uuid,
@@ -532,12 +614,28 @@ impl HhApp {
                 can_go_back: false,
                 can_go_forward: false,
                 dirty: false,
+                popup_requests: Vec::new(),
+                focus_requested: false,
             }));
             let address_state = Rc::clone(&shared);
             let title_state = Rc::clone(&shared);
             let favicon_state = Rc::clone(&shared);
             let loading_state = Rc::clone(&shared);
+            let popup_state = Rc::clone(&shared);
+            let focus_state = Rc::clone(&shared);
             let callbacks = hh_cef_view::Callbacks {
+                on_got_focus: Box::new(move || {
+                    let mut state = focus_state.borrow_mut();
+                    state.focus_requested = true;
+                    state.dirty = true;
+                }),
+                on_popup_request: Box::new(move |url| {
+                    let mut state = popup_state.borrow_mut();
+                    if state.popup_requests.len() < 4 {
+                        state.popup_requests.push(url);
+                        state.dirty = true;
+                    }
+                }),
                 on_address_change: Box::new(move |next_url| {
                     let mut state = address_state.borrow_mut();
                     if state.url != next_url {
@@ -594,16 +692,27 @@ impl HhApp {
                 synced_url: url.to_owned(),
                 synced_title: None,
                 focused: false,
+                visible: true,
+                bounds: Rc::new(RefCell::new(None)),
                 pending_state: None,
                 in_flight_state: None,
             });
+            cx.notify();
         }
         if let Some(view) = self.browser.browser_views.get_mut(&pane_id) {
-            if view.last_snapshot_url != url {
+            // Renderer navigation is persisted back through the snapshot. That
+            // echo must not reload the document (notably after history.pushState).
+            let is_navigation_echo = view.shared.borrow().url == url
+                || view.synced_url == url
+                || view
+                    .in_flight_state
+                    .as_ref()
+                    .is_some_and(|(submitted_url, _)| submitted_url == url);
+            if view.last_snapshot_url != url && !is_navigation_echo {
                 view.pane.navigate(url);
+                url.clone_into(&mut view.synced_url);
             }
             url.clone_into(&mut view.last_snapshot_url);
-            url.clone_into(&mut view.synced_url);
         }
         Ok(())
     }
@@ -615,20 +724,34 @@ impl HhApp {
         let should_focus = content_visible
             && self.session.window_active
             && self.editor.browser_url_editor.is_none();
+        let reassert = std::mem::take(&mut self.browser.reassert_focus);
+        let mut blurred = false;
         for (view_id, view) in &mut self.browser.browser_views {
             let visible_now = content_visible && visible.contains(view_id);
             let focused_now =
                 visible_now && should_focus && Some(*view_id) == self.layout.focused_pane;
             view.pane.set_visible(visible_now);
-            if view.focused != focused_now {
-                view.pane.focus(focused_now);
-                view.focused = focused_now;
+            view.visible = visible_now;
+            if !focused_now && (view.focused || reassert) {
+                view.pane.focus(false);
+                view.focused = false;
+                blurred = true;
             }
+        }
+        // Blur every old native responder before focusing the new one: HashMap
+        // iteration order must never hand focus back to GPUI after this step.
+        if should_focus
+            && let Some(pane_id) = self.layout.focused_pane.filter(|id| visible.contains(id))
+            && let Some(view) = self.browser.browser_views.get_mut(&pane_id)
+            && (!view.focused || blurred || reassert)
+        {
+            view.pane.focus(true);
+            view.focused = true;
         }
     }
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-    pub(crate) fn sync_browser_callback_state(&mut self) -> bool {
+    pub(crate) fn sync_browser_callback_state(&mut self, cx: &mut Context<Self>) -> bool {
         let browser_ids = self
             .session
             .snapshot
@@ -661,11 +784,17 @@ impl HhApp {
                     return None;
                 }
                 shared.dirty = false;
-                Some((*pane_id, shared.url.clone(), shared.title.clone()))
+                Some((
+                    *pane_id,
+                    shared.url.clone(),
+                    shared.title.clone(),
+                    std::mem::take(&mut shared.popup_requests),
+                    std::mem::take(&mut shared.focus_requested),
+                ))
             })
             .collect::<Vec<_>>();
         let changed = !updates.is_empty();
-        for (pane_id, url, title) in updates {
+        for (pane_id, url, title, popups, focus_requested) in updates {
             let Some(view) = self.browser.browser_views.get_mut(&pane_id) else {
                 continue;
             };
@@ -676,6 +805,15 @@ impl HhApp {
                 view.pending_state = None;
             } else {
                 view.pending_state = Some(next);
+            }
+            if focus_requested {
+                view.focused = true;
+                if self.layout.focused_pane != Some(pane_id) {
+                    self.focus_pane_with_snapshot(pane_id, cx);
+                }
+            }
+            for url in popups {
+                self.open_url_in_browser_split(pane_id, &url, cx);
             }
         }
         changed
@@ -786,12 +924,15 @@ impl HhApp {
     }
 
     #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
-    pub(crate) fn sync_browser_callback_state(&mut self) -> bool {
+    pub(crate) fn sync_browser_callback_state(&mut self, _cx: &mut Context<Self>) -> bool {
         false
     }
 
     #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
     pub(crate) fn flush_browser_state_updates(&mut self, _cx: &mut Context<Self>) {}
+
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
+    pub(crate) fn ensure_visible_browser_views(&mut self, _cx: &mut Context<Self>) {}
 
     pub(crate) fn render_browser_toolbar(
         &self,
@@ -980,11 +1121,11 @@ impl HhApp {
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn render_browser_workspace(
-        &mut self,
+        &self,
         pane: &Pane,
-        panes: Vec<Pane>,
-        width: f32,
-        height: f32,
+        panes: &[Pane],
+        _width: f32,
+        _height: f32,
         show_pane_header: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1006,9 +1147,6 @@ impl HhApp {
                         .into_any_element();
                 }
             };
-        if let Err(error) = self.ensure_browser_view(pane.id, &url, width, height, cx) {
-            self.browser.browser_runtime_error = Some(format!("{error:#}"));
-        }
         let state = self.browser.browser_views.get(&pane.id).map(|view| {
             let state = view.shared.borrow();
             (
@@ -1017,11 +1155,12 @@ impl HhApp {
                 state.can_go_back,
                 state.can_go_forward,
                 Rc::clone(&view.pane),
+                Rc::clone(&view.bounds),
             )
         });
         let (current_url, loading, can_go_back, can_go_forward) = state.as_ref().map_or_else(
             || (url.clone(), false, false, false),
-            |(url, loading, back, forward, _)| (url.clone(), *loading, *back, *forward),
+            |(url, loading, back, forward, _, _)| (url.clone(), *loading, *back, *forward),
         );
         let toolbar = self.render_browser_toolbar(
             pane.id,
@@ -1031,19 +1170,22 @@ impl HhApp {
             can_go_forward,
             cx,
         );
-        let content = if let Some((_, _, _, _, browser)) = state {
+        let content = if let Some((_, _, _, _, browser, last_bounds)) = state {
             canvas(
                 |_, _, _| (),
                 move |bounds, (), window, _| {
-                    browser.set_bounds(
-                        hh_cef_view::BrowserRect {
-                            x: f32::from(bounds.origin.x),
-                            y: f32::from(bounds.origin.y),
-                            width: f32::from(bounds.size.width).max(1.0),
-                            height: f32::from(bounds.size.height).max(1.0),
-                        },
-                        f32::from(window.bounds().size.height),
-                    );
+                    let rect = hh_cef_view::BrowserRect {
+                        x: f32::from(bounds.origin.x),
+                        y: f32::from(bounds.origin.y),
+                        width: f32::from(bounds.size.width).max(1.0),
+                        height: f32::from(bounds.size.height).max(1.0),
+                    };
+                    let parent_height = f32::from(window.bounds().size.height);
+                    let next = (rect, parent_height);
+                    if *last_bounds.borrow() != Some(next) {
+                        *last_bounds.borrow_mut() = Some(next);
+                        window.on_next_frame(move |_, _| browser.set_bounds(rect, parent_height));
+                    }
                 },
             )
             .size_full()
@@ -1053,7 +1195,7 @@ impl HhApp {
                 self.browser
                     .browser_runtime_error
                     .as_deref()
-                    .unwrap_or("Chromium could not be initialized"),
+                    .unwrap_or("Chromium is starting…"),
             )
         };
         let pane_id = pane.id;
@@ -1123,9 +1265,9 @@ impl HhApp {
 
     #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
     pub(crate) fn render_browser_workspace(
-        &mut self,
+        &self,
         pane: &Pane,
-        panes: Vec<Pane>,
+        panes: &[Pane],
         _width: f32,
         _height: f32,
         show_pane_header: bool,

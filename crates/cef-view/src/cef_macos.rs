@@ -5,13 +5,13 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Once, OnceLock};
-use std::time::Duration;
+use std::sync::{Mutex, Once, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, ensure};
 use cef::{
     App, Browser, CefString, ImplBrowser as _, ImplBrowserHost as _, Settings, WindowInfo,
-    api_hash, do_message_loop_work, execute_process, library_loader, sys,
+    api_hash, execute_process, library_loader, sys,
 };
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::ffi;
@@ -29,6 +29,37 @@ pub(crate) type ParentHandle = *mut c_void;
 static PROTOCOL_INSTALL: Once = Once::new();
 static HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
 static LIBRARY: OnceLock<library_loader::LibraryLoader> = OnceLock::new();
+static PUMP_SCHEDULE: PumpSchedule = PumpSchedule(Mutex::new(None));
+
+/// Only the callback owning the earliest requested deadline may run CEF work.
+/// The lock is released before pumping, which can schedule more work itself.
+struct PumpSchedule(Mutex<Option<Instant>>);
+
+impl PumpSchedule {
+    fn request(&self, deadline: Instant) -> bool {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.is_some_and(|scheduled| scheduled <= deadline) {
+            return false;
+        }
+        *pending = Some(deadline);
+        true
+    }
+
+    fn claim(&self, deadline: Instant) -> bool {
+        let mut pending = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *pending != Some(deadline) {
+            return false;
+        }
+        *pending = None;
+        true
+    }
+}
 
 pub(crate) fn ensure_main_thread() -> anyhow::Result<()> {
     ensure!(
@@ -49,6 +80,10 @@ pub(crate) fn apply_bounds(browser: &Browser, rect: BrowserRect, parent_height: 
 
 pub(crate) fn set_visible(browser: &Browser, visible: bool) {
     with_native_view(browser, |view| view.setHidden(!visible));
+}
+
+pub(crate) fn detach_native_view(browser: &Browser) {
+    with_native_view(browser, NSView::removeFromSuperview);
 }
 
 pub(crate) fn focus_parent(parent: ParentHandle) {
@@ -136,16 +171,27 @@ pub fn init_runtime(cache_dir: &Path) -> anyhow::Result<()> {
         ..Default::default()
     };
     cef_common::initialize_with_settings(&settings)?;
-    schedule_message_pump();
+    schedule_pump(0);
     Ok(())
 }
 
-fn schedule_message_pump() {
-    let when = DispatchTime::try_from(Duration::from_millis(10)).unwrap_or(DispatchTime::NOW);
-    let _ = DispatchQueue::main().after(when, || {
+pub(crate) fn schedule_pump(delay_ms: i64) {
+    let delay = Duration::from_millis(u64::try_from(delay_ms.clamp(0, 33)).unwrap_or(0));
+    let deadline = Instant::now() + delay;
+    if !PUMP_SCHEDULE.request(deadline) {
+        return;
+    }
+    let when = DispatchTime::try_from(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(DispatchTime::NOW);
+    let _ = DispatchQueue::main().after(when, move || {
+        if !PUMP_SCHEDULE.claim(deadline) {
+            return;
+        }
         if INITIALIZED.load(Ordering::Acquire) {
-            do_message_loop_work();
-            schedule_message_pump();
+            cef_common::pump_once();
+            // CEF's external pump requires a fallback when no deadline is posted.
+            // Earlier requests, including those made during pumping, take priority.
+            schedule_pump(33);
         }
     });
 }
@@ -296,7 +342,29 @@ fn with_native_view(browser: &Browser, action: impl FnOnce(&NSView)) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserRect, appkit_rect};
+    use super::{BrowserRect, Duration, Instant, Mutex, PumpSchedule, appkit_rect};
+
+    #[test]
+    fn earlier_pump_work_preempts_fallback_and_stale_callbacks() {
+        let schedule = PumpSchedule(Mutex::new(None));
+        let now = Instant::now();
+        let fallback = now + Duration::from_millis(33);
+        let earlier = now + Duration::from_millis(10);
+        assert!(schedule.request(fallback));
+        assert!(schedule.request(earlier));
+        assert!(!schedule.request(fallback));
+        assert!(!schedule.request(earlier));
+        assert!(schedule.request(now));
+        assert!(!schedule.claim(earlier));
+        assert!(schedule.claim(now));
+
+        let next = fallback + Duration::from_millis(33);
+        assert!(schedule.request(next));
+        assert!(!schedule.claim(now));
+        assert!(!schedule.claim(fallback));
+        assert!(schedule.claim(next));
+        assert!(!schedule.claim(next));
+    }
 
     fn assert_close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < f64::EPSILON);

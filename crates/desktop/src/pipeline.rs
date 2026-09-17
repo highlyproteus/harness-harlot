@@ -320,6 +320,7 @@ pub(crate) async fn poll_once(this: &WeakEntity<HhApp>, cx: &mut AsyncApp) -> Op
         .await;
     let Ok(state_changed) = this.update(cx, |this, cx| {
         let state_changed = this.apply_update_result(response, cx);
+        this.ensure_visible_browser_views(cx);
         this.sync_pty_sizes(cx);
         this.flush_browser_state_updates(cx);
         if state_changed {

@@ -86,8 +86,8 @@ use ui_state::UiStateStore;
 use updates::{UpdateCheckState, automatic_update_check_interval, automatic_update_checks_enabled};
 use view_models::{
     ArchivedView, AssistantComposer, ColorPickerState, DragHoverState, HistoryEditor, Modal,
-    PaneDrag, ResizeDrag, SelectionDrag, SidebarResizeLifecycle, SplitControlId, TabDropPreview,
-    WorkspaceDropPreview,
+    PaneDrag, ResizeDrag, SelectionAutoscroll, SelectionDrag, SidebarResizeLifecycle,
+    SplitControlId, TabDropPreview, WorkspaceDropPreview,
 };
 
 actions!(
@@ -156,6 +156,7 @@ const ACTIVE_TERMINAL_POLL_MS: u64 = 33;
 const DRAG_CLICK_SUPPRESSION_MS: u64 = 150;
 const IDLE_TERMINAL_POLL_MS: u64 = 250;
 const PTY_RESIZE_DEBOUNCE_MS: u64 = 16;
+const SELECTION_AUTOSCROLL_TICK_MS: u64 = 40;
 /// On-screen panes other than the focused one stream at this cadence so a
 /// four-way split cannot multiply the focused pane's payload every 33 ms.
 const SECONDARY_PANE_INTERVAL: Duration = Duration::from_millis(120);
@@ -359,6 +360,9 @@ struct LayoutUi {
     dragging_pane: Option<Uuid>,
     drag_hover: DragHoverState,
     selection_drag: Option<SelectionDrag>,
+    selection_autoscroll: Option<SelectionAutoscroll>,
+    autoscroll_generation: u64,
+    scroll_residual: HashMap<Uuid, f32>,
     last_sizes: HashMap<Uuid, (u16, u16)>,
     resize_generation: u64,
     workspace_pixels: (f32, f32),
@@ -374,6 +378,9 @@ impl LayoutUi {
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
             selection_drag: None,
+            selection_autoscroll: None,
+            autoscroll_generation: 0,
+            scroll_residual: HashMap::new(),
             last_sizes: HashMap::new(),
             resize_generation: 0,
             workspace_pixels: (0.0, 0.0),
@@ -426,6 +433,7 @@ struct BrowserUi {
     browser_runtime_initialized: bool,
     browser_runtime_error: Option<String>,
     cef_shutdown_subscription: Option<gpui::Subscription>,
+    reassert_focus: bool,
 }
 
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -438,6 +446,7 @@ impl BrowserUi {
             browser_runtime_initialized: false,
             browser_runtime_error: None,
             cef_shutdown_subscription: None,
+            reassert_focus: false,
         }
     }
 
@@ -448,6 +457,7 @@ impl BrowserUi {
             browser_runtime_initialized: false,
             browser_runtime_error: None,
             cef_shutdown_subscription: None,
+            reassert_focus: false,
         }
     }
 }
@@ -458,6 +468,8 @@ struct HhApp {
     terminal_font: TerminalFontProfile,
     terminal_zoom_levels: HashMap<Uuid, i8>,
     terminal_shape_cache: RefCell<HashMap<Uuid, elements::PaneShapeCache>>,
+    terminal_grid_bounds:
+        RefCell<HashMap<Uuid, (gpui::Bounds<gpui::Pixels>, typography::TerminalCellMetrics)>>,
     custom_icons: Vec<CustomIcon>,
     ui_state_store: Option<UiStateStore>,
     session: SessionState,
@@ -556,6 +568,7 @@ impl HhApp {
             terminal_font,
             terminal_zoom_levels: HashMap::new(),
             terminal_shape_cache: RefCell::new(HashMap::new()),
+            terminal_grid_bounds: RefCell::new(HashMap::new()),
             custom_icons: load_custom_icons(),
             ui_state_store,
             session: SessionState::new(
@@ -620,6 +633,11 @@ impl HhApp {
         cx.observe_window_activation(window, |this, window, cx| {
             this.session.window_active = window.is_window_active();
             if this.session.window_active {
+                #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+                {
+                    this.browser.reassert_focus = true;
+                    cx.notify();
+                }
                 if let Some(pane_id) = this.layout.focused_pane
                     && this.auto_read_pane_notifications(pane_id, cx)
                 {

@@ -142,7 +142,6 @@ mod tests {
     };
     use crate::helpers::FocusResync;
     use crate::helpers::focus_resync_for;
-    use crate::helpers::tab_identity_presentation;
     use crate::helpers::terminal_tab_count_label;
 
     use hh_protocol::SessionSnapshot;
@@ -190,7 +189,7 @@ mod tests {
         );
         assert_eq!(
             tabs.iter()
-                .map(|pane| tab_identity_presentation(pane).profile)
+                .map(|pane| pane.identity.profile)
                 .collect::<Vec<_>>(),
             vec![
                 TerminalProfile::Codex,

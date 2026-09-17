@@ -912,14 +912,19 @@ impl SessionRegistry {
             crate::pty::InputDeliveryError::definitely_unsent(format!("{error:#}"))
         })?;
         pane.write_input(bytes)?;
-        let mut state = self.state.write();
-        if find_pane_in_snapshot(&state.snapshot, pane_id).is_some_and(|pane| {
-            matches!(
-                pane.status,
-                PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention
-            )
-        }) {
-            state.set_pane_status(pane_id, PaneStatus::Working);
+        let needs_status_change = {
+            let state = self.state.read();
+            find_pane_in_snapshot(&state.snapshot, pane_id).is_some_and(|pane| {
+                matches!(
+                    pane.status,
+                    PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention
+                )
+            })
+        };
+        if needs_status_change {
+            self.state
+                .write()
+                .set_pane_status(pane_id, PaneStatus::Working);
         }
         Ok(())
     }
@@ -938,21 +943,28 @@ impl SessionRegistry {
         authority: &hh_protocol::PaneAuthority,
         bytes: &[u8],
     ) -> std::result::Result<(), crate::pty::InputDeliveryError> {
-        let mut state = self.state.write();
-        state
-            .authorized_terminal(authority)
-            .map_err(|error| {
-                crate::pty::InputDeliveryError::definitely_unsent(format!("{error:#}"))
-            })?
-            .session
-            .write_input(bytes)?;
-        if find_pane_in_snapshot(&state.snapshot, authority.pane_id).is_some_and(|pane| {
-            matches!(
-                pane.status,
-                PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention
-            )
-        }) {
-            state.set_pane_status(authority.pane_id, PaneStatus::Working);
+        let needs_status_change = {
+            // Keep authority stable through delivery without excluding other readers.
+            let state = self.state.read();
+            state
+                .authorized_terminal(authority)
+                .map_err(|error| {
+                    crate::pty::InputDeliveryError::definitely_unsent(format!("{error:#}"))
+                })?
+                .session
+                .write_input(bytes)?;
+            find_pane_in_snapshot(&state.snapshot, authority.pane_id).is_some_and(|pane| {
+                matches!(
+                    pane.status,
+                    PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention
+                )
+            })
+        };
+        if needs_status_change {
+            let mut state = self.state.write();
+            if state.authorized_terminal(authority).is_ok() {
+                state.set_pane_status(authority.pane_id, PaneStatus::Working);
+            }
         }
         Ok(())
     }

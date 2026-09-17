@@ -21,29 +21,63 @@ use hh_protocol::{
 use std::time::Instant;
 use uuid::Uuid;
 
-struct TabRowEntry {
+struct TabRowEntry<'a> {
     tab_id: Uuid,
-    group_label: Option<String>,
-    project_dir: Option<String>,
+    group_label: Option<&'a str>,
+    project_dir: Option<&'a str>,
     tab_color: Option<AppearanceColor>,
-    custom_icon: Option<String>,
+    custom_icon: Option<&'a str>,
     parent_tab: Option<Uuid>,
-    panes: Vec<Pane>,
+    panes: Vec<&'a Pane>,
     section: Option<(SidebarSection, bool)>,
 }
 
-struct WorkspaceGroupRow {
+struct WorkspaceGroupRow<'a> {
     tab_id: Uuid,
-    label: String,
-    project_dir: Option<String>,
+    label: &'a str,
+    project_dir: Option<&'a str>,
     tab_color: Option<AppearanceColor>,
-    custom_icon: Option<String>,
-    panes: Vec<Pane>,
+    custom_icon: Option<&'a str>,
+    panes: Vec<&'a Pane>,
     group_indent: f32,
     pane_indent: f32,
     tab_active: bool,
     tab_focus_target: Option<Uuid>,
     is_project: bool,
+}
+
+fn flatten_entries(
+    entries: Vec<WorkstationTabEntry<'_>>,
+    section: Option<SidebarSection>,
+) -> Vec<TabRowEntry<'_>> {
+    entries
+        .into_iter()
+        .enumerate()
+        .flat_map(move |(entry_index, entry)| {
+            let parent_id = entry.tab_id;
+            let mut flattened = vec![TabRowEntry {
+                tab_id: entry.tab_id,
+                group_label: entry.group_label,
+                project_dir: entry.project_dir,
+                tab_color: entry.color,
+                custom_icon: entry.custom_icon,
+                parent_tab: None,
+                panes: entry.panes,
+                section: section.map(|section| (section, entry_index == 0)),
+            }];
+            flattened.extend(entry.children.into_iter().map(|child| TabRowEntry {
+                tab_id: child.tab_id,
+                group_label: child.group_label,
+                project_dir: child.project_dir,
+                tab_color: child.color,
+                custom_icon: child.custom_icon,
+                parent_tab: Some(parent_id),
+                panes: child.panes,
+                section: section.map(|section| (section, false)),
+            }));
+            flattened
+        })
+        .collect()
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -130,37 +164,6 @@ impl HhApp {
         let workspace_dir = workspace.working_dir.as_deref().map(abbreviate_home);
         let (pinned_entries, project_entries, floating_entries) =
             partition_workstation_entries(workspace_tab_entries(workspace));
-        let flatten_entries = |entries: Vec<WorkstationTabEntry<'_>>,
-                               section: Option<SidebarSection>| {
-            entries
-                .into_iter()
-                .enumerate()
-                .flat_map(move |(entry_index, entry)| {
-                    let parent_id = entry.tab_id;
-                    let mut flattened = vec![TabRowEntry {
-                        tab_id: entry.tab_id,
-                        group_label: entry.group_label,
-                        project_dir: entry.project_dir,
-                        tab_color: entry.color,
-                        custom_icon: entry.custom_icon,
-                        parent_tab: None,
-                        panes: entry.panes.into_iter().cloned().collect::<Vec<_>>(),
-                        section: section.map(|section| (section, entry_index == 0)),
-                    }];
-                    flattened.extend(entry.children.into_iter().map(|child| TabRowEntry {
-                        tab_id: child.tab_id,
-                        group_label: child.group_label,
-                        project_dir: child.project_dir,
-                        tab_color: child.color,
-                        custom_icon: child.custom_icon,
-                        parent_tab: Some(parent_id),
-                        panes: child.panes.into_iter().cloned().collect::<Vec<_>>(),
-                        section: section.map(|section| (section, false)),
-                    }));
-                    flattened
-                })
-                .collect::<Vec<_>>()
-        };
         let mut tab_entries = flatten_entries(pinned_entries, Some(SidebarSection::Pinned));
         tab_entries.extend(flatten_entries(
             project_entries,
@@ -234,7 +237,7 @@ impl HhApp {
     fn render_workspace_tab_rows(
         &self,
         ctx: &WorkspaceSectionCtx,
-        tab_entries: Vec<TabRowEntry>,
+        tab_entries: Vec<TabRowEntry<'_>>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let workspace_id = ctx.workspace_id;
@@ -291,7 +294,7 @@ impl HhApp {
                         None => {
                             if let Some(pane) = panes.into_iter().next() {
                                 rows.push(self.render_workspace_terminal_row(
-                                    &pane,
+                                    pane,
                                     SidebarPaneRowContext {
                                         workspace_id,
                                         tab_id: Some(tab_id),
@@ -331,7 +334,7 @@ impl HhApp {
     fn render_workspace_group_rows(
         &self,
         ctx: &WorkspaceSectionCtx,
-        row: WorkspaceGroupRow,
+        row: WorkspaceGroupRow<'_>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let workspace_id = ctx.workspace_id;
@@ -365,12 +368,10 @@ impl HhApp {
             tab_id,
             pane_id: None,
             from_group: false,
-            title: label.clone(),
+            title: label.to_owned(),
             position: Point::default(),
         };
-        let custom_icon_path = custom_icon
-            .as_deref()
-            .and_then(|icon| self.custom_icon_path(icon));
+        let custom_icon_path = custom_icon.and_then(|icon| self.custom_icon_path(icon));
         let group_text = tab_color.map_or(THEME.foreground, |color| {
             readable_text_color(color.as_rgb())
         });
@@ -452,7 +453,7 @@ impl HhApp {
                                 f32::from(event.bounds.origin.y),
                                 f32::from(event.bounds.origin.y + event.bounds.size.height),
                             );
-                            this.sidebar.tab_drop_preview = Some(TabDropPreview {
+                            let next = Some(TabDropPreview {
                                 target_tab_id: tab_id,
                                 after: zone == HeaderDropZone::After,
                                 into_group: zone == HeaderDropZone::Into
@@ -460,7 +461,10 @@ impl HhApp {
                                         || (drag.pane_id.is_some() && drag.tab_id != tab_id)),
                             });
                             cx.stop_propagation();
-                            cx.notify();
+                            if this.sidebar.tab_drop_preview != next {
+                                this.sidebar.tab_drop_preview = next;
+                                cx.notify();
+                            }
                         } else if previews_this_tab {
                             this.sidebar.tab_drop_preview = None;
                             cx.notify();
@@ -573,7 +577,7 @@ impl HhApp {
                         .font_family(".SystemUIFont")
                         .text_xs()
                         .text_color(rgb(group_text))
-                        .child(label),
+                        .child(label.to_owned()),
                 )
                 .child(
                     div()
@@ -589,7 +593,7 @@ impl HhApp {
         if !collapsed {
             rows.extend(panes.into_iter().map(|pane| {
                 self.render_workspace_terminal_row(
-                    &pane,
+                    pane,
                     SidebarPaneRowContext {
                         workspace_id,
                         tab_id: Some(tab_id),
@@ -729,13 +733,19 @@ impl HhApp {
                         && drag.pinned == pinned
                         && event.bounds.contains(&event.event.position)
                     {
-                        this.sidebar.dragging_workspace = Some(drag.workspace_id);
-                        this.sidebar.workspace_drop_preview = Some(WorkspaceDropPreview {
+                        let next_dragging = Some(drag.workspace_id);
+                        let next_preview = Some(WorkspaceDropPreview {
                             target_workspace_id: workspace_id,
                             after: event.event.position.y > event.bounds.center().y,
                         });
                         cx.stop_propagation();
-                        cx.notify();
+                        if this.sidebar.dragging_workspace != next_dragging
+                            || this.sidebar.workspace_drop_preview != next_preview
+                        {
+                            this.sidebar.dragging_workspace = next_dragging;
+                            this.sidebar.workspace_drop_preview = next_preview;
+                            cx.notify();
+                        }
                     } else if this
                         .sidebar
                         .workspace_drop_preview

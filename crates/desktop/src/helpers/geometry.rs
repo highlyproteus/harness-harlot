@@ -279,11 +279,20 @@ pub(crate) fn collect_pane_sizes(
 ) {
     match layout {
         PaneLayout::Leaf { pane } => {
+            if !pane.kind.is_terminal() {
+                return;
+            }
             let (columns, rows) =
                 terminal_grid_for_pane(width, height, metrics_for_pane(pane.id), show_root_header);
             output.push((pane.id, columns, rows));
         }
-        PaneLayout::Stack { active, .. } => {
+        PaneLayout::Stack { active, panes } => {
+            if !panes
+                .iter()
+                .any(|pane| pane.id == *active && pane.kind.is_terminal())
+            {
+                return;
+            }
             let (columns, rows) =
                 terminal_grid_for_pane(width, height, metrics_for_pane(*active), show_root_header);
             output.push((*active, columns, rows));
@@ -642,6 +651,79 @@ mod tests {
         );
         let used_pixel_width = 568.0 + SPLIT_DIVIDER_SIZE + 564.0;
         assert!((used_pixel_width - workspace.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn mixed_pane_sizes_include_only_active_terminals() {
+        let pane = |id, kind| Pane {
+            id: Uuid::from_u128(id),
+            kind,
+            title: String::new(),
+            shell: String::new(),
+            color: None,
+            identity: hh_protocol::TerminalIdentity::default(),
+            status: hh_protocol::PaneStatus::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        let terminal = pane(1, hh_protocol::PaneKind::Terminal);
+        let browser = pane(
+            2,
+            hh_protocol::PaneKind::Browser {
+                url: "about:blank".into(),
+            },
+        );
+        let stacked_browser = pane(3, browser.kind.clone());
+        let stacked_terminal = pane(4, hh_protocol::PaneKind::Terminal);
+        let metrics = typography::TerminalCellMetrics {
+            font_size: 13.5,
+            cell_width: 8.0,
+            ascent: 10.0,
+            descent: 3.0,
+            baseline: 13.0,
+            line_height: 19.0,
+        };
+        for (active, expected) in [
+            (stacked_browser.id, vec![terminal.id]),
+            (stacked_terminal.id, vec![terminal.id, stacked_terminal.id]),
+        ] {
+            let layout = PaneLayout::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(PaneLayout::Leaf {
+                    pane: terminal.clone(),
+                }),
+                second: Box::new(PaneLayout::Split {
+                    axis: SplitAxis::Vertical,
+                    ratio: 0.5,
+                    first: Box::new(PaneLayout::Leaf {
+                        pane: browser.clone(),
+                    }),
+                    second: Box::new(PaneLayout::Stack {
+                        panes: vec![stacked_browser.clone(), stacked_terminal.clone()],
+                        active,
+                    }),
+                }),
+            };
+            let mut sizes = Vec::new();
+            collect_pane_sizes(
+                &layout,
+                1280.0,
+                820.0,
+                &|_| metrics,
+                &HashMap::new(),
+                true,
+                &mut sizes,
+            );
+            assert_eq!(
+                sizes
+                    .iter()
+                    .map(|(pane_id, _, _)| *pane_id)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+        }
     }
 
     #[test]
