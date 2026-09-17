@@ -381,6 +381,7 @@ mod tests {
         TerminalScreen {
             pane_id,
             revision: 1,
+            content_revision: 1,
             columns: 100,
             rows: 30,
             lines: vec![TerminalLine {

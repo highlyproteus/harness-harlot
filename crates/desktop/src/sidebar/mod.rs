@@ -3,9 +3,10 @@ use crate::appearance::workstation_banner_artwork;
 use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     SidebarSection, banner_fit_size, click_suppression_active, composite_rgb, element_key,
-    readable_text_color, render_bell_icon, render_headphones_icon, render_microphone_icon,
-    render_sidebar_toggle_icon, render_terminal_profile_icon, rgba_with_alpha,
-    sidebar_width_for_visibility, tab_identity_presentation, workstation_banner_header_height,
+    find_pane, identity_detail, identity_label, readable_text_color, render_bell_icon,
+    render_headphones_icon, render_microphone_icon, render_sidebar_toggle_icon,
+    render_terminal_profile_icon, rgba_with_alpha, sidebar_width_for_visibility,
+    workstation_banner_header_height,
 };
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
@@ -595,9 +596,8 @@ impl HhApp {
         } = row;
         let pane_id = pane.id;
         let selected = self.layout.focused_pane == Some(pane_id);
-        let identity = tab_identity_presentation(pane);
-        let identity_detail = identity.detail.clone();
-        let drag_title = identity.label.clone();
+        let input = cx.entity();
+        let drag_title = identity_label(pane).to_owned();
         let drop_above = !from_group
             && tab_id.is_some_and(|tab_id| {
                 self.sidebar.tab_drop_preview.is_some_and(|preview| {
@@ -644,10 +644,21 @@ impl HhApp {
             .when(selected, |element| element.border_1())
             .hover(|element| element.border_1().border_color(rgb(row_text)))
             .tooltip(move |_, cx| {
-                cx.new(|_| TooltipView {
-                    text: identity_detail.clone(),
-                })
-                .into()
+                let text = input
+                    .read(cx)
+                    .session
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .flat_map(|workspace| &workspace.tabs)
+                            .find_map(|tab| find_pane(&tab.layout, pane_id))
+                    })
+                    .map(identity_detail)
+                    .unwrap_or_default();
+                cx.new(|_| TooltipView { text }).into()
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if click_suppression_active(
@@ -694,13 +705,16 @@ impl HhApp {
                                         return;
                                     }
                                     if event.bounds.contains(&event.event.position) {
-                                        this.sidebar.tab_drop_preview = Some(TabDropPreview {
+                                        let next = Some(TabDropPreview {
                                             target_tab_id: tab_id,
                                             after: event.event.position.y > event.bounds.center().y,
                                             into_group: false,
                                         });
                                         cx.stop_propagation();
-                                        cx.notify();
+                                        if this.sidebar.tab_drop_preview != next {
+                                            this.sidebar.tab_drop_preview = next;
+                                            cx.notify();
+                                        }
                                     }
                                 },
                             ))
@@ -758,7 +772,7 @@ impl HhApp {
                         gpui::FontWeight::NORMAL
                     })
                     .text_color(rgb(row_text))
-                    .child(identity.label),
+                    .child(identity_label(pane).to_owned()),
             )
             .when(pane.kind.is_assistant(), |element| {
                 let (mic_muted, speaker_muted) = self

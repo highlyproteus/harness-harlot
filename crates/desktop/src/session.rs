@@ -244,6 +244,12 @@ impl HhApp {
                 self.terminal_shape_cache
                     .borrow_mut()
                     .retain(|id, _| self.session.screens.contains_key(id));
+                self.terminal_grid_bounds
+                    .borrow_mut()
+                    .retain(|id, _| self.session.screens.contains_key(id));
+                self.layout
+                    .scroll_residual
+                    .retain(|id, _| self.session.screens.contains_key(id));
                 if let Some(pane_id) = outcome.reassert_tab {
                     self.dispatch_control(ClientRequest::ActivateTab { pane_id });
                 }
@@ -295,7 +301,7 @@ impl HhApp {
             }
         }
         self.prune_assistant_sessions(&live_assistants, cx);
-        state_changed | self.sync_browser_callback_state()
+        state_changed | self.sync_browser_callback_state(cx)
     }
 
     pub(crate) fn focus_pane_with_snapshot(
@@ -322,6 +328,7 @@ impl HhApp {
             let changed = self.layout.focused_pane != Some(pane_id);
             self.layout.focused_pane = Some(pane_id);
             self.session.connection_error = None;
+            self.ensure_visible_browser_views(cx);
             return changed || notifications_changed;
         }
         if self.layout.focused_pane == Some(pane_id) {

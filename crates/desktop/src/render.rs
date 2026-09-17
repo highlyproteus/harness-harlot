@@ -7,7 +7,9 @@ use gpui::{
 
 use crate::HhApp;
 use crate::commands::{AppCommand, ROOT_KEY_CONTEXT};
-use crate::elements::{SidebarResizeCaptureElement, TerminalInputElement};
+use crate::elements::{
+    SidebarResizeCaptureElement, TerminalInputElement, TerminalSelectionCaptureElement,
+};
 use crate::view_models::{ColorTarget, DialogAction, Modal};
 use crate::{
     ConsumeChordPrefix, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp, NewBrowserTab,
@@ -19,6 +21,8 @@ use crate::{
 impl Render for HhApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_window_geometry(window);
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+        self.schedule_browser_presentation(window, cx);
 
         // The workspace dialog has its own focus targets. A pointer click on
         // the sidebar button must not leave native text input attached to the
@@ -106,9 +110,12 @@ impl Render for HhApp {
             }))
             .on_drag_move::<PaneDrag>(cx.listener(
                 |this, event: &gpui::DragMoveEvent<PaneDrag>, _, cx| {
-                    this.layout.dragging_pane = Some(event.drag(cx).pane_id);
-                    this.layout.drag_hover.clear();
-                    cx.notify();
+                    let next = Some(event.drag(cx).pane_id);
+                    if this.layout.dragging_pane != next {
+                        this.layout.dragging_pane = next;
+                        this.layout.drag_hover.clear();
+                        cx.notify();
+                    }
                 },
             ))
             .on_mouse_up(
@@ -232,6 +239,15 @@ impl Render for HhApp {
                         .w(px(1.0))
                         .h(px(1.0))
                         .child(SidebarResizeCaptureElement { input: cx.entity() }),
+                )
+            })
+            .when(self.layout.selection_drag.is_some(), |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .w(px(1.0))
+                        .h(px(1.0))
+                        .child(TerminalSelectionCaptureElement { input: cx.entity() }),
                 )
             })
             // The global navigation shares the macOS titlebar row. The rail

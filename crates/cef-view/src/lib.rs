@@ -23,6 +23,8 @@ pub struct Callbacks {
     pub on_title_change: Box<dyn Fn(String)>,
     pub on_favicon_change: Box<dyn Fn(Option<Vec<u8>>)>,
     pub on_loading_state: Box<dyn Fn(bool, bool, bool)>,
+    pub on_popup_request: Box<dyn Fn(String)>,
+    pub on_got_focus: Box<dyn Fn()>,
 }
 
 impl std::fmt::Debug for Callbacks {

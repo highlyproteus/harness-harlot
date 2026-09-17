@@ -10,21 +10,17 @@ use hh_protocol::{
     ClientRequest, DropPlacement, HistoryPageFlags, Pane, PaneLayout, PaneStatus, SplitAxis,
     TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, WorkspaceConnection,
 };
-#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-use std::collections::HashSet;
 
 use crate::browser::browser_command_available;
 use crate::commands::AppCommand;
 use crate::elements::{TerminalGridElement, TerminalPointerElement};
-#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-use crate::helpers::visible_panes;
 use crate::helpers::{
-    IDENTITY_MARK_SIZE, effective_split_ratio, element_key, find_pane, plain_history_line,
-    render_headphones_icon, render_microphone_icon, selection_span, split_child_dimensions,
-    split_control_id, split_element_key, split_placement_at, split_target_for_drag,
-    split_target_for_drag_ids, tab_identity_presentation, terminal_run_display_text,
-    terminal_tab_secondary_label, workspace_layout_for_focused_pane, workspace_tab_standalone_pane,
-    zoom_projection,
+    IDENTITY_MARK_SIZE, effective_split_ratio, element_key, find_pane, identity_detail,
+    identity_label, plain_history_line, render_headphones_icon, render_microphone_icon,
+    selection_span, split_child_dimensions, split_control_id, split_element_key,
+    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
+    terminal_run_display_text, terminal_tab_secondary_label, workspace_layout_for_focused_pane,
+    workspace_tab_standalone_pane, zoom_projection,
 };
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{
@@ -37,7 +33,7 @@ use uuid::Uuid;
 impl HhApp {
     pub(crate) fn render_pane_header(
         &self,
-        panes: Vec<Pane>,
+        panes: &[Pane],
         active: Uuid,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -143,9 +139,9 @@ impl HhApp {
 
     /// Wraps the assistant surface with the shared pane-header tab strip.
     pub(crate) fn render_assistant_pane(
-        &mut self,
+        &self,
         pane: &Pane,
-        panes: Vec<Pane>,
+        panes: &[Pane],
         show_pane_header: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -164,17 +160,17 @@ impl HhApp {
 
     fn render_pane_header_controls(
         &self,
-        panes: Vec<Pane>,
+        panes: &[Pane],
         active: Uuid,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         panes
-            .into_iter()
+            .iter()
             .map(|pane| {
                 let pane_id = pane.id;
-                let identity = tab_identity_presentation(&pane);
-                let identity_detail = identity.detail.clone();
-                let secondary_label = terminal_tab_secondary_label(&pane).map(str::to_owned);
+                let label = identity_label(pane);
+                let input = cx.entity();
+                let secondary_label = terminal_tab_secondary_label(pane).map(str::to_owned);
                 let selected = pane_id == active;
                 let status = pane.status;
                 let status_color = pane_status_color(status);
@@ -182,10 +178,10 @@ impl HhApp {
                     .color
                     .unwrap_or_else(|| self.terminal_accent(pane_id))
                     .as_rgb();
-                let close_tooltip = format!("Close {}…", identity.label);
+                let close_tooltip = format!("Close {label}…");
                 let drag = PaneDrag {
                     pane_id,
-                    title: identity.label.clone(),
+                    title: label.to_owned(),
                     position: Point::default(),
                 };
                 div()
@@ -236,13 +232,16 @@ impl HhApp {
                             .items_center()
                             .justify_center()
                             .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: identity_detail.clone(),
-                                })
-                                .into()
+                                let text = input
+                                    .read(cx)
+                                    .pane_metadata(pane_id)
+                                    .as_ref()
+                                    .map(identity_detail)
+                                    .unwrap_or_default();
+                                cx.new(|_| TooltipView { text }).into()
                             })
                             .child(self.render_pane_identity_mark(
-                                &pane,
+                                pane,
                                 if selected {
                                     THEME.foreground
                                 } else {
@@ -268,7 +267,7 @@ impl HhApp {
                             } else {
                                 rgb(THEME.muted)
                             })
-                            .child(identity.label),
+                            .child(label.to_owned()),
                     )
                     .when_some(secondary_label, |element, label| {
                         element.child(
@@ -522,7 +521,7 @@ impl HhApp {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn render_terminal(
         &self,
-        panes: Vec<Pane>,
+        panes: &[Pane],
         active: Uuid,
         show_pane_header: bool,
         cx: &mut Context<Self>,
@@ -540,7 +539,7 @@ impl HhApp {
         let drop_target = self
             .layout
             .dragging_pane
-            .and_then(|source| split_target_for_drag(source, &panes, active));
+            .and_then(|source| split_target_for_drag(source, panes, active));
         let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
         let tab_pane_ids = pane_ids.clone();
         let rendered_lines = if let (Some(view), Some(screen)) = (archived, screen) {
@@ -558,58 +557,46 @@ impl HhApp {
                             row,
                             cursor: None,
                             focused,
-                            pane_id: active,
                             pane_accent: terminal_accent,
                             columns: screen.columns,
                             selection: None,
                         },
                         metrics,
-                        cx,
                     )
                 })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        // Live screens render through the shaped-line cache element; one
-        // pointer overlay per row keeps mouse semantics identical to the
-        // div-per-row path it replaces.
+        // Live screens use cached glyphs and one pointer surface per pane.
         let terminal_grid = match (archived, screen) {
-            (None, Some(screen)) => {
-                let mut pointer_rows = Vec::with_capacity(screen.lines.len());
-                for row in 0..screen.lines.len() {
-                    let row_number = u16::try_from(row).unwrap_or(u16::MAX);
-                    pointer_rows.push(
+            (None, Some(screen)) => Some(
+                div()
+                    .size_full()
+                    .child(TerminalGridElement {
+                        input: cx.entity(),
+                        pane_id: active,
+                        metrics,
+                        focused,
+                        pane_accent: terminal_accent,
+                    })
+                    .child(
                         div()
                             .absolute()
                             .left(px(0.0))
-                            .top(px(f32::from(row_number) * metrics.line_height))
-                            .w_full()
-                            .h(px(metrics.line_height))
+                            .top(px(0.0))
+                            .size_full()
                             .child(TerminalPointerElement {
                                 input: cx.entity(),
                                 pane_id: active,
-                                row: row_number,
+                                rows: screen.rows,
                                 columns: screen.columns,
                                 cell_width: metrics.cell_width,
-                            })
-                            .into_any_element(),
-                    );
-                }
-                Some(
-                    div()
-                        .size_full()
-                        .child(TerminalGridElement {
-                            input: cx.entity(),
-                            pane_id: active,
-                            metrics,
-                            focused,
-                            pane_accent: terminal_accent,
-                        })
-                        .children(pointer_rows)
-                        .into_any_element(),
-                )
-            }
+                                line_height: metrics.line_height,
+                            }),
+                    )
+                    .into_any_element(),
+            ),
             _ => None,
         };
         div()
@@ -697,7 +684,25 @@ impl HhApp {
                     .text_size(px(metrics.font_size))
                     .line_height(px(metrics.line_height))
                     .text_color(rgb(THEME.foreground))
-                    .children(rendered_lines)
+                    .when_some(screen.filter(|_| archived.is_some()), |element, screen| {
+                        element.child(
+                            div().relative().size_full().children(rendered_lines).child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.0))
+                                    .top(px(0.0))
+                                    .size_full()
+                                    .child(TerminalPointerElement {
+                                        input: cx.entity(),
+                                        pane_id: active,
+                                        rows: screen.rows,
+                                        columns: screen.columns,
+                                        cell_width: metrics.cell_width,
+                                        line_height: metrics.line_height,
+                                    }),
+                            ),
+                        )
+                    })
                     .when_some(terminal_grid, |element, grid| element.child(grid))
                     .when_some(archived, |element, view| {
                         let notice = if view.page.flags.contains(HistoryPageFlags::CORRUPT) {
@@ -851,13 +856,11 @@ impl HhApp {
         line: &TerminalLine,
         render: TerminalLineRender,
         metrics: TerminalCellMetrics,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
         let TerminalLineRender {
             row,
             cursor,
             focused,
-            pane_id,
             pane_accent,
             columns,
             selection,
@@ -916,20 +919,6 @@ impl HhApp {
                         .when(focused, |cursor| cursor.bg(rgba((pane_accent << 8) | 0x30))),
                 )
             })
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .top(px(0.0))
-                    .size_full()
-                    .child(TerminalPointerElement {
-                        input: cx.entity(),
-                        pane_id,
-                        row: u16::try_from(row).unwrap_or(u16::MAX),
-                        columns,
-                        cell_width: metrics.cell_width,
-                    }),
-            )
             .into_any_element()
     }
 
@@ -1143,7 +1132,7 @@ impl HhApp {
     }
 
     pub(crate) fn render_layout(
-        &mut self,
+        &self,
         layout: &PaneLayout,
         width: f32,
         height: f32,
@@ -1155,17 +1144,22 @@ impl HhApp {
                 if pane.kind.is_browser() {
                     self.render_browser_workspace(
                         pane,
-                        vec![pane.clone()],
+                        std::slice::from_ref(pane),
                         width,
                         height,
                         show_pane_header,
                         cx,
                     )
                 } else if pane.kind.is_assistant() {
-                    self.render_assistant_pane(pane, vec![pane.clone()], show_pane_header, cx)
+                    self.render_assistant_pane(
+                        pane,
+                        std::slice::from_ref(pane),
+                        show_pane_header,
+                        cx,
+                    )
                 } else {
                     let active = pane.id;
-                    self.render_terminal(vec![pane.clone()], active, show_pane_header, cx)
+                    self.render_terminal(std::slice::from_ref(pane), active, show_pane_header, cx)
                 }
             }
             PaneLayout::Stack { panes, active } => {
@@ -1176,7 +1170,7 @@ impl HhApp {
                 {
                     self.render_browser_workspace(
                         pane,
-                        panes.clone(),
+                        panes.as_slice(),
                         width,
                         height,
                         show_pane_header,
@@ -1187,9 +1181,9 @@ impl HhApp {
                     .find(|pane| pane.id == *active)
                     .filter(|pane| pane.kind.is_assistant())
                 {
-                    self.render_assistant_pane(pane, panes.clone(), show_pane_header, cx)
+                    self.render_assistant_pane(pane, panes.as_slice(), show_pane_header, cx)
                 } else {
-                    self.render_terminal(panes.clone(), *active, show_pane_header, cx)
+                    self.render_terminal(panes.as_slice(), *active, show_pane_header, cx)
                 }
             }
             PaneLayout::Split {
@@ -1290,7 +1284,7 @@ impl HhApp {
             .join("  ")
     }
 
-    pub(crate) fn render_workspace(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(snapshot) = &self.session.snapshot else {
             return div()
                 .size_full()
@@ -1319,7 +1313,7 @@ impl HhApp {
         // successful sidebar click, so route the viewport to the tab that
         // contains the focused pane instead.
         let canonical_layout =
-            workspace_layout_for_focused_pane(workspace, self.layout.focused_pane).cloned();
+            workspace_layout_for_focused_pane(workspace, self.layout.focused_pane);
         let standalone_root = self.layout.focused_pane.is_some_and(|pane_id| {
             workspace
                 .tabs
@@ -1327,24 +1321,12 @@ impl HhApp {
                 .find(|tab| find_pane(&tab.layout, pane_id).is_some())
                 .is_some_and(|tab| workspace_tab_standalone_pane(tab).is_some())
         });
-        let zoomed_layout = canonical_layout.as_ref().and_then(|layout| {
+        let zoomed_layout = canonical_layout.and_then(|layout| {
             self.layout
                 .zoomed_pane
                 .and_then(|pane_id| zoom_projection(layout, pane_id))
         });
-        let layout = zoomed_layout.as_ref().or(canonical_layout.as_ref());
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-        let mut visible_browsers: HashSet<Uuid> = layout
-            .as_ref()
-            .map(|layout| {
-                visible_panes(layout)
-                    .into_iter()
-                    .filter(|pane_id| {
-                        find_pane(layout, *pane_id).is_some_and(|pane| pane.kind.is_browser())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let layout = zoomed_layout.as_ref().or(canonical_layout);
         let workspace_content = if let Some(layout) = layout {
             self.render_layout(
                 layout,
@@ -1428,14 +1410,6 @@ impl HhApp {
                 )
                 .into_any_element()
         };
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-        let showing_settings = matches!(self.editor.modal, Modal::AppearanceSettings);
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-        if showing_settings {
-            visible_browsers.clear();
-        }
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-        self.sync_browser_view_presentation(&visible_browsers);
         let workspace_content = match self.editor.modal {
             Modal::AppearanceSettings => self.render_appearance_settings(cx),
             _ => workspace_content,

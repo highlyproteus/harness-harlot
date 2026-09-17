@@ -29,9 +29,9 @@ pub(crate) use history_ui::{
     history_warning_text, live_scroll_target, wheel_delta_lines,
 };
 pub(crate) use icons::{
-    IDENTITY_MARK_SIZE, render_bell_icon, render_headphones_icon, render_microphone_icon,
-    render_sidebar_toggle_icon, render_terminal_profile_icon, render_terminal_profile_mark,
-    resolved_terminal_accent, resolved_workspace_color, tab_identity_presentation,
+    IDENTITY_MARK_SIZE, identity_detail, identity_label, render_bell_icon, render_headphones_icon,
+    render_microphone_icon, render_sidebar_toggle_icon, render_terminal_profile_icon,
+    render_terminal_profile_mark, resolved_terminal_accent, resolved_workspace_color,
     workspace_is_selectable,
 };
 pub(crate) use layout::{
@@ -53,6 +53,6 @@ pub(crate) use tabs::{
 pub(crate) use terminal_io::{
     TerminalPointerAction, TerminalUrlOpenTarget, plain_history_line, prepare_paste,
     selection_span, terminal_grid_for_pane, terminal_input_bytes, terminal_modifiers,
-    terminal_mouse_button, terminal_point_at, terminal_pointer_action, terminal_run_display_text,
-    terminal_url_open_target, url_at_column,
+    terminal_mouse_button, terminal_point_clamped, terminal_pointer_action,
+    terminal_run_display_text, terminal_url_open_target, url_at_column,
 };

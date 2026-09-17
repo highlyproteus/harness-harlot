@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::helpers::{
     IDENTITY_MARK_SIZE, WorkspaceTabScope, click_suppression_active, collect_terminal_tabs,
-    composite_rgb, element_key, tab_identity_presentation, workspace_strip_active_tab,
+    composite_rgb, element_key, identity_label, workspace_strip_active_tab,
     workspace_tab_focus_target, workspace_tab_set, workspace_tab_standalone_pane,
 };
 use crate::view_models::{
@@ -52,7 +52,7 @@ impl HhApp {
                             .clone()
                             .unwrap_or_else(|| tab.title.clone())
                     },
-                    |pane| tab_identity_presentation(pane).label,
+                    |pane| identity_label(pane).to_owned(),
                 );
                 let icon = if let Some(pane) = standalone_pane {
                     let accent = pane
@@ -189,13 +189,16 @@ impl HhApp {
                                 return;
                             }
                             if event.bounds.contains(&event.event.position) {
-                                this.sidebar.tab_drop_preview = Some(TabDropPreview {
+                                let next = Some(TabDropPreview {
                                     target_tab_id: tab_id,
                                     after: event.event.position.x > event.bounds.center().x,
                                     into_group: false,
                                 });
                                 cx.stop_propagation();
-                                cx.notify();
+                                if this.sidebar.tab_drop_preview != next {
+                                    this.sidebar.tab_drop_preview = next;
+                                    cx.notify();
+                                }
                             }
                         },
                     ))

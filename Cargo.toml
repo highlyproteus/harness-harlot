@@ -66,7 +66,6 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 
 [profile.release]
-overflow-checks = true
 lto = "thin"
 # Line tables keep release backtraces symbolized for the local panic log
 # without paying for full debug info.

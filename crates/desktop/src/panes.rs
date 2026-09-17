@@ -2,7 +2,7 @@
 
 use gpui::{
     ClipboardEntry, ClipboardItem, Context, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ScrollWheelEvent, Window, px,
+    MouseUpEvent, ScrollWheelEvent, Window,
 };
 use hh_protocol::{
     ClientRequest, DropPlacement, HistoryPageDirection, HistoryPageFlags, Pane, ServiceResponse,
@@ -15,14 +15,14 @@ use crate::helpers::{
     append_rename_text, apply_layout_control_mutation, collect_terminal_tabs,
     constrained_sidebar_width, effective_split_ratio, find_pane, find_split_rect,
     live_scroll_target, prepare_paste, terminal_modifiers, terminal_mouse_button,
-    terminal_pointer_action, terminal_url_open_target, url_at_column, visible_panes,
-    wheel_delta_lines, workspace_tab_set,
+    terminal_point_clamped, terminal_pointer_action, terminal_url_open_target, url_at_column,
+    visible_panes, wheel_delta_lines, workspace_tab_set,
 };
 use crate::typography::{TerminalCellMetrics, adjusted_terminal_zoom_level};
 use crate::view_models::{
     ArchivedView, AssistantComposer, CloseConfirmation, GroupRenameEditor, LayoutControlMutation,
-    Modal, PixelRect, RenameEditor, SearchEditor, SelectionDrag, SidebarResizeMove,
-    TabCloseConfirmation, WorkspaceCreationStep, route_workspace_creation_paste,
+    Modal, PixelRect, RenameEditor, SearchEditor, SelectionAutoscroll, SelectionDrag,
+    SidebarResizeMove, TabCloseConfirmation, WorkspaceCreationStep, route_workspace_creation_paste,
 };
 use crate::{
     APP_CHROME_HEIGHT, CopyTerminal, FindNextTerminal, FindTerminal, HhApp, PasteTerminal,
@@ -937,6 +937,7 @@ impl HhApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.layout.scroll_residual.remove(&pane_id);
         self.focus_pane_with_snapshot(pane_id, cx);
         self.focus_handle.focus(window);
         let mouse_reporting = self
@@ -964,6 +965,9 @@ impl HhApp {
                 }
             }
             TerminalPointerAction::DeferLeftClick(kind) => {
+                self.layout.selection_autoscroll = None;
+                self.layout.autoscroll_generation =
+                    self.layout.autoscroll_generation.wrapping_add(1);
                 self.layout.selection_drag = Some(SelectionDrag {
                     pane_id,
                     anchor: point,
@@ -973,6 +977,9 @@ impl HhApp {
                 });
             }
             TerminalPointerAction::Select(kind) => {
+                self.layout.selection_autoscroll = None;
+                self.layout.autoscroll_generation =
+                    self.layout.autoscroll_generation.wrapping_add(1);
                 self.layout.selection_drag = Some(SelectionDrag {
                     pane_id,
                     anchor: point,
@@ -1047,6 +1054,168 @@ impl HhApp {
         }
     }
 
+    pub(crate) fn drag_terminal_selection(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.layout.selection_drag.filter(|_| event.dragging()) else {
+            return;
+        };
+        let Some((bounds, metrics)) = self
+            .terminal_grid_bounds
+            .borrow()
+            .get(&selection.pane_id)
+            .copied()
+        else {
+            return;
+        };
+        let Some(screen) = self.session.screens.get(&selection.pane_id) else {
+            return;
+        };
+        let (point, overflow) = terminal_point_clamped(
+            event.position,
+            bounds,
+            screen.rows,
+            screen.columns,
+            metrics.cell_width,
+            metrics.line_height,
+        );
+        let outside_x = event.position.x < bounds.origin.x
+            || event.position.x >= bounds.origin.x + bounds.size.width;
+        if (overflow == 0 && !outside_x)
+            || (overflow != 0
+                && screen.modes.contains(TerminalModes::MOUSE_REPORTING)
+                && !event.modifiers.shift)
+        {
+            self.layout.selection_autoscroll = None;
+            return;
+        }
+        let rows = screen.rows;
+        if let Some(selection) = self.layout.selection_drag.as_mut() {
+            selection.preserve_single_cell = true;
+        }
+        if selection.deferred_mouse_click {
+            self.layout
+                .selection_drag
+                .as_mut()
+                .unwrap()
+                .deferred_mouse_click = false;
+            self.dispatch_control(ClientRequest::BeginSelection {
+                pane_id: selection.pane_id,
+                point: selection.anchor,
+                kind: selection.kind,
+            });
+        }
+        if overflow == 0 {
+            self.layout.selection_autoscroll = None;
+            self.dispatch_control(ClientRequest::UpdateSelection {
+                pane_id: selection.pane_id,
+                point,
+            });
+            cx.notify();
+            return;
+        }
+        let distance = if overflow < 0 {
+            f32::from(bounds.origin.y - event.position.y)
+        } else {
+            f32::from(event.position.y - bounds.origin.y) - f32::from(rows) * metrics.line_height
+        };
+        let speed = (1.0 + distance / metrics.line_height).min(10.0) as i32;
+        let start = self.layout.selection_autoscroll.is_none();
+        self.layout.selection_autoscroll = Some(SelectionAutoscroll {
+            pane_id: selection.pane_id,
+            lines: if overflow < 0 { speed } else { -speed },
+            edge: point,
+        });
+        if start {
+            self.layout.autoscroll_generation = self.layout.autoscroll_generation.wrapping_add(1);
+            let generation = self.layout.autoscroll_generation;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    gpui::Timer::after(std::time::Duration::from_millis(
+                        crate::SELECTION_AUTOSCROLL_TICK_MS,
+                    ))
+                    .await;
+                    let Ok(true) = this.update(cx, |this, cx| {
+                        this.tick_selection_autoscroll(generation, cx)
+                    }) else {
+                        break;
+                    };
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn tick_selection_autoscroll(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
+        if generation != self.layout.autoscroll_generation {
+            return false;
+        }
+        let Some(scroll) = self.layout.selection_autoscroll else {
+            return false;
+        };
+        if self
+            .layout
+            .selection_drag
+            .is_none_or(|selection| selection.pane_id != scroll.pane_id)
+            || !self.session.screens.contains_key(&scroll.pane_id)
+        {
+            self.layout.selection_autoscroll = None;
+            return false;
+        }
+        self.dispatch_control(ClientRequest::ScrollPane {
+            pane_id: scroll.pane_id,
+            lines: scroll.lines,
+        });
+        self.dispatch_control(ClientRequest::UpdateSelection {
+            pane_id: scroll.pane_id,
+            point: scroll.edge,
+        });
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn end_terminal_selection_outside(
+        &mut self,
+        event: &MouseUpEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.layout.selection_drag else {
+            return;
+        };
+        let grid = self
+            .terminal_grid_bounds
+            .borrow()
+            .get(&selection.pane_id)
+            .copied();
+        let Some((bounds, metrics)) = grid else {
+            self.layout.selection_drag = None;
+            self.layout.selection_autoscroll = None;
+            self.layout.autoscroll_generation = self.layout.autoscroll_generation.wrapping_add(1);
+            cx.notify();
+            return;
+        };
+        let Some(screen) = self.session.screens.get(&selection.pane_id) else {
+            return;
+        };
+        let (point, overflow) = terminal_point_clamped(
+            event.position,
+            bounds,
+            screen.rows,
+            screen.columns,
+            metrics.cell_width,
+            metrics.line_height,
+        );
+        if overflow != 0
+            || event.position.x < bounds.origin.x
+            || event.position.x >= bounds.origin.x + bounds.size.width
+        {
+            self.end_terminal_pointer(selection.pane_id, point, event, cx);
+            cx.propagate();
+        }
+    }
+
     /// URL under a grid position, or `None`. Mouse-reporting apps own their
     /// clicks, so they never get the link treatment.
     pub(crate) fn url_at_pointer(&self, pane_id: Uuid, point: TerminalPoint) -> Option<String> {
@@ -1064,6 +1233,8 @@ impl HhApp {
         event: &MouseUpEvent,
         cx: &mut Context<Self>,
     ) {
+        self.layout.selection_autoscroll = None;
+        self.layout.autoscroll_generation = self.layout.autoscroll_generation.wrapping_add(1);
         if let Some(selection) = self
             .layout
             .selection_drag
@@ -1131,12 +1302,17 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) {
         let metrics = self.terminal_metrics(pane_id);
-        let pixels = event.delta.pixel_delta(px(metrics.line_height));
-        let Some(lines) = wheel_delta_lines(f32::from(pixels.y), metrics.line_height) else {
-            // Zero-pixel wheel events (trackpad momentum tails) must not
-            // ratchet the viewport into scrollback.
+        let residual = self.layout.scroll_residual.entry(pane_id).or_default();
+        let lines = wheel_delta_lines(
+            event.delta,
+            event.touch_phase,
+            metrics.line_height,
+            residual,
+        );
+        if lines == 0 {
+            cx.stop_propagation();
             return;
-        };
+        }
         if self.editor.archived_views.contains_key(&pane_id) {
             self.scroll_archived_view(pane_id, lines, cx);
             cx.stop_propagation();
@@ -1152,17 +1328,19 @@ impl HhApp {
         });
         match live_scroll_target(mouse_reporting, event.modifiers.shift, at_live_top) {
             LiveScrollTarget::TerminalMouseReporting => {
-                self.dispatch_control(ClientRequest::MouseInput {
-                    pane_id,
-                    point,
-                    button: if lines > 0 {
-                        TerminalMouseButton::WheelUp
-                    } else {
-                        TerminalMouseButton::WheelDown
-                    },
-                    action: TerminalMouseAction::Press,
-                    modifiers: terminal_modifiers(event.modifiers),
-                });
+                for _ in 0..lines.unsigned_abs().min(8) {
+                    self.dispatch_control(ClientRequest::MouseInput {
+                        pane_id,
+                        point,
+                        button: if lines > 0 {
+                            TerminalMouseButton::WheelUp
+                        } else {
+                            TerminalMouseButton::WheelDown
+                        },
+                        action: TerminalMouseAction::Press,
+                        modifiers: terminal_modifiers(event.modifiers),
+                    });
+                }
             }
             LiveScrollTarget::LiveBuffer => {
                 self.dispatch_control(ClientRequest::ScrollPane { pane_id, lines });

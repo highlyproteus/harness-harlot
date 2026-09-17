@@ -269,6 +269,9 @@ mod tests {
             dragging_pane: None,
             drag_hover: DragHoverState::default(),
             selection_drag: None,
+            selection_autoscroll: None,
+            autoscroll_generation: 0,
+            scroll_residual: HashMap::new(),
             last_sizes: HashMap::new(),
             resize_generation: 0,
             workspace_pixels: (0.0, 0.0),
@@ -285,6 +288,7 @@ mod tests {
         TerminalScreen {
             pane_id,
             revision,
+            content_revision: revision,
             columns: 80,
             rows: 24,
             lines: Vec::new(),

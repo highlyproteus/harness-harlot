@@ -8,22 +8,17 @@ use uuid::Uuid;
 use crate::THEME;
 use crate::agent_icons::{AgentIconFormat, agent_icon_definition};
 use crate::helpers::layout::find_pane;
-use crate::view_models::TabIdentityPresentation;
 
-pub(crate) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation {
+pub(crate) fn identity_label(pane: &Pane) -> &str {
+    &pane.title
+}
+
+pub(crate) fn identity_detail(pane: &Pane) -> String {
     if pane.kind.is_browser() {
-        return TabIdentityPresentation {
-            label: pane.title.clone(),
-            profile: TerminalProfile::Terminal,
-            detail: "Chromium browser tab".to_owned(),
-        };
+        return "Chromium browser tab".to_owned();
     }
     if pane.kind.is_assistant() {
-        return TabIdentityPresentation {
-            label: pane.title.clone(),
-            profile: TerminalProfile::Terminal,
-            detail: "Voice assistant".to_owned(),
-        };
+        return "Voice assistant".to_owned();
     }
     let detection_detail = match pane.identity.source {
         hh_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
@@ -46,14 +41,10 @@ pub(crate) fn tab_identity_presentation(pane: &Pane) -> TabIdentityPresentation 
     } else {
         "Harness Harlot uses the neutral terminal glyph"
     };
-    TabIdentityPresentation {
-        label: pane.title.clone(),
-        profile: pane.identity.profile,
-        detail: format!(
-            "{} — {detection_detail}. {asset_detail}.",
-            definition.accessible_name
-        ),
-    }
+    format!(
+        "{} — {detection_detail}. {asset_detail}.",
+        definition.accessible_name
+    )
 }
 
 pub(crate) const IDENTITY_MARK_SIZE: f32 = 22.0;
@@ -336,8 +327,7 @@ mod tests {
         AppearanceColor, FALLBACK_IDENTITY_ICON_SIZE, OFFICIAL_IDENTITY_ICON_SIZE, Pane,
         SessionSnapshot, TerminalProfile, Uuid, WorkspaceConnection, WorkspaceConnectionStatus,
         agent_icon_definition, resolved_terminal_accent, resolved_workspace_color,
-        tab_identity_presentation, terminal_profile_icon_is_framed, terminal_profile_icon_size,
-        workspace_is_selectable,
+        terminal_profile_icon_is_framed, terminal_profile_icon_size, workspace_is_selectable,
     };
     use crate::helpers::{terminal_tab_secondary_label, visible_panes};
     use hh_protocol::PaneLayout;
@@ -358,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn native_tab_identity_label_and_icon_registry_smoke_test() {
+    fn native_icon_registry_smoke_test() {
         let cases = [
             (TerminalProfile::Terminal, false),
             (TerminalProfile::Hermes, true),
@@ -373,31 +363,6 @@ mod tests {
             (TerminalProfile::Gemini, true),
         ];
         for (profile, has_official_asset) in cases {
-            let label = profile.display_name();
-            let pane = Pane {
-                id: Uuid::new_v4(),
-                kind: hh_protocol::PaneKind::Terminal,
-                title: label.to_owned(),
-                shell: "zsh".to_owned(),
-                color: None,
-                identity: hh_protocol::TerminalIdentity {
-                    profile,
-                    source: if profile == TerminalProfile::Terminal {
-                        hh_protocol::TerminalIdentitySource::Fallback
-                    } else {
-                        hh_protocol::TerminalIdentitySource::Command
-                    },
-                },
-                status: hh_protocol::PaneStatus::default(),
-                custom_title: None,
-                profile_override: None,
-                custom_icon: None,
-            };
-
-            let presentation = tab_identity_presentation(&pane);
-            assert_eq!(presentation.label, label);
-            assert_eq!(presentation.profile, profile);
-            assert!(presentation.detail.contains(label));
             assert_eq!(
                 agent_icon_definition(profile).asset.is_some(),
                 has_official_asset
@@ -437,7 +402,6 @@ mod tests {
         pane.custom_title = Some(pane.title.clone());
 
         assert_eq!(terminal_tab_secondary_label(&pane), None);
-        assert_eq!(tab_identity_presentation(&pane).label, "Release terminal");
     }
 
     #[test]

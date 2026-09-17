@@ -234,6 +234,7 @@ pub(crate) struct PtySession {
     reader_exit: Mutex<std::sync::mpsc::Receiver<()>>,
     terminal: Arc<Mutex<TerminalModel>>,
     revision: Arc<AtomicU64>,
+    content_revision: Arc<AtomicU64>,
     events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
     _history: Arc<HistorySink>,
 }
@@ -444,9 +445,11 @@ impl PtySession {
             usize::from(INITIAL_ROWS),
         )));
         let revision = Arc::new(AtomicU64::new(0));
+        let content_revision = Arc::new(AtomicU64::new(0));
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let reader_terminal = Arc::clone(&terminal);
         let reader_revision = Arc::clone(&revision);
+        let reader_content_revision = Arc::clone(&content_revision);
         let reader_events = Arc::clone(&events);
         let reader_history = Arc::clone(&history);
         let (reader_exit_tx, reader_exit) = std::sync::mpsc::channel::<()>();
@@ -469,8 +472,9 @@ impl PtySession {
                                 &reader_events,
                                 &mut previous_bell_count,
                             );
-                            drop(terminal);
+                            reader_content_revision.fetch_add(1, Ordering::Release);
                             reader_revision.fetch_add(1, Ordering::Release);
+                            drop(terminal);
                             reader_history.record(&buffer[..read]);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -504,6 +508,7 @@ impl PtySession {
             reader_exit: Mutex::new(reader_exit),
             terminal,
             revision,
+            content_revision,
             events,
             _history: history,
         }))
@@ -537,7 +542,7 @@ impl PtySession {
             let mut terminal = self.terminal.lock();
             if terminal.display_offset() != 0 {
                 terminal.scroll_bottom();
-                drop(terminal);
+                self.content_revision.fetch_add(1, Ordering::Release);
                 self.revision.fetch_add(1, Ordering::Release);
             }
         }
@@ -585,9 +590,9 @@ impl PtySession {
                 pixel_height: 0,
             })
             .context("resize PTY")?;
-        self.terminal
-            .lock()
-            .resize(usize::from(columns), usize::from(rows));
+        let mut terminal = self.terminal.lock();
+        terminal.resize(usize::from(columns), usize::from(rows));
+        self.content_revision.fetch_add(1, Ordering::Release);
         self.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -609,6 +614,7 @@ impl PtySession {
         Ok(TerminalScreen {
             pane_id,
             revision: self.revision.load(Ordering::Acquire),
+            content_revision: self.content_revision.load(Ordering::Acquire),
             columns: u16::try_from(columns).context("terminal columns exceed protocol range")?,
             rows: u16::try_from(rows).context("terminal rows exceed protocol range")?,
             lines: terminal.styled_lines(),
@@ -623,17 +629,20 @@ impl PtySession {
     }
 
     pub(crate) fn begin_selection(&self, point: TerminalPoint, kind: TerminalSelectionKind) {
-        self.terminal.lock().begin_selection(point, kind);
+        let mut terminal = self.terminal.lock();
+        terminal.begin_selection(point, kind);
         self.revision.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn update_selection(&self, point: TerminalPoint) {
-        self.terminal.lock().update_selection(point);
+        let mut terminal = self.terminal.lock();
+        terminal.update_selection(point);
         self.revision.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn clear_selection(&self) {
-        self.terminal.lock().clear_selection();
+        let mut terminal = self.terminal.lock();
+        terminal.clear_selection();
         self.revision.fetch_add(1, Ordering::Release);
     }
 
@@ -642,16 +651,23 @@ impl PtySession {
     }
 
     pub(crate) fn scroll(&self, lines: i32) {
-        self.terminal.lock().scroll(lines.clamp(-10_000, 10_000));
-        self.revision.fetch_add(1, Ordering::Release);
+        let mut terminal = self.terminal.lock();
+        let previous_offset = terminal.display_offset();
+        terminal.scroll(lines.clamp(-10_000, 10_000));
+        if terminal.display_offset() != previous_offset {
+            self.content_revision.fetch_add(1, Ordering::Release);
+            self.revision.fetch_add(1, Ordering::Release);
+        }
     }
 
     pub(crate) fn search_literal(&self, query: &str, forward: bool) -> Result<bool> {
         if query.chars().count() > 256 || query.chars().any(char::is_control) {
             bail!("terminal search must be at most 256 visible characters");
         }
-        let found = self.terminal.lock().search_literal(query, forward);
+        let mut terminal = self.terminal.lock();
+        let found = terminal.search_literal(query, forward);
         if found {
+            self.content_revision.fetch_add(1, Ordering::Release);
             self.revision.fetch_add(1, Ordering::Release);
         }
         Ok(found)
@@ -811,6 +827,68 @@ mod tests {
 
     use crate::layout::first_pane_id;
     use crate::registry::SessionRegistry;
+
+    #[test]
+    fn selection_revision_preserves_content_revision() {
+        let root = std::env::temp_dir().join(format!("hh-selection-revision-{}", Uuid::new_v4()));
+        let archive = HistoryArchive::open(root.clone()).unwrap();
+        let pane_id = Uuid::new_v4();
+        let mut command = CommandBuilder::new("/usr/bin/seq");
+        command.args(["1", "200"]);
+        let session = PtySession::spawn_command(
+            pane_id,
+            Uuid::new_v4(),
+            command,
+            "selection revision test",
+            &archive,
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .reader_exit
+                .lock()
+                .recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        );
+        session.reader.lock().take().unwrap().join().unwrap();
+        for lines in [0, -1] {
+            let before = session.screen(pane_id).unwrap();
+            session.scroll(lines);
+            let unchanged = session.screen(pane_id).unwrap();
+            assert_eq!(unchanged.content_revision, before.content_revision);
+            assert_eq!(unchanged.revision, before.revision);
+        }
+        let before = session.screen(pane_id).unwrap();
+        session.begin_selection(
+            TerminalPoint { row: 0, column: 0 },
+            TerminalSelectionKind::Simple,
+        );
+        session.update_selection(TerminalPoint { row: 2, column: 2 });
+        let selected = session.screen(pane_id).unwrap();
+        assert!(selected.revision > before.revision);
+        assert_eq!(selected.content_revision, before.content_revision);
+        assert!(selected.selection.is_some());
+        session.scroll(1);
+        let scrolled = session.screen(pane_id).unwrap();
+        assert!(scrolled.revision > selected.revision);
+        assert!(scrolled.content_revision > selected.content_revision);
+        assert_eq!(scrolled.display_offset, 1);
+        session.clear_selection();
+        let cleared = session.screen(pane_id).unwrap();
+        assert!(cleared.revision > scrolled.revision);
+        assert_eq!(cleared.content_revision, scrolled.content_revision);
+        assert!(cleared.selection.is_none());
+        session.scroll(10_000);
+        let oldest = session.screen(pane_id).unwrap();
+        assert_eq!(oldest.display_offset, oldest.history_size);
+        session.scroll(1);
+        let unchanged = session.screen(pane_id).unwrap();
+        assert_eq!(unchanged.content_revision, oldest.content_revision);
+        assert_eq!(unchanged.revision, oldest.revision);
+        drop(session);
+        drop(archive);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[derive(Clone)]
     struct StalledWriter {

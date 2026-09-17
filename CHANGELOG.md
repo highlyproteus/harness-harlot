@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Accumulated precise trackpad motion by terminal line height while preserving
+  mouse-wheel notches and multi-line wheel input in mouse-reporting applications.
+- Added terminal selection auto-scroll beyond viewport edges, clamped horizontal
+  edge selection (including deferred drags in mouse-reporting terminals), and
+  release capture outside the grid; selection-only updates no longer invalidate
+  shaped text.
+- Avoided terminal revision and text-cache invalidation when scrolling cannot
+  move the viewport.
+- Reduced sidebar and pane drag allocations, redundant hover updates, terminal
+  pointer listeners, and unchanged native browser reframes.
+- Excluded nonterminal panes from PTY resize requests, preventing browser splits
+  from triggering a continuous resize/repaint loop in otherwise idle terminals.
+- Routed browser popups and modified link clicks into new splits without
+  navigating the opener; persisted soft-navigation URLs no longer reload pages.
+- Worked around the CEF 151 `ReadAnythingSoftNavigationObserver` null dereference
+  in Alloy browsers by disabling only `ImmersiveReadAnything`
+  ([CEF #4234](https://github.com/chromiumembedded/cef/issues/4234)).
+- Guarded CEF pumping against reentry, prioritized earlier work over the 33 ms
+  fallback and ignored superseded callbacks, moved native browser operations out
+  of rendering, detached closed browser views, and synchronized browser focus
+  with terminal focus hand-back.
+- Avoided registry write-lock acquisition for ordinary terminal keystrokes.
+- Updated Rustls to 0.23.45 to reject TLS 1.3 handshake messages sent across
+  encryption-level boundaries (RUSTSEC-2026-0285).
+
+### Changed
+
+- Bumped the desktop/service wire protocol from 34 to 35 for terminal
+  `content_revision`; desktop and service must be upgraded together.
+- Removed forced release overflow checks while retaining thin LTO and line-table
+  debug information.
+
 ## [0.1.19] - 2026-09-04
 
 ### Fixed

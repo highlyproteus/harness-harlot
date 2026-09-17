@@ -172,6 +172,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [futures-util 0.3.34](https://github.com/rust-lang/futures-rs) — MIT OR Apache-2.0
 - [generic-array 0.14.7](https://github.com/fizyk20/generic-array.git) — MIT
 - [getrandom 0.2.17](https://github.com/rust-random/getrandom) — MIT OR Apache-2.0
+- [getrandom 0.3.4](https://github.com/rust-random/getrandom) — MIT OR Apache-2.0
 - [getrandom 0.4.3](https://github.com/rust-random/getrandom) — MIT OR Apache-2.0
 - [gif 0.14.2](https://github.com/image-rs/image-gif) — MIT OR Apache-2.0
 - [glob 0.3.4](https://github.com/rust-lang/glob) — MIT OR Apache-2.0
@@ -371,7 +372,7 @@ Generated from the locked Cargo dependency graph by `cargo about generate --lock
 - [rustix 0.38.44](https://github.com/bytecodealliance/rustix) — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 - [rustix 1.1.4](https://github.com/bytecodealliance/rustix) — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 - [rustix-openpty 0.2.0](https://github.com/sunfishcode/rustix-openpty) — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
-- [rustls 0.23.43](https://github.com/rustls/rustls) — Apache-2.0 OR ISC OR MIT
+- [rustls 0.23.45](https://github.com/rustls/rustls) — Apache-2.0 OR ISC OR MIT
 - [rustls-native-certs 0.8.4](https://github.com/rustls/rustls-native-certs) — Apache-2.0 OR ISC OR MIT
 - [rustls-pemfile 2.2.0](https://github.com/rustls/pemfile) — Apache-2.0 OR ISC OR MIT
 - [rustls-pki-types 1.15.1](https://github.com/rustls/pki-types) — MIT OR Apache-2.0
