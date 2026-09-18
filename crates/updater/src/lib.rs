@@ -28,6 +28,10 @@ pub const EDGE_CHANNEL: &str = "edge";
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Printed by `install` once the update artifact is verified locally.
+///
+/// The desktop quits only after observing this line.
+pub const DOWNLOAD_COMPLETE_LINE: &str = "download-complete";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpdateChannel {

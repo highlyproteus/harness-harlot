@@ -9,9 +9,8 @@ can select the other mode's artifact.
 ## What is implemented now
 
 - `scripts/build-macos-app.sh release --browser --community` builds the
-  no-cost app with CEF, a production verifier, and the compile-time
-  notify-only update policy. `scripts/build-macos-app.sh release --browser`
-  retains the Developer ID layout.
+  no-cost app with CEF and a production verifier supporting explicit updates.
+  `scripts/build-macos-app.sh release --browser` retains the Developer ID layout.
 - `scripts/package-macos-release.sh VERSION BUILD --community` signs nested
   code ad hoc, emits a `*-community.dmg`, and publishes
   `manifest-macos-community-ARCH-v2.update.json`. Production packaging is
@@ -25,12 +24,12 @@ can select the other mode's artifact.
   that index. The installer checks those hashes before mounting a DMG, then
   uses the bundled verifier to validate the Ed25519 manifest and exact artifact
   bytes.
-- Community apps notify about newer community releases but both the UI and
-  `hh-update-tool install` refuse automatic replacement. Developer ID builds
-  retain the verified staged-swap updater once `TRUSTED_APPLE_TEAM_ID` is set.
-- Manual community replacement requires all terminal sessions to end. Future
-  Developer ID updates preserve the compatible service for routine app-only
-  releases and require quiescence only when the signed service protocol changes.
+- Packaged community apps support explicit verified updates from the sidebar or
+  `hh update`; Developer ID builds retain the separate staged-swap trust path
+  once `TRUSTED_APPLE_TEAM_ID` is set.
+- Manual community replacement still requires terminal sessions to end. The
+  in-app updater preserves compatible services and asks once before restarting
+  an incompatible service with live terminals.
 
 The package script refuses any dirty checkout, including untracked files.
 Every production mode requires a signed tag, pinned CEF, and the distinct
@@ -59,8 +58,8 @@ tradeoff visible instead of weakening the Developer ID checks:
    for bundle integrity and exact bundle identity/architecture.
 5. Installation uses `/Applications` when writable and otherwise
    `~/Applications`; an existing Developer ID app is not
-   silently replaced by a community app. Automatic update installation remains
-   disabled, so every future replacement repeats the explicit trust step.
+   silently replaced by a community app. Subsequent explicit updates authenticate
+   release metadata and artifacts using the compiled update trust policy.
 
 The installer never removes quarantine, disables Gatekeeper, or uses `sudo`.
 The short bootstrap pipes only the HTTPS-authenticated website script to the
@@ -152,30 +151,33 @@ bytes, ad-hoc signatures, bundle identifier, primary executable set, and CPU
 architecture before staging. It refuses a
 running desktop, asks the current managed service to persist and stop only
 after all terminal sessions have ended, and never overwrites a Developer ID
-app. A failed staged replacement restores the prior community bundle. Updates
-stay notify-only and repeat this manual process.
+app. A failed staged replacement restores the prior community bundle. This manual
+bootstrap remains separate from the explicit in-app update flow.
 
 Developer ID installation uses `install.sh` after the Team ID is configured.
-Before an automatic Developer ID update, the UI compares the signed
-session-service protocol with the running build. Routine app-only updates retain
-the compatible service and its live PTYs. A protocol-changing update shows
-**Update after sessions end** until every PTY and SSH workstation has ended.
-The installer then:
+Before an explicit update, the UI compares the signed session-service protocol
+with the running build. Routine app-only updates retain the compatible service
+and its live PTYs. A protocol-changing update asks for confirmation when terminals
+are live or their count is unavailable. The installer then:
 
-1. Downloads and verifies signed metadata, exact DMG size/hash, Developer ID
-   Team ID, hardened runtime, notarization, and bundle identifier.
-2. Waits for the desktop process to exit and, for a protocol change only, asks
-   the quiescent session service to persist and stop.
-3. Replaces the app bundle and command link as an ordered transaction, retains
-   the prior app as `Harness Harlot.previous.app`, and launches the new desktop.
-4. On replacement or relaunch failure, restores and validates the prior app and
-   command link.
+1. Downloads and verifies signed metadata and exact DMG size/hash while the
+   desktop stays open with a **Downloading…** banner. A download or integrity
+   failure restores the update button and displays an error without quitting.
+2. Emits `download-complete`, waits for the desktop to exit, and validates the
+   staged app against its community ad-hoc or Developer ID trust policy.
+3. For a protocol change, requests a quiescent service shutdown first. With
+   user-confirmed `--restart-service`, refusal triggers SIGTERM to the exact
+   managed executable, allowing persistence and PTY termination. It never sends
+   SIGKILL.
+4. Replaces the app and command link, retains `.Harness Harlot.previous.app`,
+   and launches a fresh desktop. Replacement failures restore the prior bundle.
 
-Routine app-only rollback leaves the compatible service and its PTYs running.
-A protocol-changing update waits until the service owns no live PTYs because
-desired-state recovery can recreate local shells after a service stop, but it
-does not preserve arbitrary live processes, SSH authentication, or terminal
-output; release notes must identify such migrations plainly.
+Local terminal layouts recover with fresh shells in their last valid directories;
+arbitrary running programs and live terminal output do not survive a service
+restart. SSH tabs remain offline until explicitly reconnected. CLI updates
+without `--restart-service` still require a quiescent incompatible service.
+Already-installed older updater binaries retain their old quiescence gate until
+they have themselves been replaced.
 
 Linux releases use the verified `.tar.gz` and `hh-update-tool install-local`
 flow instead of a DMG. The unprivileged installer stages the application at

@@ -21,6 +21,17 @@ pub(crate) const SETTINGS_BANNER_PREVIEW_MAX_WIDTH: f32 = 420.0;
 
 pub(crate) const SETTINGS_BANNER_PREVIEW_MAX_HEIGHT: f32 = 220.0;
 
+pub(crate) fn color_picker_hosted(target: ColorTarget, modal: &Modal) -> bool {
+    match target {
+        ColorTarget::Pane(id) => matches!(modal, Modal::TabMenu(menu) if menu.pane_id == id),
+        ColorTarget::Workspace(id) => {
+            matches!(modal, Modal::WorkspaceMenu(menu) if menu.workspace_id == id)
+        }
+        ColorTarget::Tab(id) => matches!(modal, Modal::GroupMenu(menu) if menu.tab_id == id),
+        ColorTarget::DefaultTerminal | ColorTarget::DefaultWorkspace => true,
+    }
+}
+
 /// A banner ready to render: decoded-image handle plus its pixel dimensions,
 /// which drive rail-header height and preview sizing.
 #[derive(Clone, Debug)]
@@ -56,6 +67,19 @@ pub(crate) fn workstation_banner_artwork() -> BannerArtwork {
 }
 
 impl HhApp {
+    /// Drops a picker whose menu is gone so it can never swallow terminal input.
+    pub(crate) fn active_color_picker_mut(&mut self) -> Option<&mut ColorPickerState> {
+        if self
+            .editor
+            .color_picker
+            .as_ref()
+            .is_some_and(|picker| !color_picker_hosted(picker.target, &self.editor.modal))
+        {
+            self.editor.color_picker = None;
+        }
+        self.editor.color_picker.as_mut()
+    }
+
     pub(crate) fn appearance_choices(&self) -> Vec<AppearanceColor> {
         let mut colors = self
             .session
@@ -1078,5 +1102,46 @@ impl HhApp {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::color_picker_hosted;
+    use crate::view_models::{ColorTarget, Modal, WorkspaceMenu};
+    use gpui::{point, px};
+    use uuid::Uuid;
+
+    #[test]
+    fn color_picker_hosted_only_by_its_matching_menu() {
+        let workspace_id = Uuid::new_v4();
+        let other_workspace_id = Uuid::new_v4();
+        let workspace_menu = Modal::WorkspaceMenu(WorkspaceMenu {
+            workspace_id,
+            position: point(px(0.0), px(0.0)),
+            icon_picker_open: false,
+            customize_open: false,
+        });
+
+        assert!(color_picker_hosted(
+            ColorTarget::Workspace(workspace_id),
+            &workspace_menu
+        ));
+        assert!(!color_picker_hosted(
+            ColorTarget::Workspace(other_workspace_id),
+            &workspace_menu
+        ));
+        assert!(!color_picker_hosted(
+            ColorTarget::Pane(Uuid::new_v4()),
+            &Modal::None
+        ));
+        assert!(color_picker_hosted(
+            ColorTarget::DefaultTerminal,
+            &Modal::None
+        ));
+        assert!(color_picker_hosted(
+            ColorTarget::DefaultWorkspace,
+            &Modal::None
+        ));
     }
 }

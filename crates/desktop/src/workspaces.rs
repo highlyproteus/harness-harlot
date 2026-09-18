@@ -49,6 +49,23 @@ pub(crate) fn longest_common_prefix(values: &[String]) -> String {
 }
 
 impl HhApp {
+    pub(crate) fn new_workspace_terminal(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        let Some(empty) = self.session.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .map(|workspace| workspace.tabs.is_empty())
+        }) else {
+            return;
+        };
+        if empty {
+            self.open_workspace_terminal(workspace_id, cx);
+        } else {
+            self.new_workspace_tab(workspace_id, cx);
+        }
+    }
+
     pub(crate) fn terminal_accent(&self, pane_id: Uuid) -> AppearanceColor {
         self.session
             .snapshot

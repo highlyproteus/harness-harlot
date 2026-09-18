@@ -37,6 +37,7 @@ use crate::helpers::split_placement_at;
 use crate::helpers::{
     collect_terminal_tabs, element_key, find_pane, workspace_tab_standalone_pane,
 };
+use crate::input::browser_url_editor_is_active;
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::session::session_call;
 use crate::view_models::Modal;
@@ -394,6 +395,15 @@ impl HhApp {
     }
 
     pub(crate) fn append_browser_url_text(&mut self, text: &str) -> bool {
+        if !browser_url_editor_is_active(
+            self.editor
+                .browser_url_editor
+                .as_ref()
+                .map(|editor| editor.pane_id),
+            self.layout.focused_pane,
+        ) {
+            return false;
+        }
         let Some(editor) = self.editor.browser_url_editor.as_mut() else {
             return false;
         };
@@ -542,7 +552,13 @@ impl HhApp {
             matches!(self.editor.modal, Modal::None) && self.layout.dragging_pane.is_none();
         let should_focus = content_visible
             && self.session.window_active
-            && self.editor.browser_url_editor.is_none();
+            && !browser_url_editor_is_active(
+                self.editor
+                    .browser_url_editor
+                    .as_ref()
+                    .map(|editor| editor.pane_id),
+                self.layout.focused_pane,
+            );
         let changed = self.browser.browser_views.iter().any(|(id, view)| {
             let visible_now = content_visible && visible.contains(id);
             let focused_now = visible_now && should_focus && Some(*id) == self.layout.focused_pane;
@@ -723,7 +739,13 @@ impl HhApp {
             matches!(self.editor.modal, Modal::None) && self.layout.dragging_pane.is_none();
         let should_focus = content_visible
             && self.session.window_active
-            && self.editor.browser_url_editor.is_none();
+            && !browser_url_editor_is_active(
+                self.editor
+                    .browser_url_editor
+                    .as_ref()
+                    .map(|editor| editor.pane_id),
+                self.layout.focused_pane,
+            );
         let reassert = std::mem::take(&mut self.browser.reassert_focus);
         let mut blurred = false;
         for (view_id, view) in &mut self.browser.browser_views {

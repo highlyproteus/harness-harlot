@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-09-18
+
+### Fixed
+
+- Keep the desktop open while updates download and verify; report download
+  failures without quitting, then hand off only after the package is ready.
+- Allow confirmed protocol-changing updates without closing every terminal.
+  The service persists and stops via SIGTERM; local tabs recover as fresh shells
+  in their last directories, while SSH tabs remain offline until reconnected.
+- Detect desktop exit during updater handoff instead of waiting on a stale
+  cached process entry.
+- Prevent dismissed color pickers and inactive browser URL editors from
+  swallowing terminal input; focus new terminals before their snapshots arrive.
+- Keep sidebar context menus inside the window and preserve clicks across
+  frames. Workstation menus now include New Browser, New Terminal, and an inline
+  Customize section; workstation rename uses the focused replace-on-type field.
+
 ## [0.1.20] - 2026-09-17
 
 ### Fixed

@@ -10,6 +10,7 @@ use crate::helpers::{
 };
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
+    UpdateRestartConfirmation,
 };
 use crate::{
     HhApp, MACOS_TRAFFIC_LIGHT_SAFE_INSET, SIDEBAR_RESIZE_HIT_WIDTH, SIDEBAR_RESIZE_VISUAL_WIDTH,
@@ -22,25 +23,29 @@ use gpui::{
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{NotificationKind, Pane};
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 use uuid::Uuid;
 
 mod workstation_list;
 
-pub(super) fn update_install_block_reason(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UpdateInstallPlan {
+    Install,
+    ConfirmServiceRestart { live_terminals: Option<u32> },
+}
+
+pub(crate) fn update_install_plan(
     requires_service_restart: bool,
     active_terminal_count: Option<u32>,
-) -> Option<&'static str> {
-    if !requires_service_restart {
-        return None;
-    }
-    match active_terminal_count {
-        None => Some("Wait for Harness Harlot to reconnect before updating"),
-        Some(0) => None,
-        Some(_) => Some(
-            "Close all terminals, then update — live sessions must end before the service restarts",
-        ),
+) -> UpdateInstallPlan {
+    if !requires_service_restart || active_terminal_count == Some(0) {
+        UpdateInstallPlan::Install
+    } else {
+        UpdateInstallPlan::ConfirmServiceRestart {
+            live_terminals: active_terminal_count,
+        }
     }
 }
 
@@ -332,13 +337,26 @@ impl HhApp {
                 .map(|workspace| workspace.active_terminal_count)
                 .sum::<u32>()
         });
-        if let Some(reason) =
-            update_install_block_reason(update.requires_service_restart, active_terminal_count)
-        {
-            self.session.connection_error = Some(reason.to_owned());
-            cx.notify();
-            return;
+        match update_install_plan(update.requires_service_restart, active_terminal_count) {
+            UpdateInstallPlan::Install => self.spawn_update_installer(false, cx),
+            UpdateInstallPlan::ConfirmServiceRestart { live_terminals } => {
+                self.editor.modal = Modal::UpdateRestart(UpdateRestartConfirmation {
+                    version: update.version.clone(),
+                    live_terminals,
+                });
+                cx.notify();
+            }
         }
+    }
+
+    pub(crate) fn confirm_update_restart(&mut self, cx: &mut Context<Self>) {
+        let Modal::UpdateRestart(_) = std::mem::take(&mut self.editor.modal) else {
+            return;
+        };
+        self.spawn_update_installer(true, cx);
+    }
+
+    fn spawn_update_installer(&mut self, restart_service: bool, cx: &mut Context<Self>) {
         let Some(tool) = std::env::current_exe()
             .ok()
             .and_then(|executable| {
@@ -368,25 +386,67 @@ impl HhApp {
         };
         let current_build = hh_updater::current_build().to_string();
         let process_id = process_id.to_string();
-        match Command::new(tool)
-            .args([
-                "install",
-                "--current-version",
-                env!("CARGO_PKG_VERSION"),
-                "--current-build",
-                &current_build,
-                "--wait-pid",
-                &process_id,
-                "--wait-start-time",
-                &process_start_time,
-            ])
+        let mut command = Command::new(tool);
+        command.args([
+            "install",
+            "--current-version",
+            env!("CARGO_PKG_VERSION"),
+            "--current-build",
+            &current_build,
+            "--wait-pid",
+            &process_id,
+            "--wait-start-time",
+            &process_start_time,
+        ]);
+        if restart_service {
+            command.arg("--restart-service");
+        }
+        match command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(_) => {
+            Ok(mut child) => {
+                let stdout = child.stdout.take().expect("piped installer stdout");
+                let stderr = child.stderr.take().expect("piped installer stderr");
                 if let Some(update) = self.editor.update_available.as_mut() {
                     update.installing = true;
                 }
-                cx.quit();
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            let ready = BufReader::new(stdout)
+                                .lines()
+                                .map_while(Result::ok)
+                                .any(|line| line == hh_updater::DOWNLOAD_COMPLETE_LINE);
+                            if ready {
+                                return Ok(());
+                            }
+                            let mut detail = String::new();
+                            let _ = BufReader::new(stderr).read_to_string(&mut detail);
+                            let _ = child.wait();
+                            Err(detail
+                                .lines()
+                                .rev()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or("update installer exited before downloading")
+                                .to_owned())
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| match result {
+                        Ok(()) => cx.quit(),
+                        Err(message) => {
+                            if let Some(update) = this.editor.update_available.as_mut() {
+                                update.installing = false;
+                            }
+                            this.session.connection_error =
+                                Some(format!("update installer failed: {message}"));
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
             }
             Err(error) => {
                 self.session.connection_error =

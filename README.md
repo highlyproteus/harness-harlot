@@ -56,13 +56,15 @@ hh version
 hh update --check
 ```
 
-On Linux, `hh update` verifies and stages updates, retains the previous
-application for rollback, and relaunches Harness Harlot after a successful
-replacement. Community macOS builds intentionally use a notify-only update
-policy: `hh update --check` reports a newer release, and rerunning the install
-command performs the verified manual replacement. End active terminal sessions
-before an update that changes the session-service protocol. Contributors can
-opt into the independently published main-branch feed with
+`hh update` verifies and stages updates, retains the previous application for
+rollback, and relaunches Harness Harlot after a successful replacement on Linux
+and packaged community macOS builds. The sidebar Update button keeps the app
+open while downloading and asks once before restarting an incompatible terminal
+service. Running local terminals then reopen as fresh shells in their last
+directories; their programs stop, and SSH tabs stay offline until reconnected.
+For the CLI, use `hh update --restart-service` to authorize that restart, or end
+active terminal sessions first. Compatible service updates preserve live shells.
+Contributors can opt into the independently published main-branch feed with
 `hh update --channel edge`.
 
 ### Linux desktop dependencies

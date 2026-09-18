@@ -2,6 +2,8 @@
 use std::ffi::OsStr;
 #[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub(super) fn install_prefix_for_executable(executable: &Path) -> Option<PathBuf> {
@@ -59,12 +61,17 @@ pub(super) fn relaunch_after_failed_desktop_update(arguments: &[String]) {
     else {
         return;
     };
-    if let Err(error) = super::wait_for_process_exit(process_id, process_start_time) {
-        eprintln!("could not wait to restore Harness Harlot after update failure: {error:#}");
+    let pid = sysinfo::Pid::from_u32(process_id);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]));
+    if super::processes::process_matches_start_time(&system, pid, process_start_time) {
+        // Before download readiness the desktop stays open and reports this error.
+        // Waiting for it here would delay that report and obscure the original failure.
         return;
     }
     if !app.join("Contents/MacOS/hh").is_file() {
-        eprintln!(
+        let _ = writeln!(
+            std::io::stderr(),
             "could not restore Harness Harlot after update failure: {} is not launchable",
             app.display()
         );
@@ -76,7 +83,10 @@ pub(super) fn relaunch_after_failed_desktop_update(arguments: &[String]) {
         relaunch_arguments(&app),
         "restore app after failed update",
     ) {
-        eprintln!("Harness Harlot update failed and the app could not be reopened: {error:#}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "Harness Harlot update failed and the app could not be reopened: {error:#}"
+        );
     }
 }
 

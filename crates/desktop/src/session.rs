@@ -217,7 +217,7 @@ impl HhApp {
         result: anyhow::Result<ServiceResponse>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let state_changed = match result {
+        let mut state_changed = match result {
             Ok(ServiceResponse::Updates {
                 session_revision,
                 snapshot,
@@ -301,6 +301,27 @@ impl HhApp {
             }
         }
         self.prune_assistant_sessions(&live_assistants, cx);
+        if self
+            .editor
+            .browser_url_editor
+            .as_ref()
+            .is_some_and(|editor| {
+                !self.session.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| &workspace.tabs)
+                        .any(|tab| {
+                            crate::helpers::find_pane(&tab.layout, editor.pane_id)
+                                .is_some_and(|pane| pane.kind.is_browser())
+                        })
+                })
+            })
+        {
+            self.editor.browser_url_editor = None;
+            self.editor.ime_preedit.clear();
+            state_changed = true;
+        }
         state_changed | self.sync_browser_callback_state(cx)
     }
 
@@ -309,6 +330,15 @@ impl HhApp {
         pane_id: Uuid,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self
+            .editor
+            .browser_url_editor
+            .as_ref()
+            .is_some_and(|editor| editor.pane_id != pane_id)
+        {
+            self.editor.browser_url_editor = None;
+            self.editor.ime_preedit.clear();
+        }
         let needs_activation = self.session.snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.workspaces.iter().any(|workspace| {
                 workspace
@@ -331,9 +361,11 @@ impl HhApp {
             self.ensure_visible_browser_views(cx);
             return changed || notifications_changed;
         }
-        if self.layout.focused_pane == Some(pane_id) {
+        let focus_changed = self.layout.focused_pane != Some(pane_id);
+        if !focus_changed {
             return notifications_changed;
         }
+        self.layout.focused_pane = Some(pane_id);
         self.dispatch_stream_with(
             ClientRequest::GetPaneSnapshot { pane_id },
             Box::new(move |this, cx, result| {
@@ -343,12 +375,11 @@ impl HhApp {
                         diagnostics,
                     }) => {
                         let delivered_at = Instant::now();
-                        let changed = this.layout.focused_pane != Some(pane_id)
-                            || this
-                                .session
-                                .screens
-                                .get(&pane_id)
-                                .is_none_or(|current| current.revision != screen.revision);
+                        let changed = this
+                            .session
+                            .screens
+                            .get(&pane_id)
+                            .is_none_or(|current| current.revision != screen.revision);
                         this.session.pane_states.insert(
                             pane_id,
                             PaneStreamState {
@@ -366,7 +397,6 @@ impl HhApp {
                             },
                         );
                         this.session.screens.insert(pane_id, screen);
-                        this.layout.focused_pane = Some(pane_id);
                         this.session.last_delivery.insert(pane_id, delivered_at);
                         this.session.stream_diagnostics = diagnostics;
                         this.session.connection_error = None;
@@ -379,7 +409,7 @@ impl HhApp {
                 }
             }),
         );
-        notifications_changed
+        focus_changed || notifications_changed
     }
     pub(crate) fn active_workspace_in<'a>(
         &self,

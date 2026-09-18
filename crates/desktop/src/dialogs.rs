@@ -3,8 +3,9 @@ use crate::elements::WorkspaceTextInputElement;
 use crate::view_models::{
     CloseConfirmation, CloseConfirmationKind, DialogAction, DialogSpec, DialogTone, DirEditor,
     DirEditorTarget, Modal, TabCloseConfirmation, TmuxSelectionChange, TmuxSessionPicker,
-    WorkspaceCreationDialog, WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
-    WorkspaceDeleteConfirmation, WorkspaceDisconnectConfirmation,
+    UpdateRestartConfirmation, WorkspaceCreationDialog, WorkspaceCreationField,
+    WorkspaceCreationKind, WorkspaceCreationStep, WorkspaceDeleteConfirmation,
+    WorkspaceDisconnectConfirmation,
 };
 use crate::{HhApp, THEME};
 use gpui::prelude::FluentBuilder;
@@ -113,6 +114,9 @@ impl HhApp {
                                             this.submit_dir_editor(cx);
                                         }
                                         DialogAction::CloseTab => this.confirm_tab_close(cx),
+                                        DialogAction::InstallUpdate => {
+                                            this.confirm_update_restart(cx)
+                                        }
                                     }))
                                     .child(confirm_label),
                             ),
@@ -627,6 +631,38 @@ impl HhApp {
                 confirm_tone: DialogTone::Accent,
                 confirm_id: "confirm-dir-editor",
                 action: DialogAction::ConfirmDirEditor,
+            },
+            cx,
+        )
+    }
+
+    pub(crate) fn render_update_restart_dialog(
+        &self,
+        confirmation: &UpdateRestartConfirmation,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let terminals = confirmation.live_terminals.map_or_else(
+            || "Running terminals will reopen as fresh shells in their last directories; programs running in them will be stopped. SSH tabs stay offline until reconnected.".to_owned(),
+            |count| format!("{count} running terminal{} will reopen as fresh shells in their last directories; programs running in them will be stopped. SSH tabs stay offline until reconnected.", if count == 1 { "" } else { "s" }),
+        );
+        let body = div()
+            .font_family(".SystemUIFont")
+            .text_sm()
+            .text_color(rgb(THEME.muted))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child("This update changes the terminal service protocol, so the service restarts while installing.")
+            .child(terminals)
+            .into_any_element();
+        self.confirm_dialog(
+            body,
+            DialogSpec {
+                title: format!("Update to {}", confirmation.version),
+                confirm_label: "Update and restart",
+                confirm_tone: DialogTone::Accent,
+                confirm_id: "confirm-update-restart",
+                action: DialogAction::InstallUpdate,
             },
             cx,
         )

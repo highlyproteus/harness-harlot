@@ -142,9 +142,8 @@ run_install() {
   artifact=$1
   manifest=$2
   install_home=${3:-"$work/home"}
-  HOME="$install_home" HH_SOCKET="$work/session.sock" \
-    HH_TEST_SERVICE_STOP_LOG="$work/service-stop.log" \
-    HH_LINUX_UPDATE_LAUNCH_LOG="$work/launched" "$tool" install \
+  restart_service=${4:-false}
+  set -- install \
     --fixture \
     --platform linux \
     --architecture "$architecture" \
@@ -157,6 +156,12 @@ run_install() {
     --manifest "$manifest" \
     --signature "$manifest.sig" \
     --artifact "$artifact"
+  if [ "$restart_service" = true ]; then
+    set -- "$@" --restart-service
+  fi
+  HOME="$install_home" HH_SOCKET="$work/session.sock" \
+    HH_TEST_SERVICE_STOP_LOG="$work/service-stop.log" \
+    HH_LINUX_UPDATE_LAUNCH_LOG="$work/launched" "$tool" "$@"
 }
 start_test_service() {
   rm -f "$work/session.sock"
@@ -190,7 +195,69 @@ start_test_service
 artifact=$(make_package good normal new)
 manifest="$work/good.json"
 make_manifest "$artifact" 0.2.0 1 "$manifest"
-run_install "$artifact" "$manifest"
+# The desktop keeps running until readiness, then closes its pipes and exits.
+# Exercise that handoff with an actual process, including the cached-PID exit case.
+HOME="$work/home" HH_SOCKET="$work/session.sock" HH_LINUX_UPDATE_LAUNCH_LOG="$work/launched" \
+python3 - "$tool" "$artifact" "$manifest" "$public_key" "$work" "$architecture" <<'PY'
+import datetime
+import os
+import select
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+tool, artifact, manifest, public_key, work, architecture = sys.argv[1:]
+desktop = subprocess.Popen(["sleep", "30"])
+installer = None
+try:
+    started = subprocess.check_output(
+        ["ps", "-p", str(desktop.pid), "-o", "lstart="],
+        text=True, env=dict(os.environ, LC_ALL="C"),
+    ).strip()
+    start_time = int(datetime.datetime.strptime(started, "%a %b %d %H:%M:%S %Y").timestamp())
+    command = [
+        tool, "install", "--fixture", "--platform", "linux", "--architecture", architecture,
+        "--current-version", "0.1.0", "--current-build", "0",
+        "--prefix", f"{work}/home/.local/lib", "--key-id", "test-only-v1",
+        "--public-key", public_key, "--host", "updates.example.invalid",
+        "--manifest", manifest, "--signature", manifest + ".sig", "--artifact", artifact,
+        "--wait-pid", str(desktop.pid), "--wait-start-time", str(start_time),
+    ]
+    # A download failure occurs while the original desktop is still alive.
+    # Put the tool in a bundle-shaped path to exercise macOS recovery handling.
+    bundled_tool = Path(work, "probe", "Harness Harlot.app", "Contents", "MacOS", "hh-update-tool")
+    bundled_tool.parent.mkdir(parents=True)
+    shutil.copy2(tool, bundled_tool)
+    original = Path(artifact).read_bytes()
+    try:
+        Path(artifact).write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        failed = subprocess.run(
+            [str(bundled_tool), *command[1:]], capture_output=True, timeout=5,
+        )
+        assert failed.returncode != 0 and b"SHA-256 mismatch" in failed.stderr
+        assert b"download-complete" not in failed.stdout
+        assert desktop.poll() is None, "download failure stopped the desktop"
+    finally:
+        Path(artifact).write_bytes(original)
+    installer = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert select.select([installer.stdout], [], [], 5)[0], "readiness was not published"
+    assert installer.stdout.readline() == b"download-complete\n"
+    time.sleep(0.2)
+    assert desktop.poll() is None and installer.poll() is None
+    assert not Path(work, "launched").exists(), "installed before the desktop exited"
+    installer.stdout.close()
+    installer.stderr.close()
+    desktop.terminate()
+    desktop.wait()
+    assert installer.wait(timeout=10) == 0, "installer failed after desktop exit"
+finally:
+    for process in (desktop, installer):
+        if process is not None and process.poll() is None:
+            process.terminate()
+            process.wait()
+PY
 for _ in 1 2 3 4 5; do
   [ -f "$work/launched" ] && break
   sleep 0.1
@@ -307,4 +374,96 @@ for _ in 1 2 3 4 5; do
 done
 [ "$(cat "$work/launched")" = restart ]
 
-echo "Linux updater fixture preserves compatible services, restarts incompatible services, installs atomically, and rejects rollback, archive, integrity, and ownership hazards"
+forced_artifact=$(make_package forced normal forced)
+forced_manifest="$work/forced.json"
+make_manifest "$forced_artifact" 0.5.0 6 "$forced_manifest" "$((current_protocol_version + 1))"
+
+cat >"$app/bin/hh-service" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod 0755 "$app/bin/hh-service"
+start_test_service
+if run_install "$forced_artifact" "$forced_manifest" "$work/home" true \
+  >"$work/forced-not-found.out" 2>&1; then
+  echo "Linux updater forced an unrelated process to stop" >&2
+  exit 1
+fi
+grep -q "could not find the running session service to restart" "$work/forced-not-found.out"
+kill -0 "$service_pid"
+kill "$service_pid"
+wait "$service_pid" 2>/dev/null || :
+service_pid=
+rm -f "$work/session.sock"
+
+rm -f "$work/service-stop.log"
+# Compile a real executable: copied Python launchers may exec a different binary
+# on macOS, which must not satisfy the updater's exact-executable identity check.
+cat >"$work/forced-service.c" <<'C'
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t stopping = 0;
+static void stop(int signal_number) {
+  (void)signal_number;
+  stopping = 1;
+}
+
+int main(int argc, char **argv) {
+  if (argc != 3) return 1;
+  struct sockaddr_un address = {0};
+  address.sun_family = AF_UNIX;
+  if (strlen(argv[1]) >= sizeof(address.sun_path)) return 2;
+  strcpy(address.sun_path, argv[1]);
+  struct sigaction action = {0};
+  action.sa_handler = stop;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGTERM, &action, NULL) < 0) return 3;
+  int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) < 0
+      || listen(listener, 16) < 0) return 4;
+  while (!stopping) {
+    int client = accept(listener, NULL, NULL);
+    if (client >= 0) close(client);
+    else if (errno != EINTR) return 5;
+  }
+  close(listener);
+  FILE *log = fopen(argv[2], "w");
+  if (!log) return 6;
+  fputs("SIGTERM\n", log);
+  fclose(log);
+  return unlink(argv[1]) == 0 ? 0 : 7;
+}
+C
+${CC:-cc} "$work/forced-service.c" -o "$app/bin/hh-service"
+"$app/bin/hh-service" "$work/session.sock" "$work/service-stop.log" \
+  >"$work/forced-service.out" 2>&1 &
+service_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -S "$work/session.sock" ] && break
+  sleep 0.1
+done
+[ -S "$work/session.sock" ]
+
+
+if run_install "$forced_artifact" "$forced_manifest" >"$work/forced-refused.out" 2>&1; then
+  echo "Linux updater restarted a live service without --restart-service" >&2
+  exit 1
+fi
+grep -q "re-run with --restart-service" "$work/forced-refused.out"
+kill -0 "$service_pid"
+[ -S "$work/session.sock" ]
+
+run_install "$forced_artifact" "$forced_manifest" "$work/home" true >"$work/forced.out"
+[ "$(grep -c '^download-complete$' "$work/forced.out")" -eq 1 ]
+wait "$service_pid"
+service_pid=
+[ "$(cat "$work/service-stop.log")" = SIGTERM ]
+[ ! -S "$work/session.sock" ]
+
+echo "Linux updater fixture preserves compatible services, gracefully forces incompatible service restarts, installs atomically, and rejects rollback, archive, integrity, and ownership hazards"

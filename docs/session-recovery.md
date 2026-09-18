@@ -7,6 +7,13 @@ Harness Harlot keeps two intentionally different kinds of state:
 
 A service restart cannot preserve arbitrary live processes. Harness Harlot instead validates the desired-state snapshot, starts a fresh configured shell for each recoverable local pane at the last valid local CWD (falling back to the user's home directory), preserves the safe layout metadata, and labels the pane `recovered with a fresh shell`. This is recovery, not seamless process continuation.
 
+Protocol-changing in-app updates explain this boundary and request confirmation
+before stopping live terminals. The updater downloads and verifies the package
+before the desktop quits, then uses `--restart-service` to request shutdown and,
+if necessary, SIGTERM the managed service so it can persist. Compatible updates
+leave the service and live shells running; no wire-protocol change is introduced
+by this handoff.
+
 Natural child exits remain in the layout with their final terminal grid and an `exited` label. Explicit pane close is different: the service marks the pane as terminating, requests termination when needed, waits until exit is observed, and only then removes the runtime pane and collapses its layout branch. A client disconnect performs neither transition.
 
 ## Storage safety

@@ -79,23 +79,32 @@ A packaged production build checks the architecture-specific signed manifest sho
 
 Clicking the button performs this sequence:
 
-1. If the signed manifest changes the session-service protocol, refuse the
-   update while any local, SSH, or tmux terminal remains live.
-2. Launch the bundled updater and close the desktop process.
+1. If the signed manifest changes the session-service protocol and terminals
+   are live (or their count is unavailable), ask once to confirm a service restart.
+2. Launch the bundled updater while keeping the desktop open with a
+   **Downloading…** banner.
 3. Fetch `manifest-linux-ARCH-v2.update.json` and its detached Ed25519 signature from GitHub Releases.
-4. Verify the compiled release key, stable channel, expiry, platform, architecture, glibc floor, immutable HTTPS host, artifact name, exact byte count, and SHA-256.
-5. Reject archive traversal, links, special files, duplicate files, unexpected files, unsafe ownership, and unsafe permissions.
-6. For a protocol change only, ask the quiescent session service to persist and
-   exit. Routine app-only updates leave the compatible service and its PTYs
-   running.
-7. Stage the new application on the destination filesystem, retain the current application as `harness-harlot.previous`, atomically replace the application and integration links, and relaunch the desktop.
-8. Restore the prior application if replacement or relaunch fails.
+4. Verify the compiled release key, stable channel, expiry, platform, architecture, glibc floor, immutable HTTPS host, artifact name, exact byte count, and SHA-256. A failure leaves the desktop open and displays the installer error.
+5. Emit `download-complete`, quit the desktop, and wait for its process to exit.
+6. Reject archive traversal, links, special files, duplicate files, unexpected files, unsafe ownership, and unsafe permissions.
+7. For a protocol change, request a quiescent service shutdown. If refused and
+   the user confirmed `--restart-service`, send SIGTERM to the exact managed
+   service executable and wait for persistence and shutdown; never send SIGKILL.
+   Compatible updates leave the service and its PTYs running.
+8. Stage the new application on the destination filesystem, retain the current application as `harness-harlot.previous`, atomically replace the application and integration links, and relaunch the desktop.
+9. Restore the prior application if replacement or relaunch fails.
 
 The equivalent command-line entry point is:
 
 ```bash
 ~/.local/lib/harness-harlot/bin/hh-update-tool install
 ```
+
+Add `--restart-service` (also supported by `hh update`) to authorize stopping
+live terminals for a protocol change; otherwise the CLI requires quiescence.
+Local tabs reopen as fresh shells in their last directories and running programs
+stop. SSH tabs remain offline until explicitly reconnected. Existing older
+updater binaries still use their old gate until replaced.
 
 The release manifest and archive are signed with the same offline Ed25519 update key used by the macOS channel. Linux package trust does not depend on Apple credentials. Repository/package signing can be added later for `.deb`, `.rpm`, or AppImage distribution without changing this signed update-feed contract.
 

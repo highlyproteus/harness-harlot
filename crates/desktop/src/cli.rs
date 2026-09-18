@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UpdateOptions {
     pub(crate) check_only: bool,
+    pub(crate) restart_service: bool,
     pub(crate) channel: hh_updater::UpdateChannel,
 }
 
@@ -34,32 +35,55 @@ where
         [argument] if argument == "version" || argument == "--version" => Ok(CliAction::Version),
         [argument] if argument == "doctor" => Ok(CliAction::Doctor),
         [argument] if argument == "install-cli" => Ok(CliAction::InstallCli),
-        [argument] if argument == "update" => Ok(CliAction::Update(UpdateOptions {
-            check_only: false,
-            channel: hh_updater::UpdateChannel::Stable,
-        })),
-        [command, flag] if command == "update" && flag == "--check" => {
-            Ok(CliAction::Update(UpdateOptions {
-                check_only: true,
-                channel: hh_updater::UpdateChannel::Stable,
-            }))
-        }
-        [command, flag, channel] if command == "update" && flag == "--channel" => {
-            Ok(CliAction::Update(UpdateOptions {
-                check_only: false,
-                channel: parse_channel(channel)?,
-            }))
-        }
-        [command, check, flag, channel]
-            if command == "update" && check == "--check" && flag == "--channel" =>
-        {
-            Ok(CliAction::Update(UpdateOptions {
-                check_only: true,
-                channel: parse_channel(channel)?,
-            }))
+        [command, arguments @ ..] if command == "update" => {
+            parse_update_options(arguments).map(CliAction::Update)
         }
         _ => bail!("unknown Harness Harlot command or arguments"),
     }
+}
+
+fn parse_update_options(arguments: &[String]) -> Result<UpdateOptions> {
+    let mut check_only = false;
+    let mut restart_service = false;
+    let mut channel = hh_updater::UpdateChannel::Stable;
+    let mut channel_set = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--check" => {
+                ensure!(!check_only, "--check may be specified only once");
+                check_only = true;
+            }
+            "--restart-service" => {
+                ensure!(
+                    !restart_service,
+                    "--restart-service may be specified only once"
+                );
+                restart_service = true;
+            }
+            "--channel" => {
+                ensure!(!channel_set, "--channel may be specified only once");
+                index += 1;
+                channel = parse_channel(
+                    arguments
+                        .get(index)
+                        .context("missing value for --channel")?,
+                )?;
+                channel_set = true;
+            }
+            _ => bail!("unknown Harness Harlot command or arguments"),
+        }
+        index += 1;
+    }
+    ensure!(
+        !(check_only && restart_service),
+        "--restart-service cannot be used with --check"
+    );
+    Ok(UpdateOptions {
+        check_only,
+        restart_service,
+        channel,
+    })
 }
 
 fn parse_channel(channel: &str) -> Result<hh_updater::UpdateChannel> {
@@ -71,7 +95,7 @@ fn parse_channel(channel: &str) -> Result<hh_updater::UpdateChannel> {
 }
 
 fn updater_arguments(options: &UpdateOptions, version: &str, build: u64) -> Vec<String> {
-    vec![
+    let mut arguments = vec![
         if options.check_only {
             "check"
         } else {
@@ -84,7 +108,11 @@ fn updater_arguments(options: &UpdateOptions, version: &str, build: u64) -> Vec<
         build.to_string(),
         "--channel".to_owned(),
         options.channel.as_str().to_owned(),
-    ]
+    ];
+    if options.restart_service {
+        arguments.push("--restart-service".to_owned());
+    }
+    arguments
 }
 
 fn bundled_executable(name: &str) -> Result<PathBuf> {
@@ -215,6 +243,7 @@ mod tests {
             CliAction::Update(UpdateOptions {
                 check_only: false,
                 channel: hh_updater::UpdateChannel::Stable,
+                restart_service: false,
             })
         );
         assert_eq!(
@@ -222,6 +251,7 @@ mod tests {
             CliAction::Update(UpdateOptions {
                 check_only: true,
                 channel: hh_updater::UpdateChannel::Stable,
+                restart_service: false,
             })
         );
         assert_eq!(
@@ -229,6 +259,15 @@ mod tests {
             CliAction::Update(UpdateOptions {
                 check_only: false,
                 channel: hh_updater::UpdateChannel::Edge,
+                restart_service: false,
+            })
+        );
+        assert_eq!(
+            parse_cli_action(["update", "--restart-service", "--channel", "edge"]).unwrap(),
+            CliAction::Update(UpdateOptions {
+                check_only: false,
+                channel: hh_updater::UpdateChannel::Edge,
+                restart_service: true,
             })
         );
     }
@@ -249,6 +288,7 @@ mod tests {
         assert!(parse_cli_action(["unknown"]).is_err());
         assert!(parse_cli_action(["version", "extra"]).is_err());
         assert!(parse_cli_action(["update", "--unknown"]).is_err());
+        assert!(parse_cli_action(["update", "--check", "--restart-service"]).is_err());
     }
 
     #[test]
@@ -258,6 +298,7 @@ mod tests {
                 &UpdateOptions {
                     check_only: false,
                     channel: hh_updater::UpdateChannel::Stable,
+                    restart_service: true,
                 },
                 "1.2.3",
                 42,
@@ -269,7 +310,8 @@ mod tests {
                 "--current-build",
                 "42",
                 "--channel",
-                "stable"
+                "stable",
+                "--restart-service"
             ]
         );
         assert_eq!(
@@ -277,6 +319,7 @@ mod tests {
                 &UpdateOptions {
                     check_only: true,
                     channel: hh_updater::UpdateChannel::Edge,
+                    restart_service: false,
                 },
                 "1.2.3",
                 42,

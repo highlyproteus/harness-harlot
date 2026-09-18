@@ -189,6 +189,7 @@ pub(super) struct WorkspaceMenu {
     pub(super) workspace_id: Uuid,
     pub(super) position: Point<Pixels>,
     pub(super) icon_picker_open: bool,
+    pub(super) customize_open: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -359,6 +360,12 @@ pub(super) struct WorkspaceDeleteConfirmation {
     pub(super) workspace_id: Uuid,
     pub(super) title: String,
     pub(super) active_terminal_count: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct UpdateRestartConfirmation {
+    pub(super) version: String,
+    pub(super) live_terminals: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -1013,6 +1020,7 @@ pub(super) enum DialogAction {
     RenameWorkspace,
     RenameTab,
     DeleteWorkspace,
+    InstallUpdate,
     DisconnectWorkspace,
     ClosePane,
     ConfirmDirEditor,
@@ -1038,6 +1046,7 @@ pub(super) enum Modal {
     GroupRename(GroupRenameEditor),
     Search(SearchEditor),
     WorkspaceDelete(WorkspaceDeleteConfirmation),
+    UpdateRestart(UpdateRestartConfirmation),
     TmuxPicker(TmuxSessionPicker),
     WorkspaceDisconnect(WorkspaceDisconnectConfirmation),
     Close(CloseConfirmation),

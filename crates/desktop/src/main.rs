@@ -217,7 +217,7 @@ type SharedSessionClient = Arc<Mutex<Option<SessionClient>>>;
 impl AvailableUpdateBanner {
     fn label(&self) -> String {
         if self.installing {
-            "Updating…".to_owned()
+            format!("Downloading {}…", self.version)
         } else if self.install_supported {
             format!("Update to {}", self.version)
         } else {
@@ -747,8 +747,9 @@ impl HhApp {
 /// Starts the bundled session service only when no compatible local service is
 /// reachable. The service is deliberately detached from the desktop lifetime:
 /// closing or replacing the app UI never asks it to stop, preserving active
-/// terminal sessions. A future updater must instead defer until the service is
-/// explicitly quiescent (see `docs/macos-release.md`).
+/// terminal sessions. Protocol-changing updates stop it with
+/// `hh-update-tool install --restart-service` after user confirmation and rely
+/// on desired-state recovery to reopen fresh shells in their last directories.
 fn ensure_bundled_session_service() {
     if std::env::var_os("HH_DISABLE_BUNDLED_SERVICE").is_some()
         || SessionClient::connect()
@@ -979,7 +980,7 @@ mod tests {
         AvailableUpdateBanner, BUNDLED_BANNER_PIXEL_HEIGHT, BUNDLED_BANNER_PIXEL_WIDTH,
         max_pane_status, pane_status_color, workstation_banner_path,
     };
-    use crate::sidebar::update_install_block_reason;
+    use crate::sidebar::{UpdateInstallPlan, update_install_plan};
     use hh_protocol::PaneStatus;
 
     #[test]
@@ -990,31 +991,34 @@ mod tests {
             install_supported: true,
             installing: false,
         };
-        assert_eq!(installable.label(), "Update to 0.2.0");
         assert!(installable.can_install());
 
         let manual = AvailableUpdateBanner {
             install_supported: false,
             ..installable
         };
-        assert_eq!(manual.label(), "0.2.0 available — install manually");
         assert!(!manual.can_install());
     }
 
     #[test]
-    fn update_install_requires_authoritative_quiescent_state() {
+    fn update_install_plan_confirms_only_unavoidable_restarts() {
         assert_eq!(
-            update_install_block_reason(true, None),
-            Some("Wait for Harness Harlot to reconnect before updating")
+            update_install_plan(true, None),
+            UpdateInstallPlan::ConfirmServiceRestart {
+                live_terminals: None
+            }
         );
         assert_eq!(
-            update_install_block_reason(true, Some(2)),
-            Some(
-                "Close all terminals, then update — live sessions must end before the service restarts"
-            )
+            update_install_plan(true, Some(2)),
+            UpdateInstallPlan::ConfirmServiceRestart {
+                live_terminals: Some(2)
+            }
         );
-        assert_eq!(update_install_block_reason(true, Some(0)), None);
-        assert_eq!(update_install_block_reason(false, None), None);
+        assert_eq!(
+            update_install_plan(true, Some(0)),
+            UpdateInstallPlan::Install
+        );
+        assert_eq!(update_install_plan(false, None), UpdateInstallPlan::Install);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::commands::{AppCommand, ROOT_KEY_CONTEXT};
 use crate::elements::{
     SidebarResizeCaptureElement, TerminalInputElement, TerminalSelectionCaptureElement,
 };
+use crate::input::browser_url_editor_is_active;
 use crate::view_models::{ColorTarget, DialogAction, Modal};
 use crate::{
     ConsumeChordPrefix, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp, NewBrowserTab,
@@ -29,8 +30,13 @@ impl Render for HhApp {
         // terminal behind the dialog.
         if let Some(dialog) = self.editor.modal.workspace_creation() {
             self.editor.workspace_input_focus[dialog.field.index()].focus(window);
-        } else if self.editor.browser_url_editor.is_some()
-            || self.editor.modal.pane_rename().is_some()
+        } else if browser_url_editor_is_active(
+            self.editor
+                .browser_url_editor
+                .as_ref()
+                .map(|editor| editor.pane_id),
+            self.layout.focused_pane,
+        ) || self.editor.modal.pane_rename().is_some()
             || self.editor.modal.workspace_rename().is_some()
             || self.editor.modal.group_rename().is_some()
             || self.editor.modal.dir_editor().is_some()
@@ -39,6 +45,7 @@ impl Render for HhApp {
             // views cannot consume replacement typing.
             self.focus_handle.focus(window);
         }
+        let menu_max_height = window.viewport_size().height - px(16.0);
         let modal_element = match &self.editor.modal {
             Modal::None | Modal::AppearanceSettings | Modal::Search(_) => None,
             Modal::CommandPalette(palette) => Some(self.render_command_palette(palette, cx)),
@@ -46,8 +53,8 @@ impl Render for HhApp {
                 Some(self.render_workspace_creation_dialog(dialog, cx))
             }
             Modal::WorkspaceRename(editor) => Some(self.render_rename_dialog(
-                None,
-                editor.value.clone(),
+                Some(("workspace-rename-input", editor.replace_on_type)),
+                format!("{}{}", editor.value, self.editor.ime_preedit),
                 "Rename workstation",
                 "save-workspace-rename",
                 DialogAction::RenameWorkspace,
@@ -73,16 +80,21 @@ impl Render for HhApp {
             Modal::WorkspaceDelete(confirmation) => {
                 Some(self.render_workspace_delete_dialog(confirmation, cx))
             }
+            Modal::UpdateRestart(confirmation) => {
+                Some(self.render_update_restart_dialog(confirmation, cx))
+            }
             Modal::TmuxPicker(picker) => Some(self.render_tmux_session_picker(picker, cx)),
             Modal::WorkspaceDisconnect(confirmation) => {
                 Some(self.render_workspace_disconnect_dialog(confirmation, cx))
             }
             Modal::Close(confirmation) => Some(self.render_close_dialog(confirmation, cx)),
             Modal::TabClose(confirmation) => Some(self.render_tab_close_dialog(confirmation, cx)),
-            Modal::TabMenu(menu) => Some(self.render_tab_menu(*menu, cx)),
-            Modal::WorkspaceMenu(menu) => Some(self.render_workspace_menu(*menu, cx)),
+            Modal::TabMenu(menu) => Some(self.render_tab_menu(*menu, menu_max_height, cx)),
+            Modal::WorkspaceMenu(menu) => {
+                Some(self.render_workspace_menu(*menu, menu_max_height, cx))
+            }
             Modal::CreateMenu(menu) => Some(self.render_create_menu(*menu, cx)),
-            Modal::GroupMenu(menu) => Some(self.render_group_menu(*menu, cx)),
+            Modal::GroupMenu(menu) => Some(self.render_group_menu(*menu, menu_max_height, cx)),
             Modal::WorkspaceConnectionInfo(info) => {
                 Some(self.render_workspace_connection_info(info, cx))
             }

@@ -1,15 +1,16 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
+#[cfg(all(target_os = "macos", feature = "community-macos"))]
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Output;
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -30,11 +31,11 @@ use hh_updater::{
     ReleaseArtifact, public_key_from_base64, select_verified_update,
     verify_manifest_with_key_for_channel,
 };
-use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(feature = "fixture")]
 use time::OffsetDateTime;
 
 mod macos_install;
+mod processes;
 use macos_install::install_prefix_for_executable as macos_install_prefix_for_executable;
 #[cfg(target_os = "macos")]
 use macos_install::{
@@ -43,6 +44,9 @@ use macos_install::{
 };
 #[cfg(all(test, target_os = "macos"))]
 use macos_install::{desktop_update_handoff_identity, desktop_update_relaunch_target};
+use processes::{
+    ServiceRestart, ensure_no_running_desktop_process, stop_managed_service, wait_for_process_exit,
+};
 
 #[cfg(target_os = "macos")]
 const BUNDLE_ID: &str = "com.harnessharlot.desktop";
@@ -62,18 +66,19 @@ const LINUX_BACKUP_NAME: &str = "harness-harlot.previous";
 const LINUX_ARCHIVE_ROOT: &str = "Harness-Harlot";
 const MAX_LINUX_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 const LINUX_INSTALL_MARKER: &str = "com.harnessharlot.desktop\n";
+
 #[cfg(feature = "fixture")]
 type FixtureUpdate = (Option<OwnedUpdate>, Option<(PathBuf, ReleaseArtifact)>);
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  hh-update-tool verify-trusted --manifest FILE --signature FILE [--artifact FILE] [--channel stable|edge]\n  hh-update-tool check [--current-version VERSION] [--current-build BUILD] [--channel stable|edge]\n  hh-update-tool install [--current-version VERSION] [--current-build BUILD] [--channel stable|edge] [--wait-pid PID --wait-start-time UNIX_SECONDS] [--prefix DIR]\n  hh-update-tool install-local --source DIR [--prefix DIR]"
+        "usage:\n  hh-update-tool verify-trusted --manifest FILE --signature FILE [--artifact FILE] [--channel stable|edge]\n  hh-update-tool check [--current-version VERSION] [--current-build BUILD] [--channel stable|edge]\n  hh-update-tool install [--current-version VERSION] [--current-build BUILD] [--channel stable|edge] [--restart-service] [--wait-pid PID --wait-start-time UNIX_SECONDS] [--prefix DIR]\n  hh-update-tool install-local --source DIR [--prefix DIR] [--restart-service]"
     );
     #[cfg(feature = "community-macos")]
     eprintln!("community macOS:\n  hh-update-tool prepare-community-install");
     #[cfg(feature = "fixture")]
     eprintln!(
-        "fixture-only:\n  hh-update-tool verify --key-id ID --public-key BASE64 --host HOST --manifest FILE --signature FILE [--artifact FILE] --fixture\n  hh-update-tool install --fixture --key-id ID --public-key BASE64 --host HOST --manifest FILE --signature FILE --artifact FILE [--platform macos|linux] [--architecture arm64|x86_64] [--team-id TEAM] [--current-version VERSION] [--current-build BUILD] [--wait-pid PID --wait-start-time UNIX_SECONDS] [--prefix DIR]"
+        "fixture-only:\n  hh-update-tool verify --key-id ID --public-key BASE64 --host HOST --manifest FILE --signature FILE [--artifact FILE] --fixture\n  hh-update-tool install --fixture --key-id ID --public-key BASE64 --host HOST --manifest FILE --signature FILE --artifact FILE [--platform macos|linux] [--architecture arm64|x86_64] [--team-id TEAM] [--current-version VERSION] [--current-build BUILD] [--restart-service] [--wait-pid PID --wait-start-time UNIX_SECONDS] [--prefix DIR]"
     );
     std::process::exit(2);
 }
@@ -328,6 +333,16 @@ fn run_install(arguments: &[String]) -> Result<()> {
         return Ok(());
     };
     let requires_service_restart = update.requires_service_restart;
+    let force_restart = arguments
+        .iter()
+        .any(|argument| argument == "--restart-service");
+    let restart = if !requires_service_restart {
+        ServiceRestart::Keep
+    } else if force_restart {
+        ServiceRestart::Forced
+    } else {
+        ServiceRestart::WhenQuiescent
+    };
 
     let home = env::var_os("HOME")
         .map(PathBuf::from)
@@ -373,6 +388,8 @@ fn run_install(arguments: &[String]) -> Result<()> {
     } else {
         download_verified(&update, &work.path)?
     };
+    println!("{}", hh_updater::DOWNLOAD_COMPLETE_LINE);
+    std::io::stdout().flush()?;
     match (
         optional_string_option(arguments, "--wait-pid")?,
         optional_string_option(arguments, "--wait-start-time")?,
@@ -412,14 +429,7 @@ fn run_install(arguments: &[String]) -> Result<()> {
                     );
                     MacAppTrust::DeveloperId(team_id)
                 };
-                install_dmg(
-                    &package,
-                    &prefix,
-                    &home,
-                    &trust,
-                    requires_service_restart,
-                    fixture,
-                )
+                install_dmg(&package, &prefix, &home, &trust, restart, fixture)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -427,7 +437,7 @@ fn run_install(arguments: &[String]) -> Result<()> {
             }
         }
 
-        "linux" => install_linux_archive(&package, &prefix, &home, requires_service_restart),
+        "linux" => install_linux_archive(&package, &prefix, &home, restart),
         _ => bail!("unsupported install platform {platform}"),
     }
 }
@@ -443,7 +453,7 @@ fn run_prepare_community_install(arguments: &[String]) -> Result<()> {
         .context("community updater has no parent directory")?
         .join("hh-service");
     if service.is_file() {
-        return stop_managed_service(&service);
+        return stop_managed_service(&service, ServiceRestart::WhenQuiescent);
     }
     let socket = hh_protocol::socket_path()?;
     ensure!(
@@ -451,64 +461,6 @@ fn run_prepare_community_install(arguments: &[String]) -> Result<()> {
         "a session service is running outside the managed community app; close every terminal and stop it before installing"
     );
     Ok(())
-}
-
-fn wait_for_process_exit(process_id: u32, start_time: u64) -> Result<()> {
-    ensure!(
-        process_id != std::process::id(),
-        "installer cannot wait for itself"
-    );
-    let pid = Pid::from_u32(process_id);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut system = System::new();
-    loop {
-        system.refresh_processes(ProcessesToUpdate::Some(&[pid]));
-        if !process_matches_start_time(&system, pid, start_time) {
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "desktop process {process_id} did not exit before update"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn command_line_is_desktop(command: &[&str]) -> bool {
-    command.len() == 1
-        || command.get(1..).is_some_and(|arguments| {
-            arguments
-                .iter()
-                .all(|argument| argument.starts_with("-psn_"))
-        })
-}
-
-fn ensure_no_running_desktop_process() -> Result<()> {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All);
-    let running = system.processes().values().any(|process| {
-        if process.name().to_string_lossy() != "hh" {
-            return false;
-        }
-        let command = process
-            .cmd()
-            .iter()
-            .map(|argument| argument.to_string_lossy())
-            .collect::<Vec<_>>();
-        let command = command.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        command_line_is_desktop(&command)
-    });
-    ensure!(
-        !running,
-        "quit Harness Harlot before updating; the app will restart after installation"
-    );
-    Ok(())
-}
-
-fn process_matches_start_time(system: &System, pid: Pid, start_time: u64) -> bool {
-    system
-        .process(pid)
-        .is_some_and(|process| process.start_time() == start_time)
 }
 
 fn run_install_local(arguments: &[String]) -> Result<()> {
@@ -520,6 +472,9 @@ fn run_install_local(arguments: &[String]) -> Result<()> {
         rustix::process::geteuid().as_raw() != 0,
         "refusing to install as root"
     );
+    let force_restart = arguments
+        .iter()
+        .any(|argument| argument == "--restart-service");
     let source = option(arguments, "--source")?;
     validate_linux_install(&source)?;
     let home = env::var_os("HOME")
@@ -544,7 +499,16 @@ fn run_install_local(arguments: &[String]) -> Result<()> {
         .context("stage local Linux installation")?;
     let encoder = archive.into_inner().context("finish local Linux archive")?;
     encoder.finish().context("finish local Linux compression")?;
-    install_linux_archive(&archive_path, &prefix, &home, true)
+    install_linux_archive(
+        &archive_path,
+        &prefix,
+        &home,
+        if force_restart {
+            ServiceRestart::Forced
+        } else {
+            ServiceRestart::WhenQuiescent
+        },
+    )
 }
 
 #[cfg(feature = "fixture")]
@@ -590,7 +554,7 @@ fn install_linux_archive(
     package: &Path,
     prefix: &Path,
     home: &Path,
-    restart_service: bool,
+    restart: ServiceRestart,
 ) -> Result<()> {
     fs::create_dir_all(prefix)
         .with_context(|| format!("create install prefix {}", prefix.display()))?;
@@ -644,8 +608,8 @@ fn install_linux_archive(
     extract_linux_archive(package, &extraction.path)?;
     let extracted = extraction.path.join(LINUX_ARCHIVE_ROOT);
     validate_linux_install(&extracted)?;
-    if current_installed && restart_service {
-        stop_managed_service(&app.join("bin/hh-service"))?;
+    if current_installed {
+        stop_managed_service(&app.join("bin/hh-service"), restart)?;
     }
     let mut old_moved = false;
     let mut new_installed = false;
@@ -691,6 +655,8 @@ fn install_linux_archive(
             );
         }
         let mut desktop = Command::new(app.join("bin/hh"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .context("launch updated Harness Harlot")?;
         thread::sleep(Duration::from_millis(250));
@@ -725,7 +691,10 @@ fn install_linux_archive(
             ));
         }
         if old_moved {
-            let _ = Command::new(app.join("bin/hh")).spawn();
+            let _ = Command::new(app.join("bin/hh"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
         }
         let rollback = if old_moved {
             "previous application restored"
@@ -734,7 +703,7 @@ fn install_linux_archive(
         };
         return Err(error).context(format!("install Linux update; {rollback}"));
     }
-    println!("updated Harness Harlot");
+    let _ = writeln!(std::io::stdout(), "updated Harness Harlot");
     Ok(())
 }
 
@@ -1021,7 +990,10 @@ fn warn_missing_linux_cef_dependencies(app: &Path) {
     let output = match Command::new("ldd").arg(&libcef).output() {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("warning: could not inspect CEF runtime dependencies with ldd: {error}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "warning: could not inspect CEF runtime dependencies with ldd: {error}"
+            );
             return;
         }
     };
@@ -1035,11 +1007,13 @@ fn warn_missing_linux_cef_dependencies(app: &Path) {
     if missing.is_empty() {
         return;
     }
-    eprintln!("warning: CEF runtime dependencies are missing:");
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "warning: CEF runtime dependencies are missing:");
     for dependency in missing {
-        eprintln!("  {dependency}");
+        let _ = writeln!(stderr, "  {dependency}");
     }
-    eprintln!(
+    let _ = writeln!(
+        stderr,
         "install the distribution's GTK3/NSS/ALSA/GBM packages (Ubuntu 22.04: libgtk-3-0 libnss3 libasound2 libgbm1; Ubuntu 24.04+: libgtk-3-0t64 libnss3 libasound2t64 libgbm1; Fedora: gtk3 nss alsa-lib mesa-libgbm; Arch: gtk3 nss alsa-lib mesa)"
     );
 }
@@ -1069,7 +1043,7 @@ fn install_dmg(
     prefix: &Path,
     home: &Path,
     trust: &MacAppTrust,
-    restart_service: bool,
+    restart: ServiceRestart,
     fixture: bool,
 ) -> Result<()> {
     fs::create_dir_all(prefix)
@@ -1098,9 +1072,7 @@ fn install_dmg(
     validate_managed_link(&link, &app)?;
     if path_exists(&app)? {
         validate_managed_app(&app, trust)?;
-        if restart_service {
-            stop_managed_service(&app.join("Contents/MacOS/hh-service"))?;
-        }
+        stop_managed_service(&app.join("Contents/MacOS/hh-service"), restart)?;
     }
     if path_exists(&backup)? {
         validate_managed_app(&backup, trust)?;
@@ -1201,13 +1173,16 @@ fn install_dmg(
             )),
         };
     }
-    println!("installed {}", app.display());
+    let _ = writeln!(std::io::stdout(), "installed {}", app.display());
     if let Err(error) = run_status(
         macos_relaunch_program(fixture),
         macos_relaunch_arguments(&app),
         "launch updated app",
     ) {
-        eprintln!("update installed, but Harness Harlot could not be relaunched: {error:#}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "update installed, but Harness Harlot could not be relaunched: {error:#}"
+        );
     }
     Ok(())
 }
@@ -1314,30 +1289,6 @@ fn validate_managed_link(link: &Path, app: &Path) -> Result<()> {
         "refusing to overwrite command symlink not owned by this install: {}",
         link.display()
     );
-    Ok(())
-}
-
-fn stop_managed_service(service: &Path) -> Result<()> {
-    let socket = hh_protocol::socket_path()?;
-    if StdUnixStream::connect(&socket).is_err() {
-        return Ok(());
-    }
-    let status = Command::new(service)
-        .arg("--shutdown")
-        .status()
-        .with_context(|| format!("request shutdown through {}", service.display()))?;
-    ensure!(
-        status.success(),
-        "session service refused to shut down; close every terminal before updating"
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while StdUnixStream::connect(&socket).is_ok() {
-        ensure!(
-            Instant::now() < deadline,
-            "session service did not stop before update"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
     Ok(())
 }
 
@@ -1535,7 +1486,7 @@ fn main() -> ExitCode {
     match run(&arguments) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("hh-update-tool: {error:#}");
+            let _ = writeln!(std::io::stderr(), "hh-update-tool: {error:#}");
             #[cfg(target_os = "macos")]
             relaunch_after_failed_desktop_update(&arguments);
             ExitCode::FAILURE

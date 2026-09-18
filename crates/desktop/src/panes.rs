@@ -18,6 +18,7 @@ use crate::helpers::{
     terminal_point_clamped, terminal_pointer_action, terminal_url_open_target, url_at_column,
     visible_panes, wheel_delta_lines, workspace_tab_set,
 };
+use crate::input::browser_url_editor_is_active;
 use crate::typography::{TerminalCellMetrics, adjusted_terminal_zoom_level};
 use crate::view_models::{
     ArchivedView, AssistantComposer, CloseConfirmation, GroupRenameEditor, LayoutControlMutation,
@@ -671,7 +672,13 @@ impl HhApp {
                 .is_some_and(|pane| pane.kind.is_terminal())
             && self.session.screens.contains_key(&pane_id)
             && matches!(self.editor.modal, Modal::None)
-            && self.editor.browser_url_editor.is_none()
+            && !browser_url_editor_is_active(
+                self.editor
+                    .browser_url_editor
+                    .as_ref()
+                    .map(|editor| editor.pane_id),
+                self.layout.focused_pane,
+            )
         {
             self.paste_image_to_terminal(pane_id, image, cx);
             return;
@@ -686,8 +693,7 @@ impl HhApp {
         if self.paste_voice_setting(&text, cx) {
             return;
         }
-        if self.editor.browser_url_editor.is_some() {
-            self.append_browser_url_text(&text);
+        if self.append_browser_url_text(&text) {
             cx.notify();
             return;
         }
@@ -854,7 +860,7 @@ impl HhApp {
         if text.is_empty() || text.chars().any(|character| character == '\0') {
             return;
         }
-        if let Some(picker) = self.editor.color_picker.as_mut() {
+        if let Some(picker) = self.active_color_picker_mut() {
             if picker.replace_on_type {
                 picker.hex.clear();
             }

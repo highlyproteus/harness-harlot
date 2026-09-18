@@ -1,4 +1,6 @@
+use super::processes::{command_line_is_desktop, process_matches_start_time};
 use super::*;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 #[test]
 fn production_network_updates_require_packaged_build_metadata() {

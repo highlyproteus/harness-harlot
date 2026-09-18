@@ -23,6 +23,13 @@ pub(crate) fn assistant_composer_is_active(
     composer_pane.is_some() && composer_pane == focused_pane
 }
 
+pub(crate) fn browser_url_editor_is_active(
+    editor_pane: Option<Uuid>,
+    focused_pane: Option<Uuid>,
+) -> bool {
+    editor_pane.is_some() && editor_pane == focused_pane
+}
+
 pub(crate) fn browser_key_text(
     key: &str,
     key_char: Option<&str>,
@@ -395,7 +402,13 @@ impl HhApp {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) -> BrowserKeyRoute {
-        if self.editor.browser_url_editor.is_none() {
+        if !browser_url_editor_is_active(
+            self.editor
+                .browser_url_editor
+                .as_ref()
+                .map(|editor| editor.pane_id),
+            self.layout.focused_pane,
+        ) {
             return BrowserKeyRoute::NotEditing;
         }
 
@@ -629,7 +642,7 @@ impl HhApp {
                 return;
             }
         }
-        if let Some(picker) = self.editor.color_picker.as_mut() {
+        if let Some(picker) = self.active_color_picker_mut() {
             match keystroke.key.as_str() {
                 "enter" => self.submit_color_picker(cx),
                 "escape" => {
@@ -719,6 +732,18 @@ impl HhApp {
             Modal::WorkspaceDelete(_) => {
                 match keystroke.key.as_str() {
                     "enter" => self.confirm_workspace_delete(cx),
+                    "escape" => {
+                        self.editor.modal = Modal::None;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+                cx.stop_propagation();
+                return;
+            }
+            Modal::UpdateRestart(_) => {
+                match keystroke.key.as_str() {
+                    "enter" => self.confirm_update_restart(cx),
                     "escape" => {
                         self.editor.modal = Modal::None;
                         cx.notify();
@@ -1019,7 +1044,7 @@ impl EntityInputHandler for HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{assistant_composer_is_active, browser_key_text};
+    use super::{assistant_composer_is_active, browser_key_text, browser_url_editor_is_active};
     use uuid::Uuid;
 
     #[test]
@@ -1050,5 +1075,15 @@ mod tests {
         ));
         assert!(!assistant_composer_is_active(Some(composer), None));
         assert!(!assistant_composer_is_active(None, Some(composer)));
+    }
+
+    #[test]
+    fn browser_url_editor_is_active_only_for_its_focused_pane() {
+        let editor = Uuid::new_v4();
+        let terminal = Uuid::new_v4();
+        assert!(browser_url_editor_is_active(Some(editor), Some(editor)));
+        assert!(!browser_url_editor_is_active(Some(editor), Some(terminal)));
+        assert!(!browser_url_editor_is_active(Some(editor), None));
+        assert!(!browser_url_editor_is_active(None, Some(editor)));
     }
 }
