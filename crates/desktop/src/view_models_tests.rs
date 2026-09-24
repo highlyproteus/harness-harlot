@@ -1,11 +1,12 @@
 use super::{
     ClientRequest, CloseConfirmation, CloseConfirmationKind, DialogTextEditor, DragDestination,
-    DragHoverState, DropPlacement, HashSet, MAX_ASSISTANT_INSTRUCTIONS_CHARS, MAX_SSH_INPUT_LEN,
+    DragHoverState, DropPlacement, HashSet, MAX_BOT_INSTRUCTIONS_CHARS, MAX_SSH_INPUT_LEN,
     MAX_WORKSPACE_DIR_BYTES, MouseButton, Pane, SidebarResizeLifecycle, SidebarResizeMove,
     TmuxScanScope, TmuxSession, TmuxSessionId, TmuxSessionPicker, Uuid, WorkspaceCreationDialog,
     WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
     route_workspace_creation_paste,
 };
+use hh_protocol::TerminalProfile;
 
 #[test]
 fn per_tab_close_requires_an_explicit_confirmation_for_the_exact_terminal() {
@@ -17,6 +18,7 @@ fn per_tab_close_requires_an_explicit_confirmation_for_the_exact_terminal() {
         color: None,
         identity: hh_protocol::TerminalIdentity::default(),
         status: hh_protocol::PaneStatus::default(),
+        status_changed_at_ms: 0,
         custom_title: Some("build".to_owned()),
         profile_override: None,
         custom_icon: None,
@@ -53,10 +55,9 @@ fn ssh_workspace_cannot_create_a_network_action_before_review_and_confirmation()
     );
 }
 #[test]
-fn assistant_workspace_request_trims_fields_and_expands_home() {
-    let mut dialog = WorkspaceCreationDialog::new();
-    dialog.kind = WorkspaceCreationKind::Assistant;
-    dialog.name = DialogTextEditor::with_text("  Research  ");
+fn bot_request_trims_fields_expands_home_and_requires_an_agent() {
+    let mut dialog = WorkspaceCreationDialog::new_bot(None);
+    dialog.name = DialogTextEditor::with_text("  Hive3  ");
     dialog.working_dir = DialogTextEditor::with_text("  ~/Projects  ");
     dialog.instructions = DialogTextEditor::with_text("  answer in one sentence  ");
     let expected_working_dir = std::env::var("HOME").map_or_else(
@@ -64,10 +65,14 @@ fn assistant_workspace_request_trims_fields_and_expands_home() {
         |home| format!("{home}/Projects"),
     );
 
+    assert_eq!(dialog.approved_request(), None);
+
+    dialog.agent = Some(TerminalProfile::Omp);
     assert_eq!(
         dialog.approved_request(),
-        Some(ClientRequest::CreateAssistantWorkspace {
-            title: Some("Research".to_owned()),
+        Some(ClientRequest::CreateBot {
+            name: Some("Hive3".to_owned()),
+            agent: TerminalProfile::Omp,
             working_dir: Some(expected_working_dir),
             instructions: Some("answer in one sentence".to_owned()),
         })
@@ -75,9 +80,8 @@ fn assistant_workspace_request_trims_fields_and_expands_home() {
 }
 
 #[test]
-fn assistant_workspace_fields_enforce_wire_limits() {
-    let mut dialog = WorkspaceCreationDialog::new();
-    dialog.kind = WorkspaceCreationKind::Assistant;
+fn bot_dialog_fields_enforce_wire_limits() {
+    let mut dialog = WorkspaceCreationDialog::new_bot(None);
     dialog.field = WorkspaceCreationField::WorkingDir;
     dialog.replace_text(None, &"x".repeat(MAX_WORKSPACE_DIR_BYTES + 1), false, None);
     assert_eq!(dialog.working_dir.text.len(), MAX_WORKSPACE_DIR_BYTES);
@@ -85,13 +89,13 @@ fn assistant_workspace_fields_enforce_wire_limits() {
     dialog.field = WorkspaceCreationField::Instructions;
     dialog.replace_text(
         None,
-        &"😀".repeat(MAX_ASSISTANT_INSTRUCTIONS_CHARS + 1),
+        &"😀".repeat(MAX_BOT_INSTRUCTIONS_CHARS + 1),
         false,
         None,
     );
     assert_eq!(
         dialog.instructions.text.chars().count(),
-        MAX_ASSISTANT_INSTRUCTIONS_CHARS
+        MAX_BOT_INSTRUCTIONS_CHARS
     );
 }
 

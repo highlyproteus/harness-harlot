@@ -25,8 +25,8 @@ image.workspace = true
 libc.workspace = true
 hh-protocol = { path = "../protocol" }
 hh-session-client.workspace = true
-hh-voice.workspace = true
 parking_lot.workspace = true
+regex = "1"
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -29,7 +29,7 @@ pub enum AppCommand {
     ReattachPane,
     RetryTerminalInput,
     ShowNotifications,
-    ToggleVoiceMic,
+    ShowBots,
     ShowSettings,
 }
 
@@ -183,11 +183,11 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         default_bindings: &[],
     },
     CommandDescriptor {
-        command: AppCommand::ToggleVoiceMic,
-        id: "voice.toggle-mic",
-        title: "Toggle Assistant Microphone",
-        category: "Voice",
-        default_bindings: &["cmd-shift-m"],
+        command: AppCommand::ShowBots,
+        id: "app.bots",
+        title: "Show Bots",
+        category: "Application",
+        default_bindings: &[],
     },
     CommandDescriptor {
         command: AppCommand::ShowSettings,
@@ -230,6 +230,7 @@ const fn check_registry() {
                         | AppCommand::NewGalleryTab
                         | AppCommand::RetryTerminalInput
                         | AppCommand::ShowNotifications
+                        | AppCommand::ShowBots
                         | AppCommand::ShowSettings
                 )
         );

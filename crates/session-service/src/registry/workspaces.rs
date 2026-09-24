@@ -5,11 +5,10 @@ use super::{
 };
 use crate::history::HistoryArchive;
 use crate::layout::{find_pane_mut, pane_ids_for_workspace};
-use crate::persistence::{
-    MAX_INSTRUCTIONS_CHARS, MAX_RECENT_COLORS, MAX_WORKSPACES, validate_title,
-};
+use crate::persistence::{MAX_RECENT_COLORS, MAX_WORKSPACES, validate_title};
 use crate::process::fallback_cwd;
 use crate::pty::PtySession;
+use crate::registry::bots::{forget_bots, workstation_count};
 use crate::registry::identity::set_pane_runtime_label;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -17,6 +16,7 @@ use hh_protocol::{
     Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspaceKind, WorkspacePinMove,
     validate_ssh_host, validate_workspace_dir,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -77,19 +77,6 @@ pub(crate) fn normalize_workspace_title(title: Option<&str>) -> Result<Option<St
     Ok(Some(title.to_owned()))
 }
 
-fn normalize_assistant_instructions(instructions: Option<String>) -> Result<Option<String>> {
-    let instructions = instructions
-        .map(|instructions| instructions.trim().to_owned())
-        .filter(|instructions| !instructions.is_empty());
-    if instructions
-        .as_deref()
-        .is_some_and(|instructions| instructions.chars().count() > MAX_INSTRUCTIONS_CHARS)
-    {
-        bail!("assistant instructions too long");
-    }
-    Ok(instructions)
-}
-
 pub(crate) fn next_workspace_order(workspaces: &[Workspace], pinned: bool) -> u32 {
     workspaces
         .iter()
@@ -129,7 +116,7 @@ pub(crate) fn normalize_workspace_orders(workspaces: &mut [Workspace]) {
 }
 
 impl SessionRegistry {
-    pub(crate) fn ensure_workspace_accepts_non_assistant_tabs(
+    pub(crate) fn ensure_workspace_accepts_workstation_tabs(
         &self,
         workspace_id: Uuid,
     ) -> Result<()> {
@@ -140,8 +127,8 @@ impl SessionRegistry {
             .iter()
             .find(|workspace| workspace.id == workspace_id)
             .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-        if workspace.is_assistant() {
-            bail!("assistant workspaces only hold assistant threads");
+        if workspace.is_bots() {
+            bail!("the Bots workspace only holds bots");
         }
         Ok(())
     }
@@ -252,7 +239,7 @@ impl SessionRegistry {
         let title = normalize_workspace_title(title)?;
         {
             let state = self.state.read();
-            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+            if workstation_count(&state.snapshot) >= MAX_WORKSPACES {
                 bail!("workstation limit of {MAX_WORKSPACES} reached");
             }
             if state.panes.len() >= MAX_PANES {
@@ -263,16 +250,16 @@ impl SessionRegistry {
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
-        let session = self.spawn_local_transport(pane_id, workspace_id, &cwd)?;
+        let session = self.spawn_local_transport(pane_id, workspace_id, None, &cwd)?;
         let result = (|| {
             let mut state = self.state.write();
-            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+            if workstation_count(&state.snapshot) >= MAX_WORKSPACES {
                 bail!("workstation limit of {MAX_WORKSPACES} reached");
             }
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-            let number = state.snapshot.workspaces.len() + 1;
+            let number = workstation_count(&state.snapshot) + 1;
             let order = next_workspace_order(&state.snapshot.workspaces, false);
             let pane = state.new_pane(pane_id, Some(cwd.as_path()));
             state.snapshot.workspaces.push(Workspace {
@@ -287,6 +274,7 @@ impl SessionRegistry {
                 working_dir: None,
                 kind: WorkspaceKind::Workstation,
                 instructions: None,
+                owner_bot: None,
                 custom_icon: None,
                 tabs: vec![Tab {
                     id: tab_id,
@@ -297,6 +285,8 @@ impl SessionRegistry {
                     custom_icon: None,
                     parent_tab: None,
                     pinned: false,
+                    bot: None,
+                    owner_bot: None,
                     layout: PaneLayout::Leaf { pane },
                 }],
             });
@@ -324,112 +314,6 @@ impl SessionRegistry {
             let _ = session.terminate_and_wait();
         }
         result
-    }
-    pub fn create_assistant_workspace(
-        &self,
-        title: Option<&str>,
-        working_dir: Option<String>,
-        instructions: Option<String>,
-    ) -> Result<(Uuid, Uuid)> {
-        let title = normalize_workspace_title(title)?;
-        if let Some(working_dir) = working_dir.as_deref() {
-            validate_workspace_dir(working_dir).map_err(anyhow::Error::from)?;
-        }
-        let instructions = normalize_assistant_instructions(instructions)?;
-        {
-            let state = self.state.read();
-            if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
-                bail!("workstation limit of {MAX_WORKSPACES} reached");
-            }
-            if state.panes.len() >= MAX_PANES {
-                bail!("pane limit of {MAX_PANES} reached");
-            }
-        }
-
-        let workspace_id = Uuid::new_v4();
-        let tab_id = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
-        let runtime = crate::assistant::thread::AssistantRuntime::new(
-            pane_id,
-            workspace_id,
-            Arc::clone(&self.assistant_discovery),
-            Arc::clone(&self.coding_agents),
-        )?;
-        let mut state = self.state.write();
-        if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
-            bail!("workstation limit of {MAX_WORKSPACES} reached");
-        }
-        if state.panes.len() >= MAX_PANES {
-            bail!("pane limit of {MAX_PANES} reached");
-        }
-        let number = state
-            .snapshot
-            .workspaces
-            .iter()
-            .filter(|workspace| workspace.is_assistant())
-            .count()
-            + 1;
-        let order = next_workspace_order(&state.snapshot.workspaces, false);
-        state.snapshot.workspaces.push(Workspace {
-            id: workspace_id,
-            title: title.unwrap_or_else(|| format!("Assistant {number}")),
-            color: None,
-            pinned: false,
-            pin_order: 0,
-            order,
-            active_terminal_count: 0,
-            connection: WorkspaceConnection::Local,
-            working_dir,
-            kind: WorkspaceKind::Assistant,
-            instructions,
-            custom_icon: None,
-            tabs: vec![Tab {
-                id: tab_id,
-                title: "Thread 1".to_owned(),
-                custom_title: None,
-                project_dir: None,
-                color: None,
-                custom_icon: None,
-                parent_tab: None,
-                pinned: false,
-                layout: PaneLayout::Leaf {
-                    pane: Pane {
-                        id: pane_id,
-                        title: "Assistant".to_owned(),
-                        shell: String::new(),
-                        kind: hh_protocol::PaneKind::Assistant,
-                        color: None,
-                        identity: TerminalIdentity::default(),
-                        status: hh_protocol::PaneStatus::default(),
-                        custom_title: None,
-                        profile_override: None,
-                        custom_icon: None,
-                    },
-                },
-            }],
-        });
-        state.panes.insert(
-            pane_id,
-            RuntimePane {
-                backend: RuntimePaneBackend::Assistant(Arc::clone(&runtime)),
-            },
-        );
-        let previous_revision = state.snapshot.revision;
-        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        let bytes = encode_desired_state(&state)?;
-        if let Err(error) = self.write_snapshot(&bytes) {
-            state
-                .snapshot
-                .workspaces
-                .retain(|workspace| workspace.id != workspace_id);
-            state.panes.remove(&pane_id);
-            state.snapshot.revision = previous_revision;
-            return Err(error);
-        }
-        drop(state);
-        runtime.bind_registry(&self.state);
-        runtime.start();
-        Ok((workspace_id, pane_id))
     }
 
     pub fn create_ssh_workspace(
@@ -462,13 +346,13 @@ impl SessionRegistry {
         ids: SshWorkspaceIds,
     ) -> Result<()> {
         let mut state = self.state.write();
-        if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
+        if workstation_count(&state.snapshot) >= MAX_WORKSPACES {
             bail!("workstation limit of {MAX_WORKSPACES} reached");
         }
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
-        let number = state.snapshot.workspaces.len() + 1;
+        let number = workstation_count(&state.snapshot) + 1;
         let order = next_workspace_order(&state.snapshot.workspaces, false);
         let pane = Pane {
             id: ids.pane,
@@ -478,6 +362,7 @@ impl SessionRegistry {
             color: None,
             identity: TerminalIdentity::default(),
             status: hh_protocol::PaneStatus::default(),
+            status_changed_at_ms: 0,
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -497,6 +382,7 @@ impl SessionRegistry {
             working_dir: None,
             kind: WorkspaceKind::Workstation,
             instructions: None,
+            owner_bot: None,
             custom_icon: None,
             tabs: vec![Tab {
                 id: ids.tab,
@@ -507,6 +393,8 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
+                bot: None,
+                owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             }],
         });
@@ -580,7 +468,7 @@ impl SessionRegistry {
         };
         let cwd = fallback_cwd()?;
         self.persist_ssh_workspace_intent(title, destination, ids)?;
-        let session = PtySession::spawn_local(ids.pane, ids.workspace, &cwd, &self.history)?;
+        let session = PtySession::spawn_local(ids.pane, ids.workspace, None, &cwd, &self.history)?;
         let result = self.attach_ssh_workspace(destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
@@ -906,6 +794,7 @@ impl SessionRegistry {
                 color: None,
                 identity: TerminalIdentity::default(),
                 status: hh_protocol::PaneStatus::default(),
+                status_changed_at_ms: 0,
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
@@ -919,6 +808,8 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
+                bot: None,
+                owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             });
         } else {
@@ -964,17 +855,17 @@ impl SessionRegistry {
     }
 
     pub fn delete_workspace(&self, workspace_id: Uuid) -> Result<()> {
-        let (pane_ids, sessions, assistants, tmux_client) = {
+        let (pane_ids, sessions, tmux_client) = {
             let state = self.state.read();
-            if state.snapshot.workspaces.len() <= 1 {
-                bail!("the last workstation cannot be deleted");
-            }
             let workspace = state
                 .snapshot
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
                 .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+            if !workspace.is_bots() && workstation_count(&state.snapshot) <= 1 {
+                bail!("the last workstation cannot be deleted");
+            }
             let pane_ids = pane_ids_for_workspace(workspace);
             let sessions = pane_ids
                 .iter()
@@ -986,23 +877,13 @@ impl SessionRegistry {
                         .map(|terminal| Arc::clone(&terminal.session))
                 })
                 .collect::<Vec<_>>();
-            let assistants = pane_ids
-                .iter()
-                .filter_map(|pane_id| state.panes.get(pane_id)?.assistant().map(Arc::clone))
-                .collect::<Vec<_>>();
             let tmux_client = state.tmux_clients.get(&workspace_id).cloned();
-            (pane_ids, sessions, assistants, tmux_client)
+            (pane_ids, sessions, tmux_client)
         };
         for session in &sessions {
             let _ = session.terminate_and_wait();
         }
         let mut cleanup_errors: Vec<anyhow::Error> = Vec::new();
-        for assistant in &assistants {
-            assistant.shutdown();
-            if let Err(error) = assistant.remove_session_dir() {
-                cleanup_errors.push(error);
-            }
-        }
         if let Some(directory) = hh_protocol::gallery_directory(workspace_id)
             && let Err(error) = std::fs::remove_dir_all(&directory)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -1016,17 +897,23 @@ impl SessionRegistry {
             let _ = client.kill_session();
         }
         let mut state = self.state.write();
-        if state.snapshot.workspaces.len() <= 1 {
-            bail!("the last workstation cannot be deleted");
-        }
-        let before = state.snapshot.workspaces.len();
-        state
+        let index = state
             .snapshot
             .workspaces
-            .retain(|workspace| workspace.id != workspace_id);
-        if state.snapshot.workspaces.len() == before {
-            bail!("workstation {workspace_id} disappeared while deleting");
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workstation {workspace_id} disappeared while deleting"))?;
+        if !state.snapshot.workspaces[index].is_bots() && workstation_count(&state.snapshot) <= 1 {
+            bail!("the last workstation cannot be deleted");
         }
+        let removed_workspace = state.snapshot.workspaces.remove(index);
+        let removed_bots = removed_workspace
+            .tabs
+            .iter()
+            .filter(|tab| tab.bot.is_some())
+            .map(|tab| tab.id)
+            .collect::<HashSet<_>>();
+        forget_bots(&mut state.snapshot, &removed_bots);
         let removed = pane_ids
             .into_iter()
             .filter_map(|pane_id| state.panes.remove(&pane_id))
@@ -1072,28 +959,6 @@ mod tests {
             runtime_kind_for_workspace(&WorkspaceConnection::Local),
             RuntimePaneKind::Local
         );
-    }
-
-    #[test]
-    fn failed_assistant_persistence_does_not_publish_live_state() {
-        let directory =
-            std::env::temp_dir().join(format!("hh-assistant-persistence-test-{}", Uuid::new_v4()));
-        create_owner_only_directory(&directory);
-        let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
-        let before = registry.snapshot().unwrap();
-        registry
-            .store
-            .as_ref()
-            .unwrap()
-            .inject_failure_before_replace(true);
-
-        assert!(
-            registry
-                .create_assistant_workspace(Some("Must rollback"), None, None)
-                .is_err()
-        );
-        assert_eq!(registry.snapshot().unwrap(), before);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -318,26 +318,18 @@ impl HhApp {
         let kind = dialog.kind;
         let field = dialog.field;
         let error = dialog.error.clone();
-        let assistant = kind == WorkspaceCreationKind::Assistant;
-        let heading = if assistant {
-            "New Assistant"
-        } else {
-            "New Workstation"
-        };
-        let name_label = if assistant {
-            "Assistant name (optional)"
+        let bot = kind == WorkspaceCreationKind::Bot;
+        let heading = if bot { "New bot" } else { "New Workstation" };
+        let name_label = if bot {
+            "Bot name (optional)"
         } else {
             "Workstation name (optional)"
         };
-        let name_placeholder = if assistant {
-            "Assistant name"
-        } else {
-            "Workstation name"
-        };
+        let name_placeholder = if bot { "Bot name" } else { "Workstation name" };
         let submit_label = match kind {
             WorkspaceCreationKind::Local => "Create workstation",
             WorkspaceCreationKind::SystemSsh => "Review connection",
-            WorkspaceCreationKind::Assistant => "Create assistant",
+            WorkspaceCreationKind::Bot => "Create bot",
         };
 
         div()
@@ -351,7 +343,8 @@ impl HhApp {
                     .text_color(rgb(THEME.foreground))
                     .child(heading),
             )
-            .child(
+            .when(!bot, |element| {
+                element.child(
                 div()
                     .flex()
                     .gap(px(8.0))
@@ -370,16 +363,9 @@ impl HhApp {
                         WorkspaceCreationField::Destination,
                         kind,
                         cx,
-                    ))
-                    .child(Self::render_workspace_kind_card(
-                        "new-workspace-assistant",
-                        "Assistant",
-                        WorkspaceCreationKind::Assistant,
-                        WorkspaceCreationField::Name,
-                        kind,
-                        cx,
                     )),
-            )
+                )
+            })
             .child(
                 div()
                     .font_family(".SystemUIFont")
@@ -395,8 +381,16 @@ impl HhApp {
                 ".SystemUIFont",
                 cx,
             ))
-            .when(assistant, |element| {
+            .when(bot, |element| {
                 element
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child("Agent"),
+                    )
+                    .child(self.render_bot_agent_picker(dialog.agent, cx))
                     .child(
                         div()
                             .font_family(".SystemUIFont")
@@ -417,13 +411,13 @@ impl HhApp {
                             .font_family(".SystemUIFont")
                             .text_xs()
                             .text_color(rgb(THEME.dim))
-                            .child("Custom instructions (optional)"),
+                            .child("Instructions (optional)"),
                     )
                     .child(self.render_workspace_creation_input(
                         "workspace-instructions-input",
                         field,
                         WorkspaceCreationField::Instructions,
-                        "Custom instructions (optional)",
+                        "Instructions (optional)",
                         ".SystemUIFont",
                         cx,
                     ))
@@ -709,6 +703,23 @@ impl HhApp {
         confirmation: &TabCloseConfirmation,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if confirmation.is_bot {
+            return self.confirm_dialog(
+                div()
+                    .text_sm()
+                    .text_color(rgb(THEME.muted))
+                    .child("This permanently removes the bot and ends its agent and terminal.")
+                    .into_any_element(),
+                DialogSpec {
+                    title: format!("Delete bot {}?", confirmation.title),
+                    confirm_label: "Delete bot",
+                    confirm_tone: DialogTone::Danger,
+                    confirm_id: "confirm-tab-close",
+                    action: DialogAction::CloseTab,
+                },
+                cx,
+            );
+        }
         let kind = if confirmation.is_project {
             "project"
         } else {
@@ -1061,9 +1072,6 @@ impl HhApp {
             (CloseConfirmationKind::Browser, false) => {
                 "This permanently closes this browser tab. Other tabs stay open."
             }
-            (CloseConfirmationKind::Assistant, _) => {
-                "This closes the voice assistant session. Its transcript summary is kept on disk only until this pane is removed."
-            }
             (CloseConfirmationKind::Terminal, true) => {
                 "This will terminate the last terminal and leave the saved workstation empty. You can open a new terminal from its empty state."
             }
@@ -1083,7 +1091,6 @@ impl HhApp {
                 title: format!("Close {}?", confirmation.title),
                 confirm_label: match confirmation.kind {
                     CloseConfirmationKind::Browser => "Close Browser",
-                    CloseConfirmationKind::Assistant => "Close Assistant",
                     CloseConfirmationKind::Terminal => "Close Terminal",
                 },
                 confirm_tone: DialogTone::Danger,

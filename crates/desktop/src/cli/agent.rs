@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::args::{AgentAction, AgentCommand, AgentContext, BrowserCommand, GalleryCommand};
+use super::terminal;
 
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(45);
 const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,6 +25,10 @@ pub(crate) fn execute(command: &AgentCommand) -> Result<Value> {
     match &command.action {
         AgentAction::Browser(browser) => execute_browser(&command.context, browser),
         AgentAction::Gallery(gallery) => execute_gallery(&command.context, gallery),
+        AgentAction::Terminal(terminal_command) => {
+            terminal::execute_terminal(&command.context, terminal_command)
+        }
+        AgentAction::Workstation(workstation) => terminal::execute_workstation(workstation),
         AgentAction::Mcp | AgentAction::Skill(_) => {
             bail!("agent action must be dispatched directly")
         }
@@ -41,7 +46,7 @@ pub(crate) fn print_result(result: &Value, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn client() -> Result<SessionClient> {
+pub(super) fn client() -> Result<SessionClient> {
     let client = SessionClient::connect()?;
     client.set_read_timeout(BROWSER_TIMEOUT)?;
     Ok(client)
@@ -102,7 +107,7 @@ fn required_workspace(context: &AgentContext) -> Result<Uuid> {
     ))
 }
 
-fn snapshot(client: &mut SessionClient) -> Result<SessionSnapshot> {
+pub(super) fn snapshot(client: &mut SessionClient) -> Result<SessionSnapshot> {
     match client.call(&ClientRequest::GetSnapshot)? {
         ServiceResponse::Snapshot { snapshot } => Ok(snapshot),
         response => bail!("unexpected snapshot response: {response:?}"),
@@ -395,7 +400,7 @@ fn browser_screenshot(
     added
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf> {
+pub(super) fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_owned())
     } else {

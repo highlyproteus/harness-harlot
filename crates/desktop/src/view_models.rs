@@ -1,12 +1,11 @@
 use gpui::{IntoElement, ParentElement, Pixels, Point, Render, Styled, Window, div, px, rgb};
 use hh_protocol::{
     ClientRequest, DropPlacement, MAX_SSH_INPUT_LEN, MAX_WORKSPACE_DIR_BYTES, Pane, SplitAxis,
-    TerminalHistoryPage, TerminalPoint, TerminalSelection, TerminalSelectionKind, TmuxScanScope,
-    TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
+    TerminalHistoryPage, TerminalPoint, TerminalProfile, TerminalSelection, TerminalSelectionKind,
+    TmuxScanScope, TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
 };
 use std::collections::HashSet;
 use std::ops::Range;
-use std::path::PathBuf;
 use uuid::Uuid;
 
 use gpui::{Context, MouseButton};
@@ -101,56 +100,6 @@ fn drag_ghost(title: &str, position: gpui::Point<Pixels>, terminal: bool) -> imp
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ComposerAttachment {
-    pub(super) filename: String,
-    pub(super) data_url: String,
-    pub(super) path: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct AssistantComposer {
-    pub(super) pane_id: Uuid,
-    pub(super) text: String,
-    pub(super) selection: Option<Range<usize>>,
-    pub(super) attachment: Option<ComposerAttachment>,
-}
-
-impl AssistantComposer {
-    pub(super) fn insert(&mut self, text: &str) {
-        if let Some(selection) = self.selection.take() {
-            self.text.replace_range(selection, text);
-        } else {
-            self.text.push_str(text);
-        }
-    }
-
-    pub(super) fn backspace(&mut self) {
-        if let Some(selection) = self.selection.take() {
-            self.text.replace_range(selection, "");
-        } else {
-            self.text.pop();
-        }
-    }
-
-    pub(super) fn select_all(&mut self) {
-        self.selection = (!self.text.is_empty()).then_some(0..self.text.len());
-    }
-
-    pub(super) fn selected_text(&self) -> Option<&str> {
-        self.selection
-            .as_ref()
-            .and_then(|selection| self.text.get(selection.clone()))
-    }
-
-    pub(super) fn cut_selection(&mut self) -> Option<String> {
-        let selection = self.selection.take()?;
-        let selected = self.text.get(selection.clone())?.to_owned();
-        self.text.replace_range(selection, "");
-        Some(selected)
-    }
-}
-
-#[derive(Clone, Debug)]
 pub(super) struct TooltipView {
     pub(super) text: String,
 }
@@ -184,6 +133,22 @@ pub(super) struct WorkspaceMenu {
     pub(super) position: Point<Pixels>,
     pub(super) icon_picker_open: bool,
     pub(super) customize_open: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BotMenu {
+    pub(super) tab_id: Uuid,
+    pub(super) position: Point<Pixels>,
+    pub(super) agents_open: bool,
+}
+
+/// What the left sidebar lists: workstations, live pane activity, or bots.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum SidebarMode {
+    #[default]
+    Workstations,
+    Notifications,
+    Bots,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -255,6 +220,8 @@ pub(super) struct GroupRenameEditor {
     pub(super) tab_id: Uuid,
     pub(super) value: String,
     pub(super) replace_on_type: bool,
+    /// Renames a bot rather than a group; only the dialog copy differs.
+    pub(super) bot: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,13 +298,13 @@ pub(super) struct CloseConfirmation {
 pub(super) enum CloseConfirmationKind {
     Terminal,
     Browser,
-    Assistant,
 }
 #[derive(Clone, Debug)]
 pub(super) struct TabCloseConfirmation {
     pub(super) tab_id: Uuid,
     pub(super) title: String,
     pub(super) is_project: bool,
+    pub(super) is_bot: bool,
     pub(super) child_count: usize,
     pub(super) terminal_count: usize,
 }
@@ -431,13 +398,13 @@ pub(super) enum TmuxSelectionChange {
     None,
 }
 
-const MAX_ASSISTANT_INSTRUCTIONS_CHARS: usize = 4_096;
+const MAX_BOT_INSTRUCTIONS_CHARS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WorkspaceCreationKind {
     Local,
     SystemSsh,
-    Assistant,
+    Bot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -757,6 +724,8 @@ pub(super) struct WorkspaceCreationDialog {
     pub(super) destination: DialogTextEditor,
     pub(super) working_dir: DialogTextEditor,
     pub(super) instructions: DialogTextEditor,
+    /// The bot's coding agent; only the Bot kind uses it.
+    pub(super) agent: Option<TerminalProfile>,
     pub(super) field: WorkspaceCreationField,
     pub(super) step: WorkspaceCreationStep,
     pub(super) error: Option<String>,
@@ -770,9 +739,18 @@ impl WorkspaceCreationDialog {
             destination: DialogTextEditor::default(),
             working_dir: DialogTextEditor::default(),
             instructions: DialogTextEditor::default(),
+            agent: None,
             field: WorkspaceCreationField::Name,
             step: WorkspaceCreationStep::Details,
             error: None,
+        }
+    }
+
+    pub(super) fn new_bot(agent: Option<TerminalProfile>) -> Self {
+        Self {
+            kind: WorkspaceCreationKind::Bot,
+            agent,
+            ..Self::new()
         }
     }
 
@@ -816,7 +794,7 @@ impl WorkspaceCreationDialog {
             WorkspaceCreationField::Name => (80, false),
             WorkspaceCreationField::Destination => (MAX_SSH_INPUT_LEN, true),
             WorkspaceCreationField::WorkingDir => (MAX_WORKSPACE_DIR_BYTES, true),
-            WorkspaceCreationField::Instructions => (MAX_ASSISTANT_INSTRUCTIONS_CHARS, false),
+            WorkspaceCreationField::Instructions => (MAX_BOT_INSTRUCTIONS_CHARS, false),
         };
         self.active_editor_mut().replace(
             range_utf16,
@@ -849,13 +827,14 @@ impl WorkspaceCreationDialog {
             WorkspaceCreationKind::Local if self.step == WorkspaceCreationStep::Details => {
                 Some(ClientRequest::CreateWorkspace { title })
             }
-            WorkspaceCreationKind::Assistant if self.step == WorkspaceCreationStep::Details => {
+            WorkspaceCreationKind::Bot if self.step == WorkspaceCreationStep::Details => {
                 let working_dir = (!self.working_dir.text.trim().is_empty())
                     .then(|| expand_home(self.working_dir.text.trim()));
                 let instructions = (!self.instructions.text.trim().is_empty())
                     .then(|| self.instructions.text.trim().to_owned());
-                Some(ClientRequest::CreateAssistantWorkspace {
-                    title,
+                Some(ClientRequest::CreateBot {
+                    name: title,
+                    agent: self.agent?,
                     working_dir,
                     instructions,
                 })
@@ -871,7 +850,7 @@ impl WorkspaceCreationDialog {
             }
             WorkspaceCreationKind::Local
             | WorkspaceCreationKind::SystemSsh
-            | WorkspaceCreationKind::Assistant => None,
+            | WorkspaceCreationKind::Bot => None,
         }
     }
 }
@@ -893,8 +872,6 @@ impl CloseConfirmation {
     pub(super) fn for_pane(pane: &Pane, leaves_workspace_empty: bool) -> Self {
         let kind = if pane.kind.is_browser() {
             CloseConfirmationKind::Browser
-        } else if pane.kind.is_assistant() {
-            CloseConfirmationKind::Assistant
         } else {
             CloseConfirmationKind::Terminal
         };
@@ -1049,9 +1026,9 @@ pub(super) enum Modal {
     WorkspaceMenu(WorkspaceMenu),
     CreateMenu(CreateMenu),
     GroupMenu(GroupMenu),
+    BotMenu(BotMenu),
     WorkspaceConnectionInfo(WorkspaceConnectionInfo),
     AppearanceSettings,
-    AssistantModels,
 }
 
 /// One visible panel on the Settings page; the left list selects it.
@@ -1059,26 +1036,18 @@ pub(super) enum Modal {
 pub(super) enum SettingsSection {
     #[default]
     Appearance,
-    Assistant,
-    Voice,
+    Bots,
     History,
     Updates,
 }
 
 impl SettingsSection {
-    pub(super) const ALL: [Self; 5] = [
-        Self::Appearance,
-        Self::Assistant,
-        Self::Voice,
-        Self::History,
-        Self::Updates,
-    ];
+    pub(super) const ALL: [Self; 4] = [Self::Appearance, Self::Bots, Self::History, Self::Updates];
 
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
-            Self::Assistant => "Assistant",
-            Self::Voice => "Voice",
+            Self::Bots => "Bots",
             Self::History => "History",
             Self::Updates => "Updates",
         }

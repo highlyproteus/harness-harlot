@@ -83,7 +83,6 @@ fn flatten_entries(
 #[allow(clippy::struct_excessive_bools)]
 struct WorkspaceSectionCtx {
     workspace_id: Uuid,
-    is_assistant: bool,
     index: usize,
     pinned: bool,
     active: bool,
@@ -107,7 +106,13 @@ impl HhApp {
             .session
             .snapshot
             .as_ref()
-            .map(|snapshot| snapshot.workspaces.iter().collect::<Vec<_>>())
+            .map(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| !workspace.is_bots())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
         let has_workspaces = !workspaces.is_empty();
@@ -188,7 +193,6 @@ impl HhApp {
         };
         let ctx = WorkspaceSectionCtx {
             workspace_id,
-            is_assistant: workspace.is_assistant(),
             index,
             pinned,
             active,
@@ -301,6 +305,7 @@ impl HhApp {
                                         tab_color,
                                         from_group: false,
                                         indent: group_indent,
+                                        activity: None,
                                     },
                                     cx,
                                 ));
@@ -600,6 +605,7 @@ impl HhApp {
                         tab_color,
                         from_group: true,
                         indent: pane_indent,
+                        activity: None,
                     },
                     cx,
                 )
@@ -925,16 +931,11 @@ impl HhApp {
     }
 
     fn render_workspace_card_title(&self, ctx: &WorkspaceSectionCtx) -> AnyElement {
-        let title = if ctx.is_assistant {
-            ctx.workspace_title.clone()
-        } else {
-            format!("{}  {}", ctx.index + 1, ctx.workspace_title)
-        };
+        let title = format!("{}  {}", ctx.index + 1, ctx.workspace_title);
         let icon_path = ctx
             .custom_icon
             .as_deref()
             .and_then(|icon| self.custom_icon_path(icon));
-        let has_icon = icon_path.is_some();
         div()
             .min_w(px(0.0))
             .overflow_hidden()
@@ -955,16 +956,6 @@ impl HhApp {
                                 .h(px(14.0))
                                 .object_fit(gpui::ObjectFit::Contain)
                                 .rounded(px(3.0)),
-                        )
-                    })
-                    .when(ctx.is_assistant && !has_icon, |element| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .w(px(8.0))
-                                .h(px(8.0))
-                                .rounded_full()
-                                .bg(rgb(THEME.accent)),
                         )
                     })
                     .child(

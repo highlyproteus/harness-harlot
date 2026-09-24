@@ -35,6 +35,7 @@ use uuid::Uuid;
 
 mod agent_icons;
 mod appearance;
+mod bots;
 mod browser;
 mod cli;
 mod commands;
@@ -56,7 +57,6 @@ mod session;
 mod sidebar;
 mod terminal_view;
 mod theme;
-mod voice;
 mod workspace_tab_strip;
 mod workspaces;
 
@@ -87,9 +87,9 @@ use typography::TerminalFontProfile;
 use ui_state::UiStateStore;
 use updates::{UpdateCheckState, automatic_update_check_interval, automatic_update_checks_enabled};
 use view_models::{
-    ArchivedView, AssistantComposer, ColorPickerState, DragHoverState, HistoryEditor, Modal,
-    PaneDrag, ResizeDrag, SelectionAutoscroll, SelectionDrag, SettingsSection,
-    SidebarResizeLifecycle, SplitControlId, TabDropPreview, WorkspaceDropPreview,
+    ArchivedView, ColorPickerState, DragHoverState, HistoryEditor, Modal, PaneDrag, ResizeDrag,
+    SelectionAutoscroll, SelectionDrag, SettingsSection, SidebarMode, SidebarResizeLifecycle,
+    SplitControlId, TabDropPreview, WorkspaceDropPreview,
 };
 
 actions!(
@@ -114,7 +114,7 @@ actions!(
         EqualizePanes,
         ReattachPane,
         RetryTerminalInput,
-        ToggleVoiceMic,
+        ShowBots,
         ShowSettings,
         ConsumeChordPrefix,
         CopyTerminal,
@@ -252,8 +252,12 @@ struct SessionState {
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
     pane_states: HashMap<Uuid, PaneStreamState>,
+    /// Service `Message` notifications only; pane activity is read live
+    /// from `Pane.status`.
     notifications: Vec<SessionNotification>,
     notifications_latest_id: u64,
+    /// Last Needs-you count sent to the Dock, so polling never re-sends it.
+    dock_badge: Option<usize>,
     /// When each pane's screen was last applied, used to pace on-screen panes
     /// other than the focused one.
     last_delivery: HashMap<Uuid, Instant>,
@@ -292,6 +296,7 @@ impl SessionState {
             pane_states: HashMap::new(),
             notifications: Vec::new(),
             notifications_latest_id: 0,
+            dock_badge: None,
             last_delivery: HashMap::new(),
             window_active,
             stream_diagnostics: StreamDiagnostics::default(),
@@ -318,7 +323,9 @@ struct SidebarUi {
     sidebar_resize: SidebarResizeLifecycle,
     preferred_sidebar_width: f32,
     sidebar_visible: bool,
-    sidebar_activity: bool,
+    sidebar_mode: SidebarMode,
+    /// The workstation to return to when a bot view is left.
+    return_workstation: Option<Uuid>,
     sidebar_pixels: f32,
     workstation_banner: Option<BannerArtwork>,
     workstation_banner_hidden: bool,
@@ -347,7 +354,8 @@ impl SidebarUi {
             sidebar_resize: SidebarResizeLifecycle::default(),
             preferred_sidebar_width,
             sidebar_visible: true,
-            sidebar_activity: false,
+            sidebar_mode: SidebarMode::Workstations,
+            return_workstation: None,
             sidebar_pixels: default_sidebar_width(),
             workstation_banner,
             workstation_banner_hidden,
@@ -398,7 +406,6 @@ struct EditorUi {
     history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
     browser_url_editor: Option<BrowserUrlEditor>,
-    assistant_composer: Option<AssistantComposer>,
     agent_skill_status: Option<String>,
     ime_preedit: String,
     workspace_input_focus: [FocusHandle; 4],
@@ -419,7 +426,6 @@ impl EditorUi {
             history_clear_confirmation: None,
             color_picker: None,
             browser_url_editor: None,
-            assistant_composer: None,
             agent_skill_status: None,
             ime_preedit: String::new(),
             workspace_input_focus,
@@ -487,7 +493,7 @@ struct HhApp {
     layout: LayoutUi,
     editor: EditorUi,
     gallery: GalleryUi,
-    assistant: voice::AssistantUi,
+    coding_agents: bots::CodingAgentsState,
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     browser: BrowserUi,
 }
@@ -603,7 +609,7 @@ impl HhApp {
             layout: LayoutUi::new(),
             editor: EditorUi::new(workspace_input_focus),
             gallery: GalleryUi::new(),
-            assistant: voice::AssistantUi::new(),
+            coding_agents: bots::CodingAgentsState::default(),
             #[cfg(all(target_os = "macos", feature = "browser"))]
             browser: BrowserUi::new(browser_parent_view),
             #[cfg(all(target_os = "linux", feature = "browser"))]
@@ -629,10 +635,6 @@ impl HhApp {
                 }
             }));
         }
-        app.assistant.quit_subscription = Some(cx.on_app_quit(|this, _| {
-            this.shutdown_voice();
-            async {}
-        }));
 
         cx.observe_window_bounds(window, |this, window, cx| {
             if this.update_window_geometry(window) {
@@ -648,11 +650,6 @@ impl HhApp {
                 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
                 {
                     this.browser.reassert_focus = true;
-                    cx.notify();
-                }
-                if let Some(pane_id) = this.layout.focused_pane
-                    && this.auto_read_pane_notifications(pane_id, cx)
-                {
                     cx.notify();
                 }
             } else {

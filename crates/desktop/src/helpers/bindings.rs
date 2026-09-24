@@ -3,8 +3,8 @@ use crate::view_models::SplitControlId;
 use crate::{
     DEVELOPMENT_PRODUCT_NAME, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp,
     NewBrowserTab, NewGalleryTab, NewTab, NewWorkspace, ReattachPane, RetryTerminalInput,
-    STABLE_PRODUCT_NAME, ShowCommandPalette, ShowNotifications, ShowSettings, SplitDown,
-    SplitRight, TerminalZoomIn, TerminalZoomOut, TogglePaneZoom, ToggleSidebar, ToggleVoiceMic,
+    STABLE_PRODUCT_NAME, ShowBots, ShowCommandPalette, ShowNotifications, ShowSettings, SplitDown,
+    SplitRight, TerminalZoomIn, TerminalZoomOut, TogglePaneZoom, ToggleSidebar,
 };
 use gpui::KeyBinding;
 use uuid::Uuid;
@@ -100,8 +100,8 @@ pub(crate) fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
         AppCommand::ShowNotifications => {
             KeyBinding::new(&binding.sequence, ShowNotifications, Some(ROOT_KEY_CONTEXT))
         }
-        AppCommand::ToggleVoiceMic => {
-            KeyBinding::new(&binding.sequence, ToggleVoiceMic, Some(ROOT_KEY_CONTEXT))
+        AppCommand::ShowBots => {
+            KeyBinding::new(&binding.sequence, ShowBots, Some(ROOT_KEY_CONTEXT))
         }
         AppCommand::ShowSettings => {
             KeyBinding::new(&binding.sequence, ShowSettings, Some(ROOT_KEY_CONTEXT))

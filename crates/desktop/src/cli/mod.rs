@@ -2,6 +2,7 @@ mod agent;
 mod args;
 pub(crate) mod mcp;
 pub(crate) mod skill;
+mod terminal;
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -46,7 +47,10 @@ where
             parse_update_options(arguments).map(CliAction::Update)
         }
         [command, arguments @ ..]
-            if matches!(command.as_str(), "browser" | "gallery" | "mcp" | "skill") =>
+            if matches!(
+                command.as_str(),
+                "browser" | "gallery" | "terminal" | "workstation" | "mcp" | "skill"
+            ) =>
         {
             let mut agent_arguments = Vec::with_capacity(arguments.len() + 1);
             agent_arguments.push(command.clone());
@@ -242,7 +246,10 @@ pub(crate) fn run_cli_or_request_desktop() -> Result<bool> {
             AgentAction::Skill(SkillCommand::Path) => {
                 println!("{}", skill::source_path().display());
             }
-            AgentAction::Browser(_) | AgentAction::Gallery(_) => {
+            AgentAction::Browser(_)
+            | AgentAction::Gallery(_)
+            | AgentAction::Terminal(_)
+            | AgentAction::Workstation(_) => {
                 let result = agent::execute(&command)?;
                 agent::print_result(&result, command.context.json)?;
             }

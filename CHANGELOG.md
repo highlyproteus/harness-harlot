@@ -8,35 +8,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Added service-owned Assistant orchestration through `pi --mode rpc`, with
-  streaming tool activity, model selection, optional per-action confirmation,
-  and bundled HH tools for operating workstations, windows, terminals, and
-  browsers.
+- Added Bots: a robot button beside the notifications bell switches the sidebar
+  to your bots. Each bot runs an installed agent CLI's own interface (omp,
+  Hermes, Claude Code, Codex, Gemini, and others), can be renamed, restarted, or
+  switched to another agent from its context menu, and survives restarts. Bots
+  act as coordinators: they open named worker tabs in a workstation, watch them,
+  and relay your answers when a worker needs input or approval.
+- Added a bundled omp plugin for bots with native Harness Harlot tools and worker
+  status reports, and attach the `hh mcp` server automatically to Claude Code and
+  Codex bots.
+- Added `hh terminal` commands and matching MCP tools to list, create, send to,
+  read, wait for, focus, rename, and close worker terminals, plus
+  `hh workstation new`. `hh skill install` now also installs the skill for omp.
 - Added an HH-owned private tmux substrate for local terminals. Managed shells,
   processes, and terminal output now survive desktop and session-service
   restarts when tmux 3.2 or newer is available.
 - Added automatic coding-agent discovery. The session service resolves installed
-  agent CLIs on the login `PATH`, lists them in the orchestrator prompt, and
-  exposes them to Settings, where an optional preferred agent replaces the
-  hand-typed coding agent command.
+  agent CLIs on the login `PATH` for the bot agent picker and Settings.
 - Added workstation Galleries with drag-and-drop and picker imports, selected-image
   previews, one-click Finder reveal, and private per-workstation image storage.
 - Added local browser automation for terminal agents through the `hh` CLI, a
-  stdio MCP server, the Assistant orchestrator, and an installable Harness Harlot
-  skill. Browser commands use the active desktop's embedded browser and can
-  navigate, read, evaluate, interact, capture screenshots, and call raw CDP.
+  stdio MCP server, and an installable Harness Harlot skill. Browser commands use
+  the active desktop's embedded browser and can navigate, read, evaluate,
+  interact, capture screenshots, and call raw CDP.
 
 ### Changed
 
-- Voice Mode now forwards final user transcripts to the Assistant orchestrator
-  and uses OpenAI Realtime only to speak bounded orchestrator updates. Removed
-  local conversation threads and Honcho memory integration.
-- Rebuilt Settings as a full-pane surface with an Appearance / Assistant / Voice
-  / History / Updates section list, and moved the Assistant model and
-  Full/Confirm controls out of the pane header into a composer toolbar.
-- Bumped the desktop/service wire protocol from 35 to 38 for Assistant thread
-  streaming, settings, coding-agent discovery, Gallery panes, and browser
-  command execution; desktop and service must be upgraded together.
+- Rebuilt Notifications around live status: tabs and bots are grouped as Needs
+  you, Running, and Done, newest first, using the real tab rows with status
+  badges. The bell and Dock badges count items that need you.
+- Rebuilt Settings as a full-pane surface with an Appearance / Bots / History /
+  Updates section list.
+- Bumped the desktop/service wire protocol from 35 to 39 for bots, workers,
+  status timestamps, coding-agent discovery, Gallery panes, and browser command
+  execution; desktop and service must be upgraded together. Session snapshots
+  move to schema 14; existing snapshots load with former Assistant workspaces
+  and panes removed.
+
+### Removed
+
+- Removed Voice Mode and its OpenAI Realtime integration, microphone controls,
+  and `HH_OPENAI_API_KEY` setting. Use your agent's own voice mode in a bot.
+- Removed Assistant panes and workspaces. Bots replace them.
 
 ### Fixed
 
@@ -45,17 +58,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   control keywords and extra panes in referenced windows during recovery.
 - Fall back to plain PTYs with a notification when managed tmux discovery fails,
   including an invalid `HH_TMUX_BINARY`; track both service-bundled assets.
-- Read pi's nested streamed tool calls and top-level error status correctly,
-  bound retained tool output, and report entries dropped during recovery.
-- Preserve Assistant updates across service restarts, restore Working status
-  after active-run approvals, roll back failed assistant creation writes, and
-  stop pi even when shutdown persistence fails. Finish workspace deletion before
-  reporting session-directory cleanup errors.
-- Add the persisted Full/Confirm header toggle, restrict approval shortcuts to
-  Enter/Escape outside the composer, and retain drafts until prompt acknowledgement.
-- Attach voice transcripts to absolute Assistant entry identities, skip muted
-  replies without replay, and retain queued relays across reconnects while
-  waiting for user silence.
 
 ## [0.1.21] - 2026-09-18
 

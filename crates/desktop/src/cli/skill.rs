@@ -25,6 +25,7 @@ pub(crate) fn install(home: &Path) -> Result<Vec<PathBuf>> {
         home.join(".claude/skills"),
         home.join(".codex/skills"),
         home.join(".pi/agent/skills"),
+        home.join(".omp/agent/skills"),
     ];
     let mut installed = Vec::with_capacity(roots.len());
     for root in roots {
@@ -56,7 +57,7 @@ mod tests {
     fn installation_is_idempotent_and_preserves_modified_skills() {
         let root = std::env::temp_dir().join(format!("hh-skill-test-{}", uuid::Uuid::new_v4()));
         let paths = install(&root).unwrap();
-        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.len(), 4);
         assert!(
             paths
                 .iter()

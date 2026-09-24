@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
 
-use hh_protocol::{PaneStreamState, SessionNotification, SessionSnapshot, TerminalScreen};
+use hh_protocol::{
+    NotificationKind, PaneStreamState, SessionNotification, SessionSnapshot, TerminalScreen,
+};
 use uuid::Uuid;
 
 use crate::helpers::{
@@ -32,9 +34,6 @@ pub(crate) struct ReconcileOutcome {
     pub focus_resync: Option<Uuid>,
     /// The notification ring was reset by a stale id; refetch the full list.
     pub notifications_need_refresh: bool,
-    /// New notifications arrived; auto-read them (window active) or refresh
-    /// the dock badge.
-    pub auto_read_or_badge: bool,
 }
 
 /// The `Updates` payload fields the reducer consumes.
@@ -82,7 +81,7 @@ pub(crate) fn reconcile_updates(
             sidebar.active_workspace = snapshot
                 .workspaces
                 .iter()
-                .find(|workspace| workspace_is_selectable(workspace))
+                .find(|workspace| !workspace.is_bots() && workspace_is_selectable(workspace))
                 .map(|workspace| workspace.id);
         }
         let visible = sidebar
@@ -182,7 +181,11 @@ pub(crate) fn reconcile_updates(
             .map(|notification| notification.id)
             .max()
             .unwrap_or(session.notifications_latest_id);
-        session.notifications.extend(notification_deltas);
+        session.notifications.extend(
+            notification_deltas
+                .into_iter()
+                .filter(|notification| notification.kind == NotificationKind::Message),
+        );
         let overflow = session
             .notifications
             .len()
@@ -190,7 +193,6 @@ pub(crate) fn reconcile_updates(
         if overflow > 0 {
             session.notifications.drain(..overflow);
         }
-        outcome.auto_read_or_badge = true;
         true
     };
     let connection_changed = session.connection_error.take().is_some();
@@ -227,6 +229,7 @@ mod tests {
             pane_states: HashMap::new(),
             notifications: Vec::new(),
             notifications_latest_id: 0,
+            dock_badge: None,
             last_delivery: HashMap::new(),
             window_active: true,
             stream_diagnostics: StreamDiagnostics::default(),
@@ -253,7 +256,8 @@ mod tests {
             sidebar_resize: SidebarResizeLifecycle::default(),
             preferred_sidebar_width: 200.0,
             sidebar_visible: true,
-            sidebar_activity: false,
+            sidebar_mode: crate::view_models::SidebarMode::Workstations,
+            return_workstation: None,
             sidebar_pixels: 200.0,
             workstation_banner: None,
             workstation_banner_hidden: false,
@@ -419,7 +423,58 @@ mod tests {
         assert!(session.notifications.is_empty());
         assert_eq!(session.notifications_latest_id, 0);
         assert!(outcome.notifications_need_refresh);
-        assert!(!outcome.auto_read_or_badge);
         assert!(outcome.state_changed);
+    }
+
+    #[test]
+    fn only_service_messages_are_kept_while_the_cursor_tracks_every_delta() {
+        let mut session = session_state();
+        let mut message = notification(8);
+        message.kind = NotificationKind::Message;
+        let outcome = reconcile_updates(
+            &mut session,
+            &mut sidebar(),
+            &mut layout(),
+            &mut HashMap::new(),
+            UpdatePayload {
+                session_revision: 0,
+                snapshot: None,
+                screens: Vec::new(),
+                pane_states: Vec::new(),
+                notification_deltas: vec![notification(7), message.clone(), notification(9)],
+            },
+            Instant::now(),
+        );
+        assert_eq!(session.notifications, vec![message]);
+        assert_eq!(session.notifications_latest_id, 9);
+        assert!(!outcome.notifications_need_refresh);
+    }
+
+    #[test]
+    fn a_missing_active_workspace_falls_back_to_a_workstation_never_the_bots_workspace() {
+        let mut snapshot = snapshot_with_revision(3);
+        let mut bots = snapshot.workspaces[0].clone();
+        bots.id = Uuid::new_v4();
+        bots.kind = hh_protocol::WorkspaceKind::Bots;
+        let workstation = snapshot.workspaces[0].id;
+        snapshot.workspaces.insert(0, bots);
+        let mut session = session_state();
+        let mut sidebar = sidebar();
+        sidebar.active_workspace = Some(Uuid::new_v4());
+        reconcile_updates(
+            &mut session,
+            &mut sidebar,
+            &mut layout(),
+            &mut HashMap::new(),
+            UpdatePayload {
+                session_revision: 3,
+                snapshot: Some(snapshot),
+                screens: Vec::new(),
+                pane_states: Vec::new(),
+                notification_deltas: Vec::new(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(sidebar.active_workspace, Some(workstation));
     }
 }

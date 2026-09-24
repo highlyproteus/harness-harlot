@@ -1007,9 +1007,7 @@ jobs:
           mapfile -d '' release_assets < <(find release-assets -type f -print0 | sort -z)
           (( ${#release_assets[@]} > 0 ))
           printf '%s\n' \
-            'Conversational-only Voice release. The provider receives no tools and has no authority over terminals, panes, workspaces, files, Git, agents, or memory retrieval.' \
-            '' \
-            'This community macOS build is ad-hoc signed (not Apple notarized), so macOS may ask you to grant Microphone or Screen Recording access again.' \
+            'This community macOS build is ad-hoc signed (not Apple notarized), so macOS may ask you to grant Screen Recording or other permissions again.' \
             > release-notes.md
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --verify-tag --title "Harness Harlot ${GITHUB_REF_NAME#v}" \

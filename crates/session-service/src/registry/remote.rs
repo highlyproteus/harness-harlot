@@ -189,6 +189,7 @@ impl SessionRegistry {
     /// server for one workstation. It never starts tmux, reconnects a saved
     /// SSH workstation, or writes scan output to terminal history.
     pub fn scan_tmux_sessions(&self, workspace_id: Uuid) -> Result<TmuxScanResult> {
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         let _scan_permit = self.begin_tmux_scan(workspace_id)?;
         let connection = self.workspace_connection(workspace_id)?;
         let (scope, probe) = tmux_probe_for_connection(&connection)?;
@@ -227,6 +228,7 @@ impl SessionRegistry {
         workspace_id: Uuid,
         session_ids: &[TmuxSessionId],
     ) -> Result<TmuxAttachmentResult> {
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         let connection = {
             let state = self.state.read();
             state
@@ -383,6 +385,8 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
+                bot: None,
+                owner_bot: None,
                 layout: PaneLayout::Leaf {
                     pane: Pane {
                         id: pane_id,
@@ -395,6 +399,7 @@ impl SessionRegistry {
                             source: TerminalIdentitySource::Command,
                         },
                         status: hh_protocol::PaneStatus::default(),
+                        status_changed_at_ms: 0,
                         custom_title: None,
                         profile_override: None,
                         custom_icon: None,

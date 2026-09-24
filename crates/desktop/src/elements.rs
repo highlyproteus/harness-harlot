@@ -22,13 +22,24 @@ use crate::view_models::{DialogTextEditor, WorkspaceCreationField, WorkspaceCrea
 use crate::{HhApp, THEME};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SidebarPaneRowContext {
     pub(crate) workspace_id: Uuid,
     pub(crate) tab_id: Option<Uuid>,
     pub(crate) tab_color: Option<AppearanceColor>,
     pub(crate) from_group: bool,
     pub(crate) indent: f32,
+    /// Set on Notifications rows, which never drag-reorder.
+    pub(crate) activity: Option<ActivityRow>,
+}
+
+/// The status badge and location line of one Notifications row.
+#[derive(Clone, Debug)]
+pub(crate) struct ActivityRow {
+    pub(crate) badge: &'static str,
+    pub(crate) badge_color: u32,
+    pub(crate) location: String,
+    pub(crate) bot: bool,
 }
 
 pub(crate) struct WorkspaceTextInputElement {

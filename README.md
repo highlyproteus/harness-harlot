@@ -76,7 +76,7 @@ present by default on supported Ubuntu installations or available from the
 standard package repositories.
 
 The desktop package uses the matching distribution runtime libraries. Browser tabs
-need GTK, NSS, and GBM; Voice Mode needs ALSA:
+need GTK, NSS, ALSA, and GBM:
 
 ```text
 Ubuntu 22.04:  libgtk-3-0 libnss3 libasound2 libgbm1
@@ -111,34 +111,35 @@ A group displays several terminals together in one view — and can include a br
 
 Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profile directory.
 
-## Assistant and Voice Mode
+## Bots
 
-Assistant panes run a service-owned `pi --mode rpc` orchestrator. Typed messages
-and image attachments go to the model provider configured in pi. The bundled
-extension gives pi only HH workspace tools: it can list and create workstations,
-windows, terminals, and browsers; read, send to, wait for, close, and focus
-panes; and launch a configured coding-agent command in a terminal. `Full`
-access auto-allows guarded actions; `Confirm` shows an inline Allow/Deny card
-before sending input, closing a pane, or launching a command.
-Choose `Full` or `Confirm` in the Assistant header; this setting survives service
-restarts. With the composer inactive, Enter allows the focused pane's pending
-action and Escape denies it. While composing, these keys retain their normal
-submit/close behavior; typing `y` or `n` never approves or denies an action.
-Prompt drafts and attachments remain in the composer until submission succeeds.
+Bots are the agents you talk to. Click the robot icon next to the notifications
+bell to switch the sidebar to your bots, create one with **New bot**, and pick
+which installed agent CLI runs it: omp, Hermes, Claude Code, Codex, Gemini, or
+another supported agent. Each bot runs its agent's own interface, so the agent's
+commands, settings, and voice mode work as usual. Right-click a bot to rename
+it, change its agent, restart it, or delete it. Bots survive app and service
+restarts like any other local terminal.
 
-Voice Mode is optional and uses the OpenAI Realtime API as a relay. The
-microphone remains off until you use the visible start-voice control. Final
-speech transcripts are forwarded to pi, and only bounded final orchestrator
-updates are sent back to Realtime for speech. The Realtime session receives no
-HH tools and cannot authorize actions.
-Replies received while the speaker is muted or voice is suspended are skipped,
-not replayed when listening resumes. Spoken transcripts stay attached to the
-Assistant entry being voiced even as older entries leave the visible history.
+A bot is a coordinator, not a workspace. Ask it to "spin up three worktrees and
+have omp implement the plan" and it opens named worker tabs in a workstation
+(by default one titled after the bot), each running a coding agent on its task.
+Open the workstation to watch the workers or take over any of them yourself.
+When a worker needs input or approval, the bot tells you what it is asking;
+answer the bot and it relays your decision to the worker.
 
-OpenAI credentials are not saved to the settings file. Set
-`HH_OPENAI_API_KEY` in the launch environment. pi manages credentials for its
-selected model provider. See [Assistant and Voice Mode privacy and data
-handling](PRIVACY.md) for provider and local-storage boundaries.
+omp bots load the bundled Harness Harlot plugin automatically, which also
+reports worker status changes into the bot's conversation. Claude Code and
+Codex bots get the `hh mcp` server attached at launch. Other agents need a
+one-time MCP setup; **Settings → Bots** shows the exact command. See
+[Bots privacy and data handling](PRIVACY.md).
+
+## Notifications
+
+The bell switches the sidebar to Notifications, which lists terminal tabs and
+bots by live status: **Needs you** (waiting for input or approval), then
+**Running**, then **Done**, newest first within each group. Click a row to jump
+to it. The bell and Dock badges count what needs you.
 
 ## Browser automation and Galleries
 
@@ -155,9 +156,11 @@ hh gallery add /absolute/path/to/image.png --json
 hh gallery list --json
 ```
 
-`hh mcp` exposes the same operations as a stdio MCP server. `hh skill install`
-installs the bundled agent instructions for Claude Code, Codex, and pi. The
-Assistant settings show the MCP configuration and skill installer.
+`hh terminal` controls worker terminals the same way (`list`, `new`, `send`,
+`read`, `wait`, `focus`, `close`, `rename`). `hh mcp` exposes all of these as a
+stdio MCP server. `hh skill install` installs the bundled agent instructions for
+omp, Claude Code, Codex, and pi. **Settings → Bots** shows the MCP
+configuration and skill installer.
 
 Gallery images are copied into private per-workstation application storage.
 Opening or importing from a terminal creates or reuses a Gallery without taking
@@ -235,5 +238,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 ## License
 
 Harness Harlot is available under the [MIT License](LICENSE). See also
-[Voice Mode privacy and data handling](PRIVACY.md),
+[Bots privacy and data handling](PRIVACY.md),
 [security reporting](SECURITY.md), and [third-party notices](THIRD_PARTY_NOTICES.md).

@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::assistant::discovery::discover_coding_agents;
-use crate::assistant::thread::{AssistantRuntime, CodingAgentCache, PiDiscoveryCache};
+use crate::bots::discover_coding_agents;
 use crate::history::HistoryArchive;
 use crate::layout::{
     find_pane_in_snapshot, find_pane_mut_in_snapshot, first_pane_id, pane_ids_in_snapshot,
@@ -17,12 +16,11 @@ use crate::layout::{
 use crate::persistence::{MAX_TITLE_CHARS, SnapshotStore, default_snapshot_path};
 use anyhow::{Context, Result, bail, ensure};
 use hh_protocol::{
-    AssistantSettings, BrowserAction, BrowserCommandOutcome, BrowserCommandRequest, CodingAgent,
-    HistoryArchiveStatus, HistoryClearScope, HistoryCursor, HistoryPageDirection, HistorySettings,
-    NotificationKind, Pane, PaneAuthority, PaneKind, PaneRevisionCursor, PaneStatus,
-    PaneStreamState, SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalHistoryPage,
-    TerminalIdentity, TerminalProfile, TerminalScreen, TerminalTransport, TmuxSessionId,
-    WorkspaceConnection,
+    BrowserAction, BrowserCommandOutcome, BrowserCommandRequest, CodingAgent, HistoryArchiveStatus,
+    HistoryClearScope, HistoryCursor, HistoryPageDirection, HistorySettings, NotificationKind,
+    Pane, PaneAuthority, PaneKind, PaneRevisionCursor, PaneStatus, PaneStreamState,
+    SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalHistoryPage, TerminalIdentity,
+    TerminalProfile, TerminalScreen, TerminalTransport, TmuxSessionId, WorkspaceConnection,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -30,6 +28,7 @@ use uuid::Uuid;
 
 use crate::process::{fallback_cwd, shell_title, valid_local_cwd};
 use crate::pty::{PtySession, RawPaneEvent};
+use crate::registry::bots::bot_tab_for_pane;
 use crate::registry::identity::{
     refresh_process_metadata, refresh_runtime_metadata, set_pane_runtime_label,
 };
@@ -39,6 +38,7 @@ use crate::registry::streaming::DiagnosticsSampler;
 use crate::tmux_control::{PaneSinks, TmuxControlClient, TmuxServer};
 pub use remote::{TmuxAttachmentResult, TmuxScanResult};
 
+mod bots;
 mod identity;
 mod panes;
 mod remote;
@@ -60,7 +60,6 @@ pub(crate) enum RuntimePaneBackend {
     Terminal(TerminalRuntimePane),
     Browser,
     Gallery,
-    Assistant(Arc<AssistantRuntime>),
 }
 
 #[derive(Debug)]
@@ -78,27 +77,14 @@ impl RuntimePane {
     pub(crate) fn terminal(&self) -> Option<&TerminalRuntimePane> {
         match &self.backend {
             RuntimePaneBackend::Terminal(terminal) => Some(terminal),
-            RuntimePaneBackend::Browser
-            | RuntimePaneBackend::Gallery
-            | RuntimePaneBackend::Assistant(_) => None,
+            RuntimePaneBackend::Browser | RuntimePaneBackend::Gallery => None,
         }
     }
 
     pub(crate) fn terminal_mut(&mut self) -> Option<&mut TerminalRuntimePane> {
         match &mut self.backend {
             RuntimePaneBackend::Terminal(terminal) => Some(terminal),
-            RuntimePaneBackend::Browser
-            | RuntimePaneBackend::Gallery
-            | RuntimePaneBackend::Assistant(_) => None,
-        }
-    }
-
-    pub(crate) fn assistant(&self) -> Option<&Arc<AssistantRuntime>> {
-        match &self.backend {
-            RuntimePaneBackend::Assistant(runtime) => Some(runtime),
-            RuntimePaneBackend::Terminal(_)
-            | RuntimePaneBackend::Browser
-            | RuntimePaneBackend::Gallery => None,
+            RuntimePaneBackend::Browser | RuntimePaneBackend::Gallery => None,
         }
     }
 }
@@ -237,6 +223,7 @@ impl RegistryState {
             color: None,
             identity: TerminalIdentity::default(),
             status: hh_protocol::PaneStatus::default(),
+            status_changed_at_ms: 0,
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -251,6 +238,7 @@ impl RegistryState {
             return;
         }
         pane.status = status;
+        pane.status_changed_at_ms = crate::history::now_ms();
         self.snapshot.revision = self.snapshot.revision.saturating_add(1);
     }
 
@@ -281,9 +269,6 @@ impl RegistryState {
             Some(RuntimePane {
                 backend: RuntimePaneBackend::Gallery,
             }) => bail!("gallery panes cannot host terminals"),
-            Some(RuntimePane {
-                backend: RuntimePaneBackend::Assistant(_),
-            }) => bail!("assistant tabs cannot create terminal panes"),
             None => bail!("pane {pane_id} does not exist"),
         }
     }
@@ -511,8 +496,7 @@ pub struct SessionRegistry {
     history: HistoryArchive,
     tmux_scan_gate: Arc<Mutex<TmuxScanGate>>,
     remote_ls_gate: Arc<Mutex<RemoteLsGate>>,
-    assistant_discovery: PiDiscoveryCache,
-    coding_agents: CodingAgentCache,
+    coding_agents: Arc<Mutex<Option<Vec<CodingAgent>>>>,
     browser_commands: Arc<Mutex<BrowserCommandQueue>>,
 }
 
@@ -521,7 +505,6 @@ pub struct PaneUpdateBatch {
     pub session_revision: u64,
     pub snapshot: Option<SessionSnapshot>,
     pub screens: Vec<TerminalScreen>,
-    pub assistant_threads: Vec<hh_protocol::AssistantThreadView>,
     pub pane_states: Vec<PaneStreamState>,
     pub notifications: Vec<SessionNotification>,
     pub diagnostics: StreamDiagnostics,
@@ -531,7 +514,6 @@ pub struct PaneUpdateBatch {
 pub(crate) struct PaneUpdateRequest<'a> {
     pub(crate) snapshot_revision: Option<u64>,
     pub(crate) pane_revisions: &'a [PaneRevisionCursor],
-    pub(crate) assistant_revisions: &'a [PaneRevisionCursor],
     pub(crate) subscribed_panes: &'a [Uuid],
     pub(crate) browser_executor: bool,
     pub(crate) measure_bytes: bool,
@@ -738,8 +720,7 @@ impl SessionRegistry {
         let mut tmux_clients = HashMap::new();
         let mut tmux_sinks = HashMap::new();
         let mut tmux_failures = Vec::new();
-        let assistant_discovery: PiDiscoveryCache = Arc::new(Mutex::new(None));
-        let coding_agents: CodingAgentCache = Arc::new(Mutex::new(None));
+        let mut fresh_bot_panes = Vec::new();
         for pane_id in pane_ids {
             let pane_kind = find_pane_in_snapshot(&recovered.snapshot, pane_id)
                 .with_context(|| format!("recovered pane {pane_id} is missing"))?
@@ -763,28 +744,13 @@ impl SessionRegistry {
                 );
                 continue;
             }
-            if matches!(pane_kind, PaneKind::Assistant) {
-                let workspace_id = workspace_id_for_pane(&recovered.snapshot, pane_id)
-                    .context("recovered assistant pane has no workspace")?;
-                let runtime = AssistantRuntime::new(
-                    pane_id,
-                    workspace_id,
-                    Arc::clone(&assistant_discovery),
-                    Arc::clone(&coding_agents),
-                )?;
-                panes.insert(
-                    pane_id,
-                    RuntimePane {
-                        backend: RuntimePaneBackend::Assistant(runtime),
-                    },
-                );
-                continue;
-            }
             if recovered.offline_panes.contains(&pane_id) {
                 continue;
             }
             let workspace_id = workspace_id_for_pane(&recovered.snapshot, pane_id)
                 .context("recovered pane has no workspace")?;
+            let bot_tab = bot_tab_for_pane(&recovered.snapshot, pane_id);
+            let mut reattached = false;
             let cwd = recovered
                 .cwd_by_pane
                 .remove(&pane_id)
@@ -803,6 +769,7 @@ impl SessionRegistry {
                                     },
                                 );
                                 if let Some((window_id, tmux_pane_id, pane_pid, _)) = existing {
+                                    reattached = true;
                                     return PtySession::attach_tmux(
                                         pane_id,
                                         workspace_id,
@@ -814,19 +781,30 @@ impl SessionRegistry {
                                     );
                                 }
                             }
-                            PtySession::spawn_tmux(pane_id, workspace_id, &cwd, &client, &history)
+                            PtySession::spawn_tmux(
+                                pane_id,
+                                workspace_id,
+                                bot_tab,
+                                &cwd,
+                                &client,
+                                &history,
+                            )
                         })
                 });
+            let reattached = reattached && matches!(managed, Some(Ok(_)));
             let session = match managed {
                 Some(Ok(session)) => Ok(session),
                 Some(Err(error)) => {
                     tmux_failures.push((pane_id, format!("{error:#}")));
-                    PtySession::spawn_local(pane_id, workspace_id, &cwd, &history)
+                    PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd, &history)
                 }
-                None => PtySession::spawn_local(pane_id, workspace_id, &cwd, &history),
+                None => PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd, &history),
             };
             match session {
                 Ok(session) => {
+                    if let Some(tab_id) = bot_tab.filter(|_| !reattached) {
+                        fresh_bot_panes.push(tab_id);
+                    }
                     panes.insert(
                         pane_id,
                         RuntimePane {
@@ -920,24 +898,15 @@ impl SessionRegistry {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             tmux_scan_gate: Arc::new(Mutex::new(TmuxScanGate::default())),
             remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
-            assistant_discovery,
-            coding_agents,
+            coding_agents: Arc::new(Mutex::new(None)),
             store: Some(store),
             history,
             browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
         };
-        let assistants = state
-            .read()
-            .panes
-            .values()
-            .filter_map(RuntimePane::assistant)
-            .cloned()
-            .collect::<Vec<_>>();
-        for assistant in assistants {
-            assistant.bind_registry(&state);
-            assistant.start();
-        }
         registry.persist()?;
+        for tab_id in fresh_bot_panes {
+            registry.relaunch_recovered_bot(tab_id);
+        }
         Ok(registry)
     }
 
@@ -968,22 +937,23 @@ impl SessionRegistry {
         let mut tmux_sinks = HashMap::new();
         let managed = tmux.as_ref().map(|server| {
             ensure_tmux_client(server, workspace_id, &mut tmux_clients, &mut tmux_sinks).and_then(
-                |client| PtySession::spawn_tmux(pane_id, workspace_id, &cwd, &client, &history),
+                |client| {
+                    PtySession::spawn_tmux(pane_id, workspace_id, None, &cwd, &client, &history)
+                },
             )
         });
         let (session, tmux_failure) = match managed {
             Some(Ok(session)) => (session, None),
             Some(Err(error)) => (
-                PtySession::spawn_local(pane_id, workspace_id, &cwd, &history)?,
+                PtySession::spawn_local(pane_id, workspace_id, None, &cwd, &history)?,
                 Some(format!("{error:#}")),
             ),
             None => (
-                PtySession::spawn_local(pane_id, workspace_id, &cwd, &history)?,
+                PtySession::spawn_local(pane_id, workspace_id, None, &cwd, &history)?,
                 None,
             ),
         };
         let tmux_unavailable = tmux.is_none();
-        let assistant_discovery: PiDiscoveryCache = Arc::new(Mutex::new(None));
         let state = Arc::new(RwLock::new(RegistryState {
             snapshot,
             notifications: VecDeque::new(),
@@ -1038,7 +1008,6 @@ impl SessionRegistry {
             diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             tmux_scan_gate: Arc::new(Mutex::new(TmuxScanGate::default())),
-            assistant_discovery,
             coding_agents: Arc::new(Mutex::new(None)),
             store,
             remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
@@ -1122,16 +1091,6 @@ impl SessionRegistry {
         }
     }
 
-    pub(crate) fn assistant_runtime(&self, pane_id: Uuid) -> Result<Arc<AssistantRuntime>> {
-        let state = self.state.read();
-        state
-            .panes
-            .get(&pane_id)
-            .and_then(RuntimePane::assistant)
-            .cloned()
-            .with_context(|| format!("pane {pane_id} is not an assistant"))
-    }
-
     /// Cached login-PATH scan for installed coding agent CLIs.
     pub(crate) fn coding_agents(&self, refresh: bool) -> Result<Vec<CodingAgent>> {
         if !refresh && let Some(cached) = self.coding_agents.lock().clone() {
@@ -1140,54 +1099,6 @@ impl SessionRegistry {
         let agents = discover_coding_agents()?;
         *self.coding_agents.lock() = Some(agents.clone());
         Ok(agents)
-    }
-    pub(crate) fn set_assistant_settings(&self, settings: AssistantSettings) -> Result<()> {
-        let mut state = self.state.write();
-        let previous = state.snapshot.assistant.clone();
-        state.snapshot.assistant = settings;
-        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        let bytes = encode_desired_state(&state)?;
-        if let Err(error) = self.write_snapshot(&bytes) {
-            state.snapshot.assistant = previous;
-            state.snapshot.revision = state.snapshot.revision.saturating_sub(1);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn set_assistant_model(
-        &self,
-        pane_id: Uuid,
-        provider: &str,
-        model_id: &str,
-    ) -> Result<()> {
-        let runtime = self.assistant_runtime(pane_id)?;
-        runtime.set_model(provider, model_id)?;
-        let mut state = self.state.write();
-        let previous = state.snapshot.assistant.model.clone();
-        state.snapshot.assistant.model = Some(format!("{provider}/{model_id}"));
-        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        let bytes = encode_desired_state(&state)?;
-        if let Err(error) = self.write_snapshot(&bytes) {
-            state.snapshot.assistant.model = previous;
-            state.snapshot.revision = state.snapshot.revision.saturating_sub(1);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub fn shutdown_assistants(&self) {
-        let assistants = self
-            .state
-            .read()
-            .panes
-            .values()
-            .filter_map(RuntimePane::assistant)
-            .cloned()
-            .collect::<Vec<_>>();
-        for assistant in assistants {
-            assistant.shutdown();
-        }
     }
 
     pub fn request_shutdown(&self) -> Result<()> {
@@ -1322,16 +1233,22 @@ impl SessionRegistry {
         &self,
         pane_id: Uuid,
         workspace_id: Uuid,
+        bot_tab: Option<Uuid>,
         cwd: &Path,
     ) -> Result<Arc<PtySession>> {
         if self.state.read().tmux.is_some() {
             match self.client_for_workspace(workspace_id).and_then(|client| {
-                PtySession::spawn_tmux(pane_id, workspace_id, cwd, &client, &self.history)
+                PtySession::spawn_tmux(pane_id, workspace_id, bot_tab, cwd, &client, &self.history)
             }) {
                 Ok(session) => return Ok(session),
                 Err(error) => {
-                    let session =
-                        PtySession::spawn_local(pane_id, workspace_id, cwd, &self.history)?;
+                    let session = PtySession::spawn_local(
+                        pane_id,
+                        workspace_id,
+                        bot_tab,
+                        cwd,
+                        &self.history,
+                    )?;
                     append_tmux_notification(
                         &mut self.state.write(),
                         format!("tmux window could not be created; using a plain shell: {error:#}"),
@@ -1340,7 +1257,7 @@ impl SessionRegistry {
                 }
             }
         }
-        PtySession::spawn_local(pane_id, workspace_id, cwd, &self.history)
+        PtySession::spawn_local(pane_id, workspace_id, bot_tab, cwd, &self.history)
     }
 
     pub(crate) fn spawn_pane_for_workspace(
@@ -1352,7 +1269,9 @@ impl SessionRegistry {
     ) -> Result<(Arc<PtySession>, RuntimePaneKind)> {
         let kind = runtime_kind_for_workspace(&self.workspace_connection(workspace_id)?);
         let session = match &kind {
-            RuntimePaneKind::Local => self.spawn_local_transport(pane_id, workspace_id, cwd)?,
+            RuntimePaneKind::Local => {
+                self.spawn_local_transport(pane_id, workspace_id, None, cwd)?
+            }
             RuntimePaneKind::SystemSsh { host } => {
                 PtySession::spawn_ssh(pane_id, workspace_id, host, remote_dir, &self.history)?
             }
@@ -1378,6 +1297,36 @@ pub(crate) fn create_owner_only_directory(path: &Path) {
 mod tests {
     use super::*;
     use hh_protocol::{DropPlacement, WorkspaceConnectionStatus};
+
+    #[test]
+    fn status_changed_at_ms_advances_only_on_real_transitions() {
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        let changed_at = || {
+            find_pane_in_snapshot(&registry.snapshot().unwrap(), pane_id)
+                .unwrap()
+                .status_changed_at_ms
+        };
+        assert_eq!(changed_at(), 0);
+
+        registry
+            .state
+            .write()
+            .set_pane_status(pane_id, PaneStatus::Working);
+        let working_since = changed_at();
+        assert!(working_since > 0);
+        thread::sleep(Duration::from_millis(5));
+        registry
+            .state
+            .write()
+            .set_pane_status(pane_id, PaneStatus::Working);
+        assert_eq!(changed_at(), working_since);
+        registry
+            .state
+            .write()
+            .set_pane_status(pane_id, PaneStatus::NeedsInput);
+        assert!(changed_at() > working_since);
+    }
 
     #[test]
     fn service_shutdown_requires_zero_live_terminals() {

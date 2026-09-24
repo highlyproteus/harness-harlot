@@ -116,7 +116,14 @@ impl HhApp {
             .session
             .snapshot
             .as_ref()
-            .map(|snapshot| snapshot.workspaces.clone())
+            .map(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| !workspace.is_bots())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         workspace_ids.sort_by_key(|workspace| {
             (
@@ -281,28 +288,11 @@ impl HhApp {
         })
     }
 
-    pub(crate) fn workspace_is_assistant(&self, workspace_id: Uuid) -> bool {
-        self.session.snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == workspace_id)
-                .is_some_and(hh_protocol::Workspace::is_assistant)
-        })
-    }
-
     pub(crate) fn begin_workspace_creation(&mut self, cx: &mut Context<Self>) {
         self.editor.modal = Modal::WorkspaceCreation(WorkspaceCreationDialog::new());
         self.editor.workspace_input_layouts = [None, None, None, None];
         self.editor.workspace_input_bounds = [None, None, None, None];
         cx.notify();
-    }
-
-    pub(crate) fn begin_assistant_creation(&mut self, cx: &mut Context<Self>) {
-        self.begin_workspace_creation(cx);
-        if let Some(dialog) = self.editor.modal.workspace_creation_mut() {
-            dialog.kind = WorkspaceCreationKind::Assistant;
-        }
     }
 
     pub(crate) fn focus_workspace_creation_field(
@@ -368,6 +358,14 @@ impl HhApp {
                         this.sidebar.expanded_workspaces.insert(workspace_id);
                         this.focus_pane_with_snapshot(pane_id, cx);
                         this.editor.modal = Modal::None;
+                    }
+                    Ok(ServiceResponse::BotCreated {
+                        workspace_id,
+                        pane_id,
+                        ..
+                    }) => {
+                        this.editor.modal = Modal::None;
+                        this.show_bot_pane(workspace_id, pane_id, cx);
                     }
                     Ok(response) => {
                         if let Some(dialog) = this.editor.modal.workspace_creation_mut() {

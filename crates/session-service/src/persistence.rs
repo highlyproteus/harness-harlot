@@ -7,15 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    AppearanceColor, AppearanceSettings, AssistantSettings, MAX_BROWSER_URL_LEN, Pane, PaneKind,
+    AppearanceColor, AppearanceSettings, BotSettings, BotSpec, MAX_BROWSER_URL_LEN, Pane, PaneKind,
     PaneLayout, SessionSnapshot, SplitAxis, Tab, TerminalIdentity, TerminalProfile, Workspace,
     WorkspaceConnection, WorkspaceConnectionStatus, WorkspaceKind, validate_ssh_host,
     validate_workspace_dir,
 };
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 13;
+const SCHEMA_VERSION: u16 = 14;
+/// Snapshots older than this still carry the retired Harbor Blue defaults.
+const DARK_GRAY_DEFAULTS_SCHEMA_VERSION: u16 = 13;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 pub(crate) const MAX_WORKSPACES: usize = 16;
@@ -83,8 +86,9 @@ impl SnapshotStore {
     fn load(&self) -> Result<RecoveredState> {
         let bytes = hh_protocol::read_private_file(&self.path, MAX_SNAPSHOT_BYTES)
             .with_context(|| format!("read snapshot {}", self.path.display()))?;
-        let desired: DesiredState =
+        let mut desired: DesiredState =
             serde_json::from_slice(&bytes).context("decode recovery snapshot")?;
+        desired.drop_legacy_assistants();
         desired.validate()?;
         Ok(desired.into_runtime())
     }
@@ -236,7 +240,11 @@ struct DesiredState {
     #[serde(default)]
     appearance: AppearanceSettings,
     #[serde(default)]
-    assistant: AssistantSettings,
+    bots: BotSettings,
+    /// Settings of the removed pi Assistant in schema-13 snapshots. Never written back.
+    #[serde(default, skip_serializing)]
+    #[expect(dead_code, reason = "parsed only so pre-removal snapshots still load")]
+    assistant: Option<IgnoredAny>,
     #[serde(default, skip_serializing)]
     #[expect(dead_code, reason = "parsed only so pre-removal snapshots still load")]
     tmux: RetiredTmuxSettings,
@@ -261,12 +269,25 @@ struct DesiredWorkspace {
     #[serde(default)]
     working_dir: Option<String>,
     #[serde(default)]
-    kind: WorkspaceKind,
+    kind: DesiredWorkspaceKind,
     #[serde(default)]
     instructions: Option<String>,
     #[serde(default)]
+    owner_bot: Option<Uuid>,
+    #[serde(default)]
     custom_icon: Option<String>,
     tabs: Vec<DesiredTab>,
+}
+
+/// Persisted workspace kinds, including the removed Assistant kind that
+/// schema-13 snapshots may contain until `drop_legacy_assistants` runs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DesiredWorkspaceKind {
+    #[default]
+    Workstation,
+    Bots,
+    Assistant,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -286,6 +307,10 @@ struct DesiredTab {
     parent_tab: Option<Uuid>,
     #[serde(default)]
     pinned: bool,
+    #[serde(default)]
+    bot: Option<BotSpec>,
+    #[serde(default)]
+    owner_bot: Option<Uuid>,
     layout: DesiredLayout,
 }
 
@@ -312,7 +337,7 @@ enum DesiredLayout {
 struct DesiredPane {
     id: Uuid,
     #[serde(default)]
-    kind: PaneKind,
+    kind: DesiredPaneKind,
     /// Compatibility fallback for schema-v1 readers. Live detected identity is
     /// deliberately projected to "Terminal" instead of being persisted here.
     title: String,
@@ -331,7 +356,94 @@ struct DesiredPane {
     tmux_pane: Option<String>,
 }
 
+/// Persisted pane kinds, including the removed Assistant kind that
+/// schema-13 snapshots may contain until `drop_legacy_assistants` runs.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DesiredPaneKind {
+    #[default]
+    Terminal,
+    Browser {
+        url: String,
+    },
+    Gallery,
+    Assistant,
+}
+
+impl From<&PaneKind> for DesiredPaneKind {
+    fn from(kind: &PaneKind) -> Self {
+        match kind {
+            PaneKind::Terminal => Self::Terminal,
+            PaneKind::Browser { url } => Self::Browser { url: url.clone() },
+            PaneKind::Gallery => Self::Gallery,
+        }
+    }
+}
+
+impl DesiredPaneKind {
+    fn into_runtime(self) -> PaneKind {
+        match self {
+            Self::Terminal => PaneKind::Terminal,
+            Self::Browser { url } => PaneKind::Browser { url },
+            Self::Gallery => PaneKind::Gallery,
+            Self::Assistant => unreachable!("legacy assistant panes are dropped before recovery"),
+        }
+    }
+}
+
 impl DesiredState {
+    /// Removes the retired pi Assistant from a schema-13 snapshot: its
+    /// workspaces, its panes (collapsing their layouts) and tabs left empty.
+    fn drop_legacy_assistants(&mut self) {
+        let before = self.workspaces.len();
+        self.workspaces
+            .retain(|workspace| workspace.kind != DesiredWorkspaceKind::Assistant);
+        let dropped_workspaces = self.workspaces.len() != before;
+        for workspace in &mut self.workspaces {
+            workspace.tabs = std::mem::take(&mut workspace.tabs)
+                .into_iter()
+                .filter_map(|mut tab| {
+                    tab.layout = tab.layout.without_assistants()?;
+                    Some(tab)
+                })
+                .collect();
+            let tab_ids = workspace
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<HashSet<_>>();
+            for tab in &mut workspace.tabs {
+                if tab
+                    .parent_tab
+                    .is_some_and(|parent| !tab_ids.contains(&parent))
+                {
+                    tab.parent_tab = None;
+                }
+            }
+        }
+        let has_workstation = self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.kind == DesiredWorkspaceKind::Workstation);
+        if dropped_workspaces && !has_workstation {
+            self.workspaces.push(DesiredWorkspace {
+                id: Uuid::new_v4(),
+                title: "Workstation 1".to_owned(),
+                color: None,
+                pinned: false,
+                pin_order: 0,
+                order: 1,
+                connection: WorkspaceConnection::Local,
+                working_dir: None,
+                kind: DesiredWorkspaceKind::Workstation,
+                instructions: None,
+                owner_bot: None,
+                custom_icon: None,
+                tabs: Vec::new(),
+            });
+        }
+    }
+
     fn from_runtime(
         snapshot: &SessionSnapshot,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
@@ -361,8 +473,12 @@ impl DesiredState {
                         }
                     },
                     working_dir: workspace.working_dir.clone(),
-                    kind: workspace.kind,
+                    kind: match workspace.kind {
+                        WorkspaceKind::Workstation => DesiredWorkspaceKind::Workstation,
+                        WorkspaceKind::Bots => DesiredWorkspaceKind::Bots,
+                    },
                     instructions: workspace.instructions.clone(),
+                    owner_bot: workspace.owner_bot,
                     custom_icon: workspace.custom_icon.clone(),
                     tabs: workspace
                         .tabs
@@ -377,6 +493,8 @@ impl DesiredState {
                                 custom_icon: tab.custom_icon.clone(),
                                 parent_tab: tab.parent_tab,
                                 pinned: tab.pinned,
+                                bot: tab.bot.clone(),
+                                owner_bot: tab.owner_bot,
                                 layout: DesiredLayout::from_runtime(
                                     &tab.layout,
                                     cwd_by_pane,
@@ -394,7 +512,8 @@ impl DesiredState {
             schema_version: SCHEMA_VERSION,
             revision: snapshot.revision,
             appearance: snapshot.appearance.clone(),
-            assistant: snapshot.assistant.clone(),
+            bots: snapshot.bots.clone(),
+            assistant: None,
             tmux: RetiredTmuxSettings::default(),
             workspaces,
         })
@@ -402,7 +521,7 @@ impl DesiredState {
 
     fn into_runtime(self) -> RecoveredState {
         let mut appearance = self.appearance;
-        if self.schema_version < SCHEMA_VERSION {
+        if self.schema_version < DARK_GRAY_DEFAULTS_SCHEMA_VERSION {
             if appearance.default_terminal_accent == AppearanceColor::HARBOR_BLUE {
                 appearance.default_terminal_accent = AppearanceColor::DARK_GRAY;
             }
@@ -434,8 +553,15 @@ impl DesiredState {
                     }
                 },
                 working_dir: workspace.working_dir,
-                kind: workspace.kind,
+                kind: match workspace.kind {
+                    DesiredWorkspaceKind::Workstation => WorkspaceKind::Workstation,
+                    DesiredWorkspaceKind::Bots => WorkspaceKind::Bots,
+                    DesiredWorkspaceKind::Assistant => {
+                        unreachable!("legacy assistant workspaces are dropped before recovery")
+                    }
+                },
                 instructions: workspace.instructions,
+                owner_bot: workspace.owner_bot,
                 custom_icon: workspace.custom_icon,
                 tabs: workspace
                     .tabs
@@ -449,6 +575,8 @@ impl DesiredState {
                         custom_icon: tab.custom_icon,
                         parent_tab: tab.parent_tab,
                         pinned: tab.pinned,
+                        bot: tab.bot,
+                        owner_bot: tab.owner_bot,
                         layout: tab.layout.into_runtime(
                             &mut cwd_by_pane,
                             &mut tmux_by_pane,
@@ -462,7 +590,7 @@ impl DesiredState {
             snapshot: SessionSnapshot {
                 revision: self.revision.saturating_add(1),
                 appearance,
-                assistant: self.assistant,
+                bots: self.bots,
                 terminal_transports: std::collections::HashMap::new(),
                 workspaces,
             },
@@ -482,8 +610,21 @@ impl DesiredState {
         if self.appearance.recent_colors.len() > MAX_RECENT_COLORS {
             bail!("appearance recent colors exceed {MAX_RECENT_COLORS}");
         }
-        if self.workspaces.is_empty() || self.workspaces.len() > MAX_WORKSPACES {
+        let count_kind = |kind| {
+            self.workspaces
+                .iter()
+                .filter(|workspace| workspace.kind == kind)
+                .count()
+        };
+        let workstations = count_kind(DesiredWorkspaceKind::Workstation);
+        if workstations == 0 || workstations > MAX_WORKSPACES {
             bail!("snapshot must contain 1 to {MAX_WORKSPACES} workstations");
+        }
+        if count_kind(DesiredWorkspaceKind::Bots) > 1 {
+            bail!("snapshot must contain at most one Bots workspace");
+        }
+        if count_kind(DesiredWorkspaceKind::Assistant) > 0 {
+            bail!("legacy assistant workspaces must be dropped before validation");
         }
         let mut ids = HashSet::new();
         let mut panes = 0;
@@ -507,7 +648,7 @@ impl DesiredState {
                 .as_deref()
                 .is_some_and(|instructions| instructions.chars().count() > MAX_INSTRUCTIONS_CHARS)
             {
-                bail!("assistant instructions too long");
+                bail!("workstation instructions too long");
             }
             if workspace.tabs.len() > MAX_TABS_PER_WORKSPACE {
                 bail!("workstation must contain at most {MAX_TABS_PER_WORKSPACE} tabs");
@@ -528,6 +669,19 @@ impl DesiredState {
                 }
                 if let Some(icon) = &tab.custom_icon {
                     validate_custom_icon_id(icon)?;
+                }
+                if tab.bot.is_some() != (workspace.kind == DesiredWorkspaceKind::Bots) {
+                    bail!(
+                        "tab {} must be a bot exactly when it is in the Bots workspace",
+                        tab.id
+                    );
+                }
+                if tab.bot.as_ref().is_some_and(|bot| {
+                    bot.instructions.as_deref().is_some_and(|instructions| {
+                        instructions.chars().count() > MAX_INSTRUCTIONS_CHARS
+                    })
+                }) {
+                    bail!("bot instructions too long");
                 }
                 if let Some(parent_id) = tab.parent_tab {
                     let valid_parent = parent_id != tab.id
@@ -637,6 +791,48 @@ impl DesiredLayout {
         }
     }
 
+    /// This layout without legacy assistant panes; `None` when nothing remains.
+    fn without_assistants(self) -> Option<Self> {
+        match self {
+            Self::Leaf { pane } => {
+                (pane.kind != DesiredPaneKind::Assistant).then_some(Self::Leaf { pane })
+            }
+            Self::Stack { panes, active } => {
+                let mut panes = panes
+                    .into_iter()
+                    .filter(|pane| pane.kind != DesiredPaneKind::Assistant)
+                    .collect::<Vec<_>>();
+                match panes.len() {
+                    0 => None,
+                    1 => panes.pop().map(|pane| Self::Leaf { pane }),
+                    _ => {
+                        let active = if panes.iter().any(|pane| pane.id == active) {
+                            active
+                        } else {
+                            panes[0].id
+                        };
+                        Some(Self::Stack { panes, active })
+                    }
+                }
+            }
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => match (first.without_assistants(), second.without_assistants()) {
+                (Some(first), Some(second)) => Some(Self::Split {
+                    axis,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+                (None, None) => None,
+            },
+        }
+    }
+
     fn validate(
         &self,
         depth: usize,
@@ -683,7 +879,9 @@ impl DesiredPane {
         tmux_by_pane: &HashMap<Uuid, (String, String)>,
         allow_offline: bool,
     ) -> Result<Self> {
-        let local_cwd = matches!(pane.kind, PaneKind::Terminal)
+        let local_cwd = pane
+            .kind
+            .is_terminal()
             .then(|| cwd_by_pane.get(&pane.id).cloned())
             .flatten();
         if matches!(pane.kind, PaneKind::Terminal) && local_cwd.is_none() && !allow_offline {
@@ -691,15 +889,13 @@ impl DesiredPane {
         }
         Ok(Self {
             id: pane.id,
-            kind: pane.kind.clone(),
+            kind: DesiredPaneKind::from(&pane.kind),
             title: pane
                 .custom_title
                 .clone()
                 .unwrap_or_else(|| match &pane.kind {
                     PaneKind::Terminal => "Terminal".to_owned(),
-                    PaneKind::Browser { .. } | PaneKind::Assistant | PaneKind::Gallery => {
-                        pane.title.clone()
-                    }
+                    PaneKind::Browser { .. } | PaneKind::Gallery => pane.title.clone(),
                 }),
             color: pane.color,
             custom_title: pane.custom_title.clone(),
@@ -717,7 +913,7 @@ impl DesiredPane {
         tmux_by_pane: &mut HashMap<Uuid, (String, String)>,
         offline_panes: &mut HashSet<Uuid>,
     ) -> Pane {
-        if matches!(self.kind, PaneKind::Terminal) {
+        if self.kind == DesiredPaneKind::Terminal {
             if let Some(local_cwd) = self.local_cwd {
                 cwd_by_pane.insert(self.id, local_cwd);
             } else {
@@ -727,30 +923,30 @@ impl DesiredPane {
         if let (Some(window_id), Some(pane_id)) = (&self.tmux_window, &self.tmux_pane) {
             tmux_by_pane.insert(self.id, (window_id.clone(), pane_id.clone()));
         }
+        let kind = self.kind.into_runtime();
         let custom_title = self.custom_title.or_else(|| {
-            matches!(self.kind, PaneKind::Terminal)
+            kind.is_terminal()
                 .then(|| legacy_custom_title(&self.title))
                 .flatten()
         });
         let title = custom_title
             .clone()
-            .or_else(|| match &self.kind {
+            .or_else(|| match &kind {
                 PaneKind::Terminal => self
                     .profile_override
                     .map(|profile| profile.display_name().to_owned()),
-                PaneKind::Browser { .. } | PaneKind::Assistant | PaneKind::Gallery => {
-                    Some(self.title.clone())
-                }
+                PaneKind::Browser { .. } | PaneKind::Gallery => Some(self.title.clone()),
             })
             .unwrap_or_else(|| "Terminal".to_owned());
         Pane {
             id: self.id,
-            kind: self.kind,
+            kind,
             title,
             shell: String::new(),
             color: self.color,
             identity: TerminalIdentity::default(),
             status: hh_protocol::PaneStatus::default(),
+            status_changed_at_ms: 0,
             custom_title,
             profile_override: self.profile_override,
             custom_icon: self.custom_icon,
@@ -780,12 +976,12 @@ impl DesiredPane {
             (None, None) => false,
             _ => bail!("persisted tmux pane target is invalid"),
         };
-        if has_tmux && !matches!(self.kind, PaneKind::Terminal) {
+        if has_tmux && self.kind != DesiredPaneKind::Terminal {
             bail!("only terminal panes may persist tmux targets");
         }
         match &self.kind {
-            PaneKind::Terminal => {}
-            PaneKind::Browser { url } => {
+            DesiredPaneKind::Terminal => {}
+            DesiredPaneKind::Browser { url } => {
                 if url.len() > MAX_BROWSER_URL_LEN {
                     bail!("browser URL exceeds the {MAX_BROWSER_URL_LEN}-byte limit");
                 }
@@ -803,12 +999,10 @@ impl DesiredPane {
                     bail!("browser panes may not persist terminal CWD metadata");
                 }
             }
-            PaneKind::Assistant => {
-                if self.local_cwd.is_some() {
-                    bail!("assistant panes may not persist terminal CWD metadata");
-                }
+            DesiredPaneKind::Assistant => {
+                bail!("legacy assistant panes must be dropped before validation");
             }
-            PaneKind::Gallery => {
+            DesiredPaneKind::Gallery => {
                 if self.local_cwd.is_some() {
                     bail!("gallery panes may not persist terminal CWD metadata");
                 }
@@ -870,585 +1064,5 @@ pub(super) fn validate_custom_icon_id(icon: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_directory(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("hh-{label}-{}", Uuid::new_v4()))
-    }
-
-    fn create_owner_only_directory(path: &Path) {
-        use std::os::unix::fs::DirBuilderExt as _;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .unwrap();
-    }
-
-    fn cwd_map(snapshot: &SessionSnapshot) -> HashMap<Uuid, PathBuf> {
-        let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
-            PaneLayout::Leaf { pane } => pane.id,
-            _ => panic!("seeded snapshot should contain one leaf"),
-        };
-        HashMap::from([(pane_id, std::env::temp_dir())])
-    }
-
-    #[test]
-    fn snapshot_contains_only_explicit_safe_desired_state() {
-        let directory = test_directory("safe-schema");
-        let path = directory.join("sessions.json");
-        let store = SnapshotStore::new(path.clone());
-        let snapshot = SessionSnapshot::seeded();
-        store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
-
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("local_cwd"));
-        for forbidden in [
-            "terminal_output",
-            "identity",
-            "identity_source",
-            "environment",
-            "process_id",
-            "socket",
-            "credential",
-            "secret",
-            "shell",
-        ] {
-            assert!(
-                !text.contains(forbidden),
-                "persisted forbidden field {forbidden}"
-            );
-        }
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        assert_eq!(
-            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn deliberately_empty_local_workspace_round_trips_without_creating_a_terminal() {
-        let directory = test_directory("empty-local");
-        let store = SnapshotStore::new(directory.join("sessions.json"));
-        let mut snapshot = SessionSnapshot::seeded();
-        snapshot.workspaces[0].tabs.clear();
-        snapshot.workspaces[0].active_terminal_count = 0;
-
-        store.save(&snapshot, &HashMap::new()).unwrap();
-        let recovered = store.load().unwrap();
-
-        assert_eq!(recovered.snapshot.workspaces.len(), 1);
-        assert!(recovered.snapshot.workspaces[0].tabs.is_empty());
-        assert!(recovered.cwd_by_pane.is_empty());
-        assert!(recovered.offline_panes.is_empty());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn assistant_workspace_metadata_and_pane_round_trip() {
-        let directory = test_directory("assistant-workspace");
-        let store = SnapshotStore::new(directory.join("sessions.json"));
-        let mut snapshot = SessionSnapshot::seeded();
-        let workspace_id = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
-        snapshot.workspaces.push(Workspace {
-            id: workspace_id,
-            title: "Research".to_owned(),
-            color: None,
-            pinned: false,
-            pin_order: 0,
-            order: 2,
-            active_terminal_count: 0,
-            connection: WorkspaceConnection::Local,
-            working_dir: Some("/tmp".to_owned()),
-            kind: WorkspaceKind::Assistant,
-            instructions: Some("Answer tersely".to_owned()),
-            custom_icon: Some("00000000-0000-4000-8000-000000000004.png".to_owned()),
-            tabs: vec![Tab {
-                id: Uuid::new_v4(),
-                title: "Thread 1".to_owned(),
-                custom_title: None,
-                project_dir: None,
-                color: None,
-                custom_icon: None,
-                parent_tab: None,
-                pinned: false,
-                layout: PaneLayout::Leaf {
-                    pane: Pane {
-                        id: pane_id,
-                        kind: PaneKind::Assistant,
-                        title: "Assistant".to_owned(),
-                        shell: String::new(),
-                        color: None,
-                        identity: TerminalIdentity::default(),
-                        status: hh_protocol::PaneStatus::default(),
-                        custom_title: None,
-                        profile_override: None,
-                        custom_icon: None,
-                    },
-                },
-            }],
-        });
-
-        store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
-        let recovered = store.load().unwrap();
-        let workspace = recovered
-            .snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .expect("recovered assistant workspace");
-        assert_eq!(workspace.kind, WorkspaceKind::Assistant);
-        assert_eq!(workspace.instructions.as_deref(), Some("Answer tersely"));
-        assert_eq!(
-            workspace.custom_icon.as_deref(),
-            Some("00000000-0000-4000-8000-000000000004.png")
-        );
-        assert!(matches!(
-            &workspace.tabs[0].layout,
-            PaneLayout::Leaf {
-                pane: Pane {
-                    id,
-                    kind: PaneKind::Assistant,
-                    ..
-                }
-            } if *id == pane_id
-        ));
-        assert!(!recovered.cwd_by_pane.contains_key(&pane_id));
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn ssh_workspace_layout_recovers_offline_without_runtime_or_secret_material() {
-        let directory = test_directory("ssh-layout");
-        let path = directory.join("sessions.json");
-        let store = SnapshotStore::new(path.clone());
-        let mut snapshot = SessionSnapshot::seeded();
-        let workspace = &mut snapshot.workspaces[0];
-        let first = match &workspace.tabs[0].layout {
-            PaneLayout::Leaf { pane } => pane.clone(),
-            _ => panic!("seeded snapshot should contain one leaf"),
-        };
-        let second = Pane {
-            id: Uuid::new_v4(),
-            kind: hh_protocol::PaneKind::Terminal,
-            title: "Remote two".to_owned(),
-            shell: "ssh".to_owned(),
-            color: None,
-            identity: TerminalIdentity::default(),
-            status: hh_protocol::PaneStatus::default(),
-            custom_title: None,
-            profile_override: None,
-            custom_icon: None,
-        };
-        let first_id = first.id;
-        let second_id = second.id;
-        workspace.title = "Tailnet build".to_owned();
-        workspace.pinned = true;
-        workspace.pin_order = 1;
-        workspace.connection = WorkspaceConnection::SystemSsh {
-            destination: "admin@build-node".to_owned(),
-            status: WorkspaceConnectionStatus::Connected,
-        };
-        workspace.tabs[0].layout = PaneLayout::Split {
-            axis: SplitAxis::Horizontal,
-            ratio: 0.4,
-            first: Box::new(PaneLayout::Leaf { pane: first }),
-            second: Box::new(PaneLayout::Leaf {
-                pane: second.clone(),
-            }),
-        };
-
-        store.save(&snapshot, &HashMap::new()).unwrap();
-        let recovered = store.load_or_quarantine().unwrap().unwrap();
-        let recovered_workspace = &recovered.snapshot.workspaces[0];
-
-        assert_eq!(recovered_workspace.title, "Tailnet build");
-        assert!(recovered_workspace.pinned);
-        assert_eq!(recovered_workspace.pin_order, 1);
-        let PaneLayout::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } = &recovered_workspace.tabs[0].layout
-        else {
-            panic!("saved SSH layout did not retain its split shape");
-        };
-        assert_eq!(*axis, SplitAxis::Horizontal);
-        assert!((*ratio - 0.4).abs() < f32::EPSILON);
-        assert!(matches!(first.as_ref(), PaneLayout::Leaf { pane } if pane.id == first_id));
-        assert!(matches!(second.as_ref(), PaneLayout::Leaf { pane } if pane.id == second_id));
-        assert_eq!(
-            recovered_workspace.connection,
-            WorkspaceConnection::SystemSsh {
-                destination: "admin@build-node".to_owned(),
-                status: WorkspaceConnectionStatus::Offline,
-            }
-        );
-        assert_eq!(recovered.offline_panes.len(), 2);
-        assert!(recovered.offline_panes.contains(&second_id));
-        let text = fs::read_to_string(path).unwrap();
-        for forbidden in ["password", "private_key", "agent_material", "known_hosts"] {
-            assert!(!text.contains(forbidden));
-        }
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn failed_replace_preserves_last_complete_snapshot() {
-        let directory = test_directory("atomic-fault");
-        let path = directory.join("sessions.json");
-        let store = SnapshotStore::new(path.clone());
-        let mut snapshot = SessionSnapshot::seeded();
-        let cwd_by_pane = cwd_map(&snapshot);
-        store.save(&snapshot, &cwd_by_pane).unwrap();
-        let original = fs::read(&path).unwrap();
-
-        snapshot.revision = 42;
-        store.inject_failure_before_replace(true);
-        assert!(store.save(&snapshot, &cwd_by_pane).is_err());
-        assert_eq!(fs::read(&path).unwrap(), original);
-        assert_eq!(
-            fs::read_dir(&directory)
-                .unwrap()
-                .filter_map(Result::ok)
-                .count(),
-            1
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn appearance_defaults_and_overrides_round_trip_with_old_snapshot_fallback() {
-        let directory = test_directory("appearance-round-trip");
-        let path = directory.join("sessions.json");
-        let store = SnapshotStore::new(path);
-        let mut snapshot = SessionSnapshot::seeded();
-        snapshot.appearance.default_terminal_accent = AppearanceColor::new(0x95, 0xcc, 0x7f);
-        snapshot.appearance.default_workspace_color = AppearanceColor::new(0xc9, 0x90, 0xe5);
-        snapshot.appearance.recent_colors = vec![AppearanceColor::new(0xef, 0x71, 0x7a)];
-        snapshot.workspaces[0].color = Some(AppearanceColor::new(0xe4, 0xbd, 0x72));
-        let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[0].tabs[0].layout else {
-            panic!("expected leaf");
-        };
-        pane.color = Some(AppearanceColor::new(0x67, 0xc8, 0xc6));
-        pane.title = "Live-detected Claude".to_owned();
-        pane.identity = hh_protocol::TerminalIdentity {
-            profile: TerminalProfile::Claude,
-            source: hh_protocol::TerminalIdentitySource::Command,
-        };
-        pane.status = hh_protocol::PaneStatus::Working;
-        pane.custom_title = Some("Release shell".to_owned());
-        pane.profile_override = Some(TerminalProfile::Gemini);
-        pane.custom_icon = Some("00000000-0000-4000-8000-000000000001.png".to_owned());
-
-        store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
-        let recovered = store.load().unwrap().snapshot;
-
-        assert_eq!(recovered.appearance, snapshot.appearance);
-        assert_eq!(recovered.workspaces[0].color, snapshot.workspaces[0].color);
-        let PaneLayout::Leaf {
-            pane: recovered_pane,
-        } = &recovered.workspaces[0].tabs[0].layout
-        else {
-            panic!("expected recovered leaf");
-        };
-        assert_eq!(
-            recovered_pane.color,
-            Some(AppearanceColor::new(0x67, 0xc8, 0xc6))
-        );
-        assert_eq!(recovered_pane.title, "Release shell");
-        assert_eq!(
-            recovered_pane.custom_title.as_deref(),
-            Some("Release shell")
-        );
-        assert_eq!(
-            recovered_pane.profile_override,
-            Some(TerminalProfile::Gemini)
-        );
-        assert_eq!(
-            recovered_pane.custom_icon.as_deref(),
-            Some("00000000-0000-4000-8000-000000000001.png")
-        );
-        assert_eq!(recovered_pane.identity, TerminalIdentity::default());
-        assert_eq!(recovered_pane.status, hh_protocol::PaneStatus::Idle);
-
-        let old: DesiredState = serde_json::from_str(
-            r#"{
-                "schema_version": 1,
-                "revision": 1,
-                "workspaces": [{
-                    "id": "00000000-0000-0000-0000-000000000011",
-                    "title": "Old workspace",
-                    "tabs": [{
-                        "id": "00000000-0000-0000-0000-000000000012",
-                        "title": "Terminals",
-                        "layout": {
-                            "kind": "leaf",
-                            "pane": {
-                                "id": "00000000-0000-0000-0000-000000000013",
-                                "title": "Terminal 1",
-                                "local_cwd": "/tmp"
-                            }
-                        }
-                    }]
-                }]
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(old.appearance, AppearanceSettings::default());
-        assert_eq!(old.workspaces[0].color, None);
-        let old_runtime = old.into_runtime().snapshot;
-        let PaneLayout::Leaf { pane: old_pane } = &old_runtime.workspaces[0].tabs[0].layout else {
-            panic!("expected old leaf");
-        };
-        assert_eq!(old_pane.custom_title, None);
-        assert_eq!(old_pane.profile_override, None);
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn schema_six_harbor_blue_defaults_migrate_to_dark_gray() {
-        let snapshot = SessionSnapshot::seeded();
-        let mut desired = DesiredState::from_runtime(
-            &snapshot,
-            &cwd_map(&snapshot),
-            &HashMap::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
-        desired.schema_version = 6;
-        desired.appearance.default_terminal_accent = AppearanceColor::HARBOR_BLUE;
-        desired.appearance.default_workspace_color = AppearanceColor::HARBOR_BLUE;
-
-        let recovered = desired.into_runtime().snapshot;
-
-        assert_eq!(
-            recovered.appearance.default_terminal_accent,
-            AppearanceColor::DARK_GRAY
-        );
-        assert_eq!(
-            recovered.appearance.default_workspace_color,
-            AppearanceColor::DARK_GRAY
-        );
-    }
-
-    #[test]
-    fn schema_v1_custom_names_migrate_to_explicit_overrides() {
-        let desired: DesiredState = serde_json::from_str(
-            r#"{
-                "schema_version": 1,
-                "revision": 4,
-                "workspaces": [{
-                    "id": "00000000-0000-0000-0000-000000000021",
-                    "title": "Workspace",
-                    "tabs": [{
-                        "id": "00000000-0000-0000-0000-000000000022",
-                        "title": "Terminals",
-                        "layout": {
-                            "kind": "leaf",
-                            "pane": {
-                                "id": "00000000-0000-0000-0000-000000000023",
-                                "title": "Deploy console",
-                                "local_cwd": "/tmp"
-                            }
-                        }
-                    }]
-                }]
-            }"#,
-        )
-        .unwrap();
-
-        let runtime = desired.into_runtime().snapshot;
-        let PaneLayout::Leaf { pane } = &runtime.workspaces[0].tabs[0].layout else {
-            panic!("expected leaf");
-        };
-        assert_eq!(pane.custom_title.as_deref(), Some("Deploy console"));
-        assert_eq!(pane.title, "Deploy console");
-    }
-
-    #[test]
-    fn schema_v4_snapshot_with_retired_tmux_setting_loads_and_stops_being_written() {
-        let stored: DesiredState = serde_json::from_str(
-            r#"{
-                "schema_version": 4,
-                "revision": 7,
-                "tmux": {"hide_status_bar": true},
-                "workspaces": [{
-                    "id": "00000000-0000-0000-0000-000000000031",
-                    "title": "Workstation",
-                    "tabs": [{
-                        "id": "00000000-0000-0000-0000-000000000032",
-                        "title": "Terminals",
-                        "layout": {
-                            "kind": "leaf",
-                            "pane": {
-                                "id": "00000000-0000-0000-0000-000000000033",
-                                "title": "Terminal 1",
-                                "local_cwd": "/tmp"
-                            }
-                        }
-                    }]
-                }]
-            }"#,
-        )
-        .unwrap();
-        stored.validate().unwrap();
-
-        let recovered = stored.into_runtime();
-        assert_eq!(recovered.snapshot.workspaces[0].title, "Workstation");
-
-        let rewritten = DesiredState::from_runtime(
-            &recovered.snapshot,
-            &recovered.cwd_by_pane,
-            &HashMap::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
-        let encoded = serde_json::to_string(&rewritten).unwrap();
-        assert!(!encoded.contains("tmux"), "encoded: {encoded}");
-        assert!(!encoded.contains("hide_status_bar"), "encoded: {encoded}");
-        serde_json::from_str::<DesiredState>(&encoded).unwrap();
-    }
-
-    #[test]
-    fn corrupt_or_unknown_state_is_quarantined() {
-        let directory = test_directory("quarantine");
-        create_owner_only_directory(&directory);
-        let path = directory.join("sessions.json");
-        fs::write(
-            &path,
-            br#"{"schema_version":999,"revision":0,"workspaces":[]}"#,
-        )
-        .unwrap();
-        let store = SnapshotStore::new(path.clone());
-
-        assert!(store.load_or_quarantine().unwrap().is_none());
-        assert!(!path.exists());
-        assert!(
-            fs::read_dir(&directory)
-                .unwrap()
-                .filter_map(Result::ok)
-                .any(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("sessions.corrupt-")
-                })
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn symlink_snapshot_is_quarantined_without_following_its_target() {
-        use std::os::unix::fs::symlink;
-
-        let directory = test_directory("symlink-quarantine");
-        create_owner_only_directory(&directory);
-        let target = directory.join("outside-target");
-        fs::write(&target, b"do not touch").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
-        let path = directory.join("sessions.json");
-        symlink(&target, &path).unwrap();
-        let store = SnapshotStore::new(path.clone());
-
-        assert!(store.load_or_quarantine().unwrap().is_none());
-        assert_eq!(fs::read(&target).unwrap(), b"do not touch");
-        assert_eq!(
-            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-            0o640
-        );
-        assert!(!path.exists());
-        assert!(
-            fs::read_dir(&directory)
-                .unwrap()
-                .filter_map(Result::ok)
-                .any(|entry| {
-                    entry.file_type().is_ok_and(|kind| kind.is_symlink())
-                        && entry
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with("sessions.corrupt-")
-                })
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn invalid_ratio_and_duplicate_ids_are_rejected() {
-        let snapshot = SessionSnapshot::seeded();
-        let mut desired = DesiredState::from_runtime(
-            &snapshot,
-            &cwd_map(&snapshot),
-            &HashMap::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
-        let pane = match &desired.workspaces[0].tabs[0].layout {
-            DesiredLayout::Leaf { pane } => pane.clone(),
-            _ => panic!("expected leaf"),
-        };
-        desired.workspaces[0].tabs[0].layout = DesiredLayout::Split {
-            axis: SplitAxis::Horizontal,
-            ratio: f32::NAN,
-            first: Box::new(DesiredLayout::Leaf { pane: pane.clone() }),
-            second: Box::new(DesiredLayout::Leaf { pane }),
-        };
-        assert!(desired.validate().is_err());
-    }
-    #[test]
-    fn managed_tmux_targets_round_trip_and_require_a_complete_pair() {
-        let snapshot = SessionSnapshot::seeded();
-        let pane_id = crate::layout::first_pane_id(&snapshot).unwrap();
-        let tmux_by_pane = HashMap::from([(pane_id, ("@12".to_owned(), "%34".to_owned()))]);
-        let desired = DesiredState::from_runtime(
-            &snapshot,
-            &cwd_map(&snapshot),
-            &tmux_by_pane,
-            &HashSet::new(),
-        )
-        .unwrap();
-        desired.validate().unwrap();
-        let recovered = desired.into_runtime();
-        assert_eq!(recovered.tmux_by_pane, tmux_by_pane);
-
-        let mut invalid = DesiredState::from_runtime(
-            &snapshot,
-            &cwd_map(&snapshot),
-            &HashMap::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
-        let DesiredLayout::Leaf { pane } = &mut invalid.workspaces[0].tabs[0].layout else {
-            panic!("expected leaf");
-        };
-        pane.tmux_window = Some("@12".to_owned());
-        assert!(invalid.validate().is_err());
-    }
-
-    #[test]
-    fn overlong_assistant_instructions_are_rejected() {
-        let snapshot = SessionSnapshot::seeded();
-        let mut desired = DesiredState::from_runtime(
-            &snapshot,
-            &cwd_map(&snapshot),
-            &HashMap::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
-        desired.workspaces[0].kind = WorkspaceKind::Assistant;
-        desired.workspaces[0].instructions = Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1));
-        assert!(
-            desired
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("assistant instructions too long")
-        );
-    }
-}
+#[path = "persistence_tests.rs"]
+mod tests;

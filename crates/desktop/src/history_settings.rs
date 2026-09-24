@@ -177,7 +177,7 @@ impl HhApp {
             .child(self.render_history_quota_row(&settings, cx))
             .child(self.render_history_cleanup_row(&settings, cx))
             .child(self.render_history_actions_row(
-                self.sidebar.active_workspace,
+                self.active_workstation(),
                 self.layout.focused_pane,
                 cx,
             ))

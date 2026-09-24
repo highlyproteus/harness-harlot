@@ -4,12 +4,11 @@ use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     SidebarSection, banner_fit_size, click_suppression_active, composite_rgb, element_key,
     find_pane, identity_detail, identity_label, readable_text_color, render_bell_icon,
-    render_headphones_icon, render_microphone_icon, render_sidebar_toggle_icon,
-    render_terminal_profile_icon, rgba_with_alpha, sidebar_width_for_visibility,
+    render_robot_icon, render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
     workstation_banner_header_height,
 };
 use crate::view_models::{
-    CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
+    CreateMenu, CreateMenuTarget, Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView,
     UpdateRestartConfirmation,
 };
 use crate::{
@@ -22,12 +21,14 @@ use gpui::{
     MouseButton, MouseDownEvent, Point, div, img, px, rgb, rgba,
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
-use hh_protocol::{NotificationKind, Pane};
+use hh_protocol::Pane;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 use uuid::Uuid;
 
+mod bots;
+mod notifications;
 mod workstation_list;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,15 +65,6 @@ impl HhApp {
         self.layout.workspace_pixels.0 = (window_width - self.sidebar.sidebar_pixels).max(1.0);
         self.layout.last_sizes.clear();
         self.sync_pty_sizes(cx);
-        cx.notify();
-    }
-
-    pub(crate) fn toggle_sidebar_activity(&mut self, cx: &mut Context<Self>) {
-        self.sidebar.sidebar_activity = !self.sidebar.sidebar_activity;
-        if self.sidebar.sidebar_activity {
-            self.sidebar.sidebar_visible = true;
-        }
-        self.refresh_notifications();
         cx.notify();
     }
 
@@ -122,127 +114,6 @@ impl HhApp {
         .detach();
     }
 
-    pub(crate) fn render_sidebar_activity(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut notifications = self.session.notifications.clone();
-        notifications.sort_by_key(|notification| {
-            (
-                notification.read,
-                !matches!(notification.kind, NotificationKind::Attention),
-                std::cmp::Reverse(notification.at_ms),
-            )
-        });
-
-        let rows = notifications.into_iter().map(|notification| {
-            let notification_id = notification.id;
-            let pane_id = notification.pane_id;
-            let workspace_id = notification.workspace_id;
-            let unread = !notification.read;
-            let color = match notification.kind {
-                NotificationKind::Completed => THEME.ansi[2],
-                NotificationKind::Attention => THEME.danger,
-                NotificationKind::Message => THEME.accent,
-            };
-            div()
-                .id(("sidebar-activity-row", notification_id))
-                .mx(px(8.0))
-                .my(px(2.0))
-                .px(px(7.0))
-                .py(px(6.0))
-                .rounded(px(5.0))
-                .cursor_pointer()
-                .hover(|element| element.bg(rgb(THEME.elevated)))
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_notification(notification_id, pane_id, workspace_id, cx);
-                }))
-                .child(render_terminal_profile_icon(
-                    notification.profile,
-                    THEME.muted,
-                    18.0,
-                ))
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .truncate()
-                                .text_sm()
-                                .text_color(rgb(if unread {
-                                    THEME.foreground
-                                } else {
-                                    THEME.muted
-                                }))
-                                .child(notification.pane_title),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_xs()
-                                .text_color(rgb(THEME.dim))
-                                .child(notification.workspace_title),
-                        ),
-                )
-                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(color)))
-        });
-        div()
-            .min_h(px(0.0))
-            .flex_1()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(34.0))
-                    .px(px(8.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_family(".SystemUIFont")
-                            .text_xs()
-                            .text_color(rgb(THEME.dim))
-                            .child("Activity"),
-                    )
-                    .child(
-                        div()
-                            .id("feed-mark-read")
-                            .px(px(6.0))
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(THEME.muted))
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.mark_all_notifications_read(cx)),
-                            )
-                            .child("Read all"),
-                    )
-                    .child(
-                        div()
-                            .id("feed-clear")
-                            .px(px(6.0))
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(THEME.muted))
-                            .on_click(cx.listener(|this, _, _, cx| this.clear_notifications(cx)))
-                            .child("Clear"),
-                    ),
-            )
-            .child(
-                div()
-                    .id("sidebar-activity")
-                    .min_h(px(0.0))
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
-            .into_any_element()
-    }
-
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let sidebar_content_width = self.sidebar.sidebar_pixels - SIDEBAR_RESIZE_HIT_WIDTH;
         div()
@@ -263,11 +134,10 @@ impl HhApp {
             })
             .child(self.render_sidebar_toolbar(cx))
             .child(div().h(px(1.0)).flex_none().bg(rgb(THEME.border)))
-            .when(self.sidebar.sidebar_activity, |element| {
-                element.child(self.render_sidebar_activity(cx))
-            })
-            .when(!self.sidebar.sidebar_activity, |element| {
-                element.child(self.render_workstation_list(cx))
+            .child(match self.sidebar.sidebar_mode {
+                SidebarMode::Workstations => self.render_workstation_list(cx),
+                SidebarMode::Notifications => self.render_sidebar_notifications(cx),
+                SidebarMode::Bots => self.render_sidebar_bots(cx),
             })
             .into_any_element()
     }
@@ -463,12 +333,6 @@ impl HhApp {
             .history_status
             .as_ref()
             .is_some_and(|status| status.warning.is_some());
-        let unread_notifications = self.unread_notification_count();
-        let unread_label = if unread_notifications > 99 {
-            "99+".to_owned()
-        } else {
-            unread_notifications.to_string()
-        };
         div()
             .h(px(40.0))
             .px(px(8.0))
@@ -509,66 +373,20 @@ impl HhApp {
                     })
                     .child("＋"),
             )
-            .child(
-                div()
-                    .id("notifications")
-                    .relative()
-                    .flex_none()
-                    .w(px(26.0))
-                    .h(px(26.0))
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .font_family(".SystemUIFont")
-                    .text_sm()
-                    .text_color(rgb(THEME.muted))
-                    .when(self.sidebar.sidebar_activity, |element| {
-                        element
-                            .bg(rgb(THEME.accent_soft))
-                            .border_1()
-                            .border_color(rgb(THEME.accent))
-                    })
-                    .hover(|element| {
-                        element
-                            .bg(rgb(THEME.elevated))
-                            .text_color(rgb(THEME.foreground))
-                    })
-                    .tooltip(|_, cx| {
-                        cx.new(|_| TooltipView {
-                            text: "Notifications".to_owned(),
-                        })
-                        .into()
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar_activity(cx)))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(render_bell_icon(if self.sidebar.sidebar_activity {
-                        THEME.foreground
-                    } else {
-                        THEME.muted
-                    }))
-                    .when(unread_notifications > 0, |element| {
-                        element.child(
-                            div()
-                                .absolute()
-                                .top(px(-3.0))
-                                .right(px(-5.0))
-                                .min_w(px(15.0))
-                                .h(px(14.0))
-                                .px(px(3.0))
-                                .rounded_full()
-                                .bg(rgb(THEME.danger))
-                                .font_family(".SystemUIFont")
-                                .text_size(px(9.0))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xffffff))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(unread_label),
-                        )
-                    }),
-            )
+            .child(self.render_sidebar_mode_button(
+                SidebarMode::Notifications,
+                "Notifications",
+                render_bell_icon,
+                self.needs_you_count(),
+                cx,
+            ))
+            .child(self.render_sidebar_mode_button(
+                SidebarMode::Bots,
+                "Bots",
+                render_robot_icon,
+                self.bots_needing_you(),
+                cx,
+            ))
             .when_some(self.editor.update_available.as_ref(), |toolbar, update| {
                 let label = update.label();
                 toolbar.child(
@@ -643,6 +461,75 @@ impl HhApp {
             .into_any_element()
     }
 
+    /// A toolbar toggle for one sidebar mode, with a red count badge.
+    fn render_sidebar_mode_button(
+        &self,
+        mode: SidebarMode,
+        label: &'static str,
+        icon: fn(u32) -> AnyElement,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self.sidebar.sidebar_mode == mode;
+        let count_label = if count > 99 {
+            "99+".to_owned()
+        } else {
+            count.to_string()
+        };
+        div()
+            .id(label)
+            .relative()
+            .flex_none()
+            .w(px(26.0))
+            .h(px(26.0))
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .when(active, |element| {
+                element
+                    .bg(rgb(THEME.accent_soft))
+                    .border_1()
+                    .border_color(rgb(THEME.accent))
+            })
+            .hover(|element| element.bg(rgb(THEME.elevated)))
+            .tooltip(move |_, cx| {
+                cx.new(|_| TooltipView {
+                    text: label.to_owned(),
+                })
+                .into()
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_sidebar_mode(mode, cx)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon(if active {
+                THEME.foreground
+            } else {
+                THEME.muted
+            }))
+            .when(count > 0, |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .top(px(-3.0))
+                        .right(px(-5.0))
+                        .min_w(px(15.0))
+                        .h(px(14.0))
+                        .px(px(3.0))
+                        .rounded_full()
+                        .bg(rgb(THEME.danger))
+                        .font_family(".SystemUIFont")
+                        .text_size(px(9.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(count_label),
+                )
+            })
+            .into_any_element()
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn render_workspace_terminal_row(
         &self,
@@ -656,8 +543,12 @@ impl HhApp {
             tab_color,
             from_group,
             indent,
+            activity,
         } = row;
         let pane_id = pane.id;
+        let bot_row = activity.as_ref().is_some_and(|activity| activity.bot);
+        // Notifications rows jump to their pane but never drag-reorder.
+        let drag_tab_id = tab_id.filter(|_| activity.is_none());
         let selected = self.layout.focused_pane == Some(pane_id);
         let input = cx.entity();
         let drag_title = identity_label(pane).to_owned();
@@ -687,7 +578,8 @@ impl HhApp {
             .ml(px(indent))
             .mr(px(4.0))
             .px(px(7.0))
-            .h(px(27.0))
+            .when(activity.is_none(), |element| element.h(px(27.0)))
+            .when(activity.is_some(), |element| element.py(px(5.0)))
             .rounded(px(4.0))
             .cursor_pointer()
             .flex()
@@ -731,14 +623,16 @@ impl HhApp {
                     cx.notify();
                     return;
                 }
-                if let Some(tab_id) = tab_id {
+                if let Some(tab_id) = tab_id.filter(|_| bot_row) {
+                    this.open_bot(tab_id, cx);
+                } else if let Some(tab_id) = tab_id {
                     this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
                 } else {
                     this.select_workspace_tab(workspace_id, pane_id, cx);
                 }
                 cx.stop_propagation();
             }))
-            .when_some(tab_id, |element, tab_id| {
+            .when_some(drag_tab_id, |element, tab_id| {
                 let drag = TabDrag {
                     workspace_id,
                     tab_id,
@@ -808,7 +702,10 @@ impl HhApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.open_tab_menu(pane_id, event.position, cx);
+                    match tab_id.filter(|_| bot_row) {
+                        Some(tab_id) => this.open_bot_menu(tab_id, event.position, cx),
+                        None => this.open_tab_menu(pane_id, event.position, cx),
+                    }
                     cx.stop_propagation();
                 }),
             )
@@ -826,89 +723,47 @@ impl HhApp {
                 div()
                     .min_w(px(0.0))
                     .flex_1()
-                    .truncate()
-                    .font_family(".SystemUIFont")
-                    .text_xs()
-                    .font_weight(if selected {
-                        gpui::FontWeight::MEDIUM
-                    } else {
-                        gpui::FontWeight::NORMAL
-                    })
-                    .text_color(rgb(row_text))
-                    .child(identity_label(pane).to_owned()),
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .font_weight(if selected {
+                                gpui::FontWeight::MEDIUM
+                            } else {
+                                gpui::FontWeight::NORMAL
+                            })
+                            .text_color(rgb(row_text))
+                            .child(identity_label(pane).to_owned()),
+                    )
+                    .when_some(activity.as_ref(), |element, activity| {
+                        element.child(
+                            div()
+                                .truncate()
+                                .font_family(".SystemUIFont")
+                                .text_size(px(10.0))
+                                .text_color(rgb(row_text))
+                                .opacity(0.75)
+                                .child(activity.location.clone()),
+                        )
+                    }),
             )
-            .when(pane.kind.is_assistant(), |element| {
-                let (mic_muted, speaker_muted) = self
-                    .assistant
-                    .panes
-                    .get(&pane_id)
-                    .and_then(|pane| pane.voice.as_ref())
-                    .map_or((true, false), |voice| {
-                        (voice.mic_muted, voice.speaker_muted)
-                    });
-                element
-                    .child(
-                        div()
-                            .id(("assistant-mic-sidebar", element_key(pane_id)))
-                            .flex_none()
-                            .size(px(18.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|element| element.bg(rgb(THEME.elevated)))
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: if mic_muted {
-                                        "Unmute microphone".to_owned()
-                                    } else {
-                                        "Mute microphone".to_owned()
-                                    },
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_assistant_mic(pane_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child(render_microphone_icon(if mic_muted {
-                                THEME.danger
-                            } else {
-                                row_text
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id(("assistant-headphones-sidebar", element_key(pane_id)))
-                            .flex_none()
-                            .size(px(18.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|element| element.bg(rgb(THEME.elevated)))
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: if speaker_muted {
-                                        "Unmute headphones".to_owned()
-                                    } else {
-                                        "Mute headphones".to_owned()
-                                    },
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_assistant_speaker(pane_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child(render_headphones_icon(if speaker_muted {
-                                THEME.danger
-                            } else {
-                                row_text
-                            })),
-                    )
+            .when_some(activity, |element, activity| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded(px(4.0))
+                        .bg(rgb(activity.badge_color))
+                        .font_family(".SystemUIFont")
+                        .text_size(px(9.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(readable_text_color(activity.badge_color)))
+                        .child(activity.badge),
+                )
             })
             .into_any_element()
     }
@@ -954,7 +809,13 @@ impl HhApp {
             .session
             .snapshot
             .as_ref()
-            .map(|snapshot| snapshot.workspaces.iter().collect::<Vec<_>>())
+            .map(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| !workspace.is_bots())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
         let sidebar_visible = self.sidebar.sidebar_visible;

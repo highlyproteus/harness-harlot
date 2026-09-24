@@ -151,6 +151,8 @@ mod tests {
     #[test]
     fn workspace_rail_lists_every_terminal_tab_across_stacks_and_splits() {
         let make_pane = |id: u128, title: &str, profile: TerminalProfile| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: title.to_owned(),
@@ -206,6 +208,9 @@ mod tests {
         let initial = visible_panes(&workspace.tabs[0].layout)[0];
         let tmux_pane = Uuid::from_u128(0x77);
         workspace.tabs.push(hh_protocol::Tab {
+            bot: None,
+            owner_bot: None,
+
             id: Uuid::from_u128(0x88),
             title: "buzz".to_owned(),
             custom_title: None,
@@ -216,6 +221,8 @@ mod tests {
             pinned: false,
             layout: PaneLayout::Leaf {
                 pane: Pane {
+                    status_changed_at_ms: 0,
+
                     id: tmux_pane,
                     kind: hh_protocol::PaneKind::Terminal,
                     title: "tmux buzz".to_owned(),
@@ -263,6 +270,8 @@ mod tests {
     #[test]
     fn zoom_is_a_projection_that_does_not_mutate_canonical_layout() {
         let first = Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(101),
             kind: hh_protocol::PaneKind::Terminal,
             title: "one".to_owned(),
@@ -275,6 +284,8 @@ mod tests {
             custom_icon: None,
         };
         let second = Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(102),
             kind: hh_protocol::PaneKind::Terminal,
             title: "two".to_owned(),
@@ -313,6 +324,8 @@ mod tests {
     #[test]
     fn equalize_is_a_controlled_mutation_over_all_current_split_identities() {
         let pane = |id| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: format!("pane {id}"),

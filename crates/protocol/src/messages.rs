@@ -13,10 +13,9 @@ use crate::model::{
 };
 use crate::profile::TerminalProfile;
 use crate::terminal::{
-    BrowserAction, BrowserCommandOutcome,
-    BrowserCommandRequest, CodingAgent, DropPlacement, PaneRevisionCursor, PaneStreamState,
-    SessionNotification, StreamDiagnostics, TerminalModifiers, TerminalMouseAction,
-    TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
+    BrowserAction, BrowserCommandOutcome, BrowserCommandRequest, CodingAgent, DropPlacement,
+    PaneRevisionCursor, PaneStreamState, SessionNotification, StreamDiagnostics, TerminalModifiers,
+    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
 };
 
 /// Exact pane identity and transport approved by a trusted caller. The service

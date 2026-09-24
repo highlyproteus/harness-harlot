@@ -54,7 +54,7 @@ impl GalleryUi {
 
 impl HhApp {
     pub(crate) fn new_gallery_tab(&mut self, cx: &mut Context<Self>) {
-        let Some(workspace_id) = self.sidebar.active_workspace else {
+        let Some(workspace_id) = self.active_workstation() else {
             return;
         };
         self.new_gallery_tab_in(workspace_id, cx);

@@ -97,8 +97,17 @@ pub(crate) fn command_with_terminal_env(
     command
 }
 
-/// Environment exported to local terminal agents.
-pub(crate) fn agent_env(workspace_id: Uuid) -> Vec<(&'static str, String)> {
+/// The `hh` CLI shipped next to the service executable, when present.
+pub(crate) fn hh_cli_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("hh")))
+        .filter(|path| path.is_file())
+}
+
+/// Environment exported to local terminal agents. Bot terminals also learn
+/// their bot tab so the Harness Harlot tools can attribute workers to it.
+pub(crate) fn agent_env(workspace_id: Uuid, bot_tab: Option<Uuid>) -> Vec<(&'static str, String)> {
     let mut env = vec![(hh_protocol::WORKSPACE_ID_ENV, workspace_id.to_string())];
     if let Ok(path) = hh_protocol::socket_path() {
         env.push((hh_protocol::SOCKET_ENV, path.to_string_lossy().into_owned()));
@@ -110,19 +119,23 @@ pub(crate) fn agent_env(workspace_id: Uuid) -> Vec<(&'static str, String)> {
             path.to_string_lossy().into_owned(),
         ));
     }
-    if let Some(path) = std::env::current_exe()
-        .ok()
-        .and_then(|executable| executable.parent().map(|parent| parent.join("hh")))
-        .filter(|path| path.is_file())
-    {
+    if let Some(path) = hh_cli_path() {
         env.push((hh_protocol::CLI_ENV, path.to_string_lossy().into_owned()));
+    }
+    if let Some(tab_id) = bot_tab {
+        env.push((crate::bots::BOT_TAB_ID_ENV, tab_id.to_string()));
     }
     env
 }
 
-pub(crate) fn apply_agent_env(command: &mut CommandBuilder, workspace_id: Uuid) {
+pub(crate) fn apply_agent_env(
+    command: &mut CommandBuilder,
+    workspace_id: Uuid,
+    bot_tab: Option<Uuid>,
+) {
     command.env_remove(hh_protocol::CLI_ENV);
-    for (key, value) in agent_env(workspace_id) {
+    command.env_remove(crate::bots::BOT_TAB_ID_ENV);
+    for (key, value) in agent_env(workspace_id, bot_tab) {
         command.env(key, value);
     }
 }

@@ -180,7 +180,7 @@ pub(crate) fn prepare_cef_process() {}
 
 impl HhApp {
     pub(crate) fn new_browser_tab(&mut self, cx: &mut Context<Self>) {
-        let Some(workspace_id) = self.sidebar.active_workspace else {
+        let Some(workspace_id) = self.active_workstation() else {
             return;
         };
         self.new_browser_tab_in(workspace_id, cx);
@@ -1328,27 +1328,15 @@ impl HhApp {
             .into_any_element()
     }
 
-    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn browser_views_url(&self, pane_id: Uuid) -> Option<String> {
-        self.browser
-            .browser_views
-            .get(&pane_id)
-            .map(|view| view.shared.borrow().url.clone())
-            .or_else(|| {
-                self.pane_metadata(pane_id)
-                    .and_then(|pane| match pane.kind {
-                        PaneKind::Browser { url } => Some(url),
-                        PaneKind::Terminal | PaneKind::Assistant | PaneKind::Gallery => None,
-                    })
-            })
-    }
-
-    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
-    pub(crate) fn browser_views_url(&self, pane_id: Uuid) -> Option<String> {
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+        if let Some(view) = self.browser.browser_views.get(&pane_id) {
+            return Some(view.shared.borrow().url.clone());
+        }
         self.pane_metadata(pane_id)
             .and_then(|pane| match pane.kind {
                 PaneKind::Browser { url } => Some(url),
-                PaneKind::Terminal | PaneKind::Assistant | PaneKind::Gallery => None,
+                PaneKind::Terminal | PaneKind::Gallery => None,
             })
     }
 
@@ -1362,24 +1350,9 @@ impl HhApp {
         show_pane_header: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let url =
-            match &pane.kind {
-                PaneKind::Browser { url } => url.clone(),
-                PaneKind::Terminal | PaneKind::Assistant | PaneKind::Gallery => {
-                    // A kind mismatch must degrade, never crash the render path.
-                    return div()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .when(show_pane_header, |element| {
-                            element.child(self.render_pane_header(panes, pane.id, cx))
-                        })
-                        .child(div().min_h(px(0.0)).flex_1().child(
-                            self.render_browser_placeholder("This pane is not a browser tab"),
-                        ))
-                        .into_any_element();
-                }
-            };
+        let PaneKind::Browser { url } = &pane.kind else {
+            return self.render_non_browser_pane(pane, panes, show_pane_header, cx);
+        };
         let state = self.browser.browser_views.get(&pane.id).map(|view| {
             let state = view.shared.borrow();
             (
@@ -1506,24 +1479,9 @@ impl HhApp {
         show_pane_header: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let url =
-            match &pane.kind {
-                PaneKind::Browser { url } => url.clone(),
-                PaneKind::Terminal | PaneKind::Assistant | PaneKind::Gallery => {
-                    // A kind mismatch must degrade, never crash the render path.
-                    return div()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .when(show_pane_header, |element| {
-                            element.child(self.render_pane_header(panes, pane.id, cx))
-                        })
-                        .child(div().min_h(px(0.0)).flex_1().child(
-                            self.render_browser_placeholder("This pane is not a browser tab"),
-                        ))
-                        .into_any_element();
-                }
-            };
+        let PaneKind::Browser { url } = &pane.kind else {
+            return self.render_non_browser_pane(pane, panes, show_pane_header, cx);
+        };
         div()
             .size_full()
             .flex()
@@ -1531,12 +1489,36 @@ impl HhApp {
             .when(show_pane_header, |element| {
                 element.child(self.render_pane_header(panes, pane.id, cx))
             })
-            .child(self.render_browser_toolbar(pane.id, &url, false, false, false, cx))
+            .child(self.render_browser_toolbar(pane.id, url, false, false, false, cx))
             .child(
                 div()
                     .min_h(px(0.0))
                     .flex_1()
                     .child(self.render_browser_placeholder(browser_unavailable_reason())),
+            )
+            .into_any_element()
+    }
+
+    /// A kind mismatch must degrade, never crash the render path.
+    fn render_non_browser_pane(
+        &self,
+        pane: &Pane,
+        panes: &[Pane],
+        show_pane_header: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .when(show_pane_header, |element| {
+                element.child(self.render_pane_header(panes, pane.id, cx))
+            })
+            .child(
+                div()
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .child(self.render_browser_placeholder("This pane is not a browser tab")),
             )
             .into_any_element()
     }

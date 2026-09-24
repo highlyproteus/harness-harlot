@@ -11,6 +11,7 @@ use crate::layout::{
 use crate::persistence;
 use crate::persistence::{MAX_TABS_PER_WORKSPACE, validate_title};
 use crate::process::local_spawn_dir;
+use crate::registry::bots::forget_bots;
 use crate::registry::workspaces::remember_recent_color;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -44,7 +45,7 @@ impl SessionRegistry {
     /// every request adds a tab, which is what the workstation menu's "New Tab"
     /// means.
     pub fn create_workspace_tab(&self, workspace_id: Uuid) -> Result<Uuid> {
-        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         self.append_workspace_tab(workspace_id, None, None, None)
     }
 
@@ -55,7 +56,7 @@ impl SessionRegistry {
         workspace_id: Uuid,
         parent_tab: Option<Uuid>,
     ) -> Result<Uuid> {
-        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         let number = {
             let mut state = self.state.write();
             let number = state.next_group_number;
@@ -76,7 +77,7 @@ impl SessionRegistry {
         working_dir: &str,
         title: Option<&str>,
     ) -> Result<Uuid> {
-        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         validate_workspace_dir(working_dir).map_err(anyhow::Error::from)?;
         let title = title.map_or_else(
             || {
@@ -178,6 +179,8 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab,
                 pinned: false,
+                bot: None,
+                owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             };
             let workspace = &mut state.snapshot.workspaces[workspace_index];
@@ -325,7 +328,8 @@ impl SessionRegistry {
         let replacement_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(pane_id)?;
         let workspace_id = self.workspace_for_pane(pane_id)?;
-        let replacement_session = self.spawn_local_transport(replacement_id, workspace_id, &cwd)?;
+        let replacement_session =
+            self.spawn_local_transport(replacement_id, workspace_id, None, &cwd)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -577,6 +581,8 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: resolved_parent,
                 pinned: false,
+                bot: None,
+                owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             },
         );
@@ -630,7 +636,7 @@ impl SessionRegistry {
     }
 
     pub fn close_tab(&self, tab_id: Uuid) -> Result<()> {
-        let (sessions, assistants, bytes) = {
+        let (sessions, bytes) = {
             let mut state = self.state.write();
             let workspace_index = state
                 .snapshot
@@ -677,33 +683,30 @@ impl SessionRegistry {
                         .map(|terminal| Arc::clone(&terminal.session))
                 })
                 .collect::<Vec<_>>();
-            let assistants = pane_ids
-                .iter()
-                .filter_map(|pane_id| state.panes.get(pane_id)?.assistant().map(Arc::clone))
-                .collect::<Vec<_>>();
             let terminal_count = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
             let workspace = &mut state.snapshot.workspaces[workspace_index];
+            let removed_bots = workspace
+                .tabs
+                .iter()
+                .filter(|tab| tab.bot.is_some() && tab_ids.contains(&tab.id))
+                .map(|tab| tab.id)
+                .collect::<HashSet<_>>();
             workspace.tabs.retain(|tab| !tab_ids.contains(&tab.id));
             workspace.active_terminal_count = workspace
                 .active_terminal_count
                 .saturating_sub(terminal_count);
+            forget_bots(&mut state.snapshot, &removed_bots);
             for pane_id in pane_ids {
                 state.panes.remove(&pane_id);
             }
             state.snapshot.revision = state.snapshot.revision.saturating_add(1);
             let bytes = encode_desired_state(&state)?;
-            (sessions, assistants, bytes)
+            (sessions, bytes)
         };
 
         let mut termination_errors = Vec::new();
         for session in sessions {
             if let Err(error) = session.terminate_and_wait() {
-                termination_errors.push(format!("{error:#}"));
-            }
-        }
-        for assistant in assistants {
-            assistant.shutdown();
-            if let Err(error) = assistant.remove_session_dir() {
                 termination_errors.push(format!("{error:#}"));
             }
         }

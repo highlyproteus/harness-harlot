@@ -359,12 +359,13 @@ impl PtySession {
     pub(crate) fn spawn_local(
         pane_id: Uuid,
         workspace_id: Uuid,
+        bot_tab: Option<Uuid>,
         cwd: &Path,
         archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         let shell = configured_shell();
         let mut command = local_shell_command(pane_id, cwd);
-        apply_agent_env(&mut command, workspace_id);
+        apply_agent_env(&mut command, workspace_id, bot_tab);
         Self::spawn_command(
             pane_id,
             workspace_id,
@@ -386,6 +387,7 @@ impl PtySession {
             return Self::spawn_local(
                 pane_id,
                 workspace_id,
+                None,
                 &local_spawn_dir(remote_dir)?,
                 archive,
             );
@@ -395,6 +397,7 @@ impl PtySession {
             return Self::spawn_local(
                 pane_id,
                 workspace_id,
+                None,
                 &local_spawn_dir(remote_dir)?,
                 archive,
             );
@@ -441,12 +444,13 @@ impl PtySession {
     pub(crate) fn spawn_tmux(
         pane_id: Uuid,
         workspace_id: Uuid,
+        bot_tab: Option<Uuid>,
         cwd: &Path,
         client: &Arc<TmuxControlClient>,
         archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         let pane_id_text = pane_id.to_string();
-        let agent_env = agent_env(workspace_id);
+        let agent_env = agent_env(workspace_id, bot_tab);
         let mut window_env = vec![
             (hh_protocol::pane_id_env(), pane_id_text.as_str()),
             ("COLORTERM", "truecolor"),
@@ -1339,6 +1343,7 @@ mod tests {
         let session = PtySession::spawn_tmux(
             pane_id,
             Uuid::new_v4(),
+            None,
             Path::new("/tmp"),
             &Arc::clone(&client),
             &archive,
@@ -1354,6 +1359,7 @@ mod tests {
         let second_session = PtySession::spawn_tmux(
             Uuid::new_v4(),
             Uuid::new_v4(),
+            None,
             Path::new("/tmp"),
             &second_client,
             &archive,

@@ -6,7 +6,7 @@
 //! plus the desired-state snapshot; [`serve_connection`] frames one
 //! authenticated client connection over a Unix-domain socket.
 
-mod assistant;
+mod bots;
 mod gallery;
 mod history;
 mod layout;

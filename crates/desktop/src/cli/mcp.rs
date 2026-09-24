@@ -1,12 +1,16 @@
 use std::io::{self, BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use super::agent;
-use super::args::{AgentAction, AgentCommand, AgentContext, BrowserCommand, GalleryCommand};
+use super::args::{
+    AgentAction, AgentCommand, AgentContext, BrowserCommand, GalleryCommand, NewTerminal,
+    TerminalCommand, TerminalInput, TerminalKey, WaitRequest, WaitUntil, WorkstationCommand,
+    wait_timeout,
+};
 
 pub(crate) fn server_config(command: &Path) -> Value {
     json!({
@@ -152,6 +156,63 @@ fn tool_command(
             source: PathBuf::from(required_string(arguments, "source")?),
         }),
         "gallery_list" => AgentAction::Gallery(GalleryCommand::List),
+        "terminal_list" => AgentAction::Terminal(TerminalCommand::List {
+            mine: optional_bool(arguments, "mine")?.unwrap_or(false),
+        }),
+        "terminal_new" => AgentAction::Terminal(TerminalCommand::New(NewTerminal {
+            workstation: optional_uuid(arguments, "workstation_id")?,
+            cwd: optional_string(arguments, "cwd")?.map(PathBuf::from),
+            title: optional_string(arguments, "title")?,
+            command: optional_string(arguments, "command")?,
+        })),
+        "terminal_send" => {
+            let input = TerminalInput {
+                text: optional_string(arguments, "text")?,
+                keys: optional_string_array(arguments, "keys")?
+                    .iter()
+                    .map(|key| TerminalKey::parse(key))
+                    .collect::<Result<_>>()?,
+                enter: optional_bool(arguments, "enter")?.unwrap_or(false),
+            };
+            ensure!(
+                input.text.is_some() || !input.keys.is_empty() || input.enter,
+                "terminal_send needs text, keys, or enter"
+            );
+            AgentAction::Terminal(TerminalCommand::Send {
+                pane: required_uuid(arguments, "pane_id")?,
+                input,
+            })
+        }
+        "terminal_read" => AgentAction::Terminal(TerminalCommand::Read {
+            pane: required_uuid(arguments, "pane_id")?,
+            lines: optional_u64(arguments, "lines")?
+                .map(usize::try_from)
+                .transpose()
+                .context("lines is too large")?,
+        }),
+        "terminal_wait" => AgentAction::Terminal(TerminalCommand::Wait(WaitRequest {
+            pane: required_uuid(arguments, "pane_id")?,
+            until: optional_string(arguments, "until")?
+                .as_deref()
+                .map(WaitUntil::parse)
+                .transpose()?,
+            pattern: optional_string(arguments, "pattern")?,
+            timeout_ms: wait_timeout(optional_u64(arguments, "timeout_ms")?)?,
+        })),
+        "terminal_focus" => AgentAction::Terminal(TerminalCommand::Focus {
+            pane: required_uuid(arguments, "pane_id")?,
+        }),
+        "terminal_close" => AgentAction::Terminal(TerminalCommand::Close {
+            pane: required_uuid(arguments, "pane_id")?,
+        }),
+        "terminal_rename" => AgentAction::Terminal(TerminalCommand::Rename {
+            tab: required_uuid(arguments, "tab_id")?,
+            title: required_string(arguments, "title")?,
+        }),
+        "workstation_new" => AgentAction::Workstation(WorkstationCommand::New {
+            cwd: PathBuf::from(required_string(arguments, "cwd")?),
+            title: optional_string(arguments, "title")?,
+        }),
         "gallery_dir" => AgentAction::Gallery(GalleryCommand::Dir),
         _ => bail!("unknown tool {name}"),
     };
@@ -201,6 +262,43 @@ fn optional_bool(arguments: &Map<String, Value>, name: &str) -> Result<Option<bo
                 .with_context(|| format!("{name} must be a boolean"))
         })
         .transpose()
+}
+
+fn optional_u64(arguments: &Map<String, Value>, name: &str) -> Result<Option<u64>> {
+    arguments
+        .get(name)
+        .map(|value| {
+            value
+                .as_u64()
+                .with_context(|| format!("{name} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn required_uuid(arguments: &Map<String, Value>, name: &str) -> Result<Uuid> {
+    optional_uuid(arguments, name)?.with_context(|| format!("missing {name}"))
+}
+
+fn optional_uuid(arguments: &Map<String, Value>, name: &str) -> Result<Option<Uuid>> {
+    optional_string(arguments, name)?
+        .map(|value| Uuid::parse_str(&value).with_context(|| format!("{name} must be a UUID")))
+        .transpose()
+}
+
+fn optional_string_array(arguments: &Map<String, Value>, name: &str) -> Result<Vec<String>> {
+    let Some(value) = arguments.get(name) else {
+        return Ok(Vec::new());
+    };
+    value
+        .as_array()
+        .with_context(|| format!("{name} must be an array of strings"))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("{name} must be an array of strings"))
+        })
+        .collect()
 }
 
 fn tool_definitions() -> Vec<Value> {
@@ -310,6 +408,91 @@ fn tool_definitions() -> Vec<Value> {
             "Return the workstation gallery directory",
             properties(&[("workspace_id", "string"), ("gallery_dir", "string")]),
         ),
+        tool(
+            "terminal_list",
+            "List workstations, their terminal tabs and panes with live status (needs_approval, needs_input, attention, working, done, idle) and exit state. The Bots workspace is excluded. mine=true lists only the workers created by the calling bot.",
+            properties(&[("mine", "boolean")]),
+        ),
+        tool(
+            "terminal_new",
+            "Open a worker terminal tab and optionally type a command into its shell, e.g. `omp \"task\"`. A bot's workers default to the bot's own workstation.",
+            properties(&[
+                ("workstation_id", "string"),
+                ("cwd", "string"),
+                ("title", "string"),
+                ("command", "string"),
+            ]),
+        ),
+        tool_with_schema(
+            "terminal_send",
+            "Type into a terminal pane: text first, then keys in order, then Enter when enter=true.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "keys": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": TerminalKey::NAMES }
+                    },
+                    "enter": { "type": "boolean" }
+                },
+                "required": ["pane_id"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_with_schema(
+            "terminal_read",
+            "Read a terminal pane's visible screen text, status and exit state.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "string" },
+                    "lines": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["pane_id"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_with_schema(
+            "terminal_wait",
+            "Wait until a terminal pane needs you, is done, is idle, exits, or its screen matches a regular expression. Returns the reason (needs-you, done, idle, exited, pattern, closed or timeout), status and screen tail.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": { "type": "string" },
+                    "until": { "type": "string", "enum": WaitUntil::NAMES },
+                    "pattern": { "type": "string" },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": super::args::MAX_WAIT_TIMEOUT_MS
+                    }
+                },
+                "required": ["pane_id"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "terminal_focus",
+            "Show a terminal pane's tab to the user",
+            required_properties(&[("pane_id", "string")], &[]),
+        ),
+        tool(
+            "terminal_close",
+            "Close a terminal pane and end its process",
+            required_properties(&[("pane_id", "string")], &[]),
+        ),
+        tool(
+            "terminal_rename",
+            "Rename a tab",
+            required_properties(&[("tab_id", "string"), ("title", "string")], &[]),
+        ),
+        tool(
+            "workstation_new",
+            "Create a workstation rooted at an existing directory",
+            required_properties(&[("cwd", "string")], &[("title", "string")]),
+        ),
     ]
 }
 
@@ -386,5 +569,89 @@ mod tests {
             response.pointer("/result/serverInfo/name"),
             Some(&json!("harness-harlot"))
         );
+    }
+
+    fn action(name: &str, arguments: &Value) -> Result<AgentAction> {
+        tool_command(
+            &AgentContext::default(),
+            name,
+            arguments.as_object().unwrap(),
+        )
+        .map(|command| command.action)
+    }
+
+    #[test]
+    fn terminal_tools_map_to_the_cli_commands() {
+        let pane = Uuid::new_v4();
+        assert_eq!(
+            action(
+                "terminal_send",
+                &json!({ "pane_id": pane, "text": "2", "keys": ["escape"], "enter": true }),
+            )
+            .unwrap(),
+            AgentAction::Terminal(TerminalCommand::Send {
+                pane,
+                input: TerminalInput {
+                    text: Some("2".into()),
+                    keys: vec![TerminalKey::Escape],
+                    enter: true,
+                },
+            })
+        );
+        assert_eq!(
+            action(
+                "terminal_wait",
+                &json!({ "pane_id": pane, "until": "done", "timeout_ms": 1000 }),
+            )
+            .unwrap(),
+            AgentAction::Terminal(TerminalCommand::Wait(WaitRequest {
+                pane,
+                until: Some(WaitUntil::Done),
+                pattern: None,
+                timeout_ms: 1_000,
+            }))
+        );
+        assert_eq!(
+            action(
+                "terminal_new",
+                &json!({ "workstation_id": pane, "title": "api", "command": "omp" }),
+            )
+            .unwrap(),
+            AgentAction::Terminal(TerminalCommand::New(NewTerminal {
+                workstation: Some(pane),
+                cwd: None,
+                title: Some("api".into()),
+                command: Some("omp".into()),
+            }))
+        );
+        assert_eq!(
+            action("terminal_list", &json!({ "mine": true })).unwrap(),
+            AgentAction::Terminal(TerminalCommand::List { mine: true })
+        );
+        assert!(action("terminal_send", &json!({ "pane_id": pane })).is_err());
+        assert!(
+            action(
+                "terminal_send",
+                &json!({ "pane_id": pane, "keys": ["f13"] })
+            )
+            .is_err()
+        );
+        assert!(action("terminal_read", &json!({})).is_err());
+        assert!(action("workstation_new", &json!({ "title": "x" })).is_err());
+    }
+
+    #[test]
+    fn every_listed_tool_is_dispatchable() {
+        for definition in tool_definitions() {
+            let name = definition.get("name").and_then(Value::as_str).unwrap();
+            let error = action(name, &json!({}))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                !error.starts_with("unknown tool"),
+                "{name} is not dispatched"
+            );
+        }
     }
 }

@@ -16,9 +16,8 @@ use crate::commands::AppCommand;
 use crate::elements::{TerminalGridElement, TerminalPointerElement};
 use crate::helpers::{
     IDENTITY_MARK_SIZE, effective_split_ratio, element_key, find_pane, identity_detail,
-    identity_label, plain_history_line, render_headphones_icon, render_microphone_icon,
-    selection_span, split_child_dimensions, split_control_id, split_element_key,
-    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
+    identity_label, plain_history_line, selection_span, split_child_dimensions, split_control_id,
+    split_element_key, split_placement_at, split_target_for_drag, split_target_for_drag_ids,
     terminal_run_display_text, terminal_tab_secondary_label, workspace_layout_for_focused_pane,
     workspace_tab_standalone_pane, zoom_projection,
 };
@@ -134,27 +133,6 @@ impl HhApp {
                         },
                     ))
             })
-            .into_any_element()
-    }
-
-    /// Wraps the assistant surface with the shared pane-header tab strip.
-    pub(crate) fn render_assistant_pane(
-        &self,
-        pane: &Pane,
-        panes: &[Pane],
-        show_pane_header: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .size_full()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            .when(show_pane_header, |element| {
-                element.child(self.render_pane_header(panes, pane.id, cx))
-            })
-            .child(self.render_assistant_workspace(pane, cx))
             .into_any_element()
     }
 
@@ -329,95 +307,6 @@ impl HhApp {
                             }))
                             .child("×"),
                     )
-                    .when(pane.kind.is_assistant(), |element| {
-                        let (mic_muted, speaker_muted) = self
-                            .assistant
-                            .panes
-                            .get(&pane_id)
-                            .and_then(|pane| pane.voice.as_ref())
-                            .map_or((true, false), |voice| {
-                                (voice.mic_muted, voice.speaker_muted)
-                            });
-                        element
-                            .child(
-                                div()
-                                    .id(("assistant-mic-header", element_key(pane_id)))
-                                    .ml(px(1.0))
-                                    .flex_none()
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .font_family("SF Mono")
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(if mic_muted {
-                                        THEME.danger
-                                    } else {
-                                        THEME.accent
-                                    }))
-                                    .tooltip(move |_, cx| {
-                                        cx.new(|_| TooltipView {
-                                            text: if mic_muted {
-                                                "Unmute microphone".to_owned()
-                                            } else {
-                                                "Mute microphone".to_owned()
-                                            },
-                                        })
-                                        .into()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_assistant_mic(pane_id, cx);
-                                        cx.stop_propagation();
-                                    }))
-                                    .child(render_microphone_icon(if mic_muted {
-                                        THEME.danger
-                                    } else {
-                                        THEME.accent
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id(("assistant-speaker-header", element_key(pane_id)))
-                                    .ml(px(1.0))
-                                    .flex_none()
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .font_family("SF Mono")
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(if speaker_muted {
-                                        THEME.danger
-                                    } else {
-                                        THEME.accent
-                                    }))
-                                    .tooltip(move |_, cx| {
-                                        cx.new(|_| TooltipView {
-                                            text: if speaker_muted {
-                                                "Unmute headphones".to_owned()
-                                            } else {
-                                                "Mute headphones".to_owned()
-                                            },
-                                        })
-                                        .into()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_assistant_speaker(pane_id, cx);
-                                        cx.stop_propagation();
-                                    }))
-                                    .child(render_headphones_icon(if speaker_muted {
-                                        THEME.danger
-                                    } else {
-                                        THEME.accent
-                                    })),
-                            )
-                    })
                     .into_any_element()
             })
             .collect()
@@ -537,9 +426,11 @@ impl HhApp {
             .pane_states
             .get(&active)
             .is_some_and(|state| state.exited);
+        // A bot tab is a single pane; nothing may split into it.
         let drop_target = self
             .layout
             .dragging_pane
+            .filter(|_| !self.pane_is_bot(active))
             .and_then(|source| split_target_for_drag(source, panes, active));
         let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
         let tab_pane_ids = pane_ids.clone();
@@ -1151,13 +1042,6 @@ impl HhApp {
                         show_pane_header,
                         cx,
                     )
-                } else if pane.kind.is_assistant() {
-                    self.render_assistant_pane(
-                        pane,
-                        std::slice::from_ref(pane),
-                        show_pane_header,
-                        cx,
-                    )
                 } else if pane.kind.is_gallery() {
                     self.render_gallery_pane(pane, std::slice::from_ref(pane), show_pane_header, cx)
                 } else {
@@ -1179,12 +1063,6 @@ impl HhApp {
                         show_pane_header,
                         cx,
                     )
-                } else if let Some(pane) = panes
-                    .iter()
-                    .find(|pane| pane.id == *active)
-                    .filter(|pane| pane.kind.is_assistant())
-                {
-                    self.render_assistant_pane(pane, panes.as_slice(), show_pane_header, cx)
                 } else if let Some(pane) = panes
                     .iter()
                     .find(|pane| pane.id == *active)
@@ -1310,6 +1188,9 @@ impl HhApp {
         let Some(workspace) = self.active_workspace_in(snapshot) else {
             return div().size_full().bg(rgb(THEME.terminal)).into_any_element();
         };
+        if workspace.is_bots() {
+            return self.render_bot_view(workspace, cx);
+        }
         let workspace_id = workspace.id;
         let empty_workspace_uses_ssh =
             matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. });

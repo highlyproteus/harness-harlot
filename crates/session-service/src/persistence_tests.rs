@@ -1,0 +1,689 @@
+use super::*;
+
+fn test_directory(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("hh-{label}-{}", Uuid::new_v4()))
+}
+
+fn create_owner_only_directory(path: &Path) {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .unwrap();
+}
+
+fn cwd_map(snapshot: &SessionSnapshot) -> HashMap<Uuid, PathBuf> {
+    let pane_id = match &snapshot.workspaces[0].tabs[0].layout {
+        PaneLayout::Leaf { pane } => pane.id,
+        _ => panic!("seeded snapshot should contain one leaf"),
+    };
+    HashMap::from([(pane_id, std::env::temp_dir())])
+}
+
+#[test]
+fn snapshot_contains_only_explicit_safe_desired_state() {
+    let directory = test_directory("safe-schema");
+    let path = directory.join("sessions.json");
+    let store = SnapshotStore::new(path.clone());
+    let snapshot = SessionSnapshot::seeded();
+    store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
+
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("local_cwd"));
+    for forbidden in [
+        "terminal_output",
+        "identity",
+        "identity_source",
+        "environment",
+        "process_id",
+        "socket",
+        "credential",
+        "secret",
+        "shell",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "persisted forbidden field {forbidden}"
+        );
+    }
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(
+        fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn deliberately_empty_local_workspace_round_trips_without_creating_a_terminal() {
+    let directory = test_directory("empty-local");
+    let store = SnapshotStore::new(directory.join("sessions.json"));
+    let mut snapshot = SessionSnapshot::seeded();
+    snapshot.workspaces[0].tabs.clear();
+    snapshot.workspaces[0].active_terminal_count = 0;
+
+    store.save(&snapshot, &HashMap::new()).unwrap();
+    let recovered = store.load().unwrap();
+
+    assert_eq!(recovered.snapshot.workspaces.len(), 1);
+    assert!(recovered.snapshot.workspaces[0].tabs.is_empty());
+    assert!(recovered.cwd_by_pane.is_empty());
+    assert!(recovered.offline_panes.is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn bots_workspace_bot_tabs_and_owners_round_trip() {
+    let directory = test_directory("bots");
+    let store = SnapshotStore::new(directory.join("sessions.json"));
+    let mut snapshot = SessionSnapshot::seeded();
+    snapshot.bots.default_agent = Some(TerminalProfile::Claude);
+    let bot_id = Uuid::new_v4();
+    let bots_workspace_id = Uuid::new_v4();
+    let mut bot_pane = crate::layout::pane_fixture(Uuid::new_v4());
+    bot_pane.profile_override = Some(TerminalProfile::Omp);
+    let spec = BotSpec {
+        agent: TerminalProfile::Omp,
+        instructions: Some("Prefer small PRs".to_owned()),
+    };
+    snapshot.workspaces[0].owner_bot = Some(bot_id);
+    snapshot.workspaces[0].tabs[0].owner_bot = Some(bot_id);
+    let mut bots = snapshot.workspaces[0].clone();
+    bots.id = bots_workspace_id;
+    bots.kind = WorkspaceKind::Bots;
+    bots.owner_bot = None;
+    bots.tabs = vec![Tab {
+        id: bot_id,
+        title: "Hive3".to_owned(),
+        custom_title: None,
+        project_dir: Some("/tmp".to_owned()),
+        color: None,
+        custom_icon: None,
+        parent_tab: None,
+        pinned: false,
+        bot: Some(spec.clone()),
+        owner_bot: None,
+        layout: PaneLayout::Leaf {
+            pane: bot_pane.clone(),
+        },
+    }];
+    snapshot.workspaces.push(bots);
+    let mut cwd_by_pane = cwd_map(&snapshot);
+    cwd_by_pane.insert(bot_pane.id, std::env::temp_dir());
+
+    store.save(&snapshot, &cwd_by_pane).unwrap();
+    let recovered = store.load().unwrap().snapshot;
+
+    assert_eq!(recovered.bots, snapshot.bots);
+    assert_eq!(recovered.workspaces[0].owner_bot, Some(bot_id));
+    assert_eq!(recovered.workspaces[0].tabs[0].owner_bot, Some(bot_id));
+    let bots = &recovered.workspaces[1];
+    assert!(bots.is_bots());
+    assert_eq!(bots.id, bots_workspace_id);
+    assert_eq!(bots.tabs[0].bot.as_ref(), Some(&spec));
+    assert_eq!(bots.tabs[0].project_dir.as_deref(), Some("/tmp"));
+    let PaneLayout::Leaf { pane } = &bots.tabs[0].layout else {
+        panic!("bot tab is not a leaf");
+    };
+    assert_eq!(pane.profile_override, Some(TerminalProfile::Omp));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn schema_v13_assistant_workspaces_panes_and_settings_load_without_them() {
+    let directory = test_directory("legacy-assistant");
+    create_owner_only_directory(&directory);
+    let path = directory.join("sessions.json");
+    let pane = |id: &str, kind: &str| serde_json::json!({"id": id, "kind": {"type": kind}, "title": "Pane", "local_cwd": if kind == "terminal" { Some("/tmp") } else { None }});
+    let legacy = serde_json::json!({
+        "schema_version": 13,
+        "revision": 4,
+        "assistant": {"access": "confirm", "model": "openai/gpt-5", "preferred_agent": "omp"},
+        "workspaces": [
+            {
+                "id": "00000000-0000-0000-0000-000000000041",
+                "title": "Workstation 1",
+                "tabs": [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000042",
+                        "title": "Split",
+                        "layout": {
+                            "kind": "split", "axis": "horizontal", "ratio": 0.5,
+                            "first": {"kind": "leaf", "pane": pane("00000000-0000-0000-0000-000000000043", "terminal")},
+                            "second": {"kind": "leaf", "pane": pane("00000000-0000-0000-0000-000000000044", "assistant")}
+                        }
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000045",
+                        "title": "Group",
+                        "layout": {
+                            "kind": "stack", "active": "00000000-0000-0000-0000-000000000047",
+                            "panes": [
+                                pane("00000000-0000-0000-0000-000000000046", "terminal"),
+                                pane("00000000-0000-0000-0000-000000000047", "assistant"),
+                                pane("00000000-0000-0000-0000-000000000048", "terminal")
+                            ]
+                        }
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000049",
+                        "title": "Assistant",
+                        "layout": {"kind": "leaf", "pane": pane("00000000-0000-0000-0000-00000000004a", "assistant")}
+                    }
+                ]
+            },
+            {
+                "id": "00000000-0000-0000-0000-00000000004b",
+                "title": "Research",
+                "kind": "assistant",
+                "instructions": "Answer tersely",
+                "tabs": [{
+                    "id": "00000000-0000-0000-0000-00000000004c",
+                    "title": "Thread 1",
+                    "layout": {"kind": "leaf", "pane": pane("00000000-0000-0000-0000-00000000004d", "assistant")}
+                }]
+            }
+        ]
+    });
+    fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let recovered = SnapshotStore::new(path.clone())
+        .load_or_quarantine()
+        .unwrap()
+        .expect("legacy snapshot loads instead of being quarantined");
+
+    let id = |suffix: &str| {
+        Uuid::parse_str(&format!("00000000-0000-0000-0000-0000000000{suffix}")).unwrap()
+    };
+    let workspaces = &recovered.snapshot.workspaces;
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].tabs.len(), 2);
+    let PaneLayout::Leaf { pane } = &workspaces[0].tabs[0].layout else {
+        panic!("the split collapses to its remaining terminal");
+    };
+    assert_eq!(pane.id, id("43"));
+    let PaneLayout::Stack { panes, active } = &workspaces[0].tabs[1].layout else {
+        panic!("the group keeps its two terminals");
+    };
+    assert_eq!(
+        panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+        [id("46"), id("48")]
+    );
+    assert_eq!(*active, id("46"));
+    assert_eq!(recovered.snapshot.bots, BotSettings::default());
+    assert!(path.exists());
+    assert_eq!(
+        fs::read_dir(&directory).unwrap().count(),
+        1,
+        "nothing was quarantined"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn schema_v13_snapshot_holding_only_an_assistant_workspace_gains_an_empty_workstation() {
+    let mut desired: DesiredState = serde_json::from_value(serde_json::json!({
+        "schema_version": 13,
+        "revision": 1,
+        "workspaces": [{
+            "id": "00000000-0000-0000-0000-000000000051",
+            "title": "Assistant 1",
+            "kind": "assistant",
+            "tabs": [{
+                "id": "00000000-0000-0000-0000-000000000052",
+                "title": "Thread 1",
+                "layout": {"kind": "leaf", "pane": {"id": "00000000-0000-0000-0000-000000000053", "kind": {"type": "assistant"}, "title": "Assistant", "local_cwd": null}}
+            }]
+        }]
+    }))
+    .unwrap();
+    desired.drop_legacy_assistants();
+    desired.validate().unwrap();
+    let workspaces = desired.into_runtime().snapshot.workspaces;
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].kind, WorkspaceKind::Workstation);
+    assert!(workspaces[0].tabs.is_empty());
+}
+
+#[test]
+fn ssh_workspace_layout_recovers_offline_without_runtime_or_secret_material() {
+    let directory = test_directory("ssh-layout");
+    let path = directory.join("sessions.json");
+    let store = SnapshotStore::new(path.clone());
+    let mut snapshot = SessionSnapshot::seeded();
+    let workspace = &mut snapshot.workspaces[0];
+    let first = match &workspace.tabs[0].layout {
+        PaneLayout::Leaf { pane } => pane.clone(),
+        _ => panic!("seeded snapshot should contain one leaf"),
+    };
+    let second = Pane {
+        id: Uuid::new_v4(),
+        kind: hh_protocol::PaneKind::Terminal,
+        title: "Remote two".to_owned(),
+        shell: "ssh".to_owned(),
+        color: None,
+        identity: TerminalIdentity::default(),
+        status: hh_protocol::PaneStatus::default(),
+        status_changed_at_ms: 0,
+        custom_title: None,
+        profile_override: None,
+        custom_icon: None,
+    };
+    let first_id = first.id;
+    let second_id = second.id;
+    workspace.title = "Tailnet build".to_owned();
+    workspace.pinned = true;
+    workspace.pin_order = 1;
+    workspace.connection = WorkspaceConnection::SystemSsh {
+        destination: "admin@build-node".to_owned(),
+        status: WorkspaceConnectionStatus::Connected,
+    };
+    workspace.tabs[0].layout = PaneLayout::Split {
+        axis: SplitAxis::Horizontal,
+        ratio: 0.4,
+        first: Box::new(PaneLayout::Leaf { pane: first }),
+        second: Box::new(PaneLayout::Leaf {
+            pane: second.clone(),
+        }),
+    };
+
+    store.save(&snapshot, &HashMap::new()).unwrap();
+    let recovered = store.load_or_quarantine().unwrap().unwrap();
+    let recovered_workspace = &recovered.snapshot.workspaces[0];
+
+    assert_eq!(recovered_workspace.title, "Tailnet build");
+    assert!(recovered_workspace.pinned);
+    assert_eq!(recovered_workspace.pin_order, 1);
+    let PaneLayout::Split {
+        axis,
+        ratio,
+        first,
+        second,
+    } = &recovered_workspace.tabs[0].layout
+    else {
+        panic!("saved SSH layout did not retain its split shape");
+    };
+    assert_eq!(*axis, SplitAxis::Horizontal);
+    assert!((*ratio - 0.4).abs() < f32::EPSILON);
+    assert!(matches!(first.as_ref(), PaneLayout::Leaf { pane } if pane.id == first_id));
+    assert!(matches!(second.as_ref(), PaneLayout::Leaf { pane } if pane.id == second_id));
+    assert_eq!(
+        recovered_workspace.connection,
+        WorkspaceConnection::SystemSsh {
+            destination: "admin@build-node".to_owned(),
+            status: WorkspaceConnectionStatus::Offline,
+        }
+    );
+    assert_eq!(recovered.offline_panes.len(), 2);
+    assert!(recovered.offline_panes.contains(&second_id));
+    let text = fs::read_to_string(path).unwrap();
+    for forbidden in ["password", "private_key", "agent_material", "known_hosts"] {
+        assert!(!text.contains(forbidden));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn failed_replace_preserves_last_complete_snapshot() {
+    let directory = test_directory("atomic-fault");
+    let path = directory.join("sessions.json");
+    let store = SnapshotStore::new(path.clone());
+    let mut snapshot = SessionSnapshot::seeded();
+    let cwd_by_pane = cwd_map(&snapshot);
+    store.save(&snapshot, &cwd_by_pane).unwrap();
+    let original = fs::read(&path).unwrap();
+
+    snapshot.revision = 42;
+    store.inject_failure_before_replace(true);
+    assert!(store.save(&snapshot, &cwd_by_pane).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .count(),
+        1
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn appearance_defaults_and_overrides_round_trip_with_old_snapshot_fallback() {
+    let directory = test_directory("appearance-round-trip");
+    let path = directory.join("sessions.json");
+    let store = SnapshotStore::new(path);
+    let mut snapshot = SessionSnapshot::seeded();
+    snapshot.appearance.default_terminal_accent = AppearanceColor::new(0x95, 0xcc, 0x7f);
+    snapshot.appearance.default_workspace_color = AppearanceColor::new(0xc9, 0x90, 0xe5);
+    snapshot.appearance.recent_colors = vec![AppearanceColor::new(0xef, 0x71, 0x7a)];
+    snapshot.workspaces[0].color = Some(AppearanceColor::new(0xe4, 0xbd, 0x72));
+    let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[0].tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    pane.color = Some(AppearanceColor::new(0x67, 0xc8, 0xc6));
+    pane.title = "Live-detected Claude".to_owned();
+    pane.identity = hh_protocol::TerminalIdentity {
+        profile: TerminalProfile::Claude,
+        source: hh_protocol::TerminalIdentitySource::Command,
+    };
+    pane.status = hh_protocol::PaneStatus::Working;
+    pane.custom_title = Some("Release shell".to_owned());
+    pane.profile_override = Some(TerminalProfile::Gemini);
+    pane.custom_icon = Some("00000000-0000-4000-8000-000000000001.png".to_owned());
+
+    store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
+    let recovered = store.load().unwrap().snapshot;
+
+    assert_eq!(recovered.appearance, snapshot.appearance);
+    assert_eq!(recovered.workspaces[0].color, snapshot.workspaces[0].color);
+    let PaneLayout::Leaf {
+        pane: recovered_pane,
+    } = &recovered.workspaces[0].tabs[0].layout
+    else {
+        panic!("expected recovered leaf");
+    };
+    assert_eq!(
+        recovered_pane.color,
+        Some(AppearanceColor::new(0x67, 0xc8, 0xc6))
+    );
+    assert_eq!(recovered_pane.title, "Release shell");
+    assert_eq!(
+        recovered_pane.custom_title.as_deref(),
+        Some("Release shell")
+    );
+    assert_eq!(
+        recovered_pane.profile_override,
+        Some(TerminalProfile::Gemini)
+    );
+    assert_eq!(
+        recovered_pane.custom_icon.as_deref(),
+        Some("00000000-0000-4000-8000-000000000001.png")
+    );
+    assert_eq!(recovered_pane.identity, TerminalIdentity::default());
+    assert_eq!(recovered_pane.status, hh_protocol::PaneStatus::Idle);
+
+    let old: DesiredState = serde_json::from_str(
+        r#"{
+            "schema_version": 1,
+            "revision": 1,
+            "workspaces": [{
+                "id": "00000000-0000-0000-0000-000000000011",
+                "title": "Old workspace",
+                "tabs": [{
+                    "id": "00000000-0000-0000-0000-000000000012",
+                    "title": "Terminals",
+                    "layout": {
+                        "kind": "leaf",
+                        "pane": {
+                            "id": "00000000-0000-0000-0000-000000000013",
+                            "title": "Terminal 1",
+                            "local_cwd": "/tmp"
+                        }
+                    }
+                }]
+            }]
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(old.appearance, AppearanceSettings::default());
+    assert_eq!(old.workspaces[0].color, None);
+    let old_runtime = old.into_runtime().snapshot;
+    let PaneLayout::Leaf { pane: old_pane } = &old_runtime.workspaces[0].tabs[0].layout else {
+        panic!("expected old leaf");
+    };
+    assert_eq!(old_pane.custom_title, None);
+    assert_eq!(old_pane.profile_override, None);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn schema_six_harbor_blue_defaults_migrate_to_dark_gray() {
+    let snapshot = SessionSnapshot::seeded();
+    let mut desired = DesiredState::from_runtime(
+        &snapshot,
+        &cwd_map(&snapshot),
+        &HashMap::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    desired.schema_version = 6;
+    desired.appearance.default_terminal_accent = AppearanceColor::HARBOR_BLUE;
+    desired.appearance.default_workspace_color = AppearanceColor::HARBOR_BLUE;
+
+    let recovered = desired.into_runtime().snapshot;
+
+    assert_eq!(
+        recovered.appearance.default_terminal_accent,
+        AppearanceColor::DARK_GRAY
+    );
+    assert_eq!(
+        recovered.appearance.default_workspace_color,
+        AppearanceColor::DARK_GRAY
+    );
+}
+
+#[test]
+fn schema_v1_custom_names_migrate_to_explicit_overrides() {
+    let desired: DesiredState = serde_json::from_str(
+        r#"{
+            "schema_version": 1,
+            "revision": 4,
+            "workspaces": [{
+                "id": "00000000-0000-0000-0000-000000000021",
+                "title": "Workspace",
+                "tabs": [{
+                    "id": "00000000-0000-0000-0000-000000000022",
+                    "title": "Terminals",
+                    "layout": {
+                        "kind": "leaf",
+                        "pane": {
+                            "id": "00000000-0000-0000-0000-000000000023",
+                            "title": "Deploy console",
+                            "local_cwd": "/tmp"
+                        }
+                    }
+                }]
+            }]
+        }"#,
+    )
+    .unwrap();
+
+    let runtime = desired.into_runtime().snapshot;
+    let PaneLayout::Leaf { pane } = &runtime.workspaces[0].tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    assert_eq!(pane.custom_title.as_deref(), Some("Deploy console"));
+    assert_eq!(pane.title, "Deploy console");
+}
+
+#[test]
+fn schema_v4_snapshot_with_retired_tmux_setting_loads_and_stops_being_written() {
+    let stored: DesiredState = serde_json::from_str(
+        r#"{
+            "schema_version": 4,
+            "revision": 7,
+            "tmux": {"hide_status_bar": true},
+            "workspaces": [{
+                "id": "00000000-0000-0000-0000-000000000031",
+                "title": "Workstation",
+                "tabs": [{
+                    "id": "00000000-0000-0000-0000-000000000032",
+                    "title": "Terminals",
+                    "layout": {
+                        "kind": "leaf",
+                        "pane": {
+                            "id": "00000000-0000-0000-0000-000000000033",
+                            "title": "Terminal 1",
+                            "local_cwd": "/tmp"
+                        }
+                    }
+                }]
+            }]
+        }"#,
+    )
+    .unwrap();
+    stored.validate().unwrap();
+
+    let recovered = stored.into_runtime();
+    assert_eq!(recovered.snapshot.workspaces[0].title, "Workstation");
+
+    let rewritten = DesiredState::from_runtime(
+        &recovered.snapshot,
+        &recovered.cwd_by_pane,
+        &HashMap::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let encoded = serde_json::to_string(&rewritten).unwrap();
+    assert!(!encoded.contains("tmux"), "encoded: {encoded}");
+    assert!(!encoded.contains("hide_status_bar"), "encoded: {encoded}");
+    serde_json::from_str::<DesiredState>(&encoded).unwrap();
+}
+
+#[test]
+fn corrupt_or_unknown_state_is_quarantined() {
+    let directory = test_directory("quarantine");
+    create_owner_only_directory(&directory);
+    let path = directory.join("sessions.json");
+    fs::write(
+        &path,
+        br#"{"schema_version":999,"revision":0,"workspaces":[]}"#,
+    )
+    .unwrap();
+    let store = SnapshotStore::new(path.clone());
+
+    assert!(store.load_or_quarantine().unwrap().is_none());
+    assert!(!path.exists());
+    assert!(
+        fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sessions.corrupt-")
+            })
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn symlink_snapshot_is_quarantined_without_following_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let directory = test_directory("symlink-quarantine");
+    create_owner_only_directory(&directory);
+    let target = directory.join("outside-target");
+    fs::write(&target, b"do not touch").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+    let path = directory.join("sessions.json");
+    symlink(&target, &path).unwrap();
+    let store = SnapshotStore::new(path.clone());
+
+    assert!(store.load_or_quarantine().unwrap().is_none());
+    assert_eq!(fs::read(&target).unwrap(), b"do not touch");
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert!(!path.exists());
+    assert!(
+        fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_symlink())
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("sessions.corrupt-")
+            })
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn invalid_ratio_and_duplicate_ids_are_rejected() {
+    let snapshot = SessionSnapshot::seeded();
+    let mut desired = DesiredState::from_runtime(
+        &snapshot,
+        &cwd_map(&snapshot),
+        &HashMap::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let pane = match &desired.workspaces[0].tabs[0].layout {
+        DesiredLayout::Leaf { pane } => pane.clone(),
+        _ => panic!("expected leaf"),
+    };
+    desired.workspaces[0].tabs[0].layout = DesiredLayout::Split {
+        axis: SplitAxis::Horizontal,
+        ratio: f32::NAN,
+        first: Box::new(DesiredLayout::Leaf { pane: pane.clone() }),
+        second: Box::new(DesiredLayout::Leaf { pane }),
+    };
+    assert!(desired.validate().is_err());
+}
+#[test]
+fn managed_tmux_targets_round_trip_and_require_a_complete_pair() {
+    let snapshot = SessionSnapshot::seeded();
+    let pane_id = crate::layout::first_pane_id(&snapshot).unwrap();
+    let tmux_by_pane = HashMap::from([(pane_id, ("@12".to_owned(), "%34".to_owned()))]);
+    let desired = DesiredState::from_runtime(
+        &snapshot,
+        &cwd_map(&snapshot),
+        &tmux_by_pane,
+        &HashSet::new(),
+    )
+    .unwrap();
+    desired.validate().unwrap();
+    let recovered = desired.into_runtime();
+    assert_eq!(recovered.tmux_by_pane, tmux_by_pane);
+
+    let mut invalid = DesiredState::from_runtime(
+        &snapshot,
+        &cwd_map(&snapshot),
+        &HashMap::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let DesiredLayout::Leaf { pane } = &mut invalid.workspaces[0].tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    pane.tmux_window = Some("@12".to_owned());
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn overlong_bot_instructions_are_rejected() {
+    let snapshot = SessionSnapshot::seeded();
+    let mut desired = DesiredState::from_runtime(
+        &snapshot,
+        &cwd_map(&snapshot),
+        &HashMap::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let mut bots = desired.workspaces[0].clone();
+    bots.id = Uuid::new_v4();
+    bots.kind = DesiredWorkspaceKind::Bots;
+    bots.tabs[0].id = Uuid::new_v4();
+    bots.tabs[0].bot = Some(BotSpec {
+        agent: TerminalProfile::Omp,
+        instructions: Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1)),
+    });
+    let DesiredLayout::Leaf { pane } = &mut bots.tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    pane.id = Uuid::new_v4();
+    desired.workspaces.push(bots);
+    assert_eq!(
+        desired.validate().unwrap_err().to_string(),
+        "bot instructions too long"
+    );
+}

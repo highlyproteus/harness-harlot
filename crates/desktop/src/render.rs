@@ -14,16 +14,15 @@ use crate::input::browser_url_editor_is_active;
 use crate::view_models::{ColorTarget, DialogAction, Modal};
 use crate::{
     ConsumeChordPrefix, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp, NewBrowserTab,
-    NewGalleryTab, NewTab, NewWorkspace, PaneDrag, ReattachPane, RetryTerminalInput,
+    NewGalleryTab, NewTab, NewWorkspace, PaneDrag, ReattachPane, RetryTerminalInput, ShowBots,
     ShowCommandPalette, ShowNotifications, ShowSettings, SplitDown, SplitRight, THEME,
-    TerminalZoomIn, TerminalZoomOut, TogglePaneZoom, ToggleSidebar, ToggleVoiceMic,
+    TerminalZoomIn, TerminalZoomOut, TogglePaneZoom, ToggleSidebar,
 };
 
 impl HhApp {
     fn render_modal(&self, menu_max_height: Pixels, cx: &mut Context<Self>) -> Option<AnyElement> {
         match &self.editor.modal {
             Modal::None | Modal::AppearanceSettings | Modal::Search(_) => None,
-            Modal::AssistantModels => Some(self.render_assistant_models(cx)),
             Modal::CommandPalette(palette) => Some(self.render_command_palette(palette, cx)),
             Modal::WorkspaceCreation(dialog) => {
                 Some(self.render_workspace_creation_dialog(dialog, cx))
@@ -48,7 +47,11 @@ impl HhApp {
             Modal::GroupRename(editor) => Some(self.render_rename_dialog(
                 Some(("group-rename-input", editor.replace_on_type)),
                 format!("{}{}", editor.value, self.editor.ime_preedit),
-                "Rename group",
+                if editor.bot {
+                    "Rename bot"
+                } else {
+                    "Rename group"
+                },
                 "save-group-rename",
                 DialogAction::RenameTab,
                 cx,
@@ -71,6 +74,7 @@ impl HhApp {
             }
             Modal::CreateMenu(menu) => Some(self.render_create_menu(*menu, cx)),
             Modal::GroupMenu(menu) => Some(self.render_group_menu(*menu, menu_max_height, cx)),
+            Modal::BotMenu(menu) => Some(self.render_bot_menu(*menu, menu_max_height, cx)),
             Modal::WorkspaceConnectionInfo(info) => {
                 Some(self.render_workspace_connection_info(info, cx))
             }
@@ -150,6 +154,7 @@ impl Render for HhApp {
                             | Modal::WorkspaceMenu(_)
                             | Modal::CreateMenu(_)
                             | Modal::GroupMenu(_)
+                            | Modal::BotMenu(_)
                             | Modal::WorkspaceConnectionInfo(_)
                     ) {
                         this.editor.modal = Modal::None;
@@ -233,8 +238,8 @@ impl Render for HhApp {
                 this.execute_command(AppCommand::ShowNotifications, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &ToggleVoiceMic, _, cx| {
-                this.execute_command(AppCommand::ToggleVoiceMic, cx);
+            .on_action(cx.listener(|this, _: &ShowBots, _, cx| {
+                this.execute_command(AppCommand::ShowBots, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &ShowSettings, _, cx| {

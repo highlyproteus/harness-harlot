@@ -6,7 +6,6 @@ members = [
   "crates/protocol",
   "crates/session-service",
   "crates/session-client",
-  "crates/voice",
   "crates/release-signer",
   "crates/terminal-model",
   "crates/updater",
@@ -42,7 +41,6 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 hh-session-client = { path = "crates/session-client" }
 semver = "1.0.27"
-hh-voice = { path = "crates/voice" }
 sha2 = "0.10.9"
 sysinfo = "0.31.4"
 thiserror = "2.0.16"

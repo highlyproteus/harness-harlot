@@ -198,23 +198,6 @@ impl HhApp {
                 revision: screen.revision,
             })
             .collect();
-        let assistant_revisions = on_screen
-            .iter()
-            .copied()
-            .filter(|pane_id| {
-                self.pane_metadata(*pane_id)
-                    .is_some_and(|pane| pane.kind.is_assistant())
-            })
-            .map(|pane_id| PaneRevisionCursor {
-                pane_id,
-                revision: self
-                    .assistant
-                    .panes
-                    .get(&pane_id)
-                    .and_then(|pane| pane.view.as_ref())
-                    .map_or(0, |view| view.revision),
-            })
-            .collect();
         let subscribed_panes = paced_subscriptions(
             now,
             &on_screen,
@@ -229,7 +212,6 @@ impl HhApp {
                 .as_ref()
                 .map(|snapshot| snapshot.revision),
             pane_revisions,
-            assistant_revisions,
             subscribed_panes,
             notifications_after: self.session.notifications_latest_id,
             browser_executor: cfg!(all(
@@ -249,7 +231,6 @@ impl HhApp {
                 snapshot,
                 screens,
                 pane_states,
-                assistant_threads,
                 notifications: notification_deltas,
                 diagnostics,
                 browser_commands,
@@ -269,10 +250,6 @@ impl HhApp {
                     },
                     Instant::now(),
                 );
-                let mut assistant_changed = false;
-                for view in assistant_threads {
-                    assistant_changed |= self.apply_assistant_view(view);
-                }
                 self.run_browser_commands(browser_commands, cx);
                 self.terminal_shape_cache
                     .borrow_mut()
@@ -289,16 +266,8 @@ impl HhApp {
                 if outcome.notifications_need_refresh {
                     self.refresh_notifications();
                 }
-                if outcome.auto_read_or_badge {
-                    if self.session.window_active
-                        && let Some(pane_id) = self.layout.focused_pane
-                    {
-                        self.auto_read_pane_notifications(pane_id, cx);
-                    } else {
-                        self.sync_dock_badge();
-                    }
-                }
-                let mut state_changed = outcome.state_changed || assistant_changed;
+                self.sync_dock_badge();
+                let mut state_changed = outcome.state_changed;
                 if let Some(pane_id) = outcome.focus_resync {
                     state_changed |= self.focus_pane_with_snapshot(pane_id, cx);
                 }
@@ -318,22 +287,6 @@ impl HhApp {
                 self.session.connection_error != previous
             }
         };
-        let mut live_assistants = std::collections::HashSet::new();
-        if let Some(snapshot) = self.session.snapshot.as_ref() {
-            for workspace in &snapshot.workspaces {
-                for tab in &workspace.tabs {
-                    let mut panes = Vec::new();
-                    crate::helpers::collect_terminal_tabs(&tab.layout, &mut panes);
-                    live_assistants.extend(
-                        panes
-                            .into_iter()
-                            .filter(|pane| pane.kind.is_assistant())
-                            .map(|pane| pane.id),
-                    );
-                }
-            }
-        }
-        self.prune_assistant_panes(&live_assistants, cx);
         if self
             .editor
             .browser_url_editor
@@ -383,31 +336,6 @@ impl HhApp {
         if needs_activation {
             self.dispatch(ClientRequest::ActivateTab { pane_id });
         }
-        let notifications_changed = self.auto_read_pane_notifications(pane_id, cx);
-        if self
-            .pane_metadata(pane_id)
-            .is_some_and(|pane| pane.kind.is_assistant())
-        {
-            let changed = self.layout.focused_pane != Some(pane_id);
-            self.layout.focused_pane = Some(pane_id);
-            self.session.connection_error = None;
-            if changed {
-                self.dispatch_stream_with(
-                    ClientRequest::GetAssistantThread { pane_id },
-                    Box::new(move |this, cx, result| match result {
-                        Ok(ServiceResponse::AssistantThread { view }) => {
-                            if this.apply_assistant_view(view) || notifications_changed {
-                                cx.notify();
-                            }
-                        }
-                        Ok(response) => this.report_unexpected(&response),
-                        Err(error) => this.report(&error),
-                    }),
-                );
-            }
-            self.ensure_visible_browser_views(cx);
-            return changed || notifications_changed;
-        }
         if self
             .pane_metadata(pane_id)
             .is_some_and(|pane| !pane.kind.is_terminal())
@@ -416,11 +344,11 @@ impl HhApp {
             self.layout.focused_pane = Some(pane_id);
             self.session.connection_error = None;
             self.ensure_visible_browser_views(cx);
-            return changed || notifications_changed;
+            return changed;
         }
         let focus_changed = self.layout.focused_pane != Some(pane_id);
         if !focus_changed {
-            return notifications_changed;
+            return false;
         }
         self.layout.focused_pane = Some(pane_id);
         self.dispatch_stream_with(
@@ -457,7 +385,7 @@ impl HhApp {
                         this.session.last_delivery.insert(pane_id, delivered_at);
                         this.session.stream_diagnostics = diagnostics;
                         this.session.connection_error = None;
-                        if changed || notifications_changed {
+                        if changed {
                             cx.notify();
                         }
                     }
@@ -466,7 +394,7 @@ impl HhApp {
                 }
             }),
         );
-        focus_changed || notifications_changed
+        focus_changed
     }
     pub(crate) fn active_workspace_in<'a>(
         &self,

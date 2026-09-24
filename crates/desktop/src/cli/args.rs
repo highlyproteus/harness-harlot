@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -22,6 +22,8 @@ pub(crate) struct AgentCommand {
 pub(crate) enum AgentAction {
     Browser(BrowserCommand),
     Gallery(GalleryCommand),
+    Terminal(TerminalCommand),
+    Workstation(WorkstationCommand),
     Mcp,
     Skill(SkillCommand),
 }
@@ -51,6 +53,149 @@ pub(crate) enum GalleryCommand {
     Dir,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalCommand {
+    List { mine: bool },
+    New(NewTerminal),
+    Send { pane: Uuid, input: TerminalInput },
+    Read { pane: Uuid, lines: Option<usize> },
+    Wait(WaitRequest),
+    Focus { pane: Uuid },
+    Close { pane: Uuid },
+    Rename { tab: Uuid, title: String },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NewTerminal {
+    pub(crate) workstation: Option<Uuid>,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) title: Option<String>,
+    pub(crate) command: Option<String>,
+}
+
+/// Terminal input written in order: text, then each key, then Enter.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TerminalInput {
+    pub(crate) text: Option<String>,
+    pub(crate) keys: Vec<TerminalKey>,
+    pub(crate) enter: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalKey {
+    Enter,
+    CtrlC,
+    CtrlD,
+    Escape,
+    Tab,
+    ShiftTab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Backspace,
+    Space,
+}
+
+impl TerminalKey {
+    pub(crate) const NAMES: [&'static str; 12] = [
+        "enter",
+        "ctrl-c",
+        "ctrl-d",
+        "escape",
+        "tab",
+        "shift-tab",
+        "up",
+        "down",
+        "left",
+        "right",
+        "backspace",
+        "space",
+    ];
+
+    pub(crate) fn parse(name: &str) -> Result<Self> {
+        Ok(match name {
+            "enter" => Self::Enter,
+            "ctrl-c" => Self::CtrlC,
+            "ctrl-d" => Self::CtrlD,
+            "escape" => Self::Escape,
+            "tab" => Self::Tab,
+            "shift-tab" => Self::ShiftTab,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "backspace" => Self::Backspace,
+            "space" => Self::Space,
+            _ => bail!(
+                "unknown terminal key {name}; expected one of {}",
+                Self::NAMES.join(", ")
+            ),
+        })
+    }
+
+    pub(crate) fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Enter => b"\r",
+            Self::CtrlC => b"\x03",
+            Self::CtrlD => b"\x04",
+            Self::Escape => b"\x1b",
+            Self::Tab => b"\t",
+            Self::ShiftTab => b"\x1b[Z",
+            Self::Up => b"\x1b[A",
+            Self::Down => b"\x1b[B",
+            Self::Right => b"\x1b[C",
+            Self::Left => b"\x1b[D",
+            Self::Backspace => b"\x7f",
+            Self::Space => b" ",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WaitRequest {
+    pub(crate) pane: Uuid,
+    /// `None` waits for `pattern` alone when one is given, otherwise for any condition.
+    pub(crate) until: Option<WaitUntil>,
+    pub(crate) pattern: Option<String>,
+    pub(crate) timeout_ms: u64,
+}
+
+pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const MAX_WAIT_TIMEOUT_MS: u64 = 600_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitUntil {
+    NeedsYou,
+    Done,
+    Idle,
+    Exited,
+    Any,
+}
+
+impl WaitUntil {
+    pub(crate) const NAMES: [&'static str; 5] = ["needs-you", "done", "idle", "exited", "any"];
+
+    pub(crate) fn parse(name: &str) -> Result<Self> {
+        Ok(match name {
+            "needs-you" => Self::NeedsYou,
+            "done" => Self::Done,
+            "idle" => Self::Idle,
+            "exited" => Self::Exited,
+            "any" => Self::Any,
+            _ => bail!(
+                "unknown wait condition {name}; expected one of {}",
+                Self::NAMES.join(", ")
+            ),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WorkstationCommand {
+    New { cwd: PathBuf, title: Option<String> },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SkillCommand {
     Install,
@@ -65,6 +210,8 @@ pub(crate) fn parse_agent_command(arguments: &[String]) -> Result<AgentCommand> 
     let action = match surface.as_str() {
         "browser" => AgentAction::Browser(parse_browser(arguments)?),
         "gallery" => AgentAction::Gallery(parse_gallery(arguments)?),
+        "terminal" => AgentAction::Terminal(parse_terminal(arguments)?),
+        "workstation" => AgentAction::Workstation(parse_workstation(arguments)?),
         "mcp" => {
             ensure!(arguments.is_empty(), "mcp does not accept arguments");
             AgentAction::Mcp
@@ -226,6 +373,204 @@ fn parse_gallery(arguments: &[String]) -> Result<GalleryCommand> {
     }
 }
 
+fn parse_terminal(arguments: &[String]) -> Result<TerminalCommand> {
+    let Some((command, arguments)) = arguments.split_first() else {
+        bail!("missing terminal command");
+    };
+    match command.as_str() {
+        "list" => {
+            let options = Options::scan(arguments, &[], &["--mine"])?;
+            options.positionals::<0>("hh terminal list [--mine]")?;
+            Ok(TerminalCommand::List {
+                mine: options.switch("--mine")?,
+            })
+        }
+        "new" => {
+            let options = Options::scan(
+                arguments,
+                &["--workstation", "--cwd", "--title", "--command"],
+                &[],
+            )?;
+            options.positionals::<0>(
+                "hh terminal new [--workstation ID] [--cwd DIR] [--title T] [--command CMD]",
+            )?;
+            Ok(TerminalCommand::New(NewTerminal {
+                workstation: options
+                    .single("--workstation")?
+                    .map(|value| parse_uuid_flag("--workstation", value))
+                    .transpose()?,
+                cwd: options.single("--cwd")?.map(PathBuf::from),
+                title: options.single("--title")?.map(str::to_owned),
+                command: options.single("--command")?.map(str::to_owned),
+            }))
+        }
+        "send" => {
+            let options = Options::scan(arguments, &["--text", "--key"], &["--enter"])?;
+            let [pane] =
+                options.positionals("hh terminal send PANE [--text T] [--key K]... [--enter]")?;
+            let input = TerminalInput {
+                text: options.single("--text")?.map(str::to_owned),
+                keys: options
+                    .all("--key")
+                    .map(TerminalKey::parse)
+                    .collect::<Result<_>>()?,
+                enter: options.switch("--enter")?,
+            };
+            ensure!(
+                input.text.is_some() || !input.keys.is_empty() || input.enter,
+                "terminal send needs --text, --key, or --enter"
+            );
+            Ok(TerminalCommand::Send {
+                pane: parse_uuid_flag("PANE", pane)?,
+                input,
+            })
+        }
+        "read" => {
+            let options = Options::scan(arguments, &["--lines"], &[])?;
+            let [pane] = options.positionals("hh terminal read PANE [--lines N]")?;
+            Ok(TerminalCommand::Read {
+                pane: parse_uuid_flag("PANE", pane)?,
+                lines: options
+                    .single("--lines")?
+                    .map(|value| value.parse().context("--lines must be a whole number"))
+                    .transpose()?,
+            })
+        }
+        "wait" => {
+            let options = Options::scan(arguments, &["--until", "--pattern", "--timeout-ms"], &[])?;
+            let [pane] = options.positionals(
+                "hh terminal wait PANE [--until needs-you|done|idle|exited|any] [--pattern RE] [--timeout-ms MS]",
+            )?;
+            Ok(TerminalCommand::Wait(WaitRequest {
+                pane: parse_uuid_flag("PANE", pane)?,
+                until: options
+                    .single("--until")?
+                    .map(WaitUntil::parse)
+                    .transpose()?,
+                pattern: options.single("--pattern")?.map(str::to_owned),
+                timeout_ms: wait_timeout(
+                    options
+                        .single("--timeout-ms")?
+                        .map(|value| value.parse().context("--timeout-ms must be a whole number"))
+                        .transpose()?,
+                )?,
+            }))
+        }
+        "focus" => {
+            let [pane] =
+                Options::scan(arguments, &[], &[])?.positionals("hh terminal focus PANE")?;
+            Ok(TerminalCommand::Focus {
+                pane: parse_uuid_flag("PANE", pane)?,
+            })
+        }
+        "close" => {
+            let [pane] =
+                Options::scan(arguments, &[], &[])?.positionals("hh terminal close PANE")?;
+            Ok(TerminalCommand::Close {
+                pane: parse_uuid_flag("PANE", pane)?,
+            })
+        }
+        "rename" => {
+            let [tab, title] =
+                Options::scan(arguments, &[], &[])?.positionals("hh terminal rename TAB TITLE")?;
+            Ok(TerminalCommand::Rename {
+                tab: parse_uuid_flag("TAB", tab)?,
+                title: title.to_owned(),
+            })
+        }
+        _ => bail!("unknown terminal command {command}"),
+    }
+}
+
+pub(crate) fn wait_timeout(timeout_ms: Option<u64>) -> Result<u64> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
+    ensure!(
+        timeout_ms <= MAX_WAIT_TIMEOUT_MS,
+        "wait timeout may not exceed {MAX_WAIT_TIMEOUT_MS} ms"
+    );
+    Ok(timeout_ms)
+}
+
+fn parse_workstation(arguments: &[String]) -> Result<WorkstationCommand> {
+    let Some((command, arguments)) = arguments.split_first() else {
+        bail!("missing workstation command");
+    };
+    match command.as_str() {
+        "new" => {
+            let options = Options::scan(arguments, &["--cwd", "--title"], &[])?;
+            options.positionals::<0>("hh workstation new --cwd DIR [--title T]")?;
+            Ok(WorkstationCommand::New {
+                cwd: PathBuf::from(
+                    options
+                        .single("--cwd")?
+                        .context("workstation new requires --cwd DIR")?,
+                ),
+                title: options.single("--title")?.map(str::to_owned),
+            })
+        }
+        _ => bail!("unknown workstation command {command}"),
+    }
+}
+
+/// Command-local flags scanned in order: a value flag always consumes the next
+/// argument, so values may start with dashes.
+struct Options<'a> {
+    values: Vec<(&'a str, &'a str)>,
+    switches: Vec<&'a str>,
+    positionals: Vec<&'a str>,
+}
+
+impl<'a> Options<'a> {
+    fn scan(arguments: &'a [String], value_flags: &[&str], switch_flags: &[&str]) -> Result<Self> {
+        let mut options = Self {
+            values: Vec::new(),
+            switches: Vec::new(),
+            positionals: Vec::new(),
+        };
+        let mut arguments = arguments.iter();
+        while let Some(argument) = arguments.next() {
+            let argument = argument.as_str();
+            if value_flags.contains(&argument) {
+                let value = arguments
+                    .next()
+                    .with_context(|| format!("missing value for {argument}"))?;
+                options.values.push((argument, value));
+            } else if switch_flags.contains(&argument) {
+                options.switches.push(argument);
+            } else if argument.starts_with("--") {
+                bail!("unknown option {argument}");
+            } else {
+                options.positionals.push(argument);
+            }
+        }
+        Ok(options)
+    }
+
+    fn single(&self, flag: &str) -> Result<Option<&'a str>> {
+        let mut values = self.all(flag);
+        let value = values.next();
+        ensure!(values.next().is_none(), "{flag} may be specified only once");
+        Ok(value)
+    }
+
+    fn all(&self, flag: &str) -> impl Iterator<Item = &'a str> {
+        self.values
+            .iter()
+            .filter(move |(name, _)| *name == flag)
+            .map(|(_, value)| *value)
+    }
+
+    fn switch(&self, flag: &str) -> Result<bool> {
+        let count = self.switches.iter().filter(|name| **name == flag).count();
+        ensure!(count <= 1, "{flag} may be specified only once");
+        Ok(count == 1)
+    }
+
+    fn positionals<const N: usize>(&self, usage: &str) -> Result<[&'a str; N]> {
+        <[&str; N]>::try_from(self.positionals.as_slice()).map_err(|_| anyhow!("usage: {usage}"))
+    }
+}
+
 fn parse_skill(arguments: &[String]) -> Result<SkillCommand> {
     match arguments {
         [command] if command == "install" => Ok(SkillCommand::Install),
@@ -289,5 +634,130 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    fn parse(arguments: &[&str]) -> Result<AgentAction> {
+        let arguments = arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect::<Vec<_>>();
+        parse_agent_command(&arguments).map(|command| command.action)
+    }
+
+    #[test]
+    fn terminal_send_keeps_text_keys_and_enter_in_order() {
+        let pane = Uuid::new_v4();
+        let pane_arg = pane.to_string();
+        assert_eq!(
+            parse(&[
+                "terminal", "send", &pane_arg, "--key", "down", "--text", "--yes", "--key",
+                "ctrl-c", "--enter", "--json",
+            ])
+            .unwrap(),
+            AgentAction::Terminal(TerminalCommand::Send {
+                pane,
+                input: TerminalInput {
+                    text: Some("--yes".into()),
+                    keys: vec![TerminalKey::Down, TerminalKey::CtrlC],
+                    enter: true,
+                },
+            })
+        );
+        assert!(parse(&["terminal", "send", &pane_arg]).is_err());
+        assert!(parse(&["terminal", "send", &pane_arg, "--key", "f13"]).is_err());
+        assert!(parse(&["terminal", "send", "not-a-pane", "--enter"]).is_err());
+        assert!(parse(&["terminal", "send", &pane_arg, "--text", "a", "--text", "b"]).is_err());
+    }
+
+    #[test]
+    fn terminal_wait_defaults_and_bounds() {
+        let pane = Uuid::new_v4();
+        let pane_arg = pane.to_string();
+        assert_eq!(
+            parse(&["terminal", "wait", &pane_arg]).unwrap(),
+            AgentAction::Terminal(TerminalCommand::Wait(WaitRequest {
+                pane,
+                until: None,
+                pattern: None,
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+            }))
+        );
+        assert_eq!(
+            parse(&[
+                "terminal",
+                "wait",
+                &pane_arg,
+                "--until",
+                "needs-you",
+                "--pattern",
+                "y/N",
+                "--timeout-ms",
+                "5000",
+            ])
+            .unwrap(),
+            AgentAction::Terminal(TerminalCommand::Wait(WaitRequest {
+                pane,
+                until: Some(WaitUntil::NeedsYou),
+                pattern: Some("y/N".into()),
+                timeout_ms: 5_000,
+            }))
+        );
+        assert!(parse(&["terminal", "wait", &pane_arg, "--until", "later"]).is_err());
+        assert!(parse(&["terminal", "wait", &pane_arg, "--timeout-ms", "600001"]).is_err());
+    }
+
+    #[test]
+    fn terminal_and_workstation_commands_parse_their_options() {
+        let id = Uuid::new_v4();
+        let id_arg = id.to_string();
+        assert_eq!(
+            parse(&["terminal", "list", "--mine"]).unwrap(),
+            AgentAction::Terminal(TerminalCommand::List { mine: true })
+        );
+        assert_eq!(
+            parse(&[
+                "terminal",
+                "new",
+                "--workstation",
+                &id_arg,
+                "--cwd",
+                "/tmp",
+                "--title",
+                "api",
+                "--command",
+                "omp \"fix it\"",
+            ])
+            .unwrap(),
+            AgentAction::Terminal(TerminalCommand::New(NewTerminal {
+                workstation: Some(id),
+                cwd: Some(PathBuf::from("/tmp")),
+                title: Some("api".into()),
+                command: Some("omp \"fix it\"".into()),
+            }))
+        );
+        assert_eq!(
+            parse(&["terminal", "read", &id_arg, "--lines", "40"]).unwrap(),
+            AgentAction::Terminal(TerminalCommand::Read {
+                pane: id,
+                lines: Some(40),
+            })
+        );
+        assert_eq!(
+            parse(&["terminal", "rename", &id_arg, "API worker"]).unwrap(),
+            AgentAction::Terminal(TerminalCommand::Rename {
+                tab: id,
+                title: "API worker".into(),
+            })
+        );
+        assert_eq!(
+            parse(&["workstation", "new", "--cwd", "/srv/app"]).unwrap(),
+            AgentAction::Workstation(WorkstationCommand::New {
+                cwd: PathBuf::from("/srv/app"),
+                title: None,
+            })
+        );
+        assert!(parse(&["workstation", "new"]).is_err());
+        assert!(parse(&["terminal", "list", "--all"]).is_err());
+        assert!(parse(&["terminal", "focus"]).is_err());
     }
 }

@@ -363,6 +363,8 @@ mod tests {
     #[test]
     fn workspace_tab_projection_orders_groups_before_loose_tabs() {
         let make_pane = |id: u128| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: format!("Terminal {id}"),
@@ -377,6 +379,9 @@ mod tests {
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
         workspace.tabs = vec![
             hh_protocol::Tab {
+                bot: None,
+                owner_bot: None,
+
                 id: Uuid::from_u128(10),
                 title: "Single".to_owned(),
                 custom_title: None,
@@ -388,6 +393,9 @@ mod tests {
                 layout: PaneLayout::Leaf { pane: make_pane(1) },
             },
             hh_protocol::Tab {
+                bot: None,
+                owner_bot: None,
+
                 id: Uuid::from_u128(20),
                 title: "Named".to_owned(),
                 custom_title: Some("Group 1".to_owned()),
@@ -399,6 +407,9 @@ mod tests {
                 layout: PaneLayout::Leaf { pane: make_pane(2) },
             },
             hh_protocol::Tab {
+                bot: None,
+                owner_bot: None,
+
                 id: Uuid::from_u128(30),
                 title: "Stacked".to_owned(),
                 custom_title: None,
@@ -413,6 +424,9 @@ mod tests {
                 },
             },
             hh_protocol::Tab {
+                bot: None,
+                owner_bot: None,
+
                 id: Uuid::from_u128(40),
                 title: "Split".to_owned(),
                 custom_title: None,
@@ -460,6 +474,8 @@ mod tests {
     #[test]
     fn workstation_strip_orders_projects_then_groups_then_loose_tabs() {
         let make_pane = |id: u128| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: format!("Terminal {id}"),
@@ -473,6 +489,9 @@ mod tests {
         };
         let make_leaf_tab =
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>| hh_protocol::Tab {
+                bot: None,
+                owner_bot: None,
+
                 id: Uuid::from_u128(tab_id),
                 title: format!("Tab {tab_id}"),
                 custom_title: None,
@@ -493,6 +512,9 @@ mod tests {
         workspace.tabs = vec![
             make_leaf_tab(10, 1, None),
             hh_protocol::Tab {
+                bot: None,
+                owner_bot: None,
+
                 id: group_id,
                 title: "Group".to_owned(),
                 custom_title: None,
@@ -541,6 +563,8 @@ mod tests {
     #[test]
     fn strip_click_target_resolves_from_current_snapshot() {
         let make_pane = |id: u128| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: format!("Terminal {id}"),
@@ -558,6 +582,9 @@ mod tests {
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
         workspace.tabs = vec![
             hh_protocol::Tab {
+                bot: None,
+                owner_bot: None,
+
                 id: group_id,
                 title: "Group".to_owned(),
                 custom_title: None,
@@ -572,6 +599,9 @@ mod tests {
                 },
             },
             hh_protocol::Tab {
+                bot: None,
+                owner_bot: None,
+
                 id: Uuid::from_u128(40),
                 title: "Loose".to_owned(),
                 custom_title: None,
@@ -610,6 +640,8 @@ mod tests {
     #[test]
     fn strip_active_tab_maps_project_children_to_the_project_root() {
         let make_pane = |id: u128| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: format!("Terminal {id}"),
@@ -624,6 +656,9 @@ mod tests {
         let make_tab =
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>, parent_tab: Option<Uuid>| {
                 hh_protocol::Tab {
+                    bot: None,
+                    owner_bot: None,
+
                     id: Uuid::from_u128(tab_id),
                     title: format!("Tab {tab_id}"),
                     custom_title: None,
@@ -682,6 +717,8 @@ mod tests {
     #[test]
     fn viewport_tab_strip_keeps_explicit_workstation_and_project_scopes() {
         let make_pane = |id: u128| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: format!("Terminal {id}"),
@@ -696,6 +733,9 @@ mod tests {
         let make_tab =
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>, parent_tab: Option<Uuid>| {
                 hh_protocol::Tab {
+                    bot: None,
+                    owner_bot: None,
+
                     id: Uuid::from_u128(tab_id),
                     title: format!("Tab {tab_id}"),
                     custom_title: None,
@@ -765,6 +805,8 @@ mod tests {
     #[test]
     fn only_unnamed_single_pane_tabs_render_without_a_secondary_strip() {
         let make_pane = |id: u128| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Browser {
                 url: "https://example.com".to_owned(),
@@ -779,6 +821,9 @@ mod tests {
             custom_icon: None,
         };
         let mut tab = hh_protocol::Tab {
+            bot: None,
+            owner_bot: None,
+
             id: Uuid::from_u128(10),
             title: "Example".to_owned(),
             custom_title: None,
@@ -858,6 +903,8 @@ mod tests {
     #[test]
     fn focused_workspace_tab_layout_is_rendered_instead_of_the_first_tab() {
         let pane = |id, title: &str| Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: title.to_owned(),
@@ -872,6 +919,8 @@ mod tests {
         let first = pane(1, "SSH");
         let tmux = pane(2, "tmux $2");
         let workspace = Workspace {
+            owner_bot: None,
+
             id: Uuid::nil(),
             title: "Remote".to_owned(),
             color: None,
@@ -886,6 +935,9 @@ mod tests {
             custom_icon: None,
             tabs: vec![
                 hh_protocol::Tab {
+                    bot: None,
+                    owner_bot: None,
+
                     id: Uuid::from_u128(10),
                     title: "SSH".to_owned(),
                     custom_title: None,
@@ -899,6 +951,9 @@ mod tests {
                     },
                 },
                 hh_protocol::Tab {
+                    bot: None,
+                    owner_bot: None,
+
                     id: Uuid::from_u128(20),
                     title: "tmux".to_owned(),
                     custom_title: None,
