@@ -396,10 +396,42 @@ fn read_control_output(
 ) {
     let mut startup_sender = Some(startup_sender);
     let mut response: Option<(String, Vec<String>)> = None;
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else {
-            break;
-        };
+    // tmux passes non-ASCII `%output` bytes through raw and may split a
+    // multi-byte character across two notifications, so lines are raw bytes:
+    // pane output stays bytes and other lines decode lossily. Only EOF or a
+    // read error ends the client.
+    let mut reader = BufReader::new(stdout);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if raw.last() == Some(&b'\n') {
+            raw.pop();
+        }
+        if response.is_none()
+            && let Some(rest) = raw.strip_prefix(b"%output ")
+        {
+            if let Some(space) = rest.iter().position(|byte| *byte == b' ')
+                && let Ok(pane_id) = std::str::from_utf8(&rest[..space])
+                && let Some(sink) = sinks.lock().get_mut(pane_id)
+            {
+                let bytes = unescape_tmux_output(&rest[space + 1..]);
+                ingest_output(
+                    &sink.terminal,
+                    &sink.events,
+                    &sink.revision,
+                    &sink.content_revision,
+                    Some(&sink.history),
+                    &mut sink.bell_count,
+                    &bytes,
+                );
+            }
+            continue;
+        }
+        let line = String::from_utf8_lossy(&raw).into_owned();
         if let Some((key, lines)) = &mut response {
             let mut fields = line.split_whitespace();
             let keyword = fields.next();
@@ -425,23 +457,6 @@ fn read_control_output(
                 }
             } else {
                 lines.push(line);
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("%output ") {
-            if let Some((pane_id, escaped)) = rest.split_once(' ')
-                && let Some(sink) = sinks.lock().get_mut(pane_id)
-            {
-                let bytes = unescape_tmux_output(escaped);
-                ingest_output(
-                    &sink.terminal,
-                    &sink.events,
-                    &sink.revision,
-                    &sink.content_revision,
-                    Some(&sink.history),
-                    &mut sink.bell_count,
-                    &bytes,
-                );
             }
             continue;
         }
@@ -550,8 +565,7 @@ fn shellquote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn unescape_tmux_output(value: &str) -> Vec<u8> {
-    let bytes = value.as_bytes();
+fn unescape_tmux_output(bytes: &[u8]) -> Vec<u8> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -639,9 +653,48 @@ mod tests {
     #[test]
     fn unescapes_control_mode_pty_bytes() {
         assert_eq!(
-            unescape_tmux_output(r"hello\040\033[31mred\033[0m\\tail\015\012"),
+            unescape_tmux_output(br"hello\040\033[31mred\033[0m\\tail\015\012"),
             b"hello \x1b[31mred\x1b[0m\\tail\r\n"
         );
+    }
+
+    #[test]
+    fn output_splitting_a_utf8_character_neither_ends_the_client_nor_loses_bytes() {
+        let alive = AtomicBool::new(true);
+        let (sender, reply) = sync_channel(1);
+        let pending = Mutex::new(VecDeque::from([PendingReply { id: 1, sender }]));
+        let (startup_sender, _startup) = sync_channel(1);
+        let terminal = Arc::new(Mutex::new(TerminalModel::new(80, 24)));
+        let exited = Arc::new(Mutex::new(None));
+        let history = crate::history::HistoryArchive::disabled()
+            .start_session(uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let sink = PaneSink {
+            terminal: Arc::clone(&terminal),
+            revision: Arc::default(),
+            content_revision: Arc::default(),
+            events: Arc::default(),
+            history: Arc::new(history),
+            exited: Arc::clone(&exited),
+            bell_count: 0,
+            window_id: "@1".to_owned(),
+        };
+        let sinks = Mutex::new(HashMap::from([("%1".to_owned(), sink)]));
+        // "é" is 0xC3 0xA9; tmux emitted its two bytes in separate notifications.
+        let mut stream = b"%begin 1 1 0\n%end 1 1 0\n".to_vec();
+        stream.extend_from_slice(b"%output %1 caf\xc3\n%output %1 \xa9!\n");
+        stream.extend_from_slice(b"%begin 2 2 1\nstill reading\n%end 2 2 1\n");
+        read_control_output(stream.as_slice(), &pending, &sinks, &alive, startup_sender);
+
+        assert_eq!(reply.try_recv().unwrap().unwrap(), ["still reading"]);
+        let screen = terminal
+            .lock()
+            .styled_lines()
+            .iter()
+            .flat_map(|line| line.runs.iter().map(|run| run.text.clone()))
+            .collect::<String>();
+        assert!(screen.contains("café!"), "{screen}");
+        // EOF ends the client only after every line was processed.
+        assert_eq!(exited.lock().as_deref(), Some("tmux control client exited"));
     }
 
     #[test]
