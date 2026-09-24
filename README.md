@@ -124,6 +124,8 @@ restarts like any other local terminal.
 A bot is a coordinator, not a workspace. Ask it to "spin up three worktrees and
 have omp implement the plan" and it opens named worker tabs in a workstation
 (by default one titled after the bot), each running a coding agent on its task.
+Each bot's row in the Bots sidebar counts its workers and shows one chip per
+worker tab with its live status; click a chip to jump straight to that tab.
 Open the workstation to watch the workers or take over any of them yourself.
 When a worker needs input or approval, the bot tells you what it is asking;
 answer the bot and it relays your decision to the worker.

@@ -1,15 +1,18 @@
 //! Bots: coding-agent CLIs running in the reserved Bots workspace. Bots never
 //! appear among workstations; the sidebar's Bots mode lists and opens them.
+use std::collections::HashMap;
+
 use gpui::{Context, Pixels, Point};
 use hh_protocol::{
-    BotSettings, ClientRequest, CodingAgent, Pane, ServiceResponse, Tab, TerminalProfile, Workspace,
+    BotSettings, ClientRequest, CodingAgent, Pane, PaneStatus, ServiceResponse, SessionSnapshot,
+    Tab, TerminalProfile, Workspace,
 };
 use uuid::Uuid;
 
-use crate::HhApp;
-use crate::helpers::{find_pane, visible_panes, workspace_is_selectable};
+use crate::helpers::{collect_terminal_tabs, find_pane, visible_panes, workspace_is_selectable};
 use crate::notifications::{ActivitySection, activity_section};
 use crate::view_models::{BotMenu, GroupRenameEditor, Modal, SidebarMode, WorkspaceCreationDialog};
+use crate::{HhApp, max_pane_status};
 
 mod settings;
 mod view;
@@ -47,6 +50,52 @@ pub(crate) fn bot_pane(tab: &Tab) -> Option<&Pane> {
 /// A bot's display name: its rename, else the service-chosen title.
 pub(crate) fn bot_name(tab: &Tab) -> &str {
     tab.custom_title.as_deref().unwrap_or(&tab.title)
+}
+
+/// A worker tab a bot opened, listed under that bot in the Bots sidebar.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BotWorker<'a> {
+    pub(crate) workspace: &'a Workspace,
+    pub(crate) tab: &'a Tab,
+    /// The tab's visible pane, focused when the worker is opened.
+    pub(crate) pane_id: Uuid,
+    /// Most urgent status among the tab's live panes.
+    pub(crate) status: PaneStatus,
+    /// Every pane in the tab has exited.
+    pub(crate) exited: bool,
+}
+
+/// Worker tabs keyed by their owning bot tab, in workstation and tab order.
+pub(crate) fn bot_workers(
+    snapshot: &SessionSnapshot,
+    exited: impl Fn(Uuid) -> bool,
+) -> HashMap<Uuid, Vec<BotWorker<'_>>> {
+    let mut workers: HashMap<Uuid, Vec<BotWorker<'_>>> = HashMap::new();
+    for workspace in snapshot
+        .workspaces
+        .iter()
+        .filter(|workspace| !workspace.is_bots())
+    {
+        for tab in &workspace.tabs {
+            let Some(owner) = tab.owner_bot else {
+                continue;
+            };
+            let Some(&pane_id) = visible_panes(&tab.layout).first() else {
+                continue;
+            };
+            let mut panes = Vec::new();
+            collect_terminal_tabs(&tab.layout, &mut panes);
+            let live = panes.iter().filter(|pane| !exited(pane.id));
+            workers.entry(owner).or_default().push(BotWorker {
+                workspace,
+                tab,
+                pane_id,
+                status: max_pane_status(live.clone().map(|pane| pane.status)),
+                exited: live.count() == 0,
+            });
+        }
+    }
+    workers
 }
 
 impl HhApp {
@@ -172,6 +221,19 @@ impl HhApp {
             return;
         };
         self.remember_return_workstation();
+        self.editor.modal = Modal::None;
+        self.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+    }
+
+    /// Shows one of a bot's worker tabs; the sidebar stays on Bots so the
+    /// next worker is one click away.
+    pub(crate) fn open_bot_worker(
+        &mut self,
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        pane_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
         self.editor.modal = Modal::None;
         self.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
     }
@@ -328,8 +390,98 @@ impl HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::default_bot_agent;
-    use hh_protocol::{CodingAgent, TerminalProfile};
+    use super::{bot_workers, default_bot_agent};
+    use hh_protocol::{
+        BotSpec, CodingAgent, Pane, PaneLayout, PaneStatus, SessionSnapshot, SplitAxis, Tab,
+        TerminalProfile, WorkspaceKind,
+    };
+    use uuid::Uuid;
+
+    fn pane(status: PaneStatus) -> Pane {
+        let PaneLayout::Leaf { mut pane } = SessionSnapshot::seeded()
+            .workspaces
+            .remove(0)
+            .tabs
+            .remove(0)
+            .layout
+        else {
+            unreachable!("the seeded tab is a single terminal")
+        };
+        pane.id = Uuid::new_v4();
+        pane.status = status;
+        pane
+    }
+
+    fn tab(owner_bot: Option<Uuid>, layout: PaneLayout) -> Tab {
+        let mut tab = SessionSnapshot::seeded().workspaces[0].tabs[0].clone();
+        tab.id = Uuid::new_v4();
+        tab.owner_bot = owner_bot;
+        tab.layout = layout;
+        tab
+    }
+
+    #[test]
+    fn bot_workers_group_owned_tabs_with_their_most_urgent_live_status() {
+        let (bot_a, bot_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let running = pane(PaneStatus::Working);
+        let waiting = pane(PaneStatus::NeedsApproval);
+        let finished = pane(PaneStatus::Idle);
+        let mut snapshot = SessionSnapshot::seeded();
+        let workstation = &mut snapshot.workspaces[0];
+        let split = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneLayout::Leaf {
+                pane: running.clone(),
+            }),
+            second: Box::new(PaneLayout::Leaf {
+                pane: waiting.clone(),
+            }),
+        };
+        workstation.tabs.push(tab(Some(bot_a), split));
+        workstation.tabs.push(tab(
+            Some(bot_b),
+            PaneLayout::Leaf {
+                pane: finished.clone(),
+            },
+        ));
+        let mut bots = workstation.clone();
+        bots.id = Uuid::new_v4();
+        bots.kind = WorkspaceKind::Bots;
+        let mut bot_tab = tab(
+            Some(bot_a),
+            PaneLayout::Leaf {
+                pane: pane(PaneStatus::Idle),
+            },
+        );
+        bot_tab.bot = Some(BotSpec {
+            agent: TerminalProfile::Omp,
+            instructions: None,
+        });
+        bots.tabs = vec![bot_tab];
+        snapshot.workspaces.push(bots);
+
+        let workers = bot_workers(&snapshot, |pane_id| pane_id == finished.id);
+
+        assert_eq!(
+            workers.len(),
+            2,
+            "unowned tabs and Bots-workspace tabs are not workers"
+        );
+        let [worker] = workers[&bot_a].as_slice() else {
+            panic!("bot A owns exactly one worker tab")
+        };
+        assert_eq!(worker.status, PaneStatus::NeedsApproval);
+        assert!(!worker.exited);
+        assert_eq!(
+            worker.pane_id, running.id,
+            "opening a worker focuses its visible pane"
+        );
+        let [done] = workers[&bot_b].as_slice() else {
+            panic!("bot B owns exactly one worker tab")
+        };
+        assert!(done.exited);
+    }
 
     fn agent(profile: TerminalProfile) -> CodingAgent {
         CodingAgent {

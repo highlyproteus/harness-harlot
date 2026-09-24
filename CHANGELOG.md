@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   switched to another agent from its context menu, and survives restarts. Bots
   act as coordinators: they open named worker tabs in a workstation, watch them,
   and relay your answers when a worker needs input or approval.
+- Each bot in the Bots sidebar shows how many worker tabs it has opened and a
+  status chip per worker; clicking a chip opens that worker's tab.
 - Added a bundled omp plugin for bots with native Harness Harlot tools and worker
   status reports, and attach the `hh mcp` server automatically to Claude Code and
   Codex bots.
