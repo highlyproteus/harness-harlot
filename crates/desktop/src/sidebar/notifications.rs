@@ -1,7 +1,8 @@
 //! The Notifications sidebar: live pane activity plus service messages.
 use crate::elements::{ActivityRow, SidebarPaneRowContext};
 use crate::notifications::{ActivitySection, activity_badge, activity_entries};
-use crate::{HhApp, THEME, pane_status_color};
+use crate::tab_chrome::pane_indicator;
+use crate::{HhApp, THEME};
 use gpui::prelude::FluentBuilder;
 use gpui::{AnyElement, Context, InteractiveElement, IntoElement, div, px, rgb};
 use gpui::{ParentElement, StatefulInteractiveElement, Styled};
@@ -45,9 +46,8 @@ impl HhApp {
                             indent: 4.0,
                             activity: Some(ActivityRow {
                                 badge: activity_badge(entry.pane.status, entry.exited),
-                                badge_color: pane_status_color(entry.pane.status)
-                                    .filter(|_| !entry.exited)
-                                    .unwrap_or(THEME.dim),
+                                badge_color: pane_indicator(entry.pane.status, entry.exited)
+                                    .color(),
                                 location: if bot {
                                     format!("Bot · {}", entry.workspace.title)
                                 } else {

@@ -7,6 +7,7 @@ use crate::helpers::{
     render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
     workstation_banner_header_height,
 };
+use crate::tab_chrome::render_pane_indicator;
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView,
     UpdateRestartConfirmation,
@@ -579,6 +580,8 @@ impl HhApp {
             |color| color.as_rgb(),
         );
         let row_text = readable_text_color(row_background);
+        let indicator = self.pane_indicator(pane);
+        let close_tooltip = format!("Close {label}…");
         div()
             .id(("workspace-tab", element_key(pane_id)))
             .ml(px(indent))
@@ -772,6 +775,14 @@ impl HhApp {
                         .child(activity.badge),
                 )
             })
+            .child(render_pane_indicator(indicator))
+            .child(self.render_close_button(
+                ("close-workspace-tab", element_key(pane_id)),
+                row_text,
+                close_tooltip,
+                move |this, cx| this.begin_close(pane_id, cx),
+                cx,
+            ))
             .into_any_element()
     }
 

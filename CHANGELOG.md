@@ -50,6 +50,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Every tab and terminal — top-bar tabs, pane header tabs, sidebar tab rows,
+  window ring chips, and bot thread rows — now has an always-visible × that
+  closes it with the usual confirmation (saved bot threads have none), and one
+  status slot: a spinner while running, an orange dot when it needs you, and
+  empty space otherwise. Notifications badges use the same colors.
 - Show each split window in the workstation sidebar as a ring of terminal chips,
   with no header row or collapse menu, instead of a nested row per terminal:
   the map keeps the window's proportions and each split's real size, so

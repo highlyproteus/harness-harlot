@@ -6,11 +6,12 @@ use crate::helpers::{
     readable_text_color, render_terminal_profile_icon, split_control_id, terminal_tab_count_label,
     workspace_tab_entries, workspace_terminal_tabs,
 };
-use crate::notifications::{ActivitySection, activity_badge, activity_section};
+use crate::notifications::{activity_badge, activity_section};
+use crate::tab_chrome::{PaneIndicator, render_pane_indicator};
 use crate::view_models::{
     TabDrag, TabDropPreview, TooltipView, WorkspaceDrag, WorkspaceDropPreview,
 };
-use crate::{HhApp, THEME, pane_status_color};
+use crate::{HhApp, THEME};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -768,25 +769,17 @@ impl HhApp {
     ) -> AnyElement {
         let pane_id = pane.id;
         let title = self.pane_label(pane);
-        let exited = self
-            .session
-            .pane_states
-            .get(&pane_id)
-            .is_some_and(|state| state.exited);
-        let status_dot = if exited {
-            Some(THEME.dim)
-        } else {
-            pane_status_color(pane.status)
-        };
-        let needs_you = activity_section(pane.status, exited) == Some(ActivitySection::NeedsYou);
+        let exited = self.pane_exited(pane_id);
+        let indicator = self.pane_indicator(pane);
         let focused = self.layout.focused_pane == Some(pane_id);
         let border = if focused {
             THEME.accent
-        } else if needs_you {
-            status_dot.unwrap_or(THEME.border)
+        } else if indicator == PaneIndicator::NeedsYou {
+            indicator.color()
         } else {
             THEME.border
         };
+        let close_tooltip = format!("Close {title}…");
         let tooltip = match activity_section(pane.status, exited) {
             Some(_) => format!(
                 "{} — {}",
@@ -864,16 +857,14 @@ impl HhApp {
                     .text_color(rgb(if exited { THEME.dim } else { THEME.foreground }))
                     .child(title),
             )
-            .when_some(status_dot, |element, color| {
-                element.child(
-                    div()
-                        .flex_none()
-                        .w(px(6.0))
-                        .h(px(6.0))
-                        .rounded_full()
-                        .bg(rgb(color)),
-                )
-            })
+            .child(render_pane_indicator(indicator))
+            .child(self.render_close_button(
+                ("close-group-pane-chip", element_key(pane_id)),
+                THEME.foreground,
+                close_tooltip,
+                move |this, cx| this.begin_close(pane_id, cx),
+                cx,
+            ))
             .into_any_element()
     }
 

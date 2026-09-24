@@ -5,9 +5,7 @@ use gpui::{
     MouseDownEvent, Point, div, px, relative, rgb, rgba,
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled};
-use hh_protocol::{
-    ClientRequest, DropPlacement, Pane, PaneLayout, PaneStatus, SplitAxis, WorkspaceConnection,
-};
+use hh_protocol::{ClientRequest, DropPlacement, Pane, PaneLayout, SplitAxis, WorkspaceConnection};
 
 use crate::browser::browser_command_available;
 use crate::commands::AppCommand;
@@ -18,11 +16,12 @@ use crate::helpers::{
     split_target_for_drag, split_target_for_drag_ids, terminal_tab_secondary_label,
     workspace_layout_for_focused_pane, workspace_tab_standalone_pane, zoom_projection,
 };
+use crate::tab_chrome::render_pane_indicator;
 use crate::view_models::{
     DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag, SearchEditor, SplitControlId,
     TabDrag, TooltipView, WorkspaceDrag,
 };
-use crate::{HhApp, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, THEME, pane_status_color};
+use crate::{HhApp, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, THEME};
 use uuid::Uuid;
 
 impl HhApp {
@@ -149,8 +148,7 @@ impl HhApp {
                 let input = cx.entity();
                 let secondary_label = terminal_tab_secondary_label(pane).map(str::to_owned);
                 let selected = pane_id == active;
-                let status = pane.status;
-                let status_color = pane_status_color(status);
+                let indicator = self.pane_indicator(pane);
                 let pane_accent = pane
                     .color
                     .unwrap_or_else(|| self.terminal_accent(pane_id))
@@ -259,53 +257,14 @@ impl HhApp {
                                 .child(label),
                         )
                     })
-                    .when(status != PaneStatus::Idle, |element| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .w(px(7.0))
-                                .h(px(7.0))
-                                .rounded_full()
-                                .bg(rgb(status_color.expect("non-idle status has a color"))),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(("close-tab", element_key(pane_id)))
-                            .ml(px(1.0))
-                            .flex_none()
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .line_height(px(14.0))
-                            .text_color(rgb(THEME.dim))
-                            .hover(|element| {
-                                element
-                                    .bg(rgb(THEME.elevated))
-                                    .text_color(rgb(THEME.foreground))
-                            })
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: close_tooltip.clone(),
-                                })
-                                .into()
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.begin_close(pane_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child("×"),
-                    )
+                    .child(render_pane_indicator(indicator))
+                    .child(self.render_close_button(
+                        ("close-tab", element_key(pane_id)),
+                        THEME.foreground,
+                        close_tooltip,
+                        move |this, cx| this.begin_close(pane_id, cx),
+                        cx,
+                    ))
                     .into_any_element()
             })
             .collect()

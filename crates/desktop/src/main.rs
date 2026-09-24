@@ -14,8 +14,8 @@ use gpui::{
     actions, point, px, size,
 };
 use hh_protocol::{
-    AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, PaneStatus, PaneStreamState,
-    ServiceResponse, SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalScreen,
+    AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, PaneStreamState, ServiceResponse,
+    SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalScreen,
 };
 use hh_session_client::SessionClient;
 use parking_lot::Mutex;
@@ -53,6 +53,7 @@ mod reconcile;
 mod render;
 mod session;
 mod sidebar;
+mod tab_chrome;
 mod terminal_view;
 mod theme;
 mod workspace_tab_strip;
@@ -166,34 +167,6 @@ const STABLE_PRODUCT_NAME: &str = "Harness Harlot";
 const DEVELOPMENT_PRODUCT_NAME: &str = "Harness Harlot Dev";
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 
-const fn pane_status_severity(status: PaneStatus) -> u8 {
-    match status {
-        PaneStatus::Idle => 0,
-        PaneStatus::Done => 1,
-        PaneStatus::Working => 2,
-        PaneStatus::Attention => 3,
-        PaneStatus::NeedsInput => 4,
-        PaneStatus::NeedsApproval => 5,
-    }
-}
-
-fn max_pane_status(statuses: impl IntoIterator<Item = PaneStatus>) -> PaneStatus {
-    statuses
-        .into_iter()
-        .max_by_key(|status| pane_status_severity(*status))
-        .unwrap_or_default()
-}
-
-const fn pane_status_color(status: PaneStatus) -> Option<u32> {
-    match status {
-        PaneStatus::Idle => None,
-        PaneStatus::Working => Some(THEME.dim),
-        PaneStatus::NeedsApproval => Some(THEME.danger),
-        PaneStatus::NeedsInput => Some(THEME.accent),
-        PaneStatus::Attention => Some(THEME.accent_soft),
-        PaneStatus::Done => Some(THEME.ansi[2]),
-    }
-}
 const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
     AppearanceColor::new(0x62, 0xad, 0xff),
     AppearanceColor::new(0x67, 0xc8, 0xc6),
@@ -668,6 +641,19 @@ impl HhApp {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                gpui::Timer::after(tab_chrome::SPINNER_STEP).await;
+                let Ok(()) = this.update(cx, |this, cx| {
+                    if this.any_pane_running() {
+                        cx.notify();
+                    }
+                }) else {
+                    break;
+                };
+            }
+        })
+        .detach();
         if automatic_update_checks_enabled() {
             cx.spawn(async move |this, cx| {
                 let mut first_check = true;
@@ -938,10 +924,9 @@ fn main() {
 mod tests {
     use super::{
         AvailableUpdateBanner, BUNDLED_BANNER_PIXEL_HEIGHT, BUNDLED_BANNER_PIXEL_WIDTH,
-        max_pane_status, pane_status_color, workstation_banner_path,
+        workstation_banner_path,
     };
     use crate::sidebar::{UpdateInstallPlan, update_install_plan};
-    use hh_protocol::PaneStatus;
 
     #[test]
     fn update_banner_reflects_install_capability() {
@@ -979,31 +964,6 @@ mod tests {
             UpdateInstallPlan::Install
         );
         assert_eq!(update_install_plan(false, None), UpdateInstallPlan::Install);
-    }
-
-    #[test]
-    fn pane_status_badges_use_declared_severity_and_colors() {
-        assert_eq!(
-            max_pane_status([
-                PaneStatus::Done,
-                PaneStatus::Working,
-                PaneStatus::Attention,
-                PaneStatus::NeedsInput,
-                PaneStatus::NeedsApproval,
-            ]),
-            PaneStatus::NeedsApproval
-        );
-        assert_eq!(max_pane_status([]), PaneStatus::Idle);
-        assert_eq!(pane_status_color(PaneStatus::Idle), None);
-        for status in [
-            PaneStatus::Done,
-            PaneStatus::Working,
-            PaneStatus::Attention,
-            PaneStatus::NeedsInput,
-            PaneStatus::NeedsApproval,
-        ] {
-            assert!(pane_status_color(status).is_some(), "status: {status:?}");
-        }
     }
 
     #[test]
