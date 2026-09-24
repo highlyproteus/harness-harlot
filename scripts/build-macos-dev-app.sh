@@ -74,9 +74,15 @@ cargo build --locked $cargo_release -p hh-session-service --bin hh-service
 
 app_name="Harness Harlot Dev"
 app_directory="$repository_root/target/$profile/$app_name.app"
-contents_directory="$app_directory/Contents"
+# Assemble and sign in a staging directory, then swap the finished bundle in.
+# Once macOS has launched an app from $app_directory it may refuse in-place
+# writes and re-signing there (EPERM, EIO, EBADF), while replacing the whole
+# bundle by rename still succeeds.
+staging_root=$(mktemp -d "$repository_root/target/$profile/.dev-app-staging.XXXXXX")
+trap 'rm -rf "$staging_root"' EXIT HUP INT TERM
+staged_app="$staging_root/$app_name.app"
+contents_directory="$staged_app/Contents"
 notices_directory="$contents_directory/Resources/licenses"
-rm -rf "$app_directory"
 mkdir -p "$contents_directory/MacOS" "$notices_directory/third_party/licenses"
 
 cp "$repository_root/packaging/macos/Info-dev.plist" "$contents_directory/Info.plist"
@@ -154,6 +160,8 @@ if [ "$browser_enabled" -eq 1 ]; then
   done
 fi
 codesign --force --sign - "$contents_directory/MacOS/hh-service"
-codesign --force --sign - "$app_directory"
+codesign --force --sign - "$staged_app"
 
+rm -rf "$app_directory"
+mv "$staged_app" "$app_directory"
 printf '%s\n' "$app_directory"
