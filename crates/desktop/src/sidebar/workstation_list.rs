@@ -18,7 +18,8 @@ use gpui::{
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{
-    AppearanceColor, Pane, Workspace, WorkspaceConnection, WorkspaceConnectionStatus,
+    AppearanceColor, Pane, PaneLayout, SplitAxis, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus,
 };
 use std::time::Instant;
 use uuid::Uuid;
@@ -597,24 +598,94 @@ impl HhApp {
                 .child(self.render_workspace_group_menu_button(tab_id, cx))
                 .into_any_element(),
         );
-        if !collapsed {
-            let chips = panes
-                .into_iter()
-                .map(|pane| self.render_group_pane_chip(workspace_id, tab_id, pane, cx))
-                .collect::<Vec<_>>();
+        if !collapsed && let Some(layout) = self.tab_layout(workspace_id, tab_id) {
+            // A ring holds the window's terminals, laid out like the window:
+            // side-by-side terminals share the width, stacked ones stack.
             rows.push(
                 div()
                     .ml(px(pane_indent))
                     .mr(px(4.0))
-                    .py(px(2.0))
+                    .mt(px(1.0))
+                    .mb(px(3.0))
+                    .p(px(3.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(rgb(THEME.border_strong))
                     .flex()
-                    .flex_wrap()
-                    .gap(px(4.0))
-                    .children(chips)
+                    .child(self.render_pane_chip_layout(workspace_id, tab_id, layout, cx))
                     .into_any_element(),
             );
         }
         rows
+    }
+
+    fn tab_layout(&self, workspace_id: Uuid, tab_id: Uuid) -> Option<&PaneLayout> {
+        self.session
+            .snapshot
+            .as_ref()?
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)?
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| &tab.layout)
+    }
+
+    /// Mirrors a window's split tree with chips: a side-by-side split lays
+    /// its halves out in a row, a stacked split in a column, and panes that
+    /// share one slot sit next to each other.
+    fn render_pane_chip_layout(
+        &self,
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        layout: &PaneLayout,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cell = |child: AnyElement| div().flex_1().min_w(px(0.0)).flex().child(child);
+        match layout {
+            PaneLayout::Leaf { pane } => {
+                self.render_group_pane_chip(workspace_id, tab_id, pane, cx)
+            }
+            PaneLayout::Stack { panes, .. } => div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .gap(px(3.0))
+                .children(
+                    panes
+                        .iter()
+                        .map(|pane| {
+                            cell(self.render_group_pane_chip(workspace_id, tab_id, pane, cx))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element(),
+            PaneLayout::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .gap(px(3.0))
+                .when(*axis == SplitAxis::Vertical, |element| element.flex_col())
+                .child(cell(self.render_pane_chip_layout(
+                    workspace_id,
+                    tab_id,
+                    first,
+                    cx,
+                )))
+                .child(cell(self.render_pane_chip_layout(
+                    workspace_id,
+                    tab_id,
+                    second,
+                    cx,
+                )))
+                .into_any_element(),
+        }
     }
 
     /// One terminal of a window, tmux-style: a compact chip with its icon,
@@ -666,7 +737,8 @@ impl HhApp {
         };
         div()
             .id(("group-pane-chip", element_key(pane_id)))
-            .max_w(px(150.0))
+            .flex_1()
+            .min_w(px(0.0))
             .h(px(22.0))
             .px(px(6.0))
             .rounded(px(4.0))
@@ -715,6 +787,7 @@ impl HhApp {
             ))
             .child(
                 div()
+                    .flex_1()
                     .min_w(px(0.0))
                     .truncate()
                     .font_family(".SystemUIFont")

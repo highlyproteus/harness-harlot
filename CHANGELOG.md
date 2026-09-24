@@ -37,9 +37,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Show each split window in the workstation sidebar as one row with its terminal
-  count and a compact chip per terminal (icon, name, live status) instead of a
-  nested row per terminal. Click a chip to focus that terminal, drag it out to
-  its own tab, or right-click it for the tab menu.
+  count and a ringed map of its terminals instead of a nested row per terminal:
+  side-by-side terminals share the width and stacked ones stack. Each chip shows
+  the terminal's icon, name, and live status; click it to focus that terminal,
+  drag it out to its own tab, or right-click it for the tab menu.
 - Rebuilt Notifications around live status: tabs and bots are grouped as Needs
   you, Running, and Done, newest first, using the real tab rows with status
   badges. The bell and Dock badges count items that need you.
