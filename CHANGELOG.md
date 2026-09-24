@@ -52,7 +52,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Show each split window in the workstation sidebar as a ring of terminal chips,
   with no header row or collapse menu, instead of a nested row per terminal:
-  side-by-side terminals share the width and stacked ones stack. Each chip shows
+  the map keeps the window's proportions and each split's real size, so
+  side-by-side terminals are tall and narrow, grids and full-width rows appear
+  as laid out, and stacked ones stack. Each chip shows
   the terminal's icon, name, and live status; click it to focus that terminal,
   drag it out to its own tab, or right-click it for the tab menu. Drag the ring
   to reorder the window and right-click it for the window menu.

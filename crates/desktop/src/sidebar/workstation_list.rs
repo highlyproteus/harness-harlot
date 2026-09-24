@@ -3,7 +3,7 @@ use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     HeaderDropZone, SidebarSection, WorkstationTabEntry, abbreviate_home, click_suppression_active,
     element_key, header_drop_zone, identity_detail, partition_workstation_entries,
-    readable_text_color, render_terminal_profile_icon, terminal_tab_count_label,
+    readable_text_color, render_terminal_profile_icon, split_control_id, terminal_tab_count_label,
     workspace_tab_entries, workspace_terminal_tabs,
 };
 use crate::notifications::{ActivitySection, activity_badge, activity_section};
@@ -14,7 +14,7 @@ use crate::{HhApp, THEME, pane_status_color};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    Point, div, img, px, rgb, rgba,
+    Point, div, img, px, relative, rgb, rgba,
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{
@@ -397,7 +397,7 @@ impl HhApp {
         let window_ring = !is_project;
         let content: Vec<AnyElement> = if window_ring {
             self.tab_layout(workspace_id, tab_id)
-                .map(|layout| self.render_pane_chip_layout(workspace_id, tab_id, layout, cx))
+                .map(|layout| self.render_pane_map(workspace_id, tab_id, layout, group_indent, cx))
                 .into_iter()
                 .collect()
         } else {
@@ -633,7 +633,7 @@ impl HhApp {
                     .border_1()
                     .border_color(rgb(THEME.border_strong))
                     .flex()
-                    .child(self.render_pane_chip_layout(workspace_id, tab_id, layout, cx))
+                    .child(self.render_pane_map(workspace_id, tab_id, layout, pane_indent, cx))
                     .into_any_element(),
             );
         }
@@ -653,59 +653,106 @@ impl HhApp {
             .map(|tab| &tab.layout)
     }
 
-    /// Mirrors a window's split tree with chips: a side-by-side split lays
-    /// its halves out in a row, a stacked split in a column, and panes that
-    /// share one slot sit next to each other.
-    fn render_pane_chip_layout(
+    /// A window's terminals drawn as a small map of its real layout: the map
+    /// has the window's proportions (tall enough for every row to stay
+    /// readable), and each split keeps its actual ratio, so side-by-side
+    /// terminals are tall narrow chips and a full-width bottom row spans the
+    /// whole map.
+    fn render_pane_map(
+        &self,
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        layout: &PaneLayout,
+        indent: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const ROW_MIN: f32 = 24.0;
+        let (window_width, window_height) = self.layout.workspace_pixels;
+        let map_width = (self.sidebar.sidebar_pixels - indent - 28.0).max(80.0);
+        let shaped = if window_width > 0.0 && window_height > 0.0 {
+            map_width * window_height / window_width * 0.6
+        } else {
+            0.0
+        };
+        let rows = f32::from(pane_map_rows(layout));
+        let height = shaped.max(rows * ROW_MIN).clamp(ROW_MIN, 180.0);
+        div()
+            .w_full()
+            .h(px(height))
+            .flex()
+            .child(self.render_pane_map_node(workspace_id, tab_id, layout, cx))
+            .into_any_element()
+    }
+
+    fn render_pane_map_node(
         &self,
         workspace_id: Uuid,
         tab_id: Uuid,
         layout: &PaneLayout,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let cell = |child: AnyElement| div().flex_1().min_w(px(0.0)).flex().child(child);
+        // Each cell pads itself, so relative sizes still add up to the map.
+        let cell = || div().min_w(px(0.0)).min_h(px(0.0)).p(px(1.5)).flex();
         match layout {
-            PaneLayout::Leaf { pane } => {
-                self.render_group_pane_chip(workspace_id, tab_id, pane, cx)
-            }
-            PaneLayout::Stack { panes, .. } => div()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .gap(px(3.0))
+            PaneLayout::Leaf { pane } => cell()
+                .size_full()
+                .child(self.render_group_pane_chip(workspace_id, tab_id, pane, cx))
+                .into_any_element(),
+            PaneLayout::Stack { panes, .. } => cell()
+                .size_full()
                 .children(
                     panes
                         .iter()
                         .map(|pane| {
-                            cell(self.render_group_pane_chip(workspace_id, tab_id, pane, cx))
+                            cell().flex_1().h_full().child(self.render_group_pane_chip(
+                                workspace_id,
+                                tab_id,
+                                pane,
+                                cx,
+                            ))
                         })
                         .collect::<Vec<_>>(),
                 )
                 .into_any_element(),
             PaneLayout::Split {
                 axis,
+                ratio,
                 first,
                 second,
-                ..
-            } => div()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .gap(px(3.0))
-                .when(*axis == SplitAxis::Vertical, |element| element.flex_col())
-                .child(cell(self.render_pane_chip_layout(
-                    workspace_id,
-                    tab_id,
-                    first,
-                    cx,
-                )))
-                .child(cell(self.render_pane_chip_layout(
-                    workspace_id,
-                    tab_id,
-                    second,
-                    cx,
-                )))
-                .into_any_element(),
+            } => {
+                let ratio = self
+                    .layout
+                    .split_ratios
+                    .get(&split_control_id(first, second))
+                    .copied()
+                    .unwrap_or(*ratio)
+                    .clamp(0.05, 0.95);
+                let side_by_side = *axis == SplitAxis::Horizontal;
+                div()
+                    .size_full()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .flex()
+                    .when(!side_by_side, |element| element.flex_col())
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .flex()
+                            .when(side_by_side, |element| element.w(relative(ratio)).h_full())
+                            .when(!side_by_side, |element| element.h(relative(ratio)).w_full())
+                            .child(self.render_pane_map_node(workspace_id, tab_id, first, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .flex()
+                            .child(self.render_pane_map_node(workspace_id, tab_id, second, cx)),
+                    )
+                    .into_any_element()
+            }
         }
     }
 
@@ -758,9 +805,10 @@ impl HhApp {
         };
         div()
             .id(("group-pane-chip", element_key(pane_id)))
-            .flex_1()
+            .size_full()
             .min_w(px(0.0))
-            .h(px(22.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
             .px(px(6.0))
             .rounded(px(4.0))
             .border_1()
@@ -1039,7 +1087,9 @@ impl HhApp {
                     .child(if expanded { "⌄" } else { "›" }),
             )
             .child(self.render_workspace_card_title(ctx))
-            .child(self.render_workspace_tab_count(ctx))
+            .when(!bot, |element| {
+                element.child(self.render_workspace_tab_count(ctx))
+            })
             .when(bot, |element| {
                 element.child(self.render_new_thread_button(workspace_id, cx))
             })
@@ -1281,5 +1331,69 @@ impl HhApp {
             )
             .child("…")
             .into_any_element()
+    }
+}
+
+/// How many terminal rows a window stacks vertically, so the sidebar map is
+/// tall enough for each row's chip to stay readable.
+fn pane_map_rows(layout: &PaneLayout) -> u16 {
+    match layout {
+        PaneLayout::Leaf { .. } | PaneLayout::Stack { .. } => 1,
+        PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            first,
+            second,
+            ..
+        } => pane_map_rows(first).max(pane_map_rows(second)),
+        PaneLayout::Split {
+            axis: SplitAxis::Vertical,
+            first,
+            second,
+            ..
+        } => pane_map_rows(first).saturating_add(pane_map_rows(second)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pane_map_rows;
+    use hh_protocol::{PaneLayout, SessionSnapshot, SplitAxis};
+
+    fn leaf() -> PaneLayout {
+        SessionSnapshot::seeded()
+            .workspaces
+            .remove(0)
+            .tabs
+            .remove(0)
+            .layout
+    }
+
+    fn split(axis: SplitAxis, first: PaneLayout, second: PaneLayout) -> PaneLayout {
+        PaneLayout::Split {
+            axis,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    #[test]
+    fn map_rows_follow_the_window_layout() {
+        let columns = split(SplitAxis::Horizontal, leaf(), leaf());
+        assert_eq!(pane_map_rows(&columns), 1, "side by side is one tall row");
+
+        let two_over_one = split(SplitAxis::Vertical, columns.clone(), leaf());
+        assert_eq!(pane_map_rows(&two_over_one), 2, "1|2 over a full-width 3");
+
+        let three = split(SplitAxis::Horizontal, leaf(), columns.clone());
+        let three_over_two = split(SplitAxis::Vertical, three, columns);
+        assert_eq!(pane_map_rows(&three_over_two), 2, "three columns over two");
+
+        let stacked = split(
+            SplitAxis::Vertical,
+            leaf(),
+            split(SplitAxis::Vertical, leaf(), leaf()),
+        );
+        assert_eq!(pane_map_rows(&stacked), 3);
     }
 }
