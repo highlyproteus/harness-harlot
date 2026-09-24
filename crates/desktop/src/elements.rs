@@ -330,15 +330,16 @@ impl Element for TerminalInputElement {
     }
 }
 
-/// Registers window-level listeners while the sidebar divider owns an active
-/// pointer gesture. GPUI's normal element listeners are hover-scoped, while a
-/// resize capture must continue to receive drag and release events outside the
-/// divider (and even outside the window bounds when the platform delivers them).
-pub(crate) struct SidebarResizeCaptureElement {
+/// Registers window-level listeners while the sidebar divider or a split
+/// divider owns an active pointer gesture. GPUI's normal element listeners are
+/// hover-scoped, and a terminal under the pointer that consumes mouse events
+/// (agent TUIs enable mouse reporting) would stall a bubbling resize, so the
+/// drag must keep receiving move and release events wherever the pointer goes.
+pub(crate) struct ResizeCaptureElement {
     pub(crate) input: Entity<HhApp>,
 }
 
-impl IntoElement for SidebarResizeCaptureElement {
+impl IntoElement for ResizeCaptureElement {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -346,7 +347,7 @@ impl IntoElement for SidebarResizeCaptureElement {
     }
 }
 
-impl Element for SidebarResizeCaptureElement {
+impl Element for ResizeCaptureElement {
     type RequestLayoutState = ();
     type PrepaintState = ();
 

@@ -8,7 +8,7 @@ use gpui::{
 use crate::HhApp;
 use crate::commands::{AppCommand, ROOT_KEY_CONTEXT};
 use crate::elements::{
-    SidebarResizeCaptureElement, TerminalInputElement, TerminalSelectionCaptureElement,
+    ResizeCaptureElement, TerminalInputElement, TerminalSelectionCaptureElement,
 };
 use crate::input::browser_url_editor_is_active;
 use crate::view_models::{ColorTarget, DialogAction, Modal};
@@ -262,15 +262,18 @@ impl Render for HhApp {
                     .h(px(1.0))
                     .child(TerminalInputElement { input: cx.entity() }),
             )
-            .when(self.sidebar.sidebar_resize.is_active(), |element| {
-                element.child(
-                    div()
-                        .absolute()
-                        .w(px(1.0))
-                        .h(px(1.0))
-                        .child(SidebarResizeCaptureElement { input: cx.entity() }),
-                )
-            })
+            .when(
+                self.sidebar.sidebar_resize.is_active() || self.layout.resizing.is_some(),
+                |element| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .w(px(1.0))
+                            .h(px(1.0))
+                            .child(ResizeCaptureElement { input: cx.entity() }),
+                    )
+                },
+            )
             .when(self.layout.selection_drag.is_some(), |element| {
                 element.child(
                     div()

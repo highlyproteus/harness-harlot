@@ -85,6 +85,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Keep split dividers following the pointer while dragging across terminals
+  that use the mouse (agent interfaces), and highlight a divider on hover.
 - Running the test suite or a service with a custom state directory no longer
   shares, or disrupts, the app's private tmux server.
 - Keep the private tmux server alive when creating a second workstation after

@@ -934,7 +934,18 @@ impl HhApp {
                     .w(px(4.0))
                     .cursor(CursorStyle::ResizeLeftRight)
             })
-            .bg(rgb(THEME.border))
+            .bg(rgb(
+                if self
+                    .layout
+                    .resizing
+                    .is_some_and(|drag| drag.split_id == split_id)
+                {
+                    THEME.accent
+                } else {
+                    THEME.border
+                },
+            ))
+            .hover(|element| element.bg(rgb(THEME.accent)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
