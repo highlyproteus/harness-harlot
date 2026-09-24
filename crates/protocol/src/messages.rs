@@ -8,12 +8,12 @@ use crate::history::{
     TerminalHistoryPage,
 };
 use crate::model::{
-    AppearanceColor, AssistantSettings, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport,
+    AppearanceColor, BotSettings, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport,
     TmuxScanScope, TmuxSession, TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
 };
 use crate::profile::TerminalProfile;
 use crate::terminal::{
-    AssistantImage, AssistantModel, AssistantThreadView, BrowserAction, BrowserCommandOutcome,
+    BrowserAction, BrowserCommandOutcome,
     BrowserCommandRequest, CodingAgent, DropPlacement, PaneRevisionCursor, PaneStreamState,
     SessionNotification, StreamDiagnostics, TerminalModifiers, TerminalMouseAction,
     TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
@@ -42,43 +42,43 @@ pub enum ClientRequest {
     GetUpdates {
         snapshot_revision: Option<u64>,
         pane_revisions: Vec<PaneRevisionCursor>,
-        #[serde(default)]
-        assistant_revisions: Vec<PaneRevisionCursor>,
         subscribed_panes: Vec<Uuid>,
         notifications_after: u64,
         #[serde(default)]
         browser_executor: bool,
     },
-    AssistantPrompt {
-        pane_id: Uuid,
-        text: String,
-        #[serde(default)]
-        images: Vec<AssistantImage>,
+    SetBotSettings {
+        settings: BotSettings,
     },
-    AssistantAbort {
-        pane_id: Uuid,
+    /// Creates a bot tab in the reserved `Bots` workspace (created on demand)
+    /// and launches the agent's own interface in its terminal.
+    CreateBot {
+        name: Option<String>,
+        agent: TerminalProfile,
+        working_dir: Option<String>,
+        instructions: Option<String>,
     },
-    AssistantRestart {
-        pane_id: Uuid,
+    /// Replaces the bot's agent and relaunches its terminal.
+    SetBotAgent {
+        tab_id: Uuid,
+        agent: TerminalProfile,
     },
-    AssistantApprovalResponse {
-        pane_id: Uuid,
-        request_id: String,
-        allow: bool,
+    /// Terminates the bot's terminal and launches its agent again.
+    RestartBot {
+        tab_id: Uuid,
     },
-    GetAssistantThread {
-        pane_id: Uuid,
-    },
-    GetAssistantModels {
-        pane_id: Uuid,
-    },
-    SetAssistantModel {
-        pane_id: Uuid,
-        provider: String,
-        model_id: String,
-    },
-    SetAssistantSettings {
-        settings: AssistantSettings,
+    /// Opens a worker terminal tab in a workstation and optionally types
+    /// `command` into its shell once the shell is spawned. When
+    /// `requester_pane` is a bot pane, the tab records that bot as
+    /// `owner_bot`, and `workspace_id: None` targets the bot's own
+    /// workstation (created on demand, titled after the bot). Without a bot
+    /// requester, `workspace_id` is required.
+    CreateWorker {
+        workspace_id: Option<Uuid>,
+        working_dir: Option<String>,
+        title: Option<String>,
+        command: Option<String>,
+        requester_pane: Option<Uuid>,
     },
     GetCodingAgents,
     GetNotifications,
@@ -131,12 +131,6 @@ pub enum ClientRequest {
     BrowserCommandResult {
         request_id: u64,
         outcome: BrowserCommandOutcome,
-    },
-    CreateAssistantTab {
-        workspace_id: Uuid,
-    },
-    CreateGroupAssistant {
-        target_pane: Uuid,
     },
     CreateWorkspaceGroup {
         workspace_id: Uuid,
@@ -301,11 +295,6 @@ pub enum ClientRequest {
         working_dir: String,
         authorized_root: String,
     },
-    CreateAssistantWorkspace {
-        title: Option<String>,
-        working_dir: Option<String>,
-        instructions: Option<String>,
-    },
     CreateSshWorkspace {
         title: Option<String>,
         destination: String,
@@ -421,8 +410,6 @@ pub enum ServiceResponse {
         screens: Vec<TerminalScreen>,
         pane_states: Vec<PaneStreamState>,
         notifications: Vec<SessionNotification>,
-        #[serde(default)]
-        assistant_threads: Vec<AssistantThreadView>,
         diagnostics: StreamDiagnostics,
         #[serde(default)]
         browser_commands: Vec<BrowserCommandRequest>,
@@ -434,11 +421,15 @@ pub enum ServiceResponse {
         screen: TerminalScreen,
         diagnostics: StreamDiagnostics,
     },
-    AssistantThread {
-        view: AssistantThreadView,
+    BotCreated {
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        pane_id: Uuid,
     },
-    AssistantModels {
-        models: Vec<AssistantModel>,
+    WorkerCreated {
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        pane_id: Uuid,
     },
     CodingAgents {
         agents: Vec<CodingAgent>,
@@ -607,32 +598,35 @@ mod tests {
                 }),
             ),
             (
-                ClientRequest::CreateAssistantTab { workspace_id },
-                serde_json::json!({
-                    "type": "create_assistant_tab",
-                    "workspace_id": workspace_id,
-                }),
-            ),
-            (
-                ClientRequest::CreateAssistantWorkspace {
-                    title: Some("Research".to_owned()),
+                ClientRequest::CreateBot {
+                    name: Some("Hive3".to_owned()),
+                    agent: TerminalProfile::Omp,
                     working_dir: Some("/srv/projects".to_owned()),
-                    instructions: Some("Answer tersely".to_owned()),
+                    instructions: None,
                 },
                 serde_json::json!({
-                    "type": "create_assistant_workspace",
-                    "title": "Research",
+                    "type": "create_bot",
+                    "name": "Hive3",
+                    "agent": "omp",
                     "working_dir": "/srv/projects",
-                    "instructions": "Answer tersely",
+                    "instructions": null,
                 }),
             ),
             (
-                ClientRequest::CreateGroupAssistant {
-                    target_pane: pane_id,
+                ClientRequest::CreateWorker {
+                    workspace_id: None,
+                    working_dir: Some("/srv/projects/api".to_owned()),
+                    title: Some("api-fix".to_owned()),
+                    command: Some("omp 'fix the api'".to_owned()),
+                    requester_pane: Some(pane_id),
                 },
                 serde_json::json!({
-                    "type": "create_group_assistant",
-                    "target_pane": pane_id,
+                    "type": "create_worker",
+                    "workspace_id": null,
+                    "working_dir": "/srv/projects/api",
+                    "title": "api-fix",
+                    "command": "omp 'fix the api'",
+                    "requester_pane": pane_id,
                 }),
             ),
             (
@@ -802,72 +796,6 @@ mod tests {
 
         assert_request_json_round_trips(cases);
     }
-    #[test]
-    fn assistant_prompt_with_image_round_trips() {
-        let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-        let request = ClientRequest::AssistantPrompt {
-            pane_id,
-            text: "Describe this".to_owned(),
-            images: vec![AssistantImage {
-                mime_type: "image/png".to_owned(),
-                base64: "aGVsbG8=".to_owned(),
-            }],
-        };
-        let encoded = serde_json::to_value(&request).unwrap();
-        assert_eq!(
-            encoded,
-            serde_json::json!({
-                "type": "assistant_prompt",
-                "pane_id": pane_id,
-                "text": "Describe this",
-                "images": [{
-                    "mime_type": "image/png",
-                    "base64": "aGVsbG8="
-                }]
-            })
-        );
-        assert_eq!(
-            serde_json::from_value::<ClientRequest>(encoded).unwrap(),
-            request
-        );
-    }
-
-    #[test]
-    fn updates_with_assistant_thread_round_trips() {
-        let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-        let response = ServiceResponse::Updates {
-            session_revision: 7,
-            snapshot: None,
-            screens: Vec::new(),
-            pane_states: Vec::new(),
-            notifications: Vec::new(),
-            assistant_threads: vec![AssistantThreadView {
-                pane_id,
-                revision: 3,
-                status: crate::terminal::AssistantStatus::Idle,
-                model: Some("openai/gpt-5".to_owned()),
-                entries: vec![crate::terminal::AssistantEntry::Assistant {
-                    text: "Done".to_owned(),
-                    final_: true,
-                    timestamp_ms: 42,
-                }],
-                truncated_entries: 0,
-                pending_approval: None,
-            }],
-            diagnostics: StreamDiagnostics::default(),
-            browser_commands: Vec::new(),
-        };
-        let encoded = serde_json::to_value(&response).unwrap();
-        assert_eq!(
-            encoded["assistant_threads"][0]["entries"][0]["final_"],
-            serde_json::json!(true)
-        );
-        assert_eq!(
-            serde_json::from_value::<ServiceResponse>(encoded).unwrap(),
-            response
-        );
-    }
-
     #[test]
     fn shutdown_service_request_uses_stable_snake_case_tag_and_round_trips() {
         assert_request_json_round_trips([(

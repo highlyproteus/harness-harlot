@@ -16,7 +16,7 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub appearance: AppearanceSettings,
     #[serde(default)]
-    pub assistant: AssistantSettings,
+    pub bots: BotSettings,
     /// Ephemeral transport authority projected by the local session service.
     /// Missing entries are intentionally treated as unknown and fail closed.
     #[serde(default)]
@@ -24,24 +24,22 @@ pub struct SessionSnapshot {
     pub workspaces: Vec<Workspace>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AssistantAccess {
-    #[default]
-    Full,
-    Confirm,
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotSettings {
+    /// Agent preselected when creating a bot; None picks the first installed agent.
+    #[serde(default)]
+    pub default_agent: Option<TerminalProfile>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AssistantSettings {
+/// Launch configuration of a bot tab. Bots live in the single reserved
+/// `WorkspaceKind::Bots` workspace; each bot is one tab whose terminal runs
+/// the configured agent CLI's own interface.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotSpec {
+    pub agent: TerminalProfile,
+    /// Extra standing instructions appended to the bot's coordinator prompt.
     #[serde(default)]
-    pub access: AssistantAccess,
-    /// pi model as "provider/id"; None = pi's own default.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Preferred installed coding agent; None lets the orchestrator choose among installed agents.
-    #[serde(default)]
-    pub preferred_agent: Option<TerminalProfile>,
+    pub instructions: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -111,6 +109,7 @@ impl SessionSnapshot {
             color: None,
             identity: TerminalIdentity::default(),
             status: PaneStatus::default(),
+            status_changed_at_ms: 0,
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -124,13 +123,15 @@ impl SessionSnapshot {
             custom_icon: None,
             parent_tab: None,
             pinned: false,
+            bot: None,
+            owner_bot: None,
             layout: PaneLayout::Leaf { pane },
         };
 
         Self {
             revision: 0,
             appearance: AppearanceSettings::default(),
-            assistant: AssistantSettings::default(),
+            bots: BotSettings::default(),
             terminal_transports: HashMap::new(),
             workspaces: vec![Workspace {
                 id: Uuid::new_v4(),
@@ -144,6 +145,7 @@ impl SessionSnapshot {
                 working_dir: None,
                 kind: WorkspaceKind::Workstation,
                 instructions: None,
+                owner_bot: None,
                 custom_icon: None,
                 tabs: vec![tab],
             }],
@@ -174,14 +176,17 @@ pub struct Workspace {
     pub kind: WorkspaceKind,
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Bot tab whose delegated workers default to this workstation.
+    #[serde(default)]
+    pub owner_bot: Option<Uuid>,
     #[serde(default)]
     pub custom_icon: Option<String>,
     pub tabs: Vec<Tab>,
 }
 
 impl Workspace {
-    pub fn is_assistant(&self) -> bool {
-        self.kind == WorkspaceKind::Assistant
+    pub fn is_bots(&self) -> bool {
+        self.kind == WorkspaceKind::Bots
     }
 }
 
@@ -269,7 +274,8 @@ pub enum TmuxScanScope {
 pub enum WorkspaceKind {
     #[default]
     Workstation,
-    Assistant,
+    /// The single reserved workspace holding bot tabs; never shown as a workstation.
+    Bots,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -314,6 +320,12 @@ pub struct Tab {
     pub parent_tab: Option<Uuid>,
     #[serde(default)]
     pub pinned: bool,
+    /// Present only on bot tabs inside the `Bots` workspace.
+    #[serde(default)]
+    pub bot: Option<BotSpec>,
+    /// Bot tab that created this worker tab through `CreateWorker`.
+    #[serde(default)]
+    pub owner_bot: Option<Uuid>,
     pub layout: PaneLayout,
 }
 
@@ -350,7 +362,6 @@ pub enum PaneKind {
     Browser {
         url: String,
     },
-    Assistant,
     Gallery,
 }
 
@@ -360,7 +371,7 @@ impl PaneKind {
     pub fn is_browser(&self) -> bool {
         match self {
             Self::Browser { .. } => true,
-            Self::Terminal | Self::Assistant | Self::Gallery => false,
+            Self::Terminal | Self::Gallery => false,
         }
     }
 
@@ -369,16 +380,7 @@ impl PaneKind {
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::Terminal => true,
-            Self::Browser { .. } | Self::Assistant | Self::Gallery => false,
-        }
-    }
-
-    /// Whether this pane renders a voice assistant view. Exhaustive by design
-    /// so a future variant fails compilation exactly here.
-    pub fn is_assistant(&self) -> bool {
-        match self {
-            Self::Assistant => true,
-            Self::Terminal | Self::Browser { .. } | Self::Gallery => false,
+            Self::Browser { .. } | Self::Gallery => false,
         }
     }
 
@@ -386,7 +388,7 @@ impl PaneKind {
     pub const fn is_gallery(&self) -> bool {
         match self {
             Self::Gallery => true,
-            Self::Terminal | Self::Browser { .. } | Self::Assistant => false,
+            Self::Terminal | Self::Browser { .. } => false,
         }
     }
 }
@@ -408,6 +410,9 @@ pub struct Pane {
     /// It is intentionally reset during desired-state recovery.
     #[serde(default)]
     pub status: PaneStatus,
+    /// Ephemeral epoch milliseconds of the last `status` transition; 0 = never.
+    #[serde(default)]
+    pub status_changed_at_ms: u64,
     #[serde(default)]
     pub custom_title: Option<String>,
     #[serde(default)]
@@ -446,16 +451,6 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<PaneKind>(serde_json::to_value(&browser).unwrap()).unwrap(),
             browser
-        );
-
-        let assistant = PaneKind::Assistant;
-        assert_eq!(
-            serde_json::to_value(&assistant).unwrap(),
-            serde_json::json!({ "type": "assistant" })
-        );
-        assert_eq!(
-            serde_json::from_value::<PaneKind>(serde_json::to_value(&assistant).unwrap()).unwrap(),
-            assistant
         );
 
         let gallery = PaneKind::Gallery;
