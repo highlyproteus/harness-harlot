@@ -337,6 +337,24 @@ impl HhApp {
         cx.notify();
     }
 
+    /// The toolbar ⚙ button: opens Settings, or closes it back to the
+    /// workstation or bot shown before, which Settings never changes.
+    pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.editor.modal, Modal::AppearanceSettings) {
+            self.close_settings(cx);
+        } else {
+            self.open_settings(SettingsSection::Appearance, cx);
+        }
+    }
+
+    pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.editor.modal = Modal::None;
+        self.editor.color_picker = None;
+        self.editor.history_editor = None;
+        self.editor.history_clear_confirmation = None;
+        cx.notify();
+    }
+
     pub(crate) fn select_settings_section(
         &mut self,
         section: SettingsSection,

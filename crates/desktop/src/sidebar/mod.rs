@@ -333,6 +333,10 @@ impl HhApp {
             .history_status
             .as_ref()
             .is_some_and(|status| status.warning.is_some());
+        let settings_open = matches!(
+            self.editor.modal,
+            crate::view_models::Modal::AppearanceSettings
+        );
         div()
             .h(px(40.0))
             .px(px(8.0))
@@ -427,6 +431,13 @@ impl HhApp {
                     .font_family(".SystemUIFont")
                     .text_sm()
                     .text_color(rgb(THEME.muted))
+                    .when(settings_open, |element| {
+                        element
+                            .bg(rgb(THEME.accent_soft))
+                            .border_1()
+                            .border_color(rgb(THEME.accent))
+                            .text_color(rgb(THEME.foreground))
+                    })
                     .hover(|element| {
                         element
                             .bg(rgb(THEME.elevated))
@@ -438,9 +449,7 @@ impl HhApp {
                         })
                         .into()
                     })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_settings(crate::view_models::SettingsSection::Appearance, cx);
-                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx)))
                     .flex()
                     .items_center()
                     .justify_center()

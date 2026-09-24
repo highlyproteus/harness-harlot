@@ -39,8 +39,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Rebuilt Notifications around live status: tabs and bots are grouped as Needs
   you, Running, and Done, newest first, using the real tab rows with status
   badges. The bell and Dock badges count items that need you.
-- Rebuilt Settings as a full-pane surface with an Appearance / Bots / History /
-  Updates section list.
+- Rebuilt Settings as a surface that fills the whole main area, with an
+  Appearance / Bots / History / Updates section list. The ⚙ button toggles it
+  and closing it returns to the workstation or bot shown before. The ＋ menu
+  also offers New Bot.
 - Bumped the desktop/service wire protocol from 35 to 39 for bots, workers,
   status timestamps, coding-agent discovery, Gallery panes, and browser command
   execution; desktop and service must be upgraded together. Session snapshots

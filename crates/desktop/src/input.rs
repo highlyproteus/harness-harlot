@@ -566,8 +566,7 @@ impl HhApp {
             }
             Modal::AppearanceSettings => {
                 if keystroke.key == "escape" {
-                    self.editor.modal = Modal::None;
-                    cx.notify();
+                    self.close_settings(cx);
                 }
                 cx.stop_propagation();
                 return;

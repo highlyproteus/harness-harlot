@@ -1185,6 +1185,18 @@ impl HhApp {
                 .child("session service unavailable")
                 .into_any_element();
         };
+        if matches!(self.editor.modal, Modal::AppearanceSettings) {
+            // Settings replaces the whole main area: no tab strip, bot
+            // header, or pane stays visible behind it.
+            return div()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .h_full()
+                .flex_1()
+                .bg(rgb(THEME.terminal))
+                .child(self.render_appearance_settings(cx))
+                .into_any_element();
+        }
         let Some(workspace) = self.active_workspace_in(snapshot) else {
             return div().size_full().bg(rgb(THEME.terminal)).into_any_element();
         };
@@ -1299,10 +1311,6 @@ impl HhApp {
                         ),
                 )
                 .into_any_element()
-        };
-        let workspace_content = match self.editor.modal {
-            Modal::AppearanceSettings => self.render_appearance_settings(cx),
-            _ => workspace_content,
         };
         div()
             .min_w(px(0.0))

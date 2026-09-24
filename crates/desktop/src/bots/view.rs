@@ -93,10 +93,9 @@ impl HhApp {
                     .child("Bots"),
             ),
         };
-        let content = match (&self.editor.modal, tab.and_then(bot_pane)) {
-            (Modal::AppearanceSettings, _) => self.render_appearance_settings(cx),
-            (_, Some(pane)) => self.render_terminal(std::slice::from_ref(pane), pane.id, false, cx),
-            (_, None) => self.render_no_bot_selected(cx),
+        let content = match tab.and_then(bot_pane) {
+            Some(pane) => self.render_terminal(std::slice::from_ref(pane), pane.id, false, cx),
+            None => self.render_no_bot_selected(cx),
         };
         div()
             .min_w(px(0.0))

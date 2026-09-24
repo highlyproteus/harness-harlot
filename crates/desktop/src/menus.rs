@@ -464,14 +464,19 @@ impl HhApp {
         };
         let items = match menu.target {
             CreateMenuTarget::Global => {
-                let mut items = vec![self.create_menu_item(
-                    "create-new-workstation",
-                    "New Workstation",
-                    cx,
-                    |this, cx| {
-                        this.new_workspace(cx);
-                    },
-                )];
+                let mut items = vec![
+                    self.create_menu_item(
+                        "create-new-workstation",
+                        "New Workstation",
+                        cx,
+                        |this, cx| {
+                            this.new_workspace(cx);
+                        },
+                    ),
+                    self.create_menu_item("create-new-bot", "New Bot", cx, |this, cx| {
+                        this.begin_bot_creation(cx);
+                    }),
+                ];
                 // Tab items target the shown workstation, never the Bots workspace.
                 if self.active_workstation().is_some() {
                     items.push(self.create_menu_item(
