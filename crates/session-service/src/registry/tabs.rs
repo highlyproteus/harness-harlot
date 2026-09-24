@@ -695,7 +695,11 @@ impl SessionRegistry {
             workspace.active_terminal_count = workspace
                 .active_terminal_count
                 .saturating_sub(terminal_count);
-            forget_bots(&mut state.snapshot, &removed_bots);
+            forget_bots(
+                &mut state.snapshot,
+                &removed_bots,
+                self.bots_dir().ok().as_deref(),
+            );
             for pane_id in pane_ids {
                 state.panes.remove(&pane_id);
             }

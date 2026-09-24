@@ -4,7 +4,9 @@ mod discovery;
 mod launch;
 
 pub(crate) use discovery::discover_coding_agents;
-pub(crate) use launch::{BotLaunch, bots_directory, launch_command, remove_bot_files};
+pub(crate) use launch::{
+    BotLaunch, PreparedLaunch, bot_home, bots_directory, prepare_launch, remove_bot_files,
+};
 
 /// Exported to a bot terminal so the Harness Harlot tools can attribute the
 /// workers it opens to that bot.

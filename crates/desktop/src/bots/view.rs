@@ -2,15 +2,15 @@
 //! agent picker.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Pixels,
+    AnyElement, AppContext as _, Context, InteractiveElement, IntoElement, ParentElement, Pixels,
     StatefulInteractiveElement, Styled, div, px, rgb,
 };
-use hh_protocol::{TerminalProfile, Workspace};
+use hh_protocol::{Tab, TerminalProfile, Workspace};
 
 use super::{bot_name, bot_pane};
 use crate::helpers::{element_key, find_pane, render_terminal_profile_icon};
 use crate::menus::{anchored_menu, menu_separator};
-use crate::view_models::{BotMenu, Modal};
+use crate::view_models::{BotMenu, Modal, TooltipView};
 use crate::{HhApp, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
 
 impl HhApp {
@@ -47,6 +47,7 @@ impl HhApp {
             Some(tab) => {
                 let tab_id = tab.id;
                 let agent = tab.bot.as_ref().map(|bot| bot.agent).unwrap_or_default();
+                let home = format!("Home: {}", bot_home_label(tab));
                 header
                     .child(render_terminal_profile_icon(agent, THEME.muted, 18.0))
                     .child(
@@ -60,10 +61,14 @@ impl HhApp {
                     )
                     .child(
                         div()
+                            .id(("bot-agent", element_key(tab_id)))
                             .flex_1()
                             .truncate()
                             .text_xs()
                             .text_color(rgb(THEME.dim))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| TooltipView { text: home.clone() }).into()
+                            })
                             .child(agent.display_name()),
                     )
                     .child(
@@ -150,10 +155,9 @@ impl HhApp {
     ) -> AnyElement {
         let tab_id = menu.tab_id;
         let key = element_key(tab_id);
-        let current_agent = self
-            .bot_tab(tab_id)
-            .and_then(|tab| tab.bot.as_ref())
-            .map(|bot| bot.agent);
+        let bot = self.bot_tab(tab_id).and_then(|tab| tab.bot.as_ref());
+        let current_agent = bot.map(|bot| bot.agent);
+        let custom_home = bot.is_some_and(|bot| bot.home.is_some());
         let agents: Vec<AnyElement> = if !menu.agents_open {
             Vec::new()
         } else if self.coding_agents.loading {
@@ -244,6 +248,23 @@ impl HhApp {
                     cx,
                     move |this, cx| this.restart_bot(tab_id, cx),
                 ))
+                .child(self.create_menu_item(
+                    ("set-bot-home-menu", key),
+                    "Set home folder…",
+                    cx,
+                    move |this, cx| this.begin_bot_home_edit(tab_id, cx),
+                ))
+                .when(custom_home, |element| {
+                    element.child(self.create_menu_item(
+                        ("default-bot-home-menu", key),
+                        "Use default home folder",
+                        cx,
+                        move |this, cx| {
+                            this.editor.modal = Modal::None;
+                            this.set_bot_home(tab_id, None, cx);
+                        },
+                    ))
+                })
                 .child(menu_separator())
                 .child(
                     div()
@@ -337,5 +358,23 @@ impl HhApp {
                     .child(profile.display_name())
             }))
             .into_any_element()
+    }
+}
+
+/// The folder a bot's terminal starts in: its custom home, else the default
+/// `<state>/bots/<tab id>`.
+fn bot_home_label(tab: &Tab) -> String {
+    match tab.bot.as_ref().and_then(|bot| bot.home.clone()) {
+        Some(home) => home,
+        None => hh_protocol::state_directory().map_or_else(
+            || "default bot folder".to_owned(),
+            |state| {
+                state
+                    .join("bots")
+                    .join(tab.id.to_string())
+                    .display()
+                    .to_string()
+            },
+        ),
     }
 }

@@ -361,6 +361,26 @@ impl HhApp {
         self.dispatch_bot_request(ClientRequest::RestartBot { tab_id }, cx);
     }
 
+    /// Opens the folder picker and moves the bot's home to the chosen folder.
+    pub(crate) fn begin_bot_home_edit(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        self.editor.modal = Modal::None;
+        self.prompt_local_directory(
+            "Choose home folder",
+            move |this, dir, cx| this.set_bot_home(tab_id, Some(dir), cx),
+            cx,
+        );
+    }
+
+    /// Sets the bot's home folder; `None` restores the default.
+    pub(crate) fn set_bot_home(
+        &mut self,
+        tab_id: Uuid,
+        home: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_bot_request(ClientRequest::SetBotHome { tab_id, home }, cx);
+    }
+
     /// Re-runs login-PATH discovery on the service and stores the result. An
     /// open New bot dialog without an agent adopts the default once known.
     pub(crate) fn refresh_coding_agents(&mut self, cx: &mut Context<Self>) {
@@ -462,6 +482,7 @@ mod tests {
         bot_tab.bot = Some(BotSpec {
             agent: TerminalProfile::Omp,
             instructions: None,
+            home: None,
         });
         bots.tabs = vec![bot_tab];
         snapshot.workspaces.push(bots);

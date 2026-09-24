@@ -50,6 +50,7 @@ pub enum ClientRequest {
     CreateBot {
         name: Option<String>,
         agent: TerminalProfile,
+        /// The bot's project folder, where its threads open by default.
         working_dir: Option<String>,
         instructions: Option<String>,
     },
@@ -61,6 +62,12 @@ pub enum ClientRequest {
     /// Terminates the bot's terminal and launches its agent again.
     RestartBot {
         tab_id: Uuid,
+    },
+    /// Sets the bot's home folder (None restores the default) and relaunches
+    /// its terminal there.
+    SetBotHome {
+        tab_id: Uuid,
+        home: Option<String>,
     },
     /// Opens a worker terminal tab in a workstation and optionally types
     /// `command` into its shell once the shell is spawned. When
@@ -579,6 +586,17 @@ mod tests {
                     "agent": "omp",
                     "working_dir": "/srv/projects",
                     "instructions": null,
+                }),
+            ),
+            (
+                ClientRequest::SetBotHome {
+                    tab_id,
+                    home: Some("/srv/bots/hive3".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "set_bot_home",
+                    "tab_id": tab_id,
+                    "home": "/srv/bots/hive3",
                 }),
             ),
             (

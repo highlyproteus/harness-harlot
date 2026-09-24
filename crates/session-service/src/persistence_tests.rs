@@ -87,6 +87,7 @@ fn bots_workspace_bot_tabs_and_owners_round_trip() {
     let spec = BotSpec {
         agent: TerminalProfile::Omp,
         instructions: Some("Prefer small PRs".to_owned()),
+        home: Some("/tmp".to_owned()),
     };
     snapshot.workspaces[0].owner_bot = Some(bot_id);
     snapshot.workspaces[0].tabs[0].owner_bot = Some(bot_id);
@@ -676,6 +677,7 @@ fn overlong_bot_instructions_are_rejected() {
     bots.tabs[0].bot = Some(BotSpec {
         agent: TerminalProfile::Omp,
         instructions: Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1)),
+        home: None,
     });
     let DesiredLayout::Leaf { pane } = &mut bots.tabs[0].layout else {
         panic!("expected leaf");

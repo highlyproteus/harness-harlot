@@ -396,13 +396,13 @@ impl HhApp {
                             .font_family(".SystemUIFont")
                             .text_xs()
                             .text_color(rgb(THEME.dim))
-                            .child("Working directory (optional)"),
+                            .child("Project folder (optional)"),
                     )
                     .child(self.render_workspace_creation_input(
                         "workspace-working-dir-input",
                         field,
                         WorkspaceCreationField::WorkingDir,
-                        "Working directory (optional)",
+                        "Threads open here by default",
                         "SF Mono",
                         cx,
                     ))

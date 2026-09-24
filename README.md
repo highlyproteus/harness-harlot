@@ -117,8 +117,17 @@ bell to switch the sidebar to your bots, create one with **New bot**, and pick
 which installed agent CLI runs it: omp, Hermes, Claude Code, Codex, Gemini, or
 another supported agent. Each bot runs its agent's own interface, so the agent's
 commands, settings, and voice mode work as usual. Right-click a bot to rename
-it, change its agent, restart it, or delete it. Bots survive app and service
-restarts like any other local terminal.
+it, change its agent, restart it, set its home folder, or delete it. Bots
+survive app and service restarts like any other local terminal.
+
+Each bot runs in its own home folder, by default a private folder in the app's
+state directory. On every launch Harness Harlot writes an `AGENTS.md` there with
+the coordinator instructions, the bot's name, its project folder, and your
+instructions, so every agent that reads `AGENTS.md` (omp, Claude Code, Codex,
+Hermes, and others) knows it is a bot and how to drive Harness Harlot with the
+`hh` CLI. The optional **Project folder** chosen when you create a bot is where
+its threads open by default; the home folder is only for the bot's notes. A
+custom home folder never gets an `AGENTS.md` over one that you wrote yourself.
 
 A bot is a coordinator, not a workspace. Ask it to "spin up three worktrees and
 have omp implement the plan" and it opens named worker tabs in a workstation
@@ -132,7 +141,8 @@ answer the bot and it relays your decision to the worker.
 omp bots load the bundled Harness Harlot plugin automatically, which also
 reports worker status changes into the bot's conversation. Claude Code and
 Codex bots get the `hh mcp` server attached at launch. Other agents need a
-one-time MCP setup; **Settings → Bots** shows the exact command. See
+one-time MCP setup for the tools; **Settings → Bots** shows the exact command.
+Claude Code and Codex may ask once to trust the bot's folder. See
 [Bots privacy and data handling](PRIVACY.md).
 
 ## Notifications

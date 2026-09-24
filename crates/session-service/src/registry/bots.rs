@@ -3,7 +3,9 @@ use super::{
     RegistryState, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
     TerminalRuntimePane, encode_desired_state,
 };
-use crate::bots::{BotLaunch, bots_directory, launch_command, remove_bot_files};
+use crate::bots::{
+    BotLaunch, PreparedLaunch, bot_home, bots_directory, prepare_launch, remove_bot_files,
+};
 use crate::layout::{find_pane_in_snapshot, layout_contains};
 use crate::persistence::{
     MAX_INSTRUCTIONS_CHARS, MAX_TABS_PER_WORKSPACE, MAX_WORKSPACES, validate_title,
@@ -40,8 +42,13 @@ pub(crate) fn bot_tab_for_pane(snapshot: &SessionSnapshot, pane_id: Uuid) -> Opt
         .map(|tab| tab.id)
 }
 
-/// Clears every reference to deleted bots and removes their launch files.
-pub(crate) fn forget_bots(snapshot: &mut SessionSnapshot, bots: &HashSet<Uuid>) {
+/// Clears every reference to deleted bots and removes their launch files and
+/// default home folders from `bots_dir`.
+pub(crate) fn forget_bots(
+    snapshot: &mut SessionSnapshot,
+    bots: &HashSet<Uuid>,
+    bots_dir: Option<&Path>,
+) {
     if bots.is_empty() {
         return;
     }
@@ -55,9 +62,32 @@ pub(crate) fn forget_bots(snapshot: &mut SessionSnapshot, bots: &HashSet<Uuid>) 
             }
         }
     }
-    if let Ok(directory) = bots_directory() {
+    if let Some(directory) = bots_dir {
         for bot in bots {
-            remove_bot_files(&directory, *bot);
+            remove_bot_files(directory, *bot);
+        }
+    }
+}
+
+/// The folder a fresh shell of bot `tab_id` starts in, when it can be
+/// prepared; failures are logged and the caller keeps its own directory.
+pub(crate) fn bot_spawn_dir(
+    snapshot: &SessionSnapshot,
+    bots_dir: Option<&Path>,
+    tab_id: Uuid,
+) -> Option<PathBuf> {
+    let spec = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .find(|tab| tab.id == tab_id)?
+        .bot
+        .as_ref()?;
+    match bot_home(bots_dir?, tab_id, spec) {
+        Ok(home) => Some(home),
+        Err(error) => {
+            eprintln!("could not prepare the home of bot {tab_id}: {error:#}");
+            None
         }
     }
 }
@@ -118,8 +148,8 @@ struct BotTarget {
     workspace_id: Uuid,
     pane_id: Uuid,
     name: String,
+    project_dir: Option<String>,
     spec: BotSpec,
-    cwd: PathBuf,
 }
 
 impl RegistryState {
@@ -151,8 +181,8 @@ impl RegistryState {
                 .custom_title
                 .clone()
                 .unwrap_or_else(|| tab.title.clone()),
+            project_dir: tab.project_dir.clone(),
             spec,
-            cwd: local_spawn_dir(tab.project_dir.as_deref())?,
         })
     }
 }
@@ -186,15 +216,16 @@ impl SessionRegistry {
         let spec = BotSpec {
             agent,
             instructions: normalize_bot_instructions(instructions)?,
+            home: None,
         };
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
-        let launch = self.bot_launch_command(tab_id, &title, &spec)?;
+        let launch = self.prepare_bot_launch(tab_id, &title, working_dir.as_deref(), &spec)?;
         if self.state.read().panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
         let workspace_id = self.ensure_bots_workspace()?;
-        let cwd = local_spawn_dir(working_dir.as_deref())?;
+        let cwd = launch.home.clone();
         let session = self.spawn_local_transport(pane_id, workspace_id, Some(tab_id), &cwd)?;
         let result = (|| {
             let mut state = self.state.write();
@@ -239,15 +270,20 @@ impl SessionRegistry {
             let _ = session.terminate_and_wait();
             return Err(error);
         }
-        type_when_ready(session, launch);
+        self.start_bot_agent(tab_id, session, launch);
         Ok((workspace_id, tab_id, pane_id))
     }
 
     /// Switches a bot to another agent and relaunches its terminal.
     pub fn set_bot_agent(&self, tab_id: Uuid, agent: TerminalProfile) -> Result<()> {
-        let BotTarget { name, mut spec, .. } = self.state.read().bot_target(tab_id)?;
+        let BotTarget {
+            name,
+            project_dir,
+            mut spec,
+            ..
+        } = self.state.read().bot_target(tab_id)?;
         spec.agent = agent;
-        let launch = self.bot_launch_command(tab_id, &name, &spec)?;
+        let launch = self.prepare_bot_launch(tab_id, &name, project_dir.as_deref(), &spec)?;
         {
             let mut state = self.state.write();
             let previous = state.snapshot.clone();
@@ -271,7 +307,45 @@ impl SessionRegistry {
     /// Terminates a bot's terminal and launches its agent again.
     pub fn restart_bot(&self, tab_id: Uuid) -> Result<()> {
         let target = self.state.read().bot_target(tab_id)?;
-        let launch = self.bot_launch_command(tab_id, &target.name, &target.spec)?;
+        let launch = self.prepare_bot_launch(
+            tab_id,
+            &target.name,
+            target.project_dir.as_deref(),
+            &target.spec,
+        )?;
+        self.relaunch_bot(tab_id, launch)
+    }
+
+    /// Moves a bot to a custom home folder, or back to its default home with
+    /// `None`, and relaunches its terminal there.
+    pub fn set_bot_home(&self, tab_id: Uuid, home: Option<String>) -> Result<()> {
+        if let Some(home) = home.as_deref() {
+            validate_workspace_dir(home).map_err(anyhow::Error::from)?;
+            if !valid_local_cwd(Path::new(home)) {
+                bail!("bot home {home} is not an existing directory");
+            }
+        }
+        let BotTarget {
+            name,
+            project_dir,
+            mut spec,
+            ..
+        } = self.state.read().bot_target(tab_id)?;
+        spec.home = home;
+        let launch = self.prepare_bot_launch(tab_id, &name, project_dir.as_deref(), &spec)?;
+        {
+            let mut state = self.state.write();
+            let previous = state.snapshot.clone();
+            let tab = state
+                .snapshot
+                .workspaces
+                .iter_mut()
+                .flat_map(|workspace| &mut workspace.tabs)
+                .find(|tab| tab.id == tab_id && tab.bot.is_some())
+                .with_context(|| format!("bot {tab_id} does not exist"))?;
+            tab.bot = Some(spec);
+            self.commit_or_restore(&mut state, previous, &[])?;
+        }
         self.relaunch_bot(tab_id, launch)
     }
 
@@ -420,46 +494,86 @@ impl SessionRegistry {
             .spawn(move || {
                 let launched = (|| {
                     let target = registry.state.read().bot_target(tab_id)?;
-                    let launch = registry.bot_launch_command(tab_id, &target.name, &target.spec)?;
+                    let launch = registry.prepare_bot_launch(
+                        tab_id,
+                        &target.name,
+                        target.project_dir.as_deref(),
+                        &target.spec,
+                    )?;
                     Ok::<_, anyhow::Error>((registry.pane(target.pane_id)?, launch))
                 })();
                 match launched {
-                    Ok((session, launch)) => type_when_ready(session, launch),
-                    Err(error) => registry.notify_bot_launch_failure(tab_id, &error),
+                    Ok((session, launch)) => registry.start_bot_agent(tab_id, session, launch),
+                    Err(error) => registry
+                        .notify_bot(tab_id, &format!("could not start its agent: {error:#}")),
                 }
             });
         if let Err(error) = spawned {
-            self.notify_bot_launch_failure(tab_id, &error.into());
+            self.notify_bot(tab_id, &format!("could not start its agent: {error:#}"));
         }
     }
 
-    fn notify_bot_launch_failure(&self, tab_id: Uuid, error: &anyhow::Error) {
+    /// Posts a message notification on the bot's pane, prefixed with its name.
+    fn notify_bot(&self, tab_id: Uuid, message: &str) {
         let mut state = self.state.write();
         if let Ok(target) = state.bot_target(tab_id) {
             state.append_notification(
                 target.pane_id,
                 NotificationKind::Message,
-                Some(format!(
-                    "{} could not start its agent: {error:#}",
-                    target.name
-                )),
+                Some(format!("{} {message}", target.name)),
                 crate::now_ms(),
             );
         }
     }
 
-    fn bot_launch_command(&self, tab_id: Uuid, name: &str, spec: &BotSpec) -> Result<String> {
+    /// Types the agent's launch command into the bot's fresh shell and tells
+    /// the user when a custom home kept its own `AGENTS.md`.
+    fn start_bot_agent(&self, tab_id: Uuid, session: Arc<PtySession>, launch: PreparedLaunch) {
+        type_when_ready(session, launch.command);
+        if !launch.context_written {
+            self.notify_bot(
+                tab_id,
+                &format!(
+                    "did not get its instructions: {} already has its own AGENTS.md.",
+                    launch.home.display()
+                ),
+            );
+        }
+    }
+
+    /// The service's `<state>/bots` directory; bots need a persistent registry.
+    pub(crate) fn bots_dir(&self) -> Result<PathBuf> {
+        let state_dir = self
+            .store
+            .as_ref()
+            .and_then(|store| store.directory())
+            .context("bots need a persistent session state directory")?;
+        Ok(bots_directory(state_dir))
+    }
+
+    fn prepare_bot_launch(
+        &self,
+        tab_id: Uuid,
+        name: &str,
+        project_dir: Option<&str>,
+        spec: &BotSpec,
+    ) -> Result<PreparedLaunch> {
         let mut agents = self.coding_agents(false)?;
         if !agents.iter().any(|agent| agent.profile == spec.agent) {
             agents = self.coding_agents(true)?;
         }
-        let bot = BotLaunch { tab_id, name, spec };
-        launch_command(&bot, &agents, &bots_directory()?, hh_cli_path().as_deref())
+        let bot = BotLaunch {
+            tab_id,
+            name,
+            project_dir,
+            spec,
+        };
+        prepare_launch(&bot, &agents, &self.bots_dir()?, hh_cli_path().as_deref())
     }
 
     /// Terminates the bot's terminal, respawns the same pane in a fresh shell
-    /// and types `launch` into it.
-    fn relaunch_bot(&self, tab_id: Uuid, launch: String) -> Result<()> {
+    /// in the bot's home and types the launch command into it.
+    fn relaunch_bot(&self, tab_id: Uuid, launch: PreparedLaunch) -> Result<()> {
         let (target, previous) = {
             let state = self.state.read();
             let target = state.bot_target(tab_id)?;
@@ -479,7 +593,7 @@ impl SessionRegistry {
             target.pane_id,
             target.workspace_id,
             Some(tab_id),
-            &target.cwd,
+            &launch.home,
         )?;
         let mut state = self.state.write();
         if state.bot_target(tab_id)?.pane_id != target.pane_id {
@@ -489,7 +603,7 @@ impl SessionRegistry {
         }
         let replaced = state.panes.insert(
             target.pane_id,
-            local_terminal_runtime(Arc::clone(&session), target.cwd),
+            local_terminal_runtime(Arc::clone(&session), launch.home.clone()),
         );
         set_pane_runtime_label(
             &mut state.snapshot,
@@ -504,7 +618,7 @@ impl SessionRegistry {
         let bytes = encode_desired_state(&state)?;
         drop(state);
         drop(replaced);
-        type_when_ready(session, launch);
+        self.start_bot_agent(tab_id, session, launch);
         self.write_snapshot(&bytes)
     }
 
@@ -533,7 +647,8 @@ impl SessionRegistry {
     }
 
     /// The workstation a bot's workers default to: the one it owns, or a new
-    /// one titled after the bot in the bot's working directory.
+    /// one titled after the bot in the bot's project folder (the user's home
+    /// without one).
     fn bot_workstation(&self, bot: Uuid) -> Result<Uuid> {
         let mut state = self.state.write();
         if let Some(workspace) = state
@@ -628,295 +743,5 @@ fn empty_local_workspace(id: Uuid, title: String, order: u32, kind: WorkspaceKin
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::layout::{find_pane_in_snapshot, first_pane_id};
-    use hh_protocol::CodingAgent;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    /// A registry whose agent discovery finds fake Hermes and Aider CLIs that
-    /// print a marker with the bot tab they were launched for.
-    fn registry_with_fake_agents() -> (SessionRegistry, PathBuf) {
-        let directory = std::env::temp_dir().join(format!("hh-fake-agents-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let agents = [
-            (TerminalProfile::Hermes, "hermes", "HERMES_UP"),
-            (TerminalProfile::Aider, "aider", "AIDER_UP"),
-        ]
-        .into_iter()
-        .map(|(profile, command, marker)| {
-            let path = directory.join(command);
-            std::fs::write(
-                &path,
-                format!("#!/bin/sh\necho \"{marker}:$HH_BOT_TAB_ID:$PWD\"\n"),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            CodingAgent {
-                profile,
-                command: command.to_owned(),
-                path: path.to_string_lossy().into_owned(),
-            }
-        })
-        .collect();
-        let registry = SessionRegistry::new().unwrap();
-        *registry.coding_agents.lock() = Some(agents);
-        (registry, directory)
-    }
-
-    fn screen_text(registry: &SessionRegistry, pane_id: Uuid) -> String {
-        let screen = registry.pane(pane_id).unwrap().screen(pane_id).unwrap();
-        screen
-            .lines
-            .iter()
-            .flat_map(|line| &line.runs)
-            .map(|run| run.text.as_str())
-            .collect()
-    }
-
-    fn wait_for_screen(registry: &SessionRegistry, pane_id: Uuid, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let text = screen_text(registry, pane_id);
-            if text.contains(needle) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{needle} never appeared; screen:\n{text}"
-            );
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn canonical_temp_dir() -> String {
-        std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    #[test]
-    fn bot_terminal_launches_its_agent_in_the_bots_workspace() {
-        let (registry, agents) = registry_with_fake_agents();
-        let working_dir = canonical_temp_dir();
-        let (workspace_id, tab_id, pane_id) = registry
-            .create_bot(
-                Some("Hive3"),
-                TerminalProfile::Hermes,
-                Some(working_dir.clone()),
-                Some("Be brief".to_owned()),
-            )
-            .unwrap();
-
-        wait_for_screen(
-            &registry,
-            pane_id,
-            &format!("HERMES_UP:{tab_id}:{working_dir}"),
-        );
-        let snapshot = registry.snapshot().unwrap();
-        let bots = snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .unwrap();
-        assert!(bots.is_bots());
-        assert_eq!(bots.tabs.len(), 1);
-        assert_eq!(bots.tabs[0].id, tab_id);
-        assert_eq!(bots.tabs[0].title, "Hive3");
-        assert_eq!(
-            bots.tabs[0].bot,
-            Some(BotSpec {
-                agent: TerminalProfile::Hermes,
-                instructions: Some("Be brief".to_owned()),
-            })
-        );
-        let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
-        assert_eq!(pane.profile_override, Some(TerminalProfile::Hermes));
-
-        let (second_workspace, ..) = registry
-            .create_bot(None, TerminalProfile::Aider, None, None)
-            .unwrap();
-        assert_eq!(
-            second_workspace, workspace_id,
-            "one Bots workspace is reused"
-        );
-        let snapshot = registry.snapshot().unwrap();
-        let bots = snapshot.workspaces.iter().find(|w| w.is_bots()).unwrap();
-        assert_eq!(bots.tabs[1].title, TerminalProfile::Aider.display_name());
-        std::fs::remove_dir_all(agents).unwrap();
-    }
-
-    #[test]
-    fn the_bots_workspace_is_not_a_workstation() {
-        let (registry, agents) = registry_with_fake_agents();
-        let (bots_id, ..) = registry
-            .create_bot(Some("Hive3"), TerminalProfile::Hermes, None, None)
-            .unwrap();
-        let workstation = registry.snapshot().unwrap().workspaces[0].id;
-
-        let error = registry.delete_workspace(workstation).unwrap_err();
-        assert_eq!(error.to_string(), "the last workstation cannot be deleted");
-        for error in [
-            registry.create_workspace_tab(bots_id).unwrap_err(),
-            registry.scan_tmux_sessions(bots_id).unwrap_err(),
-            registry
-                .create_worker(Some(bots_id), None, None, None, None)
-                .unwrap_err(),
-        ] {
-            assert_eq!(error.to_string(), "the Bots workspace only holds bots");
-        }
-        let (created, _) = registry.create_workspace(None).unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let created = snapshot
-            .workspaces
-            .iter()
-            .find(|w| w.id == created)
-            .unwrap();
-        assert_eq!(created.title, "Workstation 2");
-        std::fs::remove_dir_all(agents).unwrap();
-    }
-
-    #[test]
-    fn set_bot_agent_relaunches_the_same_pane_with_the_new_agent() {
-        let (registry, agents) = registry_with_fake_agents();
-        let (_, tab_id, pane_id) = registry
-            .create_bot(Some("Hive3"), TerminalProfile::Hermes, None, None)
-            .unwrap();
-        wait_for_screen(&registry, pane_id, "HERMES_UP");
-
-        registry
-            .set_bot_agent(tab_id, TerminalProfile::Aider)
-            .unwrap();
-
-        wait_for_screen(&registry, pane_id, &format!("AIDER_UP:{tab_id}"));
-        assert!(!screen_text(&registry, pane_id).contains("HERMES_UP"));
-        let snapshot = registry.snapshot().unwrap();
-        let tab = snapshot
-            .workspaces
-            .iter()
-            .flat_map(|workspace| &workspace.tabs)
-            .find(|tab| tab.id == tab_id)
-            .unwrap();
-        assert_eq!(tab.bot.as_ref().unwrap().agent, TerminalProfile::Aider);
-        let PaneLayout::Leaf { pane } = &tab.layout else {
-            panic!("bot tab holds one terminal");
-        };
-        assert_eq!(pane.id, pane_id);
-        assert_eq!(pane.profile_override, Some(TerminalProfile::Aider));
-        std::fs::remove_dir_all(agents).unwrap();
-    }
-
-    #[test]
-    fn a_fresh_shell_for_a_bot_types_its_launch_command_again() {
-        let (registry, agents) = registry_with_fake_agents();
-        let (_, tab_id, pane_id) = registry
-            .create_bot(Some("Hive3"), TerminalProfile::Hermes, None, None)
-            .unwrap();
-        wait_for_screen(&registry, pane_id, "HERMES_UP");
-        let session = {
-            let mut state = registry.state.write();
-            let terminal = state.terminal_pane_mut(pane_id).unwrap();
-            terminal.exit_status = Some("Exited with code 0".to_owned());
-            Arc::clone(&terminal.session)
-        };
-        session.terminate_and_wait().unwrap();
-
-        registry.reattach_pane(pane_id).unwrap();
-
-        assert!(!Arc::ptr_eq(&registry.pane(pane_id).unwrap(), &session));
-        wait_for_screen(&registry, pane_id, &format!("HERMES_UP:{tab_id}"));
-        std::fs::remove_dir_all(agents).unwrap();
-    }
-
-    #[test]
-    fn workers_from_a_bot_open_in_the_bot_workstation_and_run_their_command() {
-        let (registry, agents) = registry_with_fake_agents();
-        let working_dir = canonical_temp_dir();
-        let (_, bot, bot_pane) = registry
-            .create_bot(
-                Some("Hive3"),
-                TerminalProfile::Hermes,
-                Some(working_dir.clone()),
-                None,
-            )
-            .unwrap();
-
-        let (workstation, tab_id, pane_id) = registry
-            .create_worker(
-                None,
-                None,
-                Some("api-fix"),
-                Some("echo HH_WORKER_$((6 * 7)):$PWD"),
-                Some(bot_pane),
-            )
-            .unwrap();
-
-        wait_for_screen(&registry, pane_id, &format!("HH_WORKER_42:{working_dir}"));
-        let snapshot = registry.snapshot().unwrap();
-        let workspace = snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workstation)
-            .unwrap();
-        assert_eq!(workspace.kind, WorkspaceKind::Workstation);
-        assert_eq!(workspace.title, "Hive3");
-        assert_eq!(workspace.owner_bot, Some(bot));
-        assert_eq!(workspace.working_dir.as_deref(), Some(working_dir.as_str()));
-        let tab = workspace.tabs.iter().find(|tab| tab.id == tab_id).unwrap();
-        assert_eq!(tab.owner_bot, Some(bot));
-        assert_eq!(tab.custom_title.as_deref(), Some("api-fix"));
-
-        let (reused, second_tab, _) = registry
-            .create_worker(None, None, None, None, Some(bot_pane))
-            .unwrap();
-        assert_eq!(reused, workstation);
-        let (explicit, explicit_tab, _) = registry
-            .create_worker(
-                Some(snapshot.workspaces[0].id),
-                None,
-                None,
-                None,
-                Some(bot_pane),
-            )
-            .unwrap();
-        assert_eq!(explicit, snapshot.workspaces[0].id);
-        let snapshot = registry.snapshot().unwrap();
-        let owner_of = |tab_id: Uuid| {
-            snapshot
-                .workspaces
-                .iter()
-                .flat_map(|workspace| &workspace.tabs)
-                .find(|tab| tab.id == tab_id)
-                .unwrap()
-                .owner_bot
-        };
-        assert_eq!(owner_of(second_tab), Some(bot));
-        assert_eq!(owner_of(explicit_tab), Some(bot));
-
-        registry.close_tab(bot).unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        assert!(
-            snapshot
-                .workspaces
-                .iter()
-                .all(|workspace| workspace.owner_bot.is_none()
-                    && workspace.tabs.iter().all(|tab| tab.owner_bot.is_none())),
-            "a deleted bot leaves no owner references"
-        );
-        std::fs::remove_dir_all(agents).unwrap();
-    }
-
-    #[test]
-    fn workers_need_a_workstation_unless_a_bot_requests_them() {
-        let registry = SessionRegistry::new().unwrap();
-        let plain_pane = first_pane_id(&registry.snapshot().unwrap()).unwrap();
-        for requester in [None, Some(plain_pane)] {
-            let error = registry
-                .create_worker(None, None, None, Some("true"), requester)
-                .unwrap_err();
-            assert!(error.to_string().contains("workspace_id"), "{error}");
-        }
-    }
-}
+#[path = "bots_tests.rs"]
+mod tests;

@@ -54,6 +54,11 @@ impl SnapshotStore {
         }
     }
 
+    /// The directory holding the snapshot: the service's state directory.
+    pub(crate) fn directory(&self) -> Option<&Path> {
+        self.path.parent()
+    }
+
     pub(crate) fn load_or_quarantine(&self) -> Result<Option<RecoveredState>> {
         let Some(parent) = self.path.parent() else {
             bail!("snapshot path has no parent: {}", self.path.display());
@@ -682,6 +687,9 @@ impl DesiredState {
                     })
                 }) {
                     bail!("bot instructions too long");
+                }
+                if let Some(home) = tab.bot.as_ref().and_then(|bot| bot.home.as_deref()) {
+                    validate_workspace_dir(home).map_err(anyhow::Error::from)?;
                 }
                 if let Some(parent_id) = tab.parent_tab {
                     let valid_parent = parent_id != tab.id

@@ -19,7 +19,8 @@ Harlot does not read, copy, or store agent or provider credentials.
 
 When Harness Harlot launches a bot, it gives the agent:
 
-- a coordinator prompt with the bot's name and any instructions you entered;
+- an `AGENTS.md` in the bot's home folder with the coordinator prompt, the
+  bot's name, its project folder, and any instructions you entered;
 - the Harness Harlot tools: the bundled omp plugin for omp, or the local `hh mcp`
   server for agents whose launch command accepts an MCP configuration; and
 - the `HH_*` environment variables that identify the bot's terminal.
@@ -38,16 +39,22 @@ so the bot can tell you about them.
 
 ## Local storage
 
-The session snapshot records each bot's name, agent, working directory, and
-instructions, plus which worker tabs a bot created. It stores no terminal
+The session snapshot records each bot's name, agent, project folder, custom
+home folder, and instructions, plus which worker tabs a bot created. It stores no terminal
 output, credentials, or conversation content. Bot terminals keep their output
 in the private HH tmux server like other local terminals; Harness Harlot keeps
 no disk archive of terminal output.
 
-Harness Harlot writes the bundled omp plugin, each bot's coordinator prompt, and
-MCP launch configuration (containing only the `hh` executable path) to its
-owner-only application state directory. Agents keep their own conversation
-history according to their own settings.
+Each bot's default home folder is an owner-only folder in the application state
+directory. It holds the generated `AGENTS.md` and whatever notes the agent
+writes there; Harness Harlot stores no terminal output in it. Deleting a bot
+deletes its default home folder. A custom home folder you choose is never
+deleted, and an `AGENTS.md` you wrote there yourself is never overwritten.
+
+Harness Harlot also writes the bundled omp plugin and each bot's MCP launch
+configuration (containing only the `hh` executable path) to its owner-only
+application state directory. Agents keep their own conversation history
+according to their own settings.
 
 Earlier releases stored Assistant conversation files and Voice settings under
 the application state directory. This release no longer reads them and does not

@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::process::{fallback_cwd, shell_title, valid_local_cwd};
 use crate::pty::{PtySession, RawPaneEvent};
-use crate::registry::bots::bot_tab_for_pane;
+use crate::registry::bots::{bot_spawn_dir, bot_tab_for_pane};
 use crate::registry::identity::{
     refresh_process_metadata, refresh_runtime_metadata, set_pane_runtime_label,
 };
@@ -712,6 +712,7 @@ impl SessionRegistry {
         };
 
         let fallback = fallback_cwd()?;
+        let bots_dir = crate::bots::bots_directory(&state_dir);
         let pane_ids = pane_ids_in_snapshot(&recovered.snapshot);
         let mut panes = HashMap::new();
         let mut tmux_clients = HashMap::new();
@@ -748,10 +749,10 @@ impl SessionRegistry {
                 .context("recovered pane has no workspace")?;
             let bot_tab = bot_tab_for_pane(&recovered.snapshot, pane_id);
             let mut reattached = false;
-            let cwd = recovered
-                .cwd_by_pane
-                .remove(&pane_id)
-                .filter(|cwd| valid_local_cwd(cwd))
+            let saved_cwd = recovered.cwd_by_pane.remove(&pane_id);
+            let cwd = bot_tab
+                .and_then(|tab| bot_spawn_dir(&recovered.snapshot, Some(&bots_dir), tab))
+                .or_else(|| saved_cwd.filter(|cwd| valid_local_cwd(cwd)))
                 .unwrap_or_else(|| fallback.clone());
             let managed =
                 tmux.as_ref().map(|server| {

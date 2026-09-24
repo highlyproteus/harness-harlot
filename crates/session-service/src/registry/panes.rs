@@ -12,7 +12,7 @@ use crate::persistence;
 use crate::persistence::{MAX_TABS_PER_WORKSPACE, MAX_TITLE_CHARS, validate_title};
 use crate::process::{fallback_cwd, local_spawn_dir, shell_title};
 use crate::pty::PtySession;
-use crate::registry::bots::{bot_tab_for_pane, forget_bots};
+use crate::registry::bots::{bot_spawn_dir, bot_tab_for_pane, forget_bots};
 use crate::registry::identity::{
     refresh_workspace_activity, resolve_pane_identity, set_pane_runtime_label,
 };
@@ -875,7 +875,11 @@ impl SessionRegistry {
         if !did_close {
             bail!("pane {pane_id} disappeared while closing");
         }
-        forget_bots(&mut state.snapshot, &removed_bot.into_iter().collect());
+        forget_bots(
+            &mut state.snapshot,
+            &removed_bot.into_iter().collect(),
+            self.bots_dir().ok().as_deref(),
+        );
         let removed = state.panes.remove(&pane_id);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
@@ -902,12 +906,19 @@ impl SessionRegistry {
             }
             let workspace_id = workspace_id_for_pane(&state.snapshot, pane_id)
                 .with_context(|| format!("pane {pane_id} has no workstation"))?;
+            let bot_tab = bot_tab_for_pane(&state.snapshot, pane_id);
+            // A bot's fresh shell always starts in its home.
+            let cwd = bot_tab
+                .and_then(|tab| {
+                    bot_spawn_dir(&state.snapshot, self.bots_dir().ok().as_deref(), tab)
+                })
+                .unwrap_or_else(|| runtime.last_valid_cwd.clone());
             (
                 runtime.kind.clone(),
-                runtime.last_valid_cwd.clone(),
+                cwd,
                 workspace_id,
                 runtime.session.tmux_ids().is_some(),
-                bot_tab_for_pane(&state.snapshot, pane_id),
+                bot_tab,
             )
         };
         let session = match &kind {

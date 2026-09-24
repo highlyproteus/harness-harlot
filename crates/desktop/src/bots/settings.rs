@@ -231,10 +231,10 @@ impl HhApp {
             )];
         }
         let hh = hh_command();
-        self.coding_agents
-            .agents
-            .iter()
-            .enumerate()
+        let instructions =
+            note("Every agent reads its bot instructions from AGENTS.md in the bot's home folder.");
+        std::iter::once(instructions)
+            .chain(self.coding_agents.agents.iter().enumerate()
             .map(|(index, agent)| {
                 let profile = agent.profile;
                 let row = div().flex().flex_col().gap(px(6.0)).child(
@@ -256,10 +256,10 @@ impl HhApp {
                         row.child(note("The Harness Harlot plugin loads automatically."))
                     }
                     BotIntegration::McpAtLaunch => row.child(note(
-                        "The Harness Harlot MCP server is attached automatically at launch.",
+                        "The Harness Harlot MCP server is attached at launch. It may ask once to trust the bot folder.",
                     )),
                     BotIntegration::SetupCommand(command) => row
-                        .child(note("Run this once so bots can use Harness Harlot:"))
+                        .child(note("Run this once so bots get the Harness Harlot tools:"))
                         .child(
                             div()
                                 .flex()
@@ -273,7 +273,7 @@ impl HhApp {
                     )),
                 }
                 .into_any_element()
-            })
+            }))
             .collect()
     }
 

@@ -40,6 +40,10 @@ pub struct BotSpec {
     /// Extra standing instructions appended to the bot's coordinator prompt.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Custom home folder the bot's terminal starts in; None uses the default
+    /// `<state>/bots/<tab id>/`.
+    #[serde(default)]
+    pub home: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

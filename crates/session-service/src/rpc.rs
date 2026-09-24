@@ -201,6 +201,7 @@ pub(crate) fn handle_request(
         | ClientRequest::CreateBot { .. }
         | ClientRequest::SetBotAgent { .. }
         | ClientRequest::RestartBot { .. }
+        | ClientRequest::SetBotHome { .. }
         | ClientRequest::CreateWorker { .. }
         | ClientRequest::GetCodingAgents => handle_bots_request(sessions, request),
     }
@@ -725,6 +726,10 @@ fn handle_bots_request(
         }
         ClientRequest::RestartBot { tab_id } => {
             sessions.restart_bot(tab_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::SetBotHome { tab_id, home } => {
+            sessions.set_bot_home(tab_id, home)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::CreateWorker {

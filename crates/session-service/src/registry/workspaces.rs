@@ -909,7 +909,11 @@ impl SessionRegistry {
             .filter(|tab| tab.bot.is_some())
             .map(|tab| tab.id)
             .collect::<HashSet<_>>();
-        forget_bots(&mut state.snapshot, &removed_bots);
+        forget_bots(
+            &mut state.snapshot,
+            &removed_bots,
+            self.bots_dir().ok().as_deref(),
+        );
         let removed = pane_ids
             .into_iter()
             .filter_map(|pane_id| state.panes.remove(&pane_id))
