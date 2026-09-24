@@ -14,9 +14,8 @@ use gpui::{
     actions, point, px, size,
 };
 use hh_protocol::{
-    AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, HistoryArchiveStatus, HistoryClearScope,
-    PaneStatus, PaneStreamState, ServiceResponse, SessionNotification, SessionSnapshot,
-    StreamDiagnostics, TerminalScreen,
+    AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, PaneStatus, PaneStreamState,
+    ServiceResponse, SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalScreen,
 };
 use hh_session_client::SessionClient;
 use parking_lot::Mutex;
@@ -43,7 +42,6 @@ mod dialogs;
 mod elements;
 mod gallery;
 mod helpers;
-mod history_settings;
 mod image_transfer;
 mod input;
 mod menus;
@@ -87,9 +85,9 @@ use typography::TerminalFontProfile;
 use ui_state::UiStateStore;
 use updates::{UpdateCheckState, automatic_update_check_interval, automatic_update_checks_enabled};
 use view_models::{
-    ArchivedView, ColorPickerState, DragHoverState, HistoryEditor, Modal, PaneDrag, ResizeDrag,
-    SelectionAutoscroll, SelectionDrag, SettingsSection, SidebarMode, SidebarResizeLifecycle,
-    SplitControlId, TabDropPreview, WorkspaceDropPreview,
+    ColorPickerState, DragHoverState, Modal, PaneDrag, ResizeDrag, SelectionAutoscroll,
+    SelectionDrag, SettingsSection, SidebarMode, SidebarResizeLifecycle, SplitControlId,
+    TabDropPreview, WorkspaceDropPreview,
 };
 
 actions!(
@@ -233,8 +231,8 @@ impl AvailableUpdateBanner {
     }
 }
 struct SessionState {
-    /// Screen traffic only: pane updates, targeted pane snapshots, history
-    /// status. Kept separate so a keystroke never waits behind a screen payload.
+    /// Screen traffic only: pane updates and targeted pane snapshots. Kept
+    /// separate so a keystroke never waits behind a screen payload.
     stream_client: SharedSessionClient,
     /// Everything else except terminal input and selection updates.
     control_client: SharedSessionClient,
@@ -264,7 +262,6 @@ struct SessionState {
     window_active: bool,
     stream_diagnostics: StreamDiagnostics,
     connection_error: Option<String>,
-    history_status: Option<HistoryArchiveStatus>,
 }
 
 struct SessionChannels {
@@ -301,7 +298,6 @@ impl SessionState {
             window_active,
             stream_diagnostics: StreamDiagnostics::default(),
             connection_error,
-            history_status: None,
         }
     }
 }
@@ -402,8 +398,6 @@ impl LayoutUi {
 struct EditorUi {
     modal: Modal,
     settings_section: SettingsSection,
-    history_editor: Option<HistoryEditor>,
-    history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
     browser_url_editor: Option<BrowserUrlEditor>,
     agent_skill_status: Option<String>,
@@ -411,8 +405,6 @@ struct EditorUi {
     workspace_input_focus: [FocusHandle; 4],
     workspace_input_layouts: [Option<ShapedLine>; 4],
     workspace_input_bounds: [Option<Bounds<Pixels>>; 4],
-    /// Archived-history views per pane; belongs with editing UI state.
-    archived_views: HashMap<Uuid, ArchivedView>,
     update_available: Option<AvailableUpdateBanner>,
     update_check: UpdateCheckState,
 }
@@ -422,8 +414,6 @@ impl EditorUi {
         Self {
             modal: Modal::None,
             settings_section: SettingsSection::default(),
-            history_editor: None,
-            history_clear_confirmation: None,
             color_picker: None,
             browser_url_editor: None,
             agent_skill_status: None,
@@ -431,7 +421,6 @@ impl EditorUi {
             workspace_input_focus,
             workspace_input_layouts: [None, None, None, None],
             workspace_input_bounds: [None, None, None, None],
-            archived_views: HashMap::new(),
             update_available: None,
             update_check: UpdateCheckState::default(),
         }
@@ -677,28 +666,6 @@ impl HhApp {
             }
         })
         .detach();
-        cx.spawn(async move |this, cx| {
-            loop {
-                gpui::Timer::after(Duration::from_secs(5)).await;
-                let Ok(client) = this.update(cx, |this, _| Arc::clone(&this.session.stream_client))
-                else {
-                    break;
-                };
-                let response = cx
-                    .background_spawn(async move {
-                        session_call(&client, &ClientRequest::GetHistoryStatus)
-                    })
-                    .await;
-                let Ok(()) = this.update(cx, |this, cx| {
-                    if this.apply_history_status_result(response) {
-                        cx.notify();
-                    }
-                }) else {
-                    break;
-                };
-            }
-        })
-        .detach();
         if automatic_update_checks_enabled() {
             cx.spawn(async move |this, cx| {
                 let mut first_check = true;
@@ -719,8 +686,7 @@ impl HhApp {
         }
         app
     }
-    /// Screen traffic: pane updates, targeted pane snapshots, history
-    /// status. Kept only for the synchronous startup fetch; everything
+    /// Screen traffic: pane updates and targeted pane snapshots. Kept only for the synchronous startup fetch; everything
     /// else flows through the async pipelines.
     fn stream_call(&self, request: &ClientRequest) -> anyhow::Result<ServiceResponse> {
         session_call(&self.session.stream_client, request)
@@ -836,22 +802,6 @@ fn install_macos_dock_icon(development_build: bool) {
 #[cfg(not(target_os = "macos"))]
 fn install_macos_dock_icon(_: bool) {}
 
-#[cfg(target_os = "macos")]
-fn exclude_history_from_backup() {
-    let Some(history) = hh_protocol::state_directory().map(|directory| directory.join("history"))
-    else {
-        return;
-    };
-    if history.is_dir()
-        && let Err(error) = hh_macos_icon::exclude_directory_from_backup(&history)
-    {
-        eprintln!("Harness Harlot could not exclude local history from backups: {error}");
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn exclude_history_from_backup() {}
-
 /// Installs a panic hook that appends a timestamped, symbolized entry to
 /// `<state_dir>/panic.log`, or an owner-only temporary fallback, truncates it
 /// past 1 MiB, and then delegates to the previous hook so stderr output is
@@ -934,7 +884,6 @@ fn main() {
     let development_build = development_build();
     let product_name = product_name(development_build);
     ensure_bundled_session_service();
-    exclude_history_from_backup();
     Application::new()
         .with_assets(AgentIconAssets)
         .run(move |cx: &mut App| {

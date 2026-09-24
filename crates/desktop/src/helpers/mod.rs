@@ -3,10 +3,10 @@ mod bindings;
 mod dnd;
 mod file_manager;
 mod geometry;
-mod history_ui;
 mod icons;
 mod layout;
 mod polling;
+mod scroll;
 mod tabs;
 mod terminal_io;
 
@@ -26,10 +26,6 @@ pub(crate) use geometry::{
     sidebar_width_for_visibility, split_child_dimensions, workspace_pixel_size,
     workstation_banner_header_height,
 };
-pub(crate) use history_ui::{
-    LiveScrollTarget, format_bytes, format_history_date, history_label, history_scope_key,
-    history_warning_text, live_scroll_target, wheel_delta_lines,
-};
 pub(crate) use icons::{
     IDENTITY_MARK_SIZE, identity_detail, identity_label, render_bell_icon, render_robot_icon,
     render_sidebar_toggle_icon, render_terminal_profile_icon, render_terminal_profile_mark,
@@ -44,6 +40,7 @@ pub(crate) use polling::{
     next_terminal_poll_delay_ms, paced_subscriptions, pane_update_requires_repaint,
     terminal_poll_wake_requested,
 };
+pub(crate) use scroll::{LiveScrollTarget, live_scroll_target, wheel_delta_lines};
 pub(crate) use tabs::{
     FocusResync, SidebarSection, WorkspaceTabScope, WorkstationTabEntry, focus_resync_for,
     partition_workstation_entries, terminal_tab_count_label, terminal_tab_secondary_label,
@@ -52,8 +49,8 @@ pub(crate) use tabs::{
     workspace_tab_standalone_pane,
 };
 pub(crate) use terminal_io::{
-    TerminalPointerAction, TerminalUrlOpenTarget, plain_history_line, prepare_paste,
-    selection_span, terminal_grid_for_pane, terminal_input_bytes, terminal_modifiers,
-    terminal_mouse_button, terminal_point_clamped, terminal_pointer_action,
-    terminal_run_display_text, terminal_url_open_target, url_at_column,
+    TerminalPointerAction, TerminalUrlOpenTarget, prepare_paste, selection_span,
+    terminal_grid_for_pane, terminal_input_bytes, terminal_modifiers, terminal_mouse_button,
+    terminal_point_clamped, terminal_pointer_action, terminal_run_display_text,
+    terminal_url_open_target, url_at_column,
 };

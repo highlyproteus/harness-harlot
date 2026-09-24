@@ -337,11 +337,6 @@ impl HhApp {
 
     /// The 40px create / notifications / settings toolbar under the banner.
     pub(crate) fn render_sidebar_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let history_needs_attention = self
-            .session
-            .history_status
-            .as_ref()
-            .is_some_and(|status| status.warning.is_some());
         let settings_open = matches!(
             self.editor.modal,
             crate::view_models::Modal::AppearanceSettings
@@ -462,19 +457,7 @@ impl HhApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child("⚙")
-                    .when(history_needs_attention, |element| {
-                        element.child(
-                            div()
-                                .absolute()
-                                .top(px(3.0))
-                                .right(px(3.0))
-                                .w(px(5.0))
-                                .h(px(5.0))
-                                .rounded_full()
-                                .bg(rgb(THEME.danger)),
-                        )
-                    }),
+                    .child("⚙"),
             )
             .into_any_element()
     }

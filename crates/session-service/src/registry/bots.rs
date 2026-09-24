@@ -443,7 +443,7 @@ impl SessionRegistry {
                     "{} could not start its agent: {error:#}",
                     target.name
                 )),
-                crate::history::now_ms(),
+                crate::now_ms(),
             );
         }
     }

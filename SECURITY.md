@@ -28,11 +28,7 @@ data is local under the owner-only application-state directory's
 
 Processes running as the same local user are not a security boundary. Socket ownership, permissions, peer credentials, frame bounds, and timeouts provide defense in depth against cross-account access and confused-deputy failures. A malicious process already running as the user can access that user's files and interfere with their terminal sessions.
 
-Terminal history can be stored on-device under the Harness Harlot application-state directory. Persistent history is off by default; enabling it uses a 30-day, 1-GiB, oldest-first cleanup policy unless the user changes those settings. PTY output can include echoed commands and secrets printed by programs. File permissions and storage validation reduce accidental exposure; terminal output cannot be reliably scrubbed of secrets.
-
-History chunk checksums detect accidental corruption and bit rot. They are not cryptographic tamper evidence against a process running as the user.
-
-First-party Rust denies `unsafe_code` workspace-wide. Item-level allows are limited to seven Objective-C bridge sites in `crates/cef-view/src/cef_macos.rs`, four AppKit/Foundation sites in `crates/macos-icon/src/lib.rs`, and the process-entry Linux environment update that selects GPUI's X11 backend in `crates/desktop/src/browser.rs`. Every site has a local `SAFETY` justification; third-party dependencies may contain unsafe code.
+First-party Rust denies `unsafe_code` workspace-wide. Item-level allows are limited to seven Objective-C bridge sites in `crates/cef-view/src/cef_macos.rs`, three AppKit/Foundation sites in `crates/macos-icon/src/lib.rs`, and the process-entry Linux environment update that selects GPUI's X11 backend in `crates/desktop/src/browser.rs`. Every site has a local `SAFETY` justification; third-party dependencies may contain unsafe code.
 
 ## Release trust status
 

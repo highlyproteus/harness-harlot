@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::history::{HistoryArchive, HistorySink};
 #[cfg(any(test, debug_assertions))]
 use crate::process::local_spawn_dir;
 use crate::process::{
@@ -28,8 +27,6 @@ use hh_terminal_model::TerminalModel;
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use uuid::Uuid;
-
-use crate::history;
 
 pub(crate) const INITIAL_COLUMNS: u16 = 100;
 
@@ -233,7 +230,6 @@ pub(crate) struct PtySession {
     revision: Arc<AtomicU64>,
     content_revision: Arc<AtomicU64>,
     events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
-    _history: Arc<HistorySink>,
 }
 
 enum Transport {
@@ -361,84 +357,53 @@ impl PtySession {
         workspace_id: Uuid,
         bot_tab: Option<Uuid>,
         cwd: &Path,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         let shell = configured_shell();
         let mut command = local_shell_command(pane_id, cwd);
         apply_agent_env(&mut command, workspace_id, bot_tab);
-        Self::spawn_command(
-            pane_id,
-            workspace_id,
-            command,
-            &format!("configured shell {shell}"),
-            archive,
-        )
+        Self::spawn_command(pane_id, command, &format!("configured shell {shell}"))
     }
 
+    // The workspace only feeds the local SSH test seam's agent environment.
+    #[cfg_attr(not(any(test, debug_assertions)), allow(unused_variables))]
     pub(crate) fn spawn_ssh(
         pane_id: Uuid,
         workspace_id: Uuid,
         host: &str,
         remote_dir: Option<&str>,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         #[cfg(test)]
         if TEST_LOCAL_SSH_SEAM_ENABLED.load(Ordering::Relaxed) {
-            return Self::spawn_local(
-                pane_id,
-                workspace_id,
-                None,
-                &local_spawn_dir(remote_dir)?,
-                archive,
-            );
+            return Self::spawn_local(pane_id, workspace_id, None, &local_spawn_dir(remote_dir)?);
         }
         #[cfg(debug_assertions)]
         if std::env::var_os(LOCAL_SSH_TEST_SEAM_ENV).is_some() {
-            return Self::spawn_local(
-                pane_id,
-                workspace_id,
-                None,
-                &local_spawn_dir(remote_dir)?,
-                archive,
-            );
+            return Self::spawn_local(pane_id, workspace_id, None, &local_spawn_dir(remote_dir)?);
         }
         Self::spawn_command(
             pane_id,
-            workspace_id,
             system_ssh_command(pane_id, host, remote_dir)?,
             "system OpenSSH",
-            archive,
         )
     }
 
-    pub(crate) fn spawn_tmux_local(
-        pane_id: Uuid,
-        workspace_id: Uuid,
-        session_id: &TmuxSessionId,
-        archive: &HistoryArchive,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn spawn_tmux_local(pane_id: Uuid, session_id: &TmuxSessionId) -> Result<Arc<Self>> {
         Self::spawn_command(
             pane_id,
-            workspace_id,
             tmux_local_attach_command(pane_id, session_id)?,
             "tmux session attach",
-            archive,
         )
     }
 
     pub(crate) fn spawn_tmux_ssh(
         pane_id: Uuid,
-        workspace_id: Uuid,
         host: &str,
         session_id: &TmuxSessionId,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         Self::spawn_command(
             pane_id,
-            workspace_id,
             tmux_ssh_attach_command(pane_id, host, session_id)?,
             "system OpenSSH tmux session attach",
-            archive,
         )
     }
     pub(crate) fn spawn_tmux(
@@ -447,7 +412,6 @@ impl PtySession {
         bot_tab: Option<Uuid>,
         cwd: &Path,
         client: &Arc<TmuxControlClient>,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         let pane_id_text = pane_id.to_string();
         let agent_env = agent_env(workspace_id, bot_tab);
@@ -459,13 +423,11 @@ impl PtySession {
         let (window_id, tmux_pane_id, shell_pid) = client.new_window("shell", cwd, &window_env)?;
         let session = Self::new_tmux_transport(
             pane_id,
-            workspace_id,
             Arc::clone(client),
             window_id.clone(),
             tmux_pane_id.clone(),
             shell_pid,
             None,
-            archive,
         );
         if let Err(error) = &session {
             let _ = client.kill_window(&window_id);
@@ -482,38 +444,30 @@ impl PtySession {
 
     pub(crate) fn attach_tmux(
         pane_id: Uuid,
-        workspace_id: Uuid,
         client: Arc<TmuxControlClient>,
         window_id: String,
         tmux_pane_id: String,
         shell_pid: u32,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         let captured = client.capture_pane(&tmux_pane_id)?;
         Self::new_tmux_transport(
             pane_id,
-            workspace_id,
             client,
             window_id,
             tmux_pane_id,
             shell_pid,
             Some(captured),
-            archive,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn new_tmux_transport(
         pane_id: Uuid,
-        workspace_id: Uuid,
         client: Arc<TmuxControlClient>,
         window_id: String,
         tmux_pane_id: String,
         shell_pid: u32,
         captured: Option<Vec<u8>>,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
-        let history = Arc::new(archive.start_session(pane_id, workspace_id));
         let terminal = Arc::new(Mutex::new(TerminalModel::new(
             usize::from(INITIAL_COLUMNS),
             usize::from(INITIAL_ROWS),
@@ -529,7 +483,6 @@ impl PtySession {
                 &events,
                 &revision,
                 &content_revision,
-                None,
                 &mut bell_count,
                 &captured,
             );
@@ -541,7 +494,6 @@ impl PtySession {
                 revision: Arc::clone(&revision),
                 content_revision: Arc::clone(&content_revision),
                 events: Arc::clone(&events),
-                history: Arc::clone(&history),
                 exited: Arc::clone(&exited),
                 bell_count,
                 window_id: window_id.clone(),
@@ -560,21 +512,14 @@ impl PtySession {
             revision,
             content_revision,
             events,
-            _history: history,
         }))
     }
 
     pub(crate) fn spawn_command(
         pane_id: Uuid,
-        workspace_id: Uuid,
         command: CommandBuilder,
         description: &str,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
-        // Session registration may wait behind prior disk work, so do it
-        // before a child exists. Once the PTY is live, its reader only uses
-        // the archive's bounded non-blocking append path.
-        let history = Arc::new(archive.start_session(pane_id, workspace_id));
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: INITIAL_ROWS,
@@ -603,7 +548,6 @@ impl PtySession {
         let reader_revision = Arc::clone(&revision);
         let reader_content_revision = Arc::clone(&content_revision);
         let reader_events = Arc::clone(&events);
-        let reader_history = Arc::clone(&history);
         let (reader_exit_tx, reader_exit) = std::sync::mpsc::channel::<()>();
         let reader = thread::Builder::new()
             .name(format!("rmux-pty-{pane_id}"))
@@ -621,7 +565,6 @@ impl PtySession {
                             &reader_events,
                             &reader_revision,
                             &reader_content_revision,
-                            Some(&reader_history),
                             &mut previous_bell_count,
                             &buffer[..read],
                         ),
@@ -660,7 +603,6 @@ impl PtySession {
             revision,
             content_revision,
             events,
-            _history: history,
         }))
     }
 
@@ -1027,7 +969,6 @@ pub(crate) fn ingest_output(
     events: &Mutex<VecDeque<RawPaneEvent>>,
     revision: &AtomicU64,
     content_revision: &AtomicU64,
-    history: Option<&HistorySink>,
     bell_count: &mut u64,
     bytes: &[u8],
 ) {
@@ -1039,10 +980,6 @@ pub(crate) fn ingest_output(
     try_enqueue_terminal_notifications(&mut terminal, events, bell_count);
     content_revision.fetch_add(1, Ordering::Release);
     revision.fetch_add(1, Ordering::Release);
-    drop(terminal);
-    if let Some(history) = history {
-        history.record(bytes);
-    }
 }
 
 fn try_enqueue_terminal_notifications(
@@ -1060,7 +997,7 @@ fn try_enqueue_terminal_notifications(
             RawPaneEvent {
                 kind: NotificationKind::Attention,
                 message: None,
-                at_ms: history::now_ms(),
+                at_ms: crate::now_ms(),
             },
         );
     }
@@ -1070,7 +1007,7 @@ fn try_enqueue_terminal_notifications(
             RawPaneEvent {
                 kind: NotificationKind::Message,
                 message: Some(message),
-                at_ms: history::now_ms(),
+                at_ms: crate::now_ms(),
             },
         );
     }
@@ -1093,19 +1030,11 @@ mod tests {
 
     #[test]
     fn selection_revision_preserves_content_revision() {
-        let root = std::env::temp_dir().join(format!("hh-selection-revision-{}", Uuid::new_v4()));
-        let archive = HistoryArchive::open(root.clone()).unwrap();
         let pane_id = Uuid::new_v4();
         let mut command = CommandBuilder::new("/usr/bin/seq");
         command.args(["1", "200"]);
-        let session = PtySession::spawn_command(
-            pane_id,
-            Uuid::new_v4(),
-            command,
-            "selection revision test",
-            &archive,
-        )
-        .unwrap();
+        let session =
+            PtySession::spawn_command(pane_id, command, "selection revision test").unwrap();
         let Transport::Pty {
             reader_exit,
             reader,
@@ -1153,9 +1082,6 @@ mod tests {
         let unchanged = session.screen(pane_id).unwrap();
         assert_eq!(unchanged.content_revision, oldest.content_revision);
         assert_eq!(unchanged.revision, oldest.revision);
-        drop(session);
-        drop(archive);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[derive(Clone)]
@@ -1313,7 +1239,7 @@ mod tests {
         use std::collections::HashMap;
 
         use crate::tmux::system_tmux_binary;
-        use crate::tmux_control::{PaneSinks, TmuxServer};
+        use crate::tmux_control::{PaneSinks, PrivateTmuxServerGuard, TmuxServer};
 
         let Ok(binary) = system_tmux_binary() else {
             return;
@@ -1330,15 +1256,19 @@ mod tests {
         )
         .unwrap();
         let token = Uuid::new_v4().simple().to_string();
+        let socket_name = format!("hh-test-{}", &token[..12]);
+        let _server_guard = PrivateTmuxServerGuard {
+            binary: binary.clone(),
+            socket_name: socket_name.clone(),
+        };
         let server = TmuxServer {
             binary,
-            socket_name: format!("hh-test-{}", &token[..12]),
+            socket_name,
             config_path,
         };
         let sinks: PaneSinks = Arc::new(Mutex::new(HashMap::new()));
         let client =
             TmuxControlClient::spawn(&server, &format!("hh-{}", &token[..12]), sinks).unwrap();
-        let archive = HistoryArchive::disabled();
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_tmux(
             pane_id,
@@ -1346,7 +1276,6 @@ mod tests {
             None,
             Path::new("/tmp"),
             &Arc::clone(&client),
-            &archive,
         )
         .unwrap();
         session.resize(90, 25).unwrap();
@@ -1362,7 +1291,6 @@ mod tests {
             None,
             Path::new("/tmp"),
             &second_client,
-            &archive,
         )
         .unwrap();
         second_session.resize(80, 24).unwrap();
@@ -1407,12 +1335,10 @@ mod tests {
         let attached_id = Uuid::new_v4();
         let attached = PtySession::attach_tmux(
             attached_id,
-            Uuid::new_v4(),
             Arc::clone(&client),
             window_id,
             tmux_pane_id,
             shell_pid,
-            &archive,
         )
         .unwrap();
         let screen = attached.screen(attached_id).unwrap();

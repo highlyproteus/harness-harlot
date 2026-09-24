@@ -330,9 +330,6 @@ impl HhApp {
         self.sidebar.sidebar_visible = true;
         self.editor.settings_section = section;
         self.editor.color_picker = None;
-        self.editor.history_editor = None;
-        self.editor.history_clear_confirmation = None;
-        self.refresh_history_status();
         if section == SettingsSection::Bots && !self.coding_agents.loaded {
             self.refresh_coding_agents(cx);
         }
@@ -352,8 +349,6 @@ impl HhApp {
     pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.editor.modal = Modal::None;
         self.editor.color_picker = None;
-        self.editor.history_editor = None;
-        self.editor.history_clear_confirmation = None;
         cx.notify();
     }
 
@@ -985,10 +980,6 @@ impl HhApp {
         let panel = match section {
             SettingsSection::Appearance => self.render_appearance_panel(cx),
             SettingsSection::Bots => self.render_bots_settings_panel(cx),
-            SettingsSection::History => vec![
-                settings_heading("History", "Local terminal history archive."),
-                self.render_history_settings(cx),
-            ],
             SettingsSection::Updates => vec![
                 settings_heading("Updates", "Signed automatic updates."),
                 self.render_update_settings(cx),

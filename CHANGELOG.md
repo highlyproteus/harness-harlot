@@ -46,13 +46,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   you, Running, and Done, newest first, using the real tab rows with status
   badges. The bell and Dock badges count items that need you.
 - Rebuilt Settings as a surface that fills the whole main area. While it is
-  open, its Appearance / Bots / History / Updates section list replaces the left
+  open, its Appearance / Bots / Updates section list replaces the left
   sidebar, the same way the bell and robot switch it. The ⚙ button toggles
   Settings and closing it returns to the workstation or bot shown before. The ＋
   menu also offers New Bot.
-- Bumped the desktop/service wire protocol from 35 to 39 for bots, workers,
-  status timestamps, coding-agent discovery, Gallery panes, and browser command
-  execution; desktop and service must be upgraded together. Session snapshots
+- Bumped the desktop/service wire protocol from 35 to 40 for bots, workers,
+  status timestamps, coding-agent discovery, Gallery panes, browser command
+  execution, and the removed history archive requests; desktop and service must be upgraded together. Session snapshots
   move to schema 14; existing snapshots load with former Assistant workspaces
   and panes removed.
 
@@ -61,9 +61,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Removed Voice Mode and its OpenAI Realtime integration, microphone controls,
   and `HH_OPENAI_API_KEY` setting. Use your agent's own voice mode in a bot.
 - Removed Assistant panes and workspaces. Bots replace them.
+- Removed the optional local terminal history archive, its Settings section, and
+  archived search. Agent CLIs keep their own session history; live scrollback
+  and search are unchanged. Any saved archive is deleted on first start.
 
 ### Fixed
 
+- Running the test suite or a service with a custom state directory no longer
+  shares, or disrupts, the app's private tmux server.
 - Keep the private tmux server alive when creating a second workstation after
   resizing a terminal. Preserve captured terminal lines beginning with tmux
   control keywords and extra panes in referenced windows during recovery.

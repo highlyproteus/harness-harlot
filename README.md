@@ -101,7 +101,6 @@ A workstation is a machine — your local computer or an SSH host.
 - Rename any terminal tab, pick its color, or give it its own icon.
 - Known agent CLIs — Codex, Claude Code, Cursor, Aider, Gemini, and more — are recognized and labeled with their official icons automatically.
 - Your terminals keep running if the app closes, crashes, or updates. They live in a small local session service, so reopening the app puts you right back where you were. Ending a session is always explicit: close its tab or exit the shell.
-- Optional terminal history archive: beyond live scrollback, an opt-in owner-only disk archive lets explicit searches reach older output, with quotas and retention you control.
 
 ## Groups
 
@@ -174,7 +173,8 @@ revealing the selected image in Finder or the platform file manager.
 - Local terminal panes use an HH-owned private tmux server when tmux 3.2 or
   newer is installed, preserving processes and output across service restarts.
 - The managed server uses a private `hh` (`hh-dev` in development) socket and
-  does not alter the user's default tmux server.
+  does not alter the user's default tmux server. A custom `HH_STATE_DIR` gets
+  its own private server (`hh-<hash of the state directory>`).
 - The workstation menu can still scan an explicitly requested local or remote
   tmux server and attach selected sessions as tabs. Nothing is scanned in the
   background.

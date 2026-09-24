@@ -3,7 +3,6 @@ use super::{
     RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry, SshWorkspaceIds,
     TerminalRuntimePane, encode_desired_state,
 };
-use crate::history::HistoryArchive;
 use crate::layout::{find_pane_mut, pane_ids_for_workspace};
 use crate::persistence::{MAX_RECENT_COLORS, MAX_WORKSPACES, validate_title};
 use crate::process::fallback_cwd;
@@ -48,11 +47,10 @@ fn spawn_reconnect_sessions(
     destination: &str,
     working_dir: Option<&str>,
     pane_ids: &[Uuid],
-    history: &HistoryArchive,
 ) -> Result<Vec<(Uuid, Arc<PtySession>)>> {
     let mut sessions = Vec::with_capacity(pane_ids.len());
     for pane_id in pane_ids {
-        match PtySession::spawn_ssh(*pane_id, workspace_id, destination, working_dir, history) {
+        match PtySession::spawn_ssh(*pane_id, workspace_id, destination, working_dir) {
             Ok(session) => sessions.push((*pane_id, session)),
             Err(error) => {
                 for (_, session) in sessions {
@@ -330,8 +328,7 @@ impl SessionRegistry {
         };
         let cwd = fallback_cwd()?;
         self.persist_ssh_workspace_intent(title, destination, ids)?;
-        let session =
-            PtySession::spawn_ssh(ids.pane, ids.workspace, destination, None, &self.history)?;
+        let session = PtySession::spawn_ssh(ids.pane, ids.workspace, destination, None)?;
         let result = self.attach_ssh_workspace(destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
@@ -468,7 +465,7 @@ impl SessionRegistry {
         };
         let cwd = fallback_cwd()?;
         self.persist_ssh_workspace_intent(title, destination, ids)?;
-        let session = PtySession::spawn_local(ids.pane, ids.workspace, None, &cwd, &self.history)?;
+        let session = PtySession::spawn_local(ids.pane, ids.workspace, None, &cwd)?;
         let result = self.attach_ssh_workspace(destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
@@ -706,7 +703,6 @@ impl SessionRegistry {
             &plan.destination,
             plan.working_dir.as_deref(),
             &pane_ids,
-            &self.history,
         )?;
         let result = self.apply_workspace_reconnection(
             workspace_id,

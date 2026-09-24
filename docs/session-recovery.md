@@ -6,7 +6,8 @@ Harness Harlot keeps two intentionally different kinds of state:
   `hh` socket (`hh-dev` in development). The session service owns tmux's control
   connection and terminal projection, while tmux owns the local shell process
   and pane output. Closing or restarting only the desktop or session service
-  does not terminate those managed shells.
+  does not terminate those managed shells. A custom `HH_STATE_DIR` gets its own
+  private server, named from a hash of that state directory.
 - **Other runtime state** remains service-local: system-SSH PTYs, child handles,
   terminal projections, sockets, and input/output buffers. A service restart
   leaves SSH tabs offline until explicit reconnection.
@@ -14,8 +15,8 @@ Harness Harlot keeps two intentionally different kinds of state:
   workspace/tab/pane IDs, titles, split axes and ratios, active tab IDs, last
   valid local working directories, and opaque private-tmux window/pane IDs. It
   contains no environment, process handles, PIDs, credentials, or secrets.
-  Optional terminal history remains a separate owner-only archive; see
-  [local terminal history storage](terminal-history-storage.md).
+  Terminal output is never archived to disk; a `history/` directory left by an
+  earlier build's optional archive is deleted when the service starts.
 
 On restart, the service validates the desired-state snapshot and reattaches each
 managed local pane to its existing private tmux window. Missing tmux 3.2+,

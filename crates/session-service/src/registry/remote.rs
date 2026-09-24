@@ -187,7 +187,7 @@ impl SessionRegistry {
 
     /// Performs an explicit bounded metadata-only scan of the default tmux
     /// server for one workstation. It never starts tmux, reconnects a saved
-    /// SSH workstation, or writes scan output to terminal history.
+    /// SSH workstation, or writes scan output into a terminal.
     pub fn scan_tmux_sessions(&self, workspace_id: Uuid) -> Result<TmuxScanResult> {
         self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         let _scan_permit = self.begin_tmux_scan(workspace_id)?;
@@ -298,24 +298,13 @@ impl SessionRegistry {
         let pane_id = Uuid::new_v4();
         let (session, kind) = match connection {
             WorkspaceConnection::Local => (
-                PtySession::spawn_tmux_local(
-                    pane_id,
-                    workspace_id,
-                    &tmux_session.id,
-                    &self.history,
-                )?,
+                PtySession::spawn_tmux_local(pane_id, &tmux_session.id)?,
                 RuntimePaneKind::TmuxLocal {
                     session_id: tmux_session.id.clone(),
                 },
             ),
             WorkspaceConnection::SystemSsh { destination, .. } => (
-                PtySession::spawn_tmux_ssh(
-                    pane_id,
-                    workspace_id,
-                    destination,
-                    &tmux_session.id,
-                    &self.history,
-                )?,
+                PtySession::spawn_tmux_ssh(pane_id, destination, &tmux_session.id)?,
                 RuntimePaneKind::TmuxSystemSsh {
                     host: destination.clone(),
                     session_id: tmux_session.id.clone(),
@@ -478,14 +467,12 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from("printf fixture; sleep 1"),
             ]),
             "live remote tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let tmux_session = tmux_session("$12", "remote-editor");
@@ -519,14 +506,12 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from("printf fixture; sleep 1"),
             ]),
             "live tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let tmux_session = tmux_session("$9", "editor");
@@ -564,14 +549,12 @@ mod tests {
         let tmux_pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             tmux_pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from("printf fixture; sleep 1"),
             ]),
             "live tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let tmux_session = tmux_session("$11", "persisted-group");
@@ -624,10 +607,8 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![OsString::from("/usr/bin/false")]),
             "failed tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -716,14 +697,12 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from("printf fixture; sleep 5"),
             ]),
             "live tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let tmux_session = tmux_session("$9", "editor");

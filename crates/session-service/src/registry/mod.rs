@@ -1,4 +1,4 @@
-//! Session registry core: state, recovery, history, and spawn plumbing.
+//! Session registry core: state, recovery, and spawn plumbing.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::bots::discover_coding_agents;
-use crate::history::HistoryArchive;
 use crate::layout::{
     find_pane_in_snapshot, find_pane_mut_in_snapshot, first_pane_id, pane_ids_in_snapshot,
     retain_persistable_panes, workspace_id_for_pane,
@@ -16,11 +15,10 @@ use crate::layout::{
 use crate::persistence::{MAX_TITLE_CHARS, SnapshotStore, default_snapshot_path};
 use anyhow::{Context, Result, bail, ensure};
 use hh_protocol::{
-    BrowserAction, BrowserCommandOutcome, BrowserCommandRequest, CodingAgent, HistoryArchiveStatus,
-    HistoryClearScope, HistoryCursor, HistoryPageDirection, HistorySettings, NotificationKind,
+    BrowserAction, BrowserCommandOutcome, BrowserCommandRequest, CodingAgent, NotificationKind,
     Pane, PaneAuthority, PaneKind, PaneRevisionCursor, PaneStatus, PaneStreamState,
-    SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalHistoryPage, TerminalIdentity,
-    TerminalProfile, TerminalScreen, TerminalTransport, TmuxSessionId, WorkspaceConnection,
+    SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalIdentity, TerminalProfile,
+    TerminalScreen, TerminalTransport, TmuxSessionId, WorkspaceConnection,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -238,7 +236,7 @@ impl RegistryState {
             return;
         }
         pane.status = status;
-        pane.status_changed_at_ms = crate::history::now_ms();
+        pane.status_changed_at_ms = crate::now_ms();
         self.snapshot.revision = self.snapshot.revision.saturating_add(1);
     }
 
@@ -493,7 +491,6 @@ pub struct SessionRegistry {
     diagnostics_sampler: Arc<Mutex<DiagnosticsSampler>>,
     shutdown_requested: Arc<AtomicBool>,
     store: Option<SnapshotStore>,
-    history: HistoryArchive,
     tmux_scan_gate: Arc<Mutex<TmuxScanGate>>,
     remote_ls_gate: Arc<Mutex<RemoteLsGate>>,
     coding_agents: Arc<Mutex<Option<Vec<CodingAgent>>>>,
@@ -633,15 +630,16 @@ pub(crate) fn terminate_runtime_panes(panes: &HashMap<Uuid, RuntimePane>) {
         let _ = terminal.session.terminate_and_wait();
     }
 }
-fn discover_managed_tmux() -> (Option<TmuxServer>, Option<String>) {
+fn discover_managed_tmux(state_dir: &Path) -> (Option<TmuxServer>, Option<String>) {
     #[cfg(test)]
     {
-        let _ = TmuxServer::discover as fn() -> Result<Option<TmuxServer>>;
+        let _ = state_dir;
+        let _ = TmuxServer::discover as fn(&Path) -> Result<Option<TmuxServer>>;
         (None, None)
     }
     #[cfg(not(test))]
     {
-        match TmuxServer::discover() {
+        match TmuxServer::discover(state_dir) {
             Ok(server) => (server, None),
             Err(error) => (None, Some(format!("{error:#}"))),
         }
@@ -681,14 +679,14 @@ fn append_tmux_notification(state: &mut RegistryState, message: String) {
             pane_id,
             NotificationKind::Message,
             Some(message),
-            crate::history::now_ms(),
+            crate::now_ms(),
         );
     }
 }
 
 impl SessionRegistry {
     pub fn new() -> Result<Self> {
-        Self::seeded(None, HistoryArchive::disabled())
+        Self::seeded_with_tmux(None, None, None)
     }
 
     pub fn load_default() -> Result<Self> {
@@ -700,16 +698,15 @@ impl SessionRegistry {
         if !path.is_absolute() {
             bail!("recovery snapshot path must be absolute");
         }
-        let history_root = path
+        let state_dir = path
             .parent()
             .context("recovery snapshot path has no parent")?
-            .join("history");
-        let history = HistoryArchive::open(history_root)?;
+            .to_path_buf();
+        remove_retired_history_archive(&state_dir);
         let store = SnapshotStore::new(path);
-        let (tmux, tmux_unavailable_reason) = discover_managed_tmux();
+        let (tmux, tmux_unavailable_reason) = discover_managed_tmux(&state_dir);
         let Some(mut recovered) = store.load_or_quarantine()? else {
-            let registry =
-                Self::seeded_with_tmux(Some(store), history, tmux, tmux_unavailable_reason)?;
+            let registry = Self::seeded_with_tmux(Some(store), tmux, tmux_unavailable_reason)?;
             registry.persist()?;
             return Ok(registry);
         };
@@ -772,23 +769,14 @@ impl SessionRegistry {
                                     reattached = true;
                                     return PtySession::attach_tmux(
                                         pane_id,
-                                        workspace_id,
                                         client,
                                         window_id,
                                         tmux_pane_id,
                                         pane_pid,
-                                        &history,
                                     );
                                 }
                             }
-                            PtySession::spawn_tmux(
-                                pane_id,
-                                workspace_id,
-                                bot_tab,
-                                &cwd,
-                                &client,
-                                &history,
-                            )
+                            PtySession::spawn_tmux(pane_id, workspace_id, bot_tab, &cwd, &client)
                         })
                 });
             let reattached = reattached && matches!(managed, Some(Ok(_)));
@@ -796,9 +784,9 @@ impl SessionRegistry {
                 Some(Ok(session)) => Ok(session),
                 Some(Err(error)) => {
                     tmux_failures.push((pane_id, format!("{error:#}")));
-                    PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd, &history)
+                    PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd)
                 }
-                None => PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd, &history),
+                None => PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd),
             };
             match session {
                 Ok(session) => {
@@ -900,7 +888,6 @@ impl SessionRegistry {
             remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
             coding_agents: Arc::new(Mutex::new(None)),
             store: Some(store),
-            history,
             browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
         };
         registry.persist()?;
@@ -910,18 +897,8 @@ impl SessionRegistry {
         Ok(registry)
     }
 
-    pub(crate) fn seeded(store: Option<SnapshotStore>, history: HistoryArchive) -> Result<Self> {
-        let (tmux, tmux_unavailable_reason) = if store.is_some() {
-            discover_managed_tmux()
-        } else {
-            (None, None)
-        };
-        Self::seeded_with_tmux(store, history, tmux, tmux_unavailable_reason)
-    }
-
     fn seeded_with_tmux(
         store: Option<SnapshotStore>,
-        history: HistoryArchive,
         tmux: Option<TmuxServer>,
         tmux_unavailable_reason: Option<String>,
     ) -> Result<Self> {
@@ -937,19 +914,17 @@ impl SessionRegistry {
         let mut tmux_sinks = HashMap::new();
         let managed = tmux.as_ref().map(|server| {
             ensure_tmux_client(server, workspace_id, &mut tmux_clients, &mut tmux_sinks).and_then(
-                |client| {
-                    PtySession::spawn_tmux(pane_id, workspace_id, None, &cwd, &client, &history)
-                },
+                |client| PtySession::spawn_tmux(pane_id, workspace_id, None, &cwd, &client),
             )
         });
         let (session, tmux_failure) = match managed {
             Some(Ok(session)) => (session, None),
             Some(Err(error)) => (
-                PtySession::spawn_local(pane_id, workspace_id, None, &cwd, &history)?,
+                PtySession::spawn_local(pane_id, workspace_id, None, &cwd)?,
                 Some(format!("{error:#}")),
             ),
             None => (
-                PtySession::spawn_local(pane_id, workspace_id, None, &cwd, &history)?,
+                PtySession::spawn_local(pane_id, workspace_id, None, &cwd)?,
                 None,
             ),
         };
@@ -1011,7 +986,6 @@ impl SessionRegistry {
             coding_agents: Arc::new(Mutex::new(None)),
             store,
             remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
-            history,
             browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
         })
     }
@@ -1138,47 +1112,6 @@ impl SessionRegistry {
             .map_or(Ok(()), |store| store.write_snapshot(bytes))
     }
 
-    pub fn history_status(&self) -> HistoryArchiveStatus {
-        self.history.status()
-    }
-
-    pub fn set_history_settings(&self, settings: HistorySettings) -> Result<()> {
-        self.history.update_settings(settings)
-    }
-
-    pub fn clear_history(&self, scope: HistoryClearScope) -> Result<()> {
-        if let HistoryClearScope::Workspace { workspace_id } = scope {
-            let state = self.state.read();
-            if !state
-                .snapshot
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.id == workspace_id)
-            {
-                bail!("workstation {workspace_id} does not exist");
-            }
-        }
-        self.history.clear(scope)
-    }
-
-    pub fn load_history_page(
-        &self,
-        pane_id: Uuid,
-        cursor: Option<HistoryCursor>,
-        direction: HistoryPageDirection,
-    ) -> Result<Option<TerminalHistoryPage>> {
-        self.history.load_page(pane_id, cursor, direction)
-    }
-
-    pub fn search_archived_history(
-        &self,
-        pane_id: Uuid,
-        query: &str,
-        before: Option<HistoryCursor>,
-    ) -> Result<Option<TerminalHistoryPage>> {
-        self.history.search(pane_id, query, before)
-    }
-
     pub(crate) fn pane(&self, pane_id: Uuid) -> Result<Arc<PtySession>> {
         let state = self.state.read();
         Ok(Arc::clone(&state.terminal_pane(pane_id)?.session))
@@ -1238,17 +1171,11 @@ impl SessionRegistry {
     ) -> Result<Arc<PtySession>> {
         if self.state.read().tmux.is_some() {
             match self.client_for_workspace(workspace_id).and_then(|client| {
-                PtySession::spawn_tmux(pane_id, workspace_id, bot_tab, cwd, &client, &self.history)
+                PtySession::spawn_tmux(pane_id, workspace_id, bot_tab, cwd, &client)
             }) {
                 Ok(session) => return Ok(session),
                 Err(error) => {
-                    let session = PtySession::spawn_local(
-                        pane_id,
-                        workspace_id,
-                        bot_tab,
-                        cwd,
-                        &self.history,
-                    )?;
+                    let session = PtySession::spawn_local(pane_id, workspace_id, bot_tab, cwd)?;
                     append_tmux_notification(
                         &mut self.state.write(),
                         format!("tmux window could not be created; using a plain shell: {error:#}"),
@@ -1257,7 +1184,7 @@ impl SessionRegistry {
                 }
             }
         }
-        PtySession::spawn_local(pane_id, workspace_id, bot_tab, cwd, &self.history)
+        PtySession::spawn_local(pane_id, workspace_id, bot_tab, cwd)
     }
 
     pub(crate) fn spawn_pane_for_workspace(
@@ -1273,13 +1200,33 @@ impl SessionRegistry {
                 self.spawn_local_transport(pane_id, workspace_id, None, cwd)?
             }
             RuntimePaneKind::SystemSsh { host } => {
-                PtySession::spawn_ssh(pane_id, workspace_id, host, remote_dir, &self.history)?
+                PtySession::spawn_ssh(pane_id, workspace_id, host, remote_dir)?
             }
             RuntimePaneKind::TmuxLocal { .. } | RuntimePaneKind::TmuxSystemSsh { .. } => {
                 unreachable!("workspace connection cannot resolve to a runtime-only tmux pane")
             }
         };
         Ok((session, kind))
+    }
+}
+
+/// Deletes `<state>/history`, the retired terminal history archive of raw PTY
+/// output, removing a symlink itself rather than its target. Failures are
+/// logged and never block startup.
+fn remove_retired_history_archive(state_directory: &Path) {
+    let archive = state_directory.join("history");
+    let removal = match std::fs::symlink_metadata(&archive) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&archive),
+        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::remove_file(&archive),
+        Ok(_) => return,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = removal {
+        eprintln!(
+            "failed to remove retired terminal history archive {}: {error}",
+            archive.display()
+        );
     }
 }
 
@@ -1297,6 +1244,28 @@ pub(crate) fn create_owner_only_directory(path: &Path) {
 mod tests {
     use super::*;
     use hh_protocol::{DropPlacement, WorkspaceConnectionStatus};
+
+    #[test]
+    fn retired_history_archive_is_removed_without_following_a_symlink() {
+        let root = std::env::temp_dir().join(format!("hh-retired-history-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        let archive = state.join("history");
+        std::fs::create_dir_all(archive.join("sessions")).unwrap();
+        std::fs::write(archive.join("sessions/chunk"), b"raw output").unwrap();
+        remove_retired_history_archive(&state);
+        assert!(!archive.exists());
+
+        let target = root.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep"), b"unrelated").unwrap();
+        std::os::unix::fs::symlink(&target, &archive).unwrap();
+        remove_retired_history_archive(&state);
+        assert!(std::fs::symlink_metadata(&archive).is_err());
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"unrelated");
+
+        remove_retired_history_archive(&state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn status_changed_at_ms_advances_only_on_real_transitions() {

@@ -1,10 +1,13 @@
+mod support;
+
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use hh_protocol::{AppearanceColor, PaneKind, PaneLayout, SplitAxis};
 use hh_session_service::SessionRegistry;
+use support::TestStateDir;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use uuid::Uuid;
 
@@ -48,7 +51,6 @@ fn daemon_restart_restores_layout_and_working_directories() {
     wait_for_process_cwd(&recovered, first, &expected_cwd);
 
     drop(recovered);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -121,7 +123,6 @@ fn browser_tabs_round_trip_without_a_pty_and_reject_terminal_operations() {
     );
 
     drop(recovered);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -181,7 +182,6 @@ fn gallery_tabs_round_trip_without_a_pty() {
     );
 
     drop(recovered);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -242,7 +242,6 @@ fn grouped_browser_panes_round_trip_inside_the_group_stack() {
     }));
 
     drop(recovered);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -306,7 +305,6 @@ fn projects_and_working_dirs_round_trip() {
     );
 
     drop(recovered);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -342,7 +340,6 @@ fn project_group_inherits_project_directory() {
     let grouped_pane = registry.create_group_terminal(child_pane).unwrap();
     wait_for_process_cwd(&registry, grouped_pane, &project_dir);
     drop(registry);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -379,7 +376,6 @@ fn close_tab_removes_tab_children_and_sessions() {
     assert!(registry.pane_process_id(project_pane).is_err());
     assert!(registry.pane_process_id(child_pane).is_err());
     drop(registry);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -402,7 +398,6 @@ fn tab_color_and_icon_round_trip() {
     assert_eq!(tab.color, Some(color));
     assert_eq!(tab.custom_icon.as_deref(), Some(icon.as_str()));
     drop(recovered);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -424,7 +419,6 @@ fn list_remote_directory_lists_local_subdirectories() {
         ["a".to_owned(), "b".to_owned()]
     );
     drop(registry);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 fn wait_for_process_cwd(registry: &SessionRegistry, pane_id: Uuid, expected: &Path) {
@@ -467,8 +461,8 @@ fn leaf(layout: &PaneLayout) -> &hh_protocol::Pane {
     }
 }
 
-fn test_directory(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("hh-integration-{label}-{}", Uuid::new_v4()))
+fn test_directory(label: &str) -> TestStateDir {
+    TestStateDir::new(label)
 }
 
 fn create_owner_only_directory(path: &std::path::Path) {

@@ -309,13 +309,7 @@ impl SessionRegistry {
                 tab_title: "Terminals".to_owned(),
             }),
             WorkspaceConnection::SystemSsh { destination, .. } => Ok(InitialTerminalSpawn {
-                session: PtySession::spawn_ssh(
-                    pane_id,
-                    workspace_id,
-                    destination,
-                    working_dir,
-                    &self.history,
-                )?,
+                session: PtySession::spawn_ssh(pane_id, workspace_id, destination, working_dir)?,
                 kind: RuntimePaneKind::SystemSsh {
                     host: destination.clone(),
                 },
@@ -460,7 +454,7 @@ impl SessionRegistry {
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
-        let session = PtySession::spawn_ssh(pane_id, workspace_id, host, None, &self.history)?;
+        let session = PtySession::spawn_ssh(pane_id, workspace_id, host, None)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -923,19 +917,18 @@ impl SessionRegistry {
                 bot_tab,
                 &cwd,
                 &self.client_for_workspace(workspace_id)?,
-                &self.history,
             )?,
             RuntimePaneKind::Local => {
-                PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd, &self.history)?
+                PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd)?
             }
             RuntimePaneKind::SystemSsh { host } => {
-                PtySession::spawn_ssh(pane_id, workspace_id, host, None, &self.history)?
+                PtySession::spawn_ssh(pane_id, workspace_id, host, None)?
             }
             RuntimePaneKind::TmuxLocal { session_id } => {
-                PtySession::spawn_tmux_local(pane_id, workspace_id, session_id, &self.history)?
+                PtySession::spawn_tmux_local(pane_id, session_id)?
             }
             RuntimePaneKind::TmuxSystemSsh { host, session_id } => {
-                PtySession::spawn_tmux_ssh(pane_id, workspace_id, host, session_id, &self.history)?
+                PtySession::spawn_tmux_ssh(pane_id, host, session_id)?
             }
         };
         if kind.is_runtime_only()

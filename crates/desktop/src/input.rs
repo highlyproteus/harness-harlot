@@ -538,26 +538,6 @@ impl HhApp {
             cx.stop_propagation();
             return;
         }
-        if let Some(editor) = self.editor.history_editor.as_mut() {
-            match keystroke.key.as_str() {
-                "enter" => self.submit_history_edit(cx),
-                "escape" => {
-                    self.editor.history_editor = None;
-                    cx.notify();
-                }
-                "backspace" => {
-                    Self::apply_inline_backspace(
-                        &mut editor.text,
-                        &mut editor.replace_on_type,
-                        &mut editor.invalid,
-                    );
-                    cx.notify();
-                }
-                _ => {}
-            }
-            cx.stop_propagation();
-            return;
-        }
         match &self.editor.modal {
             Modal::None => {}
             Modal::CommandPalette(_) => {

@@ -234,7 +234,6 @@ mod tests {
             window_active: true,
             stream_diagnostics: StreamDiagnostics::default(),
             connection_error: None,
-            history_status: None,
         }
     }
 

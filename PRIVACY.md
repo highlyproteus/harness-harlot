@@ -41,8 +41,8 @@ so the bot can tell you about them.
 The session snapshot records each bot's name, agent, working directory, and
 instructions, plus which worker tabs a bot created. It stores no terminal
 output, credentials, or conversation content. Bot terminals keep their output
-in the private HH tmux server like other local terminals; optional terminal
-history follows [local terminal history storage](docs/terminal-history-storage.md).
+in the private HH tmux server like other local terminals; Harness Harlot keeps
+no disk archive of terminal output.
 
 Harness Harlot writes the bundled omp plugin, each bot's coordinator prompt, and
 MCP launch configuration (containing only the `hh` executable path) to its

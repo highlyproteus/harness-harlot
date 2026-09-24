@@ -11,7 +11,6 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
 use std::time::Duration;
 
-use crate::history::HistorySink;
 use crate::persistence::validate_title;
 use crate::process::{configured_shell, is_trusted_executable_file, run_bounded_command};
 use crate::pty::{RawPaneEvent, ingest_output};
@@ -32,7 +31,6 @@ pub(crate) struct PaneSink {
     pub revision: Arc<AtomicU64>,
     pub content_revision: Arc<AtomicU64>,
     pub events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
-    pub history: Arc<HistorySink>,
     pub exited: Arc<Mutex<Option<String>>>,
     pub bell_count: u64,
     pub window_id: String,
@@ -71,7 +69,9 @@ pub(crate) struct TmuxServer {
 }
 
 impl TmuxServer {
-    pub(crate) fn discover() -> Result<Option<Self>> {
+    /// Discovers tmux and prepares the private server owned by `state_dir`,
+    /// whose `sessions.json` references that server's window and pane ids.
+    pub(crate) fn discover(state_dir: &Path) -> Result<Option<Self>> {
         let binary = match std::env::var_os("HH_TMUX_BINARY") {
             Some(path) => {
                 let path =
@@ -91,8 +91,9 @@ impl TmuxServer {
             return Ok(None);
         }
 
-        let state = hh_protocol::state_directory().context("state directory is unavailable")?;
-        let directory = state.join("tmux");
+        hh_protocol::ensure_private_directory(state_dir)
+            .with_context(|| format!("prepare state directory {}", state_dir.display()))?;
+        let directory = state_dir.join("tmux");
         hh_protocol::ensure_private_directory(&directory)
             .with_context(|| format!("prepare tmux directory {}", directory.display()))?;
         let config_path = directory.join("hh.conf");
@@ -105,13 +106,77 @@ impl TmuxServer {
 
         Ok(Some(Self {
             binary,
-            socket_name: if cfg!(debug_assertions) {
-                "hh-dev".to_owned()
-            } else {
-                "hh".to_owned()
-            },
+            socket_name: managed_tmux_socket_name(state_dir),
             config_path,
         }))
+    }
+}
+
+/// Names the private tmux server (`tmux -L <name>`) owned by `state_dir`.
+///
+/// The default install keeps the readable `hh` (release) or `hh-dev` (debug)
+/// socket. Any other state directory, including every `HH_STATE_DIR`
+/// override, gets `hh-<fnv1a64 of the canonical path>` so disposable test and
+/// custom-state services never share or disrupt the app's live server. The
+/// digest is fixed (not `DefaultHasher`) so a restarted or updated service
+/// finds the same server again.
+#[must_use]
+pub fn managed_tmux_socket_name(state_dir: &Path) -> String {
+    let canonical = canonical_state_dir(state_dir);
+    let is_default_install = std::env::var_os(hh_protocol::STATE_DIR_ENV).is_none()
+        && hh_protocol::state_directory()
+            .is_some_and(|default| canonical_state_dir(&default) == canonical);
+    if is_default_install {
+        let name = if cfg!(debug_assertions) {
+            "hh-dev"
+        } else {
+            "hh"
+        };
+        return name.to_owned();
+    }
+    format!(
+        "hh-{:016x}",
+        fnv1a64(canonical.as_os_str().as_encoded_bytes())
+    )
+}
+
+fn canonical_state_dir(state_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf())
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Kills a private test tmux server and removes its socket file when
+/// dropped, including on panic. Refuses the app's `hh`/`hh-dev` servers.
+#[cfg(test)]
+pub(crate) struct PrivateTmuxServerGuard {
+    pub binary: PathBuf,
+    pub socket_name: String,
+}
+
+#[cfg(test)]
+impl Drop for PrivateTmuxServerGuard {
+    fn drop(&mut self) {
+        assert!(
+            self.socket_name != "hh" && self.socket_name != "hh-dev",
+            "refusing to kill the app's tmux server {}",
+            self.socket_name
+        );
+        let _ = Command::new(&self.binary)
+            .args(["-L", &self.socket_name, "kill-server"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // tmux leaves the socket file behind on macOS after the server exits.
+        let base =
+            std::env::var_os("TMUX_TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let uid = rustix::process::getuid().as_raw();
+        let _ = std::fs::remove_file(base.join(format!("tmux-{uid}")).join(&self.socket_name));
     }
 }
 
@@ -424,7 +489,6 @@ fn read_control_output(
                     &sink.events,
                     &sink.revision,
                     &sink.content_revision,
-                    Some(&sink.history),
                     &mut sink.bell_count,
                     &bytes,
                 );
@@ -666,14 +730,11 @@ mod tests {
         let (startup_sender, _startup) = sync_channel(1);
         let terminal = Arc::new(Mutex::new(TerminalModel::new(80, 24)));
         let exited = Arc::new(Mutex::new(None));
-        let history = crate::history::HistoryArchive::disabled()
-            .start_session(uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let sink = PaneSink {
             terminal: Arc::clone(&terminal),
             revision: Arc::default(),
             content_revision: Arc::default(),
             events: Arc::default(),
-            history: Arc::new(history),
             exited: Arc::clone(&exited),
             bell_count: 0,
             window_id: "@1".to_owned(),

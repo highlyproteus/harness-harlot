@@ -3,10 +3,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::history::{
-    HistoryArchiveStatus, HistoryClearScope, HistoryCursor, HistoryPageDirection, HistorySettings,
-    TerminalHistoryPage,
-};
 use crate::model::{
     AppearanceColor, BotSettings, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport,
     TmuxScanScope, TmuxSession, TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
@@ -368,23 +364,6 @@ pub enum ClientRequest {
         columns: u16,
         rows: u16,
     },
-    GetHistoryStatus,
-    SetHistorySettings {
-        settings: HistorySettings,
-    },
-    ClearHistory {
-        scope: HistoryClearScope,
-    },
-    LoadHistoryPage {
-        pane_id: Uuid,
-        cursor: Option<HistoryCursor>,
-        direction: HistoryPageDirection,
-    },
-    SearchArchivedHistory {
-        pane_id: Uuid,
-        query: String,
-        before: Option<HistoryCursor>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -469,15 +448,6 @@ pub enum ServiceResponse {
     },
     SearchResult {
         found: bool,
-    },
-    HistoryStatus {
-        status: HistoryArchiveStatus,
-    },
-    HistoryPage {
-        page: Option<TerminalHistoryPage>,
-    },
-    HistorySearchResult {
-        page: Option<TerminalHistoryPage>,
     },
     Error {
         message: String,

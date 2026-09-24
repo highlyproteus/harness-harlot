@@ -436,35 +436,6 @@ impl HhApp {
         visible_panes(projected.as_ref().unwrap_or(layout))
     }
 
-    pub(crate) fn refresh_history_status(&mut self) {
-        self.dispatch_stream_with(
-            ClientRequest::GetHistoryStatus,
-            Box::new(|this, cx, result| {
-                if this.apply_history_status_result(result) {
-                    cx.notify();
-                }
-            }),
-        );
-    }
-
-    pub(crate) fn apply_history_status_result(
-        &mut self,
-        response: anyhow::Result<ServiceResponse>,
-    ) -> bool {
-        let previous = self.session.history_status.clone();
-        match response {
-            Ok(ServiceResponse::HistoryStatus { status }) => {
-                self.session.history_status = Some(status);
-                self.session.connection_error = None;
-            }
-            Ok(response) => {
-                self.report_unexpected(&response);
-            }
-            Err(error) => self.report(&error),
-        }
-        self.session.history_status != previous
-    }
-
     pub(crate) fn update_window_geometry(&mut self, window: &Window) -> bool {
         let window_width = f32::from(window.bounds().size.width);
         let sidebar_pixels = sidebar_width_for_visibility(

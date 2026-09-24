@@ -3,9 +3,7 @@
 
 use objc2::AnyThread as _;
 use objc2_app_kit::{NSApplication, NSDockTile, NSImage};
-use objc2_foundation::{
-    NSBundle, NSNumber, NSString, NSURL, NSURLIsExcludedFromBackupKey, ns_string,
-};
+use objc2_foundation::{NSBundle, NSString, ns_string};
 
 // SAFETY: `NSApp` is AppKit's process-global application pointer.
 #[allow(unsafe_code)]
@@ -56,22 +54,5 @@ pub fn set_dock_badge(label: Option<&str>) {
         };
         let dock_tile: objc2::rc::Retained<NSDockTile> = app.dockTile();
         dock_tile.setBadgeLabel(label.as_deref());
-    }
-}
-
-/// Excludes an existing local-history directory from Time Machine snapshots.
-///
-/// # Errors
-///
-/// Returns the Foundation error when macOS refuses to update the resource key.
-pub fn exclude_directory_from_backup(path: &std::path::Path) -> Result<(), String> {
-    let path = NSString::from_str(&path.to_string_lossy());
-    let url = NSURL::fileURLWithPath_isDirectory(&path, true);
-    let excluded = NSNumber::new_bool(true);
-    // SAFETY: NSURLIsExcludedFromBackupKey requires an NSNumber boolean value.
-    #[allow(unsafe_code)]
-    unsafe {
-        url.setResourceValue_forKey_error(Some(&excluded), NSURLIsExcludedFromBackupKey)
-            .map_err(|error| error.localizedDescription().to_string())
     }
 }

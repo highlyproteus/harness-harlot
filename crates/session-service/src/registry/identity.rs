@@ -1,6 +1,5 @@
 //! Runtime identity discovery: process profiles, titles, and workspace activity.
 use super::{RegistryState, RuntimePane};
-use crate::history;
 use crate::layout::{find_pane_in_snapshot, find_pane_mut_in_snapshot, pane_ids_for_workspace};
 use crate::process::valid_local_cwd;
 use crate::registry::status::omp_title_status;
@@ -149,7 +148,7 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
                     pane_id,
                     NotificationKind::Completed,
                     None,
-                    history::now_ms(),
+                    crate::now_ms(),
                 );
                 state.set_pane_status(pane_id, PaneStatus::Done);
             }

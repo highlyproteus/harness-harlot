@@ -1,8 +1,8 @@
 use gpui::{IntoElement, ParentElement, Pixels, Point, Render, Styled, Window, div, px, rgb};
 use hh_protocol::{
     ClientRequest, DropPlacement, MAX_SSH_INPUT_LEN, MAX_WORKSPACE_DIR_BYTES, Pane, SplitAxis,
-    TerminalHistoryPage, TerminalPoint, TerminalProfile, TerminalSelection, TerminalSelectionKind,
-    TmuxScanScope, TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
+    TerminalPoint, TerminalProfile, TerminalSelectionKind, TmuxScanScope, TmuxSession,
+    TmuxSessionId, normalize_ssh_input, validate_ssh_host,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -235,36 +235,6 @@ pub(super) enum RenameTarget {
 pub(super) struct SearchEditor {
     pub(super) query: String,
     pub(super) no_match: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct ArchivedView {
-    pub(super) page: TerminalHistoryPage,
-    pub(super) first_line: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HistoryEditField {
-    RetentionDays,
-    QuotaGib,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct HistoryEditor {
-    pub(super) field: HistoryEditField,
-    pub(super) text: String,
-    pub(super) replace_on_type: bool,
-    pub(super) invalid: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct TerminalLineRender {
-    pub(super) row: usize,
-    pub(super) cursor: Option<hh_protocol::TerminalCursor>,
-    pub(super) focused: bool,
-    pub(super) pane_accent: u32,
-    pub(super) columns: u16,
-    pub(super) selection: Option<TerminalSelection>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1037,18 +1007,16 @@ pub(super) enum SettingsSection {
     #[default]
     Appearance,
     Bots,
-    History,
     Updates,
 }
 
 impl SettingsSection {
-    pub(super) const ALL: [Self; 4] = [Self::Appearance, Self::Bots, Self::History, Self::Updates];
+    pub(super) const ALL: [Self; 3] = [Self::Appearance, Self::Bots, Self::Updates];
 
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
             Self::Bots => "Bots",
-            Self::History => "History",
             Self::Updates => "Updates",
         }
     }

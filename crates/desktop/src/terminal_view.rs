@@ -1,14 +1,12 @@
-//! Terminal pane rendering: headers, lines, search, and drops.
+//! Terminal pane rendering: headers, search, and drops.
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Context, CursorStyle, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, Point, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, px,
-    relative, rgb, rgba,
+    MouseDownEvent, Point, div, px, relative, rgb, rgba,
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled};
 use hh_protocol::{
-    ClientRequest, DropPlacement, HistoryPageFlags, Pane, PaneLayout, PaneStatus, SplitAxis,
-    TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, WorkspaceConnection,
+    ClientRequest, DropPlacement, Pane, PaneLayout, PaneStatus, SplitAxis, WorkspaceConnection,
 };
 
 use crate::browser::browser_command_available;
@@ -16,15 +14,14 @@ use crate::commands::AppCommand;
 use crate::elements::{TerminalGridElement, TerminalPointerElement};
 use crate::helpers::{
     IDENTITY_MARK_SIZE, effective_split_ratio, element_key, find_pane, identity_detail,
-    identity_label, plain_history_line, selection_span, split_child_dimensions, split_control_id,
-    split_element_key, split_placement_at, split_target_for_drag, split_target_for_drag_ids,
-    terminal_run_display_text, terminal_tab_secondary_label, workspace_layout_for_focused_pane,
-    workspace_tab_standalone_pane, zoom_projection,
+    identity_label, split_child_dimensions, split_control_id, split_element_key,
+    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
+    terminal_tab_secondary_label, workspace_layout_for_focused_pane, workspace_tab_standalone_pane,
+    zoom_projection,
 };
-use crate::typography::TerminalCellMetrics;
 use crate::view_models::{
     DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag, SearchEditor, SplitControlId,
-    TabDrag, TerminalLineRender, TooltipView, WorkspaceDrag,
+    TabDrag, TooltipView, WorkspaceDrag,
 };
 use crate::{HhApp, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, THEME, pane_status_color};
 use uuid::Uuid;
@@ -420,7 +417,6 @@ impl HhApp {
         let terminal_accent = self.terminal_accent(active).as_rgb();
         let metrics = self.terminal_metrics(active);
         let screen = self.session.screens.get(&active);
-        let archived = self.editor.archived_views.get(&active);
         let exited = self
             .session
             .pane_states
@@ -434,63 +430,34 @@ impl HhApp {
             .and_then(|source| split_target_for_drag(source, panes, active));
         let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
         let tab_pane_ids = pane_ids.clone();
-        let rendered_lines = if let (Some(view), Some(screen)) = (archived, screen) {
-            view.page
-                .lines
-                .iter()
-                .skip(view.first_line)
-                .take(usize::from(screen.rows))
-                .map(|line| plain_history_line(line))
-                .enumerate()
-                .map(|(row, line)| {
-                    self.render_terminal_line(
-                        &line,
-                        TerminalLineRender {
-                            row,
-                            cursor: None,
-                            focused,
-                            pane_accent: terminal_accent,
-                            columns: screen.columns,
-                            selection: None,
-                        },
-                        metrics,
-                    )
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
         // Live screens use cached glyphs and one pointer surface per pane.
-        let terminal_grid = match (archived, screen) {
-            (None, Some(screen)) => Some(
-                div()
-                    .size_full()
-                    .child(TerminalGridElement {
-                        input: cx.entity(),
-                        pane_id: active,
-                        metrics,
-                        focused,
-                        pane_accent: terminal_accent,
-                    })
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(0.0))
-                            .top(px(0.0))
-                            .size_full()
-                            .child(TerminalPointerElement {
-                                input: cx.entity(),
-                                pane_id: active,
-                                rows: screen.rows,
-                                columns: screen.columns,
-                                cell_width: metrics.cell_width,
-                                line_height: metrics.line_height,
-                            }),
-                    )
-                    .into_any_element(),
-            ),
-            _ => None,
-        };
+        let terminal_grid = screen.map(|screen| {
+            div()
+                .size_full()
+                .child(TerminalGridElement {
+                    input: cx.entity(),
+                    pane_id: active,
+                    metrics,
+                    focused,
+                    pane_accent: terminal_accent,
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .size_full()
+                        .child(TerminalPointerElement {
+                            input: cx.entity(),
+                            pane_id: active,
+                            rows: screen.rows,
+                            columns: screen.columns,
+                            cell_width: metrics.cell_width,
+                            line_height: metrics.line_height,
+                        }),
+                )
+                .into_any_element()
+        });
         div()
             .id(("terminal", element_key(active)))
             .size_full()
@@ -576,51 +543,7 @@ impl HhApp {
                     .text_size(px(metrics.font_size))
                     .line_height(px(metrics.line_height))
                     .text_color(rgb(THEME.foreground))
-                    .when_some(screen.filter(|_| archived.is_some()), |element, screen| {
-                        element.child(
-                            div().relative().size_full().children(rendered_lines).child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.0))
-                                    .top(px(0.0))
-                                    .size_full()
-                                    .child(TerminalPointerElement {
-                                        input: cx.entity(),
-                                        pane_id: active,
-                                        rows: screen.rows,
-                                        columns: screen.columns,
-                                        cell_width: metrics.cell_width,
-                                        line_height: metrics.line_height,
-                                    }),
-                            ),
-                        )
-                    })
                     .when_some(terminal_grid, |element, grid| element.child(grid))
-                    .when_some(archived, |element, view| {
-                        let notice = if view.page.flags.contains(HistoryPageFlags::CORRUPT) {
-                            "LOCAL HISTORY · CORRUPT CHUNK · gap preserved"
-                        } else if view.page.flags.contains(HistoryPageFlags::GAP_BEFORE)
-                            || view.page.flags.contains(HistoryPageFlags::GAP_AFTER)
-                        {
-                            "LOCAL HISTORY · archive gap · live terminal unaffected"
-                        } else {
-                            "LOCAL HISTORY · disk-backed page · scroll down for live"
-                        };
-                        element.child(
-                            div()
-                                .absolute()
-                                .top(px(3.0))
-                                .right(px(8.0))
-                                .px(px(6.0))
-                                .py(px(2.0))
-                                .rounded(px(4.0))
-                                .bg(rgb(THEME.elevated))
-                                .font_family("SF Mono")
-                                .text_xs()
-                                .text_color(rgb(THEME.muted))
-                                .child(notice),
-                        )
-                    })
                     .when(
                         focused
                             && self.editor.modal.search().is_none()
@@ -650,9 +573,7 @@ impl HhApp {
                         |element, editor| element.child(self.render_search_bar(editor)),
                     )
                     .when_some(
-                        screen
-                            .filter(|_| archived.is_none())
-                            .filter(|screen| screen.display_offset > 0),
+                        screen.filter(|screen| screen.display_offset > 0),
                         |element, screen| {
                             let jump = -i32::try_from(screen.display_offset).unwrap_or(i32::MAX);
                             element.child(
@@ -743,77 +664,6 @@ impl HhApp {
             .into_any_element()
     }
 
-    pub(crate) fn render_terminal_line(
-        &self,
-        line: &TerminalLine,
-        render: TerminalLineRender,
-        metrics: TerminalCellMetrics,
-    ) -> AnyElement {
-        let TerminalLineRender {
-            row,
-            cursor,
-            focused,
-            pane_accent,
-            columns,
-            selection,
-        } = render;
-        let mut start_column = 0_u16;
-        let styled_runs = line
-            .runs
-            .iter()
-            .map(|style| {
-                let columns = style.columns;
-                let element = self.render_terminal_run(style, metrics, start_column, columns);
-                start_column = start_column.saturating_add(columns);
-                element
-            })
-            .collect::<Vec<_>>();
-        let cursor_column = cursor
-            .filter(|cursor| usize::from(cursor.row) == row)
-            .map(|cursor| cursor.column);
-        div()
-            .relative()
-            .h(px(metrics.line_height))
-            .flex_none()
-            .overflow_hidden()
-            .when_some(
-                selection.and_then(|selection| selection_span(selection, row, columns)),
-                |element, (start, width)| {
-                    let span = metrics.span(start, width);
-                    element.child(
-                        div()
-                            .absolute()
-                            .left(px(span.x))
-                            .top(px(0.0))
-                            .w(px(span.width))
-                            .h(px(span.height))
-                            .bg(rgb(THEME.selection)),
-                    )
-                },
-            )
-            .children(styled_runs)
-            .when_some(cursor_column, |element, column| {
-                let cursor = metrics.span(column, 1);
-                element.child(
-                    div()
-                        .absolute()
-                        .left(px(cursor.x))
-                        .top(px(0.0))
-                        .w(px(cursor.width))
-                        .h(px(cursor.height))
-                        .rounded(px(1.0))
-                        .border_1()
-                        .border_color(if focused {
-                            rgb(pane_accent)
-                        } else {
-                            rgb(THEME.muted)
-                        })
-                        .when(focused, |cursor| cursor.bg(rgba((pane_accent << 8) | 0x30))),
-                )
-            })
-            .into_any_element()
-    }
-
     pub(crate) fn render_search_bar(&self, editor: &SearchEditor) -> AnyElement {
         div()
             .absolute()
@@ -856,70 +706,6 @@ impl HhApp {
             } else {
                 "↵ next"
             })
-            .into_any_element()
-    }
-
-    pub(crate) fn render_terminal_run(
-        &self,
-        style: &TerminalRun,
-        metrics: TerminalCellMetrics,
-        start_column: u16,
-        columns: u16,
-    ) -> AnyElement {
-        let bold = style.attributes.contains(TerminalAttributes::BOLD);
-        let dim = style.attributes.contains(TerminalAttributes::DIM);
-        let italic = style.attributes.contains(TerminalAttributes::ITALIC);
-        let underline = style.attributes.contains(TerminalAttributes::UNDERLINE);
-        let strikethrough = style.attributes.contains(TerminalAttributes::STRIKETHROUGH);
-        let foreground = THEME.terminal_color(style.foreground, bold, dim);
-        let background = THEME.terminal_color(style.background, false, false);
-        let span = metrics.span(start_column, columns);
-        let glyph_top = (metrics.baseline - metrics.ascent).max(0.0);
-        let glyph_height = metrics.ascent + metrics.descent;
-        let text = if style.text.contains('\t') {
-            terminal_run_display_text(style, start_column)
-        } else {
-            style.text.clone()
-        };
-        let text_len = text.len();
-        div()
-            .absolute()
-            .left(px(span.x))
-            .top(px(0.0))
-            .w(px(span.width))
-            .h(px(span.height))
-            .overflow_hidden()
-            .when(
-                style.background != TerminalColor::DefaultBackground,
-                |element| element.bg(rgb(background)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .top(px(glyph_top))
-                    .w_full()
-                    .h(px(glyph_height))
-                    .whitespace_nowrap()
-                    .font(self.terminal_font.font(bold, italic))
-                    .text_size(px(metrics.font_size))
-                    .line_height(px(glyph_height))
-                    .child(StyledText::new(text).with_runs(vec![TextRun {
-                        len: text_len,
-                        font: self.terminal_font.font(bold, italic),
-                        color: rgb(foreground).into(),
-                        background_color: None,
-                        underline: underline.then_some(UnderlineStyle {
-                            thickness: px(1.0),
-                            color: Some(rgb(foreground).into()),
-                            wavy: false,
-                        }),
-                        strikethrough: strikethrough.then_some(StrikethroughStyle {
-                            thickness: px(1.0),
-                            color: Some(rgb(foreground).into()),
-                        }),
-                    }])),
-            )
             .into_any_element()
     }
 

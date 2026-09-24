@@ -197,11 +197,6 @@ pub(crate) fn handle_request(
         ClientRequest::ScanTmuxSessions { .. }
         | ClientRequest::ListRemoteDirectory { .. }
         | ClientRequest::AttachTmuxSessions { .. } => handle_remote_request(sessions, request),
-        ClientRequest::GetHistoryStatus
-        | ClientRequest::SetHistorySettings { .. }
-        | ClientRequest::ClearHistory { .. }
-        | ClientRequest::LoadHistoryPage { .. }
-        | ClientRequest::SearchArchivedHistory { .. } => handle_history_request(sessions, request),
         ClientRequest::SetBotSettings { .. }
         | ClientRequest::CreateBot { .. }
         | ClientRequest::SetBotAgent { .. }
@@ -698,44 +693,6 @@ fn handle_remote_request(
             })
         }
         _ => unreachable!("remote request dispatched to the wrong handler"),
-    }
-}
-
-fn handle_history_request(
-    sessions: &SessionRegistry,
-    request: ClientRequest,
-) -> Result<ServiceResponse> {
-    match request {
-        ClientRequest::GetHistoryStatus => Ok(ServiceResponse::HistoryStatus {
-            status: sessions.history_status(),
-        }),
-        ClientRequest::SetHistorySettings { settings } => {
-            sessions.set_history_settings(settings)?;
-            Ok(ServiceResponse::HistoryStatus {
-                status: sessions.history_status(),
-            })
-        }
-        ClientRequest::ClearHistory { scope } => {
-            sessions.clear_history(scope)?;
-            Ok(ServiceResponse::HistoryStatus {
-                status: sessions.history_status(),
-            })
-        }
-        ClientRequest::LoadHistoryPage {
-            pane_id,
-            cursor,
-            direction,
-        } => Ok(ServiceResponse::HistoryPage {
-            page: sessions.load_history_page(pane_id, cursor, direction)?,
-        }),
-        ClientRequest::SearchArchivedHistory {
-            pane_id,
-            query,
-            before,
-        } => Ok(ServiceResponse::HistorySearchResult {
-            page: sessions.search_archived_history(pane_id, &query, before)?,
-        }),
-        _ => unreachable!("history request dispatched to the wrong handler"),
     }
 }
 
