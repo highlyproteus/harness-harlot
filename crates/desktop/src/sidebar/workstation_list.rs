@@ -38,7 +38,6 @@ struct TabRowEntry<'a> {
 struct WorkspaceGroupRow<'a> {
     tab_id: Uuid,
     label: &'a str,
-    project_dir: Option<&'a str>,
     tab_color: Option<AppearanceColor>,
     custom_icon: Option<&'a str>,
     panes: Vec<&'a Pane>,
@@ -319,7 +318,6 @@ impl HhApp {
                             WorkspaceGroupRow {
                                 tab_id,
                                 label,
-                                project_dir,
                                 tab_color,
                                 custom_icon,
                                 panes,
@@ -349,7 +347,6 @@ impl HhApp {
         let WorkspaceGroupRow {
             tab_id,
             label,
-            project_dir,
             tab_color,
             custom_icon,
             panes,
@@ -385,19 +382,107 @@ impl HhApp {
         });
         let group_detail_text =
             tab_color.map_or(THEME.dim, |color| readable_text_color(color.as_rgb()));
+        // A window is its ring of terminal chips, with no header row. Project
+        // folders keep a collapsible header because they hold other tabs.
+        let window_ring = !is_project;
+        let content: Vec<AnyElement> = if window_ring {
+            self.tab_layout(workspace_id, tab_id)
+                .map(|layout| self.render_pane_chip_layout(workspace_id, tab_id, layout, cx))
+                .into_iter()
+                .collect()
+        } else {
+            let mut parts = vec![
+                div()
+                    .id(("toggle-workspace-group", element_key(tab_id)))
+                    .flex_none()
+                    .w(px(12.0))
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(group_detail_text))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_group_collapsed(tab_id, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(if collapsed { "▸" } else { "▾" })
+                    .into_any_element(),
+            ];
+            parts.push(match custom_icon_path {
+                Some(path) => img(path)
+                    .flex_none()
+                    .w(px(11.0))
+                    .h(px(11.0))
+                    .object_fit(gpui::ObjectFit::Contain)
+                    .rounded(px(2.0))
+                    .into_any_element(),
+                None => div()
+                    .relative()
+                    .flex_none()
+                    .w(px(11.0))
+                    .h(px(8.0))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .top(px(2.0))
+                            .w(px(11.0))
+                            .h(px(6.0))
+                            .rounded(px(1.5))
+                            .border_1()
+                            .border_color(rgb(THEME.muted)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .top(px(0.0))
+                            .w(px(5.0))
+                            .h(px(3.0))
+                            .rounded(px(1.0))
+                            .bg(rgb(THEME.muted)),
+                    )
+                    .into_any_element(),
+            });
+            parts.push(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(group_text))
+                    .child(label.to_owned())
+                    .into_any_element(),
+            );
+            parts.push(
+                div()
+                    .flex_none()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(group_detail_text))
+                    .child(count_label)
+                    .into_any_element(),
+            );
+            parts.push(self.render_workspace_group_menu_button(tab_id, cx));
+            parts
+        };
         rows.push(
             div()
                 .id(("workspace-group", element_key(tab_id)))
                 .ml(px(group_indent))
                 .mr(px(4.0))
-                .px(px(7.0))
-                .h(px(27.0))
-                .rounded(px(4.0))
-                .border_t(if drop_above { px(2.0) } else { px(0.0) })
-                .border_b(if drop_below { px(2.0) } else { px(0.0) })
+                .when(window_ring, |element| {
+                    element.p(px(3.0)).my(px(2.0)).rounded(px(6.0)).border_1()
+                })
+                .when(!window_ring, |element| {
+                    element.px(px(7.0)).h(px(27.0)).rounded(px(4.0))
+                })
+                .when(drop_above, |element| element.border_t(px(2.0)))
+                .when(drop_below, |element| element.border_b(px(2.0)))
                 .when(drop_into, |element| element.border_1())
                 .border_color(rgb(if drop_into || drop_above || drop_below {
                     THEME.accent
+                } else if window_ring {
+                    THEME.border_strong
                 } else {
                     THEME.border
                 }))
@@ -520,87 +605,13 @@ impl HhApp {
                         cx.stop_propagation();
                     }),
                 )
-                .child(
-                    div()
-                        .id(("toggle-workspace-group", element_key(tab_id)))
-                        .flex_none()
-                        .w(px(12.0))
-                        .font_family(".SystemUIFont")
-                        .text_xs()
-                        .text_color(rgb(group_detail_text))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_group_collapsed(tab_id, cx);
-                            cx.stop_propagation();
-                        }))
-                        .child(if collapsed { "▸" } else { "▾" }),
-                )
-                .when_some(custom_icon_path.clone(), |element, path| {
-                    element.child(
-                        img(path)
-                            .flex_none()
-                            .w(px(11.0))
-                            .h(px(11.0))
-                            .object_fit(gpui::ObjectFit::Contain)
-                            .rounded(px(2.0)),
-                    )
-                })
-                .when(
-                    custom_icon_path.is_none() && project_dir.is_some(),
-                    |element| {
-                        element.child(
-                            div()
-                                .relative()
-                                .flex_none()
-                                .w(px(11.0))
-                                .h(px(8.0))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(0.0))
-                                        .top(px(2.0))
-                                        .w(px(11.0))
-                                        .h(px(6.0))
-                                        .rounded(px(1.5))
-                                        .border_1()
-                                        .border_color(rgb(THEME.muted)),
-                                )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(0.0))
-                                        .top(px(0.0))
-                                        .w(px(5.0))
-                                        .h(px(3.0))
-                                        .rounded(px(1.0))
-                                        .bg(rgb(THEME.muted)),
-                                ),
-                        )
-                    },
-                )
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .flex_1()
-                        .truncate()
-                        .font_family(".SystemUIFont")
-                        .text_xs()
-                        .text_color(rgb(group_text))
-                        .child(label.to_owned()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_family(".SystemUIFont")
-                        .text_xs()
-                        .text_color(rgb(group_detail_text))
-                        .child(count_label),
-                )
-                .child(self.render_workspace_group_menu_button(tab_id, cx))
+                .children(content)
                 .into_any_element(),
         );
-        if !collapsed && let Some(layout) = self.tab_layout(workspace_id, tab_id) {
-            // A ring holds the window's terminals, laid out like the window:
-            // side-by-side terminals share the width, stacked ones stack.
+        if is_project
+            && !collapsed
+            && let Some(layout) = self.tab_layout(workspace_id, tab_id)
+        {
             rows.push(
                 div()
                     .ml(px(pane_indent))
