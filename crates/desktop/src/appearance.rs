@@ -326,6 +326,8 @@ impl HhApp {
 
     pub(crate) fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.editor.modal = Modal::AppearanceSettings;
+        // The section list lives in the sidebar, so Settings always shows it.
+        self.sidebar.sidebar_visible = true;
         self.editor.settings_section = section;
         self.editor.color_picker = None;
         self.editor.history_editor = None;
@@ -921,7 +923,9 @@ impl HhApp {
             .into_any_element()
     }
 
-    pub(crate) fn render_appearance_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The app sidebar while Settings is open: its section list, the same
+    /// way the bell and robot swap the sidebar for their views.
+    pub(crate) fn render_sidebar_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let section = self.editor.settings_section;
         let nav = SettingsSection::ALL
             .into_iter()
@@ -930,6 +934,7 @@ impl HhApp {
                 let active = candidate == section;
                 div()
                     .id(("settings-section", index))
+                    .mx(px(6.0))
                     .px(px(10.0))
                     .py(px(7.0))
                     .rounded(px(6.0))
@@ -953,6 +958,30 @@ impl HhApp {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
+        div()
+            .min_h(px(0.0))
+            .flex_1()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(34.0))
+                    .px(px(12.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(THEME.foreground))
+                    .child("Settings"),
+            )
+            .child(div().flex().flex_col().gap(px(2.0)).children(nav))
+            .into_any_element()
+    }
+
+    pub(crate) fn render_appearance_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let section = self.editor.settings_section;
         let panel = match section {
             SettingsSection::Appearance => self.render_appearance_panel(cx),
             SettingsSection::Bots => self.render_bots_settings_panel(cx),
@@ -1016,49 +1045,26 @@ impl HhApp {
                                     .bg(rgb(THEME.elevated))
                                     .text_color(rgb(THEME.foreground))
                             })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.editor.modal = Modal::None;
-                                cx.notify();
-                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                             .child("×"),
                     ),
             )
             .child(
                 div()
+                    .id("settings-workspace-content")
                     .min_h(px(0.0))
                     .flex_1()
-                    .flex()
+                    .overflow_y_scroll()
+                    .px(px(32.0))
+                    .py(px(24.0))
                     .child(
                         div()
-                            .w(px(188.0))
-                            .flex_none()
-                            .bg(rgb(THEME.sidebar))
-                            .border_r_1()
-                            .border_color(rgb(THEME.border))
-                            .py(px(12.0))
-                            .px(px(8.0))
+                            .max_w(px(640.0))
+                            .w_full()
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
-                            .children(nav),
-                    )
-                    .child(
-                        div()
-                            .id("settings-workspace-content")
-                            .min_h(px(0.0))
-                            .flex_1()
-                            .overflow_y_scroll()
-                            .px(px(32.0))
-                            .py(px(24.0))
-                            .child(
-                                div()
-                                    .max_w(px(640.0))
-                                    .w_full()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(18.0))
-                                    .children(panel),
-                            ),
+                            .gap(px(18.0))
+                            .children(panel),
                     ),
             )
             .into_any_element()

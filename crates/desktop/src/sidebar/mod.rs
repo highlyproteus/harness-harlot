@@ -134,11 +134,20 @@ impl HhApp {
             })
             .child(self.render_sidebar_toolbar(cx))
             .child(div().h(px(1.0)).flex_none().bg(rgb(THEME.border)))
-            .child(match self.sidebar.sidebar_mode {
-                SidebarMode::Workstations => self.render_workstation_list(cx),
-                SidebarMode::Notifications => self.render_sidebar_notifications(cx),
-                SidebarMode::Bots => self.render_sidebar_bots(cx),
-            })
+            .child(
+                if matches!(
+                    self.editor.modal,
+                    crate::view_models::Modal::AppearanceSettings
+                ) {
+                    self.render_sidebar_settings(cx)
+                } else {
+                    match self.sidebar.sidebar_mode {
+                        SidebarMode::Workstations => self.render_workstation_list(cx),
+                        SidebarMode::Notifications => self.render_sidebar_notifications(cx),
+                        SidebarMode::Bots => self.render_sidebar_bots(cx),
+                    }
+                },
+            )
             .into_any_element()
     }
 
@@ -479,7 +488,11 @@ impl HhApp {
         count: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let active = self.sidebar.sidebar_mode == mode;
+        let active = self.sidebar.sidebar_mode == mode
+            && !matches!(
+                self.editor.modal,
+                crate::view_models::Modal::AppearanceSettings
+            );
         let count_label = if count > 99 {
             "99+".to_owned()
         } else {

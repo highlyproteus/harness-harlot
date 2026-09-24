@@ -154,8 +154,13 @@ impl HhApp {
         })
     }
 
+    /// The bell and robot buttons. With Settings open they close it and show
+    /// their view; otherwise a second click returns to the workstations.
     pub(crate) fn toggle_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
-        let next = if self.sidebar.sidebar_mode == mode {
+        let next = if matches!(self.editor.modal, Modal::AppearanceSettings) {
+            self.close_settings(cx);
+            mode
+        } else if self.sidebar.sidebar_mode == mode {
             SidebarMode::Workstations
         } else {
             mode
