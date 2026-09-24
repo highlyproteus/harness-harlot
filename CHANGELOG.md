@@ -58,6 +58,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   control keywords and extra panes in referenced windows during recovery.
 - Fall back to plain PTYs with a notification when managed tmux discovery fails,
   including an invalid `HH_TMUX_BINARY`; track both service-bundled assets.
+- Keep managed terminals attached when a program's output splits a multi-byte
+  character across tmux notifications; previously the pane was reported as
+  exited while its program kept running.
 
 ## [0.1.21] - 2026-09-18
 
