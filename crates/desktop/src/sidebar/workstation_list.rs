@@ -2,13 +2,15 @@
 use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     HeaderDropZone, SidebarSection, WorkstationTabEntry, abbreviate_home, click_suppression_active,
-    element_key, header_drop_zone, partition_workstation_entries, readable_text_color,
-    terminal_tab_count_label, workspace_tab_entries, workspace_terminal_tabs,
+    element_key, header_drop_zone, identity_detail, identity_label, partition_workstation_entries,
+    readable_text_color, render_terminal_profile_icon, terminal_tab_count_label,
+    workspace_tab_entries, workspace_terminal_tabs,
 };
+use crate::notifications::{ActivitySection, activity_badge, activity_section};
 use crate::view_models::{
     TabDrag, TabDropPreview, TooltipView, WorkspaceDrag, WorkspaceDropPreview,
 };
-use crate::{HhApp, THEME};
+use crate::{HhApp, THEME, pane_status_color};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -596,22 +598,141 @@ impl HhApp {
                 .into_any_element(),
         );
         if !collapsed {
-            rows.extend(panes.into_iter().map(|pane| {
-                self.render_workspace_terminal_row(
-                    pane,
-                    SidebarPaneRowContext {
-                        workspace_id,
-                        tab_id: Some(tab_id),
-                        tab_color,
-                        from_group: true,
-                        indent: pane_indent,
-                        activity: None,
-                    },
-                    cx,
-                )
-            }));
+            let chips = panes
+                .into_iter()
+                .map(|pane| self.render_group_pane_chip(workspace_id, tab_id, pane, cx))
+                .collect::<Vec<_>>();
+            rows.push(
+                div()
+                    .ml(px(pane_indent))
+                    .mr(px(4.0))
+                    .py(px(2.0))
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.0))
+                    .children(chips)
+                    .into_any_element(),
+            );
         }
         rows
+    }
+
+    /// One terminal of a window, tmux-style: a compact chip with its icon,
+    /// name, and status. Click focuses it, dragging moves it out to its own
+    /// tab, and right-click opens its tab menu.
+    fn render_group_pane_chip(
+        &self,
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        pane: &Pane,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pane_id = pane.id;
+        let title = identity_label(pane).to_owned();
+        let exited = self
+            .session
+            .pane_states
+            .get(&pane_id)
+            .is_some_and(|state| state.exited);
+        let status_dot = if exited {
+            Some(THEME.dim)
+        } else {
+            pane_status_color(pane.status)
+        };
+        let needs_you = activity_section(pane.status, exited) == Some(ActivitySection::NeedsYou);
+        let focused = self.layout.focused_pane == Some(pane_id);
+        let border = if focused {
+            THEME.accent
+        } else if needs_you {
+            status_dot.unwrap_or(THEME.border)
+        } else {
+            THEME.border
+        };
+        let tooltip = match activity_section(pane.status, exited) {
+            Some(_) => format!(
+                "{} — {}",
+                identity_detail(pane),
+                activity_badge(pane.status, exited)
+            ),
+            None => identity_detail(pane),
+        };
+        let drag = TabDrag {
+            workspace_id,
+            tab_id,
+            pane_id: Some(pane_id),
+            from_group: true,
+            title: title.clone(),
+            position: Point::default(),
+        };
+        div()
+            .id(("group-pane-chip", element_key(pane_id)))
+            .max_w(px(150.0))
+            .h(px(22.0))
+            .px(px(6.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgb(border))
+            .when(focused, |element| element.bg(rgb(THEME.accent_soft)))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            .hover(|element| element.bg(rgb(THEME.elevated)))
+            .tooltip(move |_, cx| {
+                cx.new(|_| TooltipView {
+                    text: tooltip.clone(),
+                })
+                .into()
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if click_suppression_active(
+                    &mut this.sidebar.suppress_tab_click_until,
+                    Instant::now(),
+                ) {
+                    cx.notify();
+                    return;
+                }
+                this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+                cx.stop_propagation();
+            }))
+            .on_drag(drag, |info: &TabDrag, position, _, cx| {
+                cx.new(|_| TabDrag {
+                    position,
+                    ..info.clone()
+                })
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_tab_menu(pane_id, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(render_terminal_profile_icon(
+                pane.identity.profile,
+                THEME.muted,
+                13.0,
+            ))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(if exited { THEME.dim } else { THEME.foreground }))
+                    .child(title),
+            )
+            .when_some(status_dot, |element, color| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded_full()
+                        .bg(rgb(color)),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_workspace_group_menu_button(
