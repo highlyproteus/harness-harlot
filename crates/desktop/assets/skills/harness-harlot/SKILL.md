@@ -21,7 +21,7 @@ A bot talks with the user and delegates the actual work to worker terminals. Do 
 
 ## Terminal commands
 
-- `hh terminal list [--mine]`: workstations → tabs → terminal panes with `pane_id`, `tab_id`, titles, `profile`, `status`, `status_changed_at_ms`, `exited`, `cwd`, `owner_bot`, `owner_thread` (the bot thread pane that opened the tab) and `owner_thread_live`. `--mine` lists the workers of every thread of the calling bot. The Bots workspace is never listed.
+- `hh terminal list [--mine]`: workstations → tabs → terminal panes with `pane_id`, `tab_id`, titles, `profile`, `status`, `status_changed_at_ms`, `exited`, `cwd`, `owner_bot`, `owner_thread` (the bot thread pane that opened the tab) and `owner_thread_live`. `--mine` lists the workers of every thread of the calling bot (`owner_bot` is the bot id, `$HH_BOT_ID` in its terminals). Bots themselves are never listed.
 - `hh terminal new [--workstation ID] [--cwd DIR] [--title T] [--command CMD]`: opens a worker tab. The command is typed into the new shell once it starts.
 - `hh terminal send PANE [--text T] [--key K]... [--enter]`: writes text, then each key, then Enter. Keys: `enter`, `ctrl-c`, `ctrl-d`, `escape`, `tab`, `shift-tab`, `up`, `down`, `left`, `right`, `backspace`, `space`. Text alone is not submitted; add `--enter`.
 - `hh terminal read PANE [--lines N]`: the visible screen text (optionally only the last N lines), status and exit state.
@@ -30,7 +30,7 @@ A bot talks with the user and delegates the actual work to worker terminals. Do 
 - `hh terminal close PANE`: closes the pane and ends its process. Only close workers the user no longer needs.
 - `hh terminal rename TAB TITLE`: renames a tab.
 - `hh workstation new --cwd DIR [--title T]`: creates a workstation rooted at an existing directory.
-- `hh bot info`: the calling bot's `tab_id`, its live thread `panes` and its `active_pane`. The omp plugin also calls `hh bot report-session --session ID` to record which omp session a bot thread pane shows.
+- `hh bot info`: the calling bot's `bot_id` and `name`, the caller's `tab_id`, the bot's live thread `panes` (each thread tab can be split into several) and its `active_pane`. The omp plugin also calls `hh bot report-session --session ID` to record which omp session a bot thread pane shows.
 
 ## Browser
 

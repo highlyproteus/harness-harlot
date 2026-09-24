@@ -121,6 +121,24 @@ fn needs_you_in(layout: &PaneLayout, pane_states: &HashMap<Uuid, PaneStreamState
     }
 }
 
+/// Bot workspaces with at least one pane waiting on the user.
+pub(crate) fn bots_needing_you(
+    snapshot: &SessionSnapshot,
+    pane_states: &HashMap<Uuid, PaneStreamState>,
+) -> usize {
+    snapshot
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.is_bot())
+        .filter(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .any(|tab| needs_you_in(&tab.layout, pane_states) > 0)
+        })
+        .count()
+}
+
 impl HhApp {
     pub(crate) fn refresh_notifications(&mut self) {
         self.dispatch_with(
@@ -193,9 +211,60 @@ impl HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivitySection, activity_entries};
-    use hh_protocol::{PaneLayout, PaneStatus, PaneStreamState, SessionSnapshot};
+    use super::{ActivitySection, activity_entries, bots_needing_you};
+    use hh_protocol::{
+        PaneLayout, PaneStatus, PaneStreamState, SessionSnapshot, Tab, Workspace, WorkspaceKind,
+    };
     use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn tab_with(template: &Tab, status: PaneStatus) -> (Tab, Uuid) {
+        let mut tab = template.clone();
+        tab.id = Uuid::new_v4();
+        let PaneLayout::Leaf { pane } = &mut tab.layout else {
+            unreachable!("seeded tabs are single panes");
+        };
+        pane.id = Uuid::new_v4();
+        pane.status = status;
+        let pane_id = pane.id;
+        (tab, pane_id)
+    }
+
+    fn bot(template: &Workspace, tabs: Vec<Tab>) -> Workspace {
+        let mut bot = template.clone();
+        bot.id = Uuid::new_v4();
+        bot.kind = WorkspaceKind::Bot;
+        bot.tabs = tabs;
+        bot
+    }
+
+    #[test]
+    fn bots_needing_you_counts_bots_not_panes_and_ignores_workstations_and_exited_panes() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let workstation = snapshot.workspaces[0].clone();
+        let template = workstation.tabs[0].clone();
+        let (waiting, _) = tab_with(&template, PaneStatus::NeedsApproval);
+        let (also_waiting, _) = tab_with(&template, PaneStatus::NeedsInput);
+        let (working, _) = tab_with(&template, PaneStatus::Working);
+        let (exited_tab, exited) = tab_with(&template, PaneStatus::NeedsInput);
+        snapshot.workspaces[0].tabs = vec![tab_with(&template, PaneStatus::NeedsInput).0];
+        snapshot.workspaces.extend([
+            bot(&workstation, vec![waiting, also_waiting]),
+            bot(&workstation, vec![working]),
+            bot(&workstation, vec![exited_tab]),
+        ]);
+        let pane_states = HashMap::from([(
+            exited,
+            PaneStreamState {
+                pane_id: exited,
+                revision: 1,
+                subscribed: false,
+                dirty: false,
+                exited: true,
+            },
+        )]);
+        assert_eq!(bots_needing_you(&snapshot, &pane_states), 1);
+    }
 
     #[test]
     fn activity_groups_needs_you_running_done_newest_first_and_treats_exited_as_done() {

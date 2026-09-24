@@ -129,22 +129,21 @@ Hermes, and others) knows it is a bot and how to drive Harness Harlot with the
 its workers open by default; the home folder is only for the bot's notes. A
 custom home folder never gets an `AGENTS.md` over one that you wrote yourself.
 
-A bot is a coordinator, not a workspace. Ask it to "spin up three worktrees and
-have omp implement the plan" and it opens named worker tabs in a workstation
-(by default one titled after the bot), each running a coding agent on its task.
-Each bot's row in the Bots sidebar counts its workers and shows one chip per
-worker tab with its live status; click a chip to jump straight to that tab.
-Open the workstation to watch the workers or take over any of them yourself.
+A bot is a coordinator. Ask it to "spin up three worktrees and have omp
+implement the plan" and it opens named worker tabs in a workstation (by default
+one titled after the bot), each running a coding agent on its task. Open the
+workstation to watch the workers or take over any of them yourself.
 When a worker needs input or approval, the bot tells you what it is asking;
 answer the bot and it relays your decision to the worker.
 
-omp bots keep threads: separate conversations listed under the bot in the Bots
-sidebar, pinned first and newest next. Click ＋ on a bot for a new thread and
-click a thread to go back to it as you left it. Recent threads stay live in
-their own terminal; older ones reopen with their full history. Starting `/new`
-or `/resume` inside omp shows up as the current thread, and each thread hears
-only about the workers it opened. Right-click a thread to pin it. Bots of other
-agents keep one conversation, and ＋ restarts it.
+Each bot is its own space with thread tabs you can split and rearrange like a
+workstation: its card in the Bots sidebar looks like a workstation card, and
+each open conversation (thread) is a tab. Click ＋ on the bot's card for a new
+thread tab. omp bots list their saved threads below the open ones, pinned
+first and newest next; click one to reopen it with its full history, or
+right-click it to pin it. Up to five threads stay open; older idle ones close
+and stay saved. Starting `/new` or `/resume` inside omp shows up as that tab's
+thread, and each thread hears only about the workers it opened.
 
 omp bots load the bundled Harness Harlot plugin automatically, which also
 reports worker status changes into the bot's conversation. Claude Code and

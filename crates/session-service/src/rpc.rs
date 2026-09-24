@@ -724,16 +724,16 @@ fn handle_bots_request(
                 pane_id,
             })
         }
-        ClientRequest::SetBotAgent { tab_id, agent } => {
-            sessions.set_bot_agent(tab_id, agent)?;
+        ClientRequest::SetBotAgent { bot_id, agent } => {
+            sessions.set_bot_agent(bot_id, agent)?;
             Ok(ServiceResponse::Ack)
         }
-        ClientRequest::RestartBot { tab_id } => {
-            sessions.restart_bot(tab_id)?;
+        ClientRequest::RestartBot { bot_id } => {
+            sessions.restart_bot(bot_id)?;
             Ok(ServiceResponse::Ack)
         }
-        ClientRequest::SetBotHome { tab_id, home } => {
-            sessions.set_bot_home(tab_id, home)?;
+        ClientRequest::SetBotHome { bot_id, home } => {
+            sessions.set_bot_home(bot_id, home)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::CreateWorker {
@@ -756,19 +756,19 @@ fn handle_bots_request(
                 pane_id,
             })
         }
-        ClientRequest::ListBotThreads { tab_id } => Ok(ServiceResponse::BotThreads {
-            threads: sessions.list_bot_threads(tab_id)?,
+        ClientRequest::ListBotThreads { bot_id } => Ok(ServiceResponse::BotThreads {
+            threads: sessions.list_bot_threads(bot_id)?,
         }),
-        ClientRequest::OpenBotThread { tab_id, thread_id } => {
-            sessions.open_bot_thread(tab_id, thread_id.as_deref())?;
-            Ok(ServiceResponse::Ack)
+        ClientRequest::OpenBotThread { bot_id, thread_id } => {
+            let (tab_id, pane_id) = sessions.open_bot_thread(bot_id, thread_id.as_deref())?;
+            Ok(ServiceResponse::BotThreadOpened { tab_id, pane_id })
         }
         ClientRequest::SetBotThreadPinned {
-            tab_id,
+            bot_id,
             thread_id,
             pinned,
         } => {
-            sessions.set_bot_thread_pinned(tab_id, &thread_id, pinned)?;
+            sessions.set_bot_thread_pinned(bot_id, &thread_id, pinned)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::ReportBotSession {

@@ -209,7 +209,6 @@ mod tests {
         let tmux_pane = Uuid::from_u128(0x77);
         workspace.tabs.push(hh_protocol::Tab {
             owner_thread: None,
-            bot: None,
             owner_bot: None,
 
             id: Uuid::from_u128(0x88),

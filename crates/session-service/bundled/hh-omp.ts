@@ -54,7 +54,7 @@ type WorkerTab = {
   panes: WorkerPane[];
 };
 type Workstation = { workstation_id: string; title: string; tabs: WorkerTab[] };
-type BotInfo = { tab_id: string; active_pane: string };
+type BotInfo = { bot_id: string; active_pane: string | null };
 
 /** Worker states the watcher reports. `busy` covers working and idle. */
 type Category = "busy" | "needs-you" | "done" | "exited";
@@ -399,9 +399,9 @@ export default function harnessHarlot(pi: ExtensionAPI): void {
     },
   });
 
-  // Only bot terminals carry HH_BOT_TAB_ID; the CLI resolves the bot pane from
+  // Only bot terminals carry HH_BOT_ID; the CLI resolves the bot pane from
   // HH_PANE_ID.
-  if (!process.env.HH_BOT_TAB_ID) return;
+  if (!process.env.HH_BOT_ID) return;
   const ownPane = process.env.HH_PANE_ID;
 
   // ----------------------------------------------------------- thread session

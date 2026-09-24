@@ -238,7 +238,10 @@ impl HhApp {
                 .filter(|tab| tab.parent_tab.is_none())
                 .map(|tab| (tab.id, tab.pinned))
         });
-        let workspace_id = self.workspace_id_for_pane(pane_id);
+        // Bot threads get no generic browser/gallery siblings.
+        let workspace_id = self
+            .workspace_id_for_pane(pane_id)
+            .filter(|workspace_id| !self.workspace_is_bot(*workspace_id));
         anchored_menu(
             menu.position,
             div()
@@ -477,7 +480,7 @@ impl HhApp {
                         this.begin_bot_creation(cx);
                     }),
                 ];
-                // Tab items target the shown workstation, never the Bots workspace.
+                // Tab items target the shown workstation, never a bot.
                 if self.active_workstation().is_some() {
                     items.push(self.create_menu_item(
                         "create-new-tab",
@@ -569,6 +572,9 @@ impl HhApp {
         let is_project = metadata.is_some_and(|metadata| metadata.1);
         let has_parent = metadata.is_some_and(|metadata| metadata.2);
         let pinned = metadata.is_some_and(|metadata| metadata.3);
+        // A bot's tabs hold threads only: no generic panes or groups.
+        let creatable =
+            workspace_id.is_none_or(|workspace_id| !self.workspace_is_bot(workspace_id));
         let inline_color_picker = self
             .editor
             .color_picker
@@ -589,12 +595,14 @@ impl HhApp {
                 .border_color(rgb(THEME.border_strong))
                 .shadow_lg()
                 .occlude()
-                .child(self.create_menu_item(
-                    ("new-group-terminal", element_key(tab_id)),
-                    "New terminal in group",
-                    cx,
-                    move |this, cx| this.new_group_terminal(tab_id, cx),
-                ))
+                .when(creatable, |element| {
+                    element.child(self.create_menu_item(
+                        ("new-group-terminal", element_key(tab_id)),
+                        "New terminal in group",
+                        cx,
+                        move |this, cx| this.new_group_terminal(tab_id, cx),
+                    ))
+                })
                 .when(!has_parent, |element| {
                     element.child(
                         div()
@@ -614,7 +622,7 @@ impl HhApp {
                             .child(if pinned { "Unpin" } else { "Pin to top" }),
                     )
                 })
-                .when(browser_command_available(), |element| {
+                .when(creatable && browser_command_available(), |element| {
                     element.child(self.create_menu_item(
                         ("new-browser-in-group", element_key(tab_id)),
                         "New Browser",
@@ -622,12 +630,14 @@ impl HhApp {
                         move |this, cx| this.new_group_browser(tab_id, cx),
                     ))
                 })
-                .child(self.create_menu_item(
-                    ("new-gallery-in-group", element_key(tab_id)),
-                    "New Gallery",
-                    cx,
-                    move |this, cx| this.new_group_gallery(tab_id, cx),
-                ))
+                .when(creatable, |element| {
+                    element.child(self.create_menu_item(
+                        ("new-gallery-in-group", element_key(tab_id)),
+                        "New Gallery",
+                        cx,
+                        move |this, cx| this.new_group_gallery(tab_id, cx),
+                    ))
+                })
                 .when_some(
                     workspace_id.filter(|_| is_project && !has_parent),
                     |element, workspace_id| {

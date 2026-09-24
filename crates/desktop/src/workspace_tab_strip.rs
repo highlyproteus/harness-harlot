@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use crate::helpers::{
     IDENTITY_MARK_SIZE, WorkspaceTabScope, click_suppression_active, collect_terminal_tabs,
-    composite_rgb, element_key, identity_label, workspace_strip_active_tab,
-    workspace_tab_focus_target, workspace_tab_set, workspace_tab_standalone_pane,
+    composite_rgb, element_key, workspace_strip_active_tab, workspace_tab_focus_target,
+    workspace_tab_set, workspace_tab_standalone_pane,
 };
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
@@ -36,6 +36,7 @@ impl HhApp {
             WorkspaceTabScope::Project(project_id) => Some(project_id),
         };
         let active_tab = workspace_strip_active_tab(workspace, scope, self.layout.focused_pane);
+        let bot = workspace.is_bot();
         let tabs = tab_set
             .tabs
             .into_iter()
@@ -45,14 +46,7 @@ impl HhApp {
                 let active = active_tab == Some(tab.id);
                 let standalone_pane = workspace_tab_standalone_pane(tab);
                 let is_standalone = standalone_pane.is_some();
-                let label = standalone_pane.map_or_else(
-                    || {
-                        tab.custom_title
-                            .clone()
-                            .unwrap_or_else(|| tab.title.clone())
-                    },
-                    |pane| identity_label(pane).to_owned(),
-                );
+                let label = self.tab_label(tab);
                 let icon = if let Some(pane) = standalone_pane {
                     let accent = pane
                         .color
@@ -346,13 +340,22 @@ impl HhApp {
                             .bg(rgb(THEME.elevated))
                             .text_color(rgb(THEME.foreground))
                     })
-                    .tooltip(|_, cx| {
+                    .tooltip(move |_, cx| {
                         cx.new(|_| TooltipView {
-                            text: "Add project, terminal, browser, or group".to_owned(),
+                            text: if bot {
+                                "New thread".to_owned()
+                            } else {
+                                "Add project, terminal, browser, or group".to_owned()
+                            },
                         })
                         .into()
                     })
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        // A bot's tabs are its threads; ＋ starts one.
+                        if bot {
+                            this.open_bot_thread(workspace_id, None, cx);
+                            return;
+                        }
                         this.editor.modal = Modal::CreateMenu(CreateMenu {
                             position: event.position(),
                             target: CreateMenuTarget::TabStrip {

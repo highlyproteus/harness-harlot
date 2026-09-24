@@ -120,7 +120,7 @@ impl HhApp {
                 snapshot
                     .workspaces
                     .iter()
-                    .filter(|workspace| !workspace.is_bots())
+                    .filter(|workspace| !workspace.is_bot())
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -396,6 +396,7 @@ impl HhApp {
                 workspace_id,
                 value: workspace.title.clone(),
                 replace_on_type: true,
+                bot: workspace.is_bot(),
             });
             cx.notify();
         }
@@ -987,6 +988,7 @@ impl HhApp {
                 workspace_id,
                 title: workspace.title.clone(),
                 active_terminal_count: workspace.active_terminal_count,
+                bot: workspace.is_bot(),
             });
             cx.notify();
         }

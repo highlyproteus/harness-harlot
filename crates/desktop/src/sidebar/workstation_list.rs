@@ -2,7 +2,7 @@
 use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     HeaderDropZone, SidebarSection, WorkstationTabEntry, abbreviate_home, click_suppression_active,
-    element_key, header_drop_zone, identity_detail, identity_label, partition_workstation_entries,
+    element_key, header_drop_zone, identity_detail, partition_workstation_entries,
     readable_text_color, render_terminal_profile_icon, terminal_tab_count_label,
     workspace_tab_entries, workspace_terminal_tabs,
 };
@@ -18,7 +18,7 @@ use gpui::{
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{
-    AppearanceColor, Pane, PaneLayout, SplitAxis, Workspace, WorkspaceConnection,
+    AppearanceColor, Pane, PaneLayout, SplitAxis, TerminalProfile, Workspace, WorkspaceConnection,
     WorkspaceConnectionStatus,
 };
 use std::time::Instant;
@@ -99,6 +99,8 @@ struct WorkspaceSectionCtx {
     custom_icon: Option<String>,
     drop_above: bool,
     drop_below: bool,
+    /// A bot card: its agent replaces the workstation number.
+    bot: Option<TerminalProfile>,
 }
 
 impl HhApp {
@@ -112,7 +114,7 @@ impl HhApp {
                 snapshot
                     .workspaces
                     .iter()
-                    .filter(|workspace| !workspace.is_bots())
+                    .filter(|workspace| !workspace.is_bot())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -209,7 +211,12 @@ impl HhApp {
             custom_icon: workspace.custom_icon.clone(),
             drop_above,
             drop_below,
+            bot: workspace.bot.as_ref().map(|bot| bot.agent),
         };
+        let saved_threads = ctx
+            .bot
+            .filter(|_| expanded)
+            .and_then(|agent| self.render_saved_thread_rows(workspace_id, agent, cx));
         div()
             .child(
                 div()
@@ -221,7 +228,9 @@ impl HhApp {
                     .gap(px(2.0))
                     .child(self.render_workspace_card_header(&ctx, drag, cx))
                     .when(expanded, |element| {
-                        if terminal_count == 0 {
+                        if terminal_count == 0 && ctx.bot.is_some() {
+                            element
+                        } else if terminal_count == 0 {
                             element.child(
                                 div()
                                     .ml(px(28.0))
@@ -235,7 +244,8 @@ impl HhApp {
                         } else {
                             element.children(self.render_workspace_tab_rows(&ctx, tab_entries, cx))
                         }
-                    }),
+                    })
+                    .children(saved_threads),
             )
             .into_any_element()
     }
@@ -710,7 +720,7 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pane_id = pane.id;
-        let title = identity_label(pane).to_owned();
+        let title = self.pane_label(pane);
         let exited = self
             .session
             .pane_states
@@ -895,6 +905,7 @@ impl HhApp {
         let workspace_dir = ctx.workspace_dir.clone();
         let drop_above = ctx.drop_above;
         let drop_below = ctx.drop_below;
+        let bot = ctx.bot.is_some();
         div()
             .id(("workspace", element_key(workspace_id)))
             .h(px(if workspace_dir.is_some() { 42.0 } else { 31.0 }))
@@ -928,7 +939,11 @@ impl HhApp {
                         cx.notify();
                         return;
                     }
-                    this.select_workspace(workspace_id, cx);
+                    if bot {
+                        this.open_bot(workspace_id, cx);
+                    } else {
+                        this.select_workspace(workspace_id, cx);
+                    }
                 }))
             })
             .on_drag(drag, |info: &WorkspaceDrag, position, _, cx| {
@@ -983,7 +998,7 @@ impl HhApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.open_workspace_menu(workspace_id, event.position, cx);
+                    this.open_card_menu(workspace_id, bot, event.position, cx);
                     cx.stop_propagation();
                 }),
             )
@@ -1025,6 +1040,9 @@ impl HhApp {
             )
             .child(self.render_workspace_card_title(ctx))
             .child(self.render_workspace_tab_count(ctx))
+            .when(bot, |element| {
+                element.child(self.render_new_thread_button(workspace_id, cx))
+            })
             .child(self.render_workspace_menu_button(ctx, cx))
             .when(connected, |element| {
                 element
@@ -1136,7 +1154,15 @@ impl HhApp {
     }
 
     fn render_workspace_card_title(&self, ctx: &WorkspaceSectionCtx) -> AnyElement {
-        let title = format!("{}  {}", ctx.index + 1, ctx.workspace_title);
+        let title = match ctx.bot {
+            Some(_) => ctx.workspace_title.clone(),
+            None => format!("{}  {}", ctx.index + 1, ctx.workspace_title),
+        };
+        let text_color = if ctx.active || ctx.connected || ctx.offline {
+            ctx.active_text
+        } else {
+            THEME.foreground
+        };
         let icon_path = ctx
             .custom_icon
             .as_deref()
@@ -1153,6 +1179,9 @@ impl HhApp {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
+                    .when_some(ctx.bot, |element, agent| {
+                        element.child(render_terminal_profile_icon(agent, text_color, 14.0))
+                    })
                     .when_some(icon_path, |element, path| {
                         element.child(
                             img(path)
@@ -1169,11 +1198,7 @@ impl HhApp {
                             .truncate()
                             .text_sm()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(if ctx.active || ctx.connected || ctx.offline {
-                                rgb(ctx.active_text)
-                            } else {
-                                rgb(THEME.foreground)
-                            })
+                            .text_color(rgb(text_color))
                             .child(title),
                     ),
             )
@@ -1233,6 +1258,7 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let workspace_id = ctx.workspace_id;
+        let bot = ctx.bot.is_some();
         div()
             .id(("workspace-row-menu", element_key(workspace_id)))
             .flex_none()
@@ -1249,7 +1275,7 @@ impl HhApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.open_workspace_menu(workspace_id, event.position, cx);
+                    this.open_card_menu(workspace_id, bot, event.position, cx);
                     cx.stop_propagation();
                 }),
             )

@@ -1,62 +1,53 @@
-//! Bot threads: the saved omp conversations of a bot, listed under its card
-//! in the Bots sidebar. The desktop caches each bot's list and refreshes it
+//! Bot threads: each omp bot's live and saved conversations. Live threads are
+//! the panes of the bot workspace's tabs; saved ones are listed under them in
+//! the bot's sidebar card. The desktop caches each bot's list and refreshes it
 //! while Bots mode is shown.
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{Context, Pixels, Point};
-use hh_protocol::{BotThread, ClientRequest, ServiceResponse, Tab, TerminalProfile};
+use hh_protocol::{BotSpec, BotThread, ClientRequest, Pane, ServiceResponse, Tab, TerminalProfile};
 use uuid::Uuid;
 
-use super::bot_pane;
 use crate::HhApp;
-use crate::helpers::find_pane;
+use crate::helpers::{
+    WorkspaceTabScope, find_pane, identity_label, visible_panes, workspace_tab_standalone_pane,
+};
 use crate::view_models::{BotThreadMenu, Modal, SidebarMode};
 
-/// How often the expanded thread lists refresh while Bots mode is shown.
+/// How often the thread lists refresh while Bots mode is shown.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Title of a thread whose omp session has no title yet.
+pub(crate) const NEW_THREAD_TITLE: &str = "New thread";
 
 #[derive(Debug, Default)]
 pub(crate) struct BotThreadsState {
-    /// Each omp bot's threads as last listed by the service.
+    /// Each omp bot's threads as last listed by the service, by bot id.
     pub(crate) lists: HashMap<Uuid, Vec<BotThread>>,
-    /// Chevron choices; bots without one are expanded only while selected.
-    pub(crate) expanded: HashMap<Uuid, bool>,
     in_flight: HashSet<Uuid>,
     polling: bool,
-    /// Bot tabs with an `OpenBotThread` whose pane switch the main area has
-    /// not followed yet.
-    opening: HashMap<Uuid, PendingOpen>,
-}
-
-/// An `OpenBotThread` the desktop waits to see in a snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PendingOpen {
-    /// The bot's current pane when the request was sent.
-    pub(crate) from_pane: Option<Uuid>,
-    /// The snapshot revision the desktop held when the service acknowledged.
-    pub(crate) acked_at: Option<u64>,
-}
-
-impl PendingOpen {
-    /// Whether a snapshot at `revision` whose bot shows `active` reflects the
-    /// open: the pane changed, or the snapshot is newer than the ack.
-    pub(crate) fn settled(self, active: Option<Uuid>, revision: u64) -> bool {
-        active != self.from_pane || self.acked_at.is_some_and(|acked| revision > acked)
-    }
+    /// Each bot's live thread panes when its list was last requested; a
+    /// change (thread opened, closed, or evicted) refreshes the list.
+    listed_panes: HashMap<Uuid, Vec<Uuid>>,
+    /// The bot pane whose activation the service last recorded.
+    pub(crate) activated: Option<Uuid>,
 }
 
 /// Threads exist only for omp bots.
-pub(crate) fn has_threads(tab: &Tab) -> bool {
-    tab.bot
-        .as_ref()
-        .is_some_and(|bot| bot.agent == TerminalProfile::Omp)
+pub(crate) fn has_threads(bot: &BotSpec) -> bool {
+    bot.agent == TerminalProfile::Omp
 }
 
-/// Whether a bot's thread list is shown: the chevron choice, else expanded
-/// while the bot is selected.
-pub(crate) fn threads_expanded(choice: Option<bool>, selected: bool) -> bool {
-    choice.unwrap_or(selected)
+/// Saved (not live) threads: pinned first, then newest first.
+pub(crate) fn saved_threads(threads: &[BotThread]) -> Vec<&BotThread> {
+    let mut saved = threads
+        .iter()
+        .filter(|thread| thread.pane_id.is_none())
+        .collect::<Vec<_>>();
+    saved.sort_by_key(|thread| (!thread.pinned, Reverse(thread.updated_ms)));
+    saved
 }
 
 /// Compact age of a thread: `now`, `5m`, `3h`, `2d`, `3w`.
@@ -80,51 +71,63 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl HhApp {
-    /// The bot is shown in the main area.
-    pub(crate) fn bot_is_selected(&self, tab: &Tab) -> bool {
-        self.bots_workspace()
-            .is_some_and(|workspace| self.sidebar.active_workspace == Some(workspace.id))
-            && self
-                .layout
-                .focused_pane
-                .is_some_and(|pane_id| find_pane(&tab.layout, pane_id).is_some())
-    }
-
-    pub(crate) fn bot_threads_expanded(&self, tab: &Tab) -> bool {
-        has_threads(tab)
-            && threads_expanded(
-                self.bot_threads.expanded.get(&tab.id).copied(),
-                self.bot_is_selected(tab),
-            )
-    }
-
-    pub(crate) fn toggle_bot_threads(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        let Some(expanded) = self
-            .bot_tab(tab_id)
-            .map(|tab| self.bot_threads_expanded(tab))
-        else {
-            return;
-        };
-        self.bot_threads.expanded.insert(tab_id, !expanded);
-        if !expanded {
-            self.refresh_bot_threads(tab_id);
+    /// A pane's display name: a bot thread shows its omp thread title (or
+    /// "New thread"); every other pane its own title.
+    pub(crate) fn pane_label(&self, pane: &Pane) -> String {
+        match self.bot_for_pane(pane.id) {
+            Some(bot_id) => self
+                .bot_threads
+                .lists
+                .get(&bot_id)
+                .and_then(|threads| {
+                    threads
+                        .iter()
+                        .find(|thread| thread.pane_id == Some(pane.id))
+                })
+                .and_then(|thread| thread.title.clone())
+                .unwrap_or_else(|| NEW_THREAD_TITLE.to_owned()),
+            None => identity_label(pane).to_owned(),
         }
-        cx.notify();
+    }
+
+    /// A tab's display name: its rename, else its single pane's label, else
+    /// (a bot tab holding several threads) its first visible thread's title,
+    /// else the service-chosen title.
+    pub(crate) fn tab_label(&self, tab: &Tab) -> String {
+        if let Some(title) = &tab.custom_title {
+            return title.clone();
+        }
+        if let Some(pane) = workspace_tab_standalone_pane(tab) {
+            return self.pane_label(pane);
+        }
+        visible_panes(&tab.layout)
+            .first()
+            .and_then(|pane_id| find_pane(&tab.layout, *pane_id))
+            .filter(|pane| self.pane_is_bot(pane.id))
+            .map_or_else(|| tab.title.clone(), |pane| self.pane_label(pane))
     }
 
     /// Asks the service for one bot's threads unless a request is pending.
-    pub(crate) fn refresh_bot_threads(&mut self, tab_id: Uuid) {
-        if !self.bot_threads.in_flight.insert(tab_id) {
+    pub(crate) fn refresh_bot_threads(&mut self, bot_id: Uuid) {
+        let Some(bot) = self.bot_spec(bot_id) else {
+            return;
+        };
+        if !has_threads(bot) {
+            return;
+        }
+        let panes = bot.thread_panes.keys().copied().collect();
+        self.bot_threads.listed_panes.insert(bot_id, panes);
+        if !self.bot_threads.in_flight.insert(bot_id) {
             return;
         }
         self.dispatch_with(
-            ClientRequest::ListBotThreads { tab_id },
+            ClientRequest::ListBotThreads { bot_id },
             Box::new(move |this, cx, result| {
-                this.bot_threads.in_flight.remove(&tab_id);
-                let exists = this.bot_tab(tab_id).is_some();
+                this.bot_threads.in_flight.remove(&bot_id);
+                let exists = this.bot_workspace(bot_id).is_some();
                 match result {
                     Ok(ServiceResponse::BotThreads { threads }) if exists => {
-                        this.bot_threads.lists.insert(tab_id, threads);
+                        this.bot_threads.lists.insert(bot_id, threads);
                     }
                     Ok(ServiceResponse::BotThreads { .. }) => {}
                     Ok(response) => this.report_unexpected(&response),
@@ -137,35 +140,44 @@ impl HhApp {
         );
     }
 
-    /// Drops state of deleted bots and refreshes every expanded omp bot.
-    fn refresh_expanded_bot_threads(&mut self) {
-        let Some(workspace) = self.bots_workspace() else {
-            return;
-        };
-        let live = workspace
-            .tabs
-            .iter()
-            .filter(|tab| has_threads(tab))
-            .map(|tab| tab.id)
-            .collect::<HashSet<_>>();
-        let expanded = workspace
-            .tabs
-            .iter()
-            .filter(|tab| self.bot_threads_expanded(tab))
-            .map(|tab| tab.id)
+    /// Drops state of deleted bots and refreshes every omp bot's threads.
+    fn refresh_all_bot_threads(&mut self) {
+        let bots = self
+            .bot_workspaces()
+            .into_iter()
+            .map(|workspace| workspace.id)
             .collect::<Vec<_>>();
         let state = &mut self.bot_threads;
-        state.lists.retain(|tab_id, _| live.contains(tab_id));
-        state.expanded.retain(|tab_id, _| live.contains(tab_id));
-        state.opening.retain(|tab_id, _| live.contains(tab_id));
-        for tab_id in expanded {
-            self.refresh_bot_threads(tab_id);
+        state.lists.retain(|bot_id, _| bots.contains(bot_id));
+        state.listed_panes.retain(|bot_id, _| bots.contains(bot_id));
+        for bot_id in bots {
+            self.refresh_bot_threads(bot_id);
+        }
+    }
+
+    /// After a snapshot in Bots mode: refreshes the bots whose live threads
+    /// changed since their list was requested.
+    pub(crate) fn refresh_changed_bot_threads(&mut self) {
+        if self.sidebar.sidebar_mode != SidebarMode::Bots {
+            return;
+        }
+        let changed = self
+            .bot_workspaces()
+            .into_iter()
+            .filter_map(|workspace| {
+                let bot = workspace.bot.as_ref().filter(|bot| has_threads(bot))?;
+                let listed = self.bot_threads.listed_panes.get(&workspace.id)?;
+                (!listed.iter().eq(bot.thread_panes.keys())).then_some(workspace.id)
+            })
+            .collect::<Vec<_>>();
+        for bot_id in changed {
+            self.refresh_bot_threads(bot_id);
         }
     }
 
     /// Refreshes now and every few seconds until Bots mode is left.
     pub(crate) fn start_bot_threads_refresh(&mut self, cx: &mut Context<Self>) {
-        self.refresh_expanded_bot_threads();
+        self.refresh_all_bot_threads();
         if self.bot_threads.polling {
             return;
         }
@@ -178,7 +190,7 @@ impl HhApp {
                         this.bot_threads.polling = false;
                         return false;
                     }
-                    this.refresh_expanded_bot_threads();
+                    this.refresh_all_bot_threads();
                     true
                 }) else {
                     break;
@@ -188,74 +200,29 @@ impl HhApp {
         .detach();
     }
 
-    /// Shows a bot's thread: `None` starts a new one. Non-omp bots have no
-    /// threads; a new thread restarts them fresh.
+    /// Shows a bot's thread: a saved thread id resumes it in a new tab, a
+    /// live one focuses its pane, and `None` starts a new thread tab.
     pub(crate) fn open_bot_thread(
         &mut self,
-        tab_id: Uuid,
+        bot_id: Uuid,
         thread_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.bot_tab(tab_id) else {
-            return;
-        };
-        if !has_threads(tab) {
-            self.restart_bot(tab_id, cx);
-            self.open_bot(tab_id, cx);
-            return;
-        }
-        let from_pane = bot_pane(tab).map(|pane| pane.id);
-        let live_pane = thread_id.as_deref().and_then(|thread_id| {
-            self.bot_threads
-                .lists
-                .get(&tab_id)?
-                .iter()
-                .find(|thread| thread.id == thread_id)?
-                .pane_id
-                .filter(|pane_id| find_pane(&tab.layout, *pane_id).is_some())
-        });
-        match (
-            live_pane,
-            self.bots_workspace().map(|workspace| workspace.id),
-        ) {
-            (Some(pane_id), Some(workspace_id)) => {
-                self.remember_return_workstation();
-                self.editor.modal = Modal::None;
-                self.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
-            }
-            _ => self.open_bot(tab_id, cx),
-        }
-        self.bot_threads.opening.insert(
-            tab_id,
-            PendingOpen {
-                from_pane,
-                acked_at: None,
-            },
-        );
         self.dispatch_with(
-            ClientRequest::OpenBotThread { tab_id, thread_id },
+            ClientRequest::OpenBotThread { bot_id, thread_id },
             Box::new(move |this, cx, result| {
                 match result {
-                    Ok(ServiceResponse::Ack) => {
-                        let revision = this
-                            .session
-                            .snapshot
-                            .as_ref()
-                            .map_or(0, |snapshot| snapshot.revision);
-                        if let Some(pending) = this.bot_threads.opening.get_mut(&tab_id) {
-                            pending.acked_at = Some(revision);
-                        }
+                    Ok(ServiceResponse::BotThreadOpened { tab_id, pane_id }) => {
+                        this.bot_threads.activated = Some(pane_id);
+                        this.editor.modal = Modal::None;
+                        this.sidebar.dismissed_workspace_tabs.remove(&tab_id);
+                        this.sidebar.workspace_tab_scope = WorkspaceTabScope::Workstation;
                         this.layout.last_sizes.clear();
-                        this.refresh_bot_threads(tab_id);
+                        this.focus_created_pane(bot_id, pane_id, cx);
+                        this.refresh_bot_threads(bot_id);
                     }
-                    Ok(response) => {
-                        this.bot_threads.opening.remove(&tab_id);
-                        this.report_unexpected(&response);
-                    }
-                    Err(error) => {
-                        this.bot_threads.opening.remove(&tab_id);
-                        this.report(&error);
-                    }
+                    Ok(response) => this.report_unexpected(&response),
+                    Err(error) => this.report(&error),
                 }
                 cx.notify();
             }),
@@ -263,22 +230,45 @@ impl HhApp {
         cx.notify();
     }
 
+    /// Records that the user focused a bot's thread pane, once per change of
+    /// the focused bot pane, so the service never evicts the thread in use.
+    pub(crate) fn note_bot_pane_focus(&mut self, pane_id: Uuid) {
+        if self.bot_threads.activated == Some(pane_id) {
+            return;
+        }
+        let Some(bot_id) = self.bot_for_pane(pane_id) else {
+            return;
+        };
+        self.bot_threads.activated = Some(pane_id);
+        self.dispatch_with(
+            ClientRequest::OpenBotThread {
+                bot_id,
+                thread_id: Some(format!("pane:{pane_id}")),
+            },
+            Box::new(|this, _, result| {
+                if let Err(error) = result {
+                    this.report(&error);
+                }
+            }),
+        );
+    }
+
     pub(crate) fn set_bot_thread_pinned(
         &mut self,
-        tab_id: Uuid,
+        bot_id: Uuid,
         thread_id: String,
         pinned: bool,
         cx: &mut Context<Self>,
     ) {
         self.dispatch_with(
             ClientRequest::SetBotThreadPinned {
-                tab_id,
+                bot_id,
                 thread_id,
                 pinned,
             },
             Box::new(move |this, cx, result| {
                 match result {
-                    Ok(ServiceResponse::Ack) => this.refresh_bot_threads(tab_id),
+                    Ok(ServiceResponse::Ack) => this.refresh_bot_threads(bot_id),
                     Ok(response) => this.report_unexpected(&response),
                     Err(error) => this.report(&error),
                 }
@@ -290,73 +280,26 @@ impl HhApp {
 
     pub(crate) fn open_bot_thread_menu(
         &mut self,
-        tab_id: Uuid,
+        bot_id: Uuid,
         thread: &BotThread,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         self.editor.color_picker = None;
         self.editor.modal = Modal::BotThreadMenu(BotThreadMenu {
-            tab_id,
+            bot_id,
             thread_id: thread.id.clone(),
             pinned: thread.pinned,
             position,
         });
         cx.notify();
     }
-
-    /// Follows the service's pane switch after `OpenBotThread`. Returns the
-    /// stack pane the update round should still reassert (a pending open
-    /// suppresses reasserting the bot's previous pane) and the pane to focus.
-    pub(crate) fn settle_bot_thread_open(
-        &mut self,
-        reassert: Option<Uuid>,
-    ) -> (Option<Uuid>, Option<Uuid>) {
-        if self.bot_threads.opening.is_empty() {
-            return (reassert, None);
-        }
-        let Some(workspace) = self.bots_workspace() else {
-            self.bot_threads.opening.clear();
-            return (reassert, None);
-        };
-        let showing_bots = self.sidebar.active_workspace == Some(workspace.id);
-        let revision = self
-            .session
-            .snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.revision);
-        let focused = self.layout.focused_pane;
-        let mut reassert = reassert;
-        let mut focus = None;
-        let mut settled = Vec::new();
-        for (&tab_id, &pending) in &self.bot_threads.opening {
-            let Some(tab) = workspace.tabs.iter().find(|tab| tab.id == tab_id) else {
-                settled.push(tab_id);
-                continue;
-            };
-            if reassert.is_some_and(|pane_id| find_pane(&tab.layout, pane_id).is_some()) {
-                reassert = None;
-            }
-            let active = bot_pane(tab).map(|pane| pane.id);
-            if !pending.settled(active, revision) {
-                continue;
-            }
-            settled.push(tab_id);
-            let viewing = focused.is_none_or(|pane_id| find_pane(&tab.layout, pane_id).is_some());
-            if showing_bots && viewing && active != focused {
-                focus = active;
-            }
-        }
-        for tab_id in settled {
-            self.bot_threads.opening.remove(&tab_id);
-        }
-        (reassert, focus)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingOpen, relative_time, threads_expanded};
+    use super::{relative_time, saved_threads};
+    use hh_protocol::BotThread;
     use uuid::Uuid;
 
     #[test]
@@ -379,34 +322,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn thread_lists_follow_selection_until_the_chevron_is_used() {
-        assert!(threads_expanded(None, true));
-        assert!(!threads_expanded(None, false));
-        assert!(threads_expanded(Some(true), false));
-        assert!(!threads_expanded(Some(false), true));
+    fn thread(id: &str, updated_ms: u64, pinned: bool, live: bool) -> BotThread {
+        BotThread {
+            id: id.to_owned(),
+            title: None,
+            updated_ms,
+            pinned,
+            pane_id: live.then(Uuid::new_v4),
+            tab_id: None,
+        }
     }
 
     #[test]
-    fn a_pending_open_settles_on_a_pane_switch_or_a_newer_snapshot() {
-        let (old, new) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        let in_flight = PendingOpen {
-            from_pane: Some(old),
-            acked_at: None,
-        };
-        assert!(
-            !in_flight.settled(Some(old), 99),
-            "a stale snapshot before the ack does not settle"
-        );
-        assert!(in_flight.settled(Some(new), 1));
-        let acked = PendingOpen {
-            acked_at: Some(7),
-            ..in_flight
-        };
-        assert!(!acked.settled(Some(old), 7));
-        assert!(
-            acked.settled(Some(old), 8),
-            "reopening the current thread settles once a newer snapshot lands"
-        );
+    fn saved_threads_exclude_live_ones_and_put_pinned_then_newest_first() {
+        let threads = [
+            thread("old", 10, false, false),
+            thread("live", 99, true, true),
+            thread("new", 30, false, false),
+            thread("pinned-old", 5, true, false),
+            thread("pinned-new", 20, true, false),
+        ];
+        let order = saved_threads(&threads)
+            .into_iter()
+            .map(|thread| thread.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["pinned-new", "pinned-old", "new", "old"]);
     }
 }

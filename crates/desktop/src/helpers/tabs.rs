@@ -380,7 +380,6 @@ mod tests {
         workspace.tabs = vec![
             hh_protocol::Tab {
                 owner_thread: None,
-                bot: None,
                 owner_bot: None,
 
                 id: Uuid::from_u128(10),
@@ -395,7 +394,6 @@ mod tests {
             },
             hh_protocol::Tab {
                 owner_thread: None,
-                bot: None,
                 owner_bot: None,
 
                 id: Uuid::from_u128(20),
@@ -410,7 +408,6 @@ mod tests {
             },
             hh_protocol::Tab {
                 owner_thread: None,
-                bot: None,
                 owner_bot: None,
 
                 id: Uuid::from_u128(30),
@@ -428,7 +425,6 @@ mod tests {
             },
             hh_protocol::Tab {
                 owner_thread: None,
-                bot: None,
                 owner_bot: None,
 
                 id: Uuid::from_u128(40),
@@ -494,7 +490,6 @@ mod tests {
         let make_leaf_tab =
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>| hh_protocol::Tab {
                 owner_thread: None,
-                bot: None,
                 owner_bot: None,
 
                 id: Uuid::from_u128(tab_id),
@@ -518,7 +513,6 @@ mod tests {
             make_leaf_tab(10, 1, None),
             hh_protocol::Tab {
                 owner_thread: None,
-                bot: None,
                 owner_bot: None,
 
                 id: group_id,
@@ -589,7 +583,6 @@ mod tests {
         workspace.tabs = vec![
             hh_protocol::Tab {
                 owner_thread: None,
-                bot: None,
                 owner_bot: None,
 
                 id: group_id,
@@ -607,7 +600,6 @@ mod tests {
             },
             hh_protocol::Tab {
                 owner_thread: None,
-                bot: None,
                 owner_bot: None,
 
                 id: Uuid::from_u128(40),
@@ -665,7 +657,6 @@ mod tests {
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>, parent_tab: Option<Uuid>| {
                 hh_protocol::Tab {
                     owner_thread: None,
-                    bot: None,
                     owner_bot: None,
 
                     id: Uuid::from_u128(tab_id),
@@ -743,7 +734,6 @@ mod tests {
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>, parent_tab: Option<Uuid>| {
                 hh_protocol::Tab {
                     owner_thread: None,
-                    bot: None,
                     owner_bot: None,
 
                     id: Uuid::from_u128(tab_id),
@@ -832,7 +822,6 @@ mod tests {
         };
         let mut tab = hh_protocol::Tab {
             owner_thread: None,
-            bot: None,
             owner_bot: None,
 
             id: Uuid::from_u128(10),
@@ -931,6 +920,7 @@ mod tests {
         let tmux = pane(2, "tmux $2");
         let workspace = Workspace {
             owner_bot: None,
+            bot: None,
 
             id: Uuid::nil(),
             title: "Remote".to_owned(),
@@ -947,7 +937,6 @@ mod tests {
             tabs: vec![
                 hh_protocol::Tab {
                     owner_thread: None,
-                    bot: None,
                     owner_bot: None,
 
                     id: Uuid::from_u128(10),
@@ -964,7 +953,6 @@ mod tests {
                 },
                 hh_protocol::Tab {
                     owner_thread: None,
-                    bot: None,
                     owner_bot: None,
 
                     id: Uuid::from_u128(20),

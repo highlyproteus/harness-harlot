@@ -106,8 +106,8 @@ pub(crate) fn hh_cli_path() -> Option<PathBuf> {
 }
 
 /// Environment exported to local terminal agents. Bot terminals also learn
-/// their bot tab so the Harness Harlot tools can attribute workers to it.
-pub(crate) fn agent_env(workspace_id: Uuid, bot_tab: Option<Uuid>) -> Vec<(&'static str, String)> {
+/// their bot so the Harness Harlot tools can attribute workers to it.
+pub(crate) fn agent_env(workspace_id: Uuid, bot_id: Option<Uuid>) -> Vec<(&'static str, String)> {
     let mut env = vec![(hh_protocol::WORKSPACE_ID_ENV, workspace_id.to_string())];
     if let Ok(path) = hh_protocol::socket_path() {
         env.push((hh_protocol::SOCKET_ENV, path.to_string_lossy().into_owned()));
@@ -122,8 +122,8 @@ pub(crate) fn agent_env(workspace_id: Uuid, bot_tab: Option<Uuid>) -> Vec<(&'sta
     if let Some(path) = hh_cli_path() {
         env.push((hh_protocol::CLI_ENV, path.to_string_lossy().into_owned()));
     }
-    if let Some(tab_id) = bot_tab {
-        env.push((crate::bots::BOT_TAB_ID_ENV, tab_id.to_string()));
+    if let Some(bot_id) = bot_id {
+        env.push((crate::bots::BOT_ID_ENV, bot_id.to_string()));
     }
     env
 }
@@ -131,11 +131,11 @@ pub(crate) fn agent_env(workspace_id: Uuid, bot_tab: Option<Uuid>) -> Vec<(&'sta
 pub(crate) fn apply_agent_env(
     command: &mut CommandBuilder,
     workspace_id: Uuid,
-    bot_tab: Option<Uuid>,
+    bot_id: Option<Uuid>,
 ) {
     command.env_remove(hh_protocol::CLI_ENV);
-    command.env_remove(crate::bots::BOT_TAB_ID_ENV);
-    for (key, value) in agent_env(workspace_id, bot_tab) {
+    command.env_remove(crate::bots::BOT_ID_ENV);
+    for (key, value) in agent_env(workspace_id, bot_id) {
         command.env(key, value);
     }
 }

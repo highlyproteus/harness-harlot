@@ -34,7 +34,7 @@ impl HhApp {
                 }
                 rows.push(section_heading(section.title()));
                 rows.extend(section_entries.map(|entry| {
-                    let bot = entry.workspace.is_bots();
+                    let bot = entry.workspace.is_bot();
                     self.render_workspace_terminal_row(
                         entry.pane,
                         SidebarPaneRowContext {
@@ -49,7 +49,7 @@ impl HhApp {
                                     .filter(|_| !entry.exited)
                                     .unwrap_or(THEME.dim),
                                 location: if bot {
-                                    "Bot".to_owned()
+                                    format!("Bot · {}", entry.workspace.title)
                                 } else {
                                     entry.workspace.title.clone()
                                 },

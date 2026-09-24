@@ -1,4 +1,5 @@
-//! Bots: the reserved Bots workspace, bot terminals, and bot-owned workers.
+//! Bots: bot workspaces, their thread terminals, and bot-owned workers.
+//! Each bot is its own `WorkspaceKind::Bot` workspace whose id is the bot id.
 use super::{
     RegistryState, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
     TerminalRuntimePane, encode_desired_state,
@@ -6,11 +7,9 @@ use super::{
 use crate::bots::{
     BotLaunch, PreparedLaunch, bot_home, bots_directory, prepare_launch, remove_bot_files,
 };
-use crate::layout::{
-    collect_pane_ids, find_pane_in_snapshot, find_pane_mut, first_layout_pane, layout_contains,
-};
+use crate::layout::{collect_pane_ids, find_pane_in_snapshot, find_pane_mut, layout_contains};
 use crate::persistence::{
-    MAX_INSTRUCTIONS_CHARS, MAX_TABS_PER_WORKSPACE, MAX_WORKSPACES, validate_title,
+    MAX_BOTS, MAX_INSTRUCTIONS_CHARS, MAX_TABS_PER_WORKSPACE, MAX_WORKSPACES, validate_title,
 };
 use crate::process::{fallback_cwd, hh_cli_path, local_spawn_dir, shell_title, valid_local_cwd};
 use crate::pty::{MAX_INPUT_FRAME, PtySession};
@@ -18,31 +17,50 @@ use crate::registry::identity::{refresh_workspace_activity, set_pane_runtime_lab
 use crate::registry::workspaces::next_workspace_order;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    BotSettings, BotSpec, BotThreadPane, MAX_PANES, NotificationKind, PaneLayout, PaneStatus,
+    BotSettings, BotSpec, BotThreadPane, MAX_PANES, NotificationKind, Pane, PaneLayout, PaneStatus,
     SessionSnapshot, Tab, TerminalProfile, Workspace, WorkspaceConnection, WorkspaceKind,
     validate_workspace_dir,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const BOTS_WORKSPACE_TITLE: &str = "Bots";
+/// Title of a thread tab; the desktop shows the thread's own title once known.
+pub(crate) const THREAD_TAB_TITLE: &str = "New thread";
 /// Longest wait for a fresh shell's first output before its command is typed.
 const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(3);
 const SHELL_READY_POLL: Duration = Duration::from_millis(20);
 
-/// The bot tab containing `pane_id`, when that pane is a bot terminal.
-pub(crate) fn bot_tab_for_pane(snapshot: &SessionSnapshot, pane_id: Uuid) -> Option<Uuid> {
+/// The bot (workspace) containing `pane_id`, when that pane is a bot thread.
+pub(crate) fn bot_for_pane(snapshot: &SessionSnapshot, pane_id: Uuid) -> Option<Uuid> {
     snapshot
         .workspaces
         .iter()
-        .filter(|workspace| workspace.is_bots())
-        .flat_map(|workspace| &workspace.tabs)
-        .find(|tab| tab.bot.is_some() && layout_contains(&tab.layout, pane_id))
-        .map(|tab| tab.id)
+        .filter(|workspace| workspace.is_bot())
+        .find(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .any(|tab| layout_contains(&tab.layout, pane_id))
+        })
+        .map(|workspace| workspace.id)
+}
+
+/// Drops the thread entries of panes no longer in their bot workspace.
+pub(crate) fn prune_bot_threads(workspace: &mut Workspace) {
+    let Some(spec) = workspace.bot.as_mut() else {
+        return;
+    };
+    let mut live = Vec::new();
+    for tab in &workspace.tabs {
+        collect_pane_ids(&tab.layout, &mut live);
+    }
+    spec.thread_panes
+        .retain(|pane_id, _| live.contains(pane_id));
 }
 
 /// Clears every reference to deleted bots and removes their launch files and
@@ -62,6 +80,7 @@ pub(crate) fn forget_bots(
         for tab in &mut workspace.tabs {
             if tab.owner_bot.is_some_and(|bot| bots.contains(&bot)) {
                 tab.owner_bot = None;
+                tab.owner_thread = None;
             }
         }
     }
@@ -72,36 +91,39 @@ pub(crate) fn forget_bots(
     }
 }
 
-/// The folder a fresh shell of bot `tab_id` starts in, when it can be
+/// The folder a fresh shell of bot `bot_id` starts in, when it can be
 /// prepared; failures are logged and the caller keeps its own directory.
 pub(crate) fn bot_spawn_dir(
     snapshot: &SessionSnapshot,
     bots_dir: Option<&Path>,
-    tab_id: Uuid,
+    bot_id: Uuid,
 ) -> Option<PathBuf> {
     let spec = snapshot
         .workspaces
         .iter()
-        .flat_map(|workspace| &workspace.tabs)
-        .find(|tab| tab.id == tab_id)?
+        .find(|workspace| workspace.id == bot_id)?
         .bot
         .as_ref()?;
-    match bot_home(bots_dir?, tab_id, spec) {
+    match bot_home(bots_dir?, bot_id, spec) {
         Ok(home) => Some(home),
         Err(error) => {
-            eprintln!("could not prepare the home of bot {tab_id}: {error:#}");
+            eprintln!("could not prepare the home of bot {bot_id}: {error:#}");
             None
         }
     }
 }
 
-/// Number of regular workstations; the Bots workspace never counts.
+/// Number of regular workstations; bots never count.
 pub(crate) fn workstation_count(snapshot: &SessionSnapshot) -> usize {
     snapshot
         .workspaces
         .iter()
-        .filter(|workspace| !workspace.is_bots())
+        .filter(|workspace| !workspace.is_bot())
         .count()
+}
+
+fn bot_count(snapshot: &SessionSnapshot) -> usize {
+    snapshot.workspaces.len() - workstation_count(snapshot)
 }
 
 fn normalize_bot_name(name: Option<&str>) -> Result<Option<String>> {
@@ -146,13 +168,31 @@ fn type_when_ready(session: Arc<PtySession>, line: String) {
     }
 }
 
-/// A bot tab's identity and launch location, read under the registry lock.
+/// A new thread tab showing `pane`.
+pub(crate) fn thread_tab(tab_id: Uuid, pane: Pane) -> Tab {
+    Tab {
+        id: tab_id,
+        title: THREAD_TAB_TITLE.to_owned(),
+        custom_title: None,
+        project_dir: None,
+        color: None,
+        custom_icon: None,
+        parent_tab: None,
+        pinned: false,
+        owner_bot: None,
+        owner_thread: None,
+        layout: PaneLayout::Leaf { pane },
+    }
+}
+
+/// A bot's identity and launch location, read under the registry lock.
 pub(super) struct BotTarget {
-    pub(super) workspace_id: Uuid,
-    /// The pane the bot shows: its stack's active thread pane.
-    pub(super) active_pane: Uuid,
-    /// Every live thread pane, in layout order.
+    /// The thread the user works with: the most recently activated pane.
+    pub(super) active_pane: Option<Uuid>,
+    /// Every live thread pane, in tab and layout order.
     pub(super) panes: Vec<Uuid>,
+    /// The tab containing each live thread pane.
+    pub(super) tab_by_pane: HashMap<Uuid, Uuid>,
     pub(super) name: String,
     pub(super) project_dir: Option<String>,
     pub(super) spec: BotSpec,
@@ -166,40 +206,75 @@ impl BotTarget {
             .get(&pane_id)
             .and_then(|thread| thread.session.as_deref())
     }
+
+    fn activated_ms(&self, pane_id: Uuid) -> u64 {
+        self.spec
+            .thread_panes
+            .get(&pane_id)
+            .map_or(0, |thread| thread.activated_ms)
+    }
 }
 
 impl RegistryState {
-    pub(super) fn bot_target(&self, tab_id: Uuid) -> Result<BotTarget> {
-        let (workspace, tab) = self
+    pub(super) fn bot_target(&self, bot_id: Uuid) -> Result<BotTarget> {
+        let workspace = self
             .snapshot
             .workspaces
             .iter()
-            .filter(|workspace| workspace.is_bots())
-            .find_map(|workspace| {
-                workspace
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.id == tab_id)
-                    .map(|tab| (workspace, tab))
-            })
-            .with_context(|| format!("bot {tab_id} does not exist"))?;
-        let spec = tab
+            .find(|workspace| workspace.id == bot_id && workspace.is_bot())
+            .with_context(|| format!("bot {bot_id} does not exist"))?;
+        let spec = workspace
             .bot
             .clone()
-            .with_context(|| format!("bot {tab_id} does not exist"))?;
+            .with_context(|| format!("bot {bot_id} does not exist"))?;
         let mut panes = Vec::new();
-        collect_pane_ids(&tab.layout, &mut panes);
-        Ok(BotTarget {
-            workspace_id: workspace.id,
-            active_pane: first_layout_pane(&tab.layout),
+        let mut tab_by_pane = HashMap::new();
+        for tab in &workspace.tabs {
+            let first = panes.len();
+            collect_pane_ids(&tab.layout, &mut panes);
+            for pane_id in &panes[first..] {
+                tab_by_pane.insert(*pane_id, tab.id);
+            }
+        }
+        let mut target = BotTarget {
+            active_pane: None,
             panes,
-            name: tab
-                .custom_title
-                .clone()
-                .unwrap_or_else(|| tab.title.clone()),
-            project_dir: tab.project_dir.clone(),
+            tab_by_pane,
+            name: workspace.title.clone(),
+            project_dir: workspace.working_dir.clone(),
             spec,
-        })
+        };
+        target.active_pane = target
+            .panes
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, pane_id)| (target.activated_ms(**pane_id), Reverse(*index)))
+            .map(|(_, pane_id)| *pane_id);
+        Ok(target)
+    }
+
+    pub(super) fn bot_workspace_mut(&mut self, bot_id: Uuid) -> Result<&mut Workspace> {
+        self.snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == bot_id && workspace.bot.is_some())
+            .with_context(|| format!("bot {bot_id} does not exist"))
+    }
+
+    pub(super) fn bot_spec_mut(&mut self, bot_id: Uuid) -> Result<&mut BotSpec> {
+        self.bot_workspace_mut(bot_id)?
+            .bot
+            .as_mut()
+            .with_context(|| format!("bot {bot_id} does not exist"))
+    }
+
+    /// Refuses generic pane or tab creation next to `pane_id` in a bot:
+    /// threads are only added through `OpenBotThread`.
+    pub(crate) fn refuse_bot_pane(&self, pane_id: Uuid) -> Result<()> {
+        if bot_for_pane(&self.snapshot, pane_id).is_some() {
+            bail!("a bot only holds its threads; open a new thread instead");
+        }
+        Ok(())
     }
 }
 
@@ -216,8 +291,8 @@ impl SessionRegistry {
         written
     }
 
-    /// Creates a bot tab in the Bots workspace and types its agent's launch
-    /// command into the new shell. Returns `(workspace_id, tab_id, pane_id)`.
+    /// Creates a bot workspace with one thread tab and types its agent's
+    /// launch command into the new shell. Returns `(bot_id, tab_id, pane_id)`.
     pub fn create_bot(
         &self,
         name: Option<&str>,
@@ -229,6 +304,7 @@ impl SessionRegistry {
         if let Some(dir) = working_dir.as_deref() {
             validate_workspace_dir(dir).map_err(anyhow::Error::from)?;
         }
+        let bot_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let spec = BotSpec {
@@ -244,48 +320,37 @@ impl SessionRegistry {
                 },
             )]),
         };
-        let launch =
-            self.prepare_bot_launch(tab_id, &title, working_dir.as_deref(), &spec, None)?;
-        if self.state.read().panes.len() >= MAX_PANES {
-            bail!("pane limit of {MAX_PANES} reached");
+        {
+            let state = self.state.read();
+            if bot_count(&state.snapshot) >= MAX_BOTS {
+                bail!("bot limit of {MAX_BOTS} reached");
+            }
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
+            }
         }
-        let workspace_id = self.ensure_bots_workspace()?;
+        let launch =
+            self.prepare_bot_launch(bot_id, &title, working_dir.as_deref(), &spec, None)?;
         let cwd = launch.home.clone();
-        let session = self.spawn_local_transport(pane_id, workspace_id, Some(tab_id), &cwd)?;
+        let session = self.spawn_local_transport(pane_id, bot_id, Some(bot_id), &cwd)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
+            if bot_count(&state.snapshot) >= MAX_BOTS {
+                bail!("bot limit of {MAX_BOTS} reached");
+            }
             let previous = state.snapshot.clone();
             let mut pane = state.new_pane(pane_id, Some(cwd.as_path()));
-            pane.title.clone_from(&title);
-            pane.custom_title = Some(title.clone());
             pane.profile_override = Some(agent);
-            let workspace = state
-                .snapshot
-                .workspaces
-                .iter_mut()
-                .find(|workspace| workspace.id == workspace_id)
-                .context("the Bots workspace disappeared")?;
-            if workspace.tabs.len() >= MAX_TABS_PER_WORKSPACE {
-                bail!("bot limit of {MAX_TABS_PER_WORKSPACE} reached");
-            }
-            workspace.tabs.push(Tab {
-                owner_thread: None,
-                id: tab_id,
-                title,
-                custom_title: None,
-                project_dir: working_dir,
-                color: None,
-                custom_icon: None,
-                parent_tab: None,
-                pinned: false,
-                bot: Some(spec),
-                owner_bot: None,
-                layout: PaneLayout::Leaf { pane },
-            });
-            workspace.active_terminal_count = workspace.active_terminal_count.saturating_add(1);
+            let order = next_workspace_order(&state.snapshot.workspaces, false);
+            let mut workspace = empty_local_workspace(bot_id, title, order, WorkspaceKind::Bot);
+            workspace.working_dir = working_dir;
+            workspace.bot = Some(spec);
+            workspace.active_terminal_count = 1;
+            workspace.tabs.push(thread_tab(tab_id, pane));
+            state.snapshot.workspaces.push(workspace);
             state.panes.insert(
                 pane_id,
                 local_terminal_runtime(Arc::clone(&session), cwd.clone()),
@@ -296,19 +361,20 @@ impl SessionRegistry {
             let _ = session.terminate_and_wait();
             return Err(error);
         }
-        self.start_bot_agent(tab_id, session, launch);
-        Ok((workspace_id, tab_id, pane_id))
+        self.start_bot_agent(bot_id, session, launch);
+        Ok((bot_id, tab_id, pane_id))
     }
 
-    /// Switches a bot to another agent. A changed agent collapses the bot to
-    /// its active pane with a fresh conversation; the same agent restarts it.
-    pub fn set_bot_agent(&self, tab_id: Uuid, agent: TerminalProfile) -> Result<()> {
-        let target = self.state.read().bot_target(tab_id)?;
+    /// Switches a bot to another agent. A changed agent closes every thread
+    /// but the active one, which restarts with a fresh conversation; the same
+    /// agent restarts the active thread.
+    pub fn set_bot_agent(&self, bot_id: Uuid, agent: TerminalProfile) -> Result<()> {
+        let target = self.state.read().bot_target(bot_id)?;
         if target.spec.agent == agent {
-            return self.restart_bot(tab_id);
+            return self.restart_bot(bot_id);
         }
         for pane_id in &target.panes {
-            if *pane_id != target.active_pane {
+            if Some(*pane_id) != target.active_pane {
                 self.close_pane(*pane_id)?;
             }
         }
@@ -318,66 +384,80 @@ impl SessionRegistry {
             mut spec,
             active_pane,
             ..
-        } = self.state.read().bot_target(tab_id)?;
+        } = self.state.read().bot_target(bot_id)?;
         spec.agent = agent;
-        spec.thread_panes = BTreeMap::from([(
-            active_pane,
-            BotThreadPane {
-                session: None,
-                activated_ms: crate::now_ms(),
-            },
-        )]);
-        let launch = self.prepare_bot_launch(tab_id, &name, project_dir.as_deref(), &spec, None)?;
+        spec.thread_panes = active_pane
+            .map(|pane_id| {
+                (
+                    pane_id,
+                    BotThreadPane {
+                        session: None,
+                        activated_ms: crate::now_ms(),
+                    },
+                )
+            })
+            .into_iter()
+            .collect();
+        let launch = active_pane
+            .map(|_| self.prepare_bot_launch(bot_id, &name, project_dir.as_deref(), &spec, None))
+            .transpose()?;
         {
             let mut state = self.state.write();
             let previous = state.snapshot.clone();
-            let tab = state
-                .snapshot
-                .workspaces
-                .iter_mut()
-                .flat_map(|workspace| &mut workspace.tabs)
-                .find(|tab| tab.id == tab_id && tab.bot.is_some())
-                .with_context(|| format!("bot {tab_id} does not exist"))?;
-            tab.bot = Some(spec);
-            let pane = find_pane_mut(&mut tab.layout, active_pane)
-                .with_context(|| format!("bot {tab_id} changed while switching agents"))?;
-            pane.profile_override = Some(agent);
+            let workspace = state.bot_workspace_mut(bot_id)?;
+            workspace.bot = Some(spec);
+            if let Some(pane_id) = active_pane {
+                let pane = workspace
+                    .tabs
+                    .iter_mut()
+                    .find_map(|tab| find_pane_mut(&mut tab.layout, pane_id))
+                    .with_context(|| format!("bot {bot_id} changed while switching agents"))?;
+                pane.profile_override = Some(agent);
+            }
             self.commit_or_restore(&mut state, previous, &[])?;
         }
-        self.relaunch_bot(tab_id, active_pane, launch)
+        match (active_pane, launch) {
+            (Some(pane_id), Some(launch)) => self.relaunch_bot(bot_id, pane_id, launch),
+            _ => Ok(()),
+        }
     }
 
     /// Terminates the bot's active thread pane and launches its agent again,
-    /// resuming the pane's conversation when it is known.
-    pub fn restart_bot(&self, tab_id: Uuid) -> Result<()> {
-        let target = self.state.read().bot_target(tab_id)?;
+    /// resuming the pane's conversation when it is known. A bot without live
+    /// threads opens a new one.
+    pub fn restart_bot(&self, bot_id: Uuid) -> Result<()> {
+        let target = self.state.read().bot_target(bot_id)?;
+        let Some(active_pane) = target.active_pane else {
+            self.open_bot_thread(bot_id, None)?;
+            return Ok(());
+        };
         let launch = self.prepare_bot_launch(
-            tab_id,
+            bot_id,
             &target.name,
             target.project_dir.as_deref(),
             &target.spec,
-            target.session_of(target.active_pane),
+            target.session_of(active_pane),
         )?;
-        self.relaunch_bot(tab_id, target.active_pane, launch)
+        self.relaunch_bot(bot_id, active_pane, launch)
     }
 
     /// Moves a bot to a custom home folder, or back to its default home with
-    /// `None`, and relaunches its terminal there.
-    pub fn set_bot_home(&self, tab_id: Uuid, home: Option<String>) -> Result<()> {
+    /// `None`, and relaunches its threads there.
+    pub fn set_bot_home(&self, bot_id: Uuid, home: Option<String>) -> Result<()> {
         if let Some(home) = home.as_deref() {
             validate_workspace_dir(home).map_err(anyhow::Error::from)?;
             if !valid_local_cwd(Path::new(home)) {
                 bail!("bot home {home} is not an existing directory");
             }
         }
-        let mut target = self.state.read().bot_target(tab_id)?;
+        let mut target = self.state.read().bot_target(bot_id)?;
         target.spec.home = home;
         let launches = target
             .panes
             .iter()
             .map(|pane_id| {
                 self.prepare_bot_launch(
-                    tab_id,
+                    bot_id,
                     &target.name,
                     target.project_dir.as_deref(),
                     &target.spec,
@@ -390,18 +470,11 @@ impl SessionRegistry {
         {
             let mut state = self.state.write();
             let previous = state.snapshot.clone();
-            let tab = state
-                .snapshot
-                .workspaces
-                .iter_mut()
-                .flat_map(|workspace| &mut workspace.tabs)
-                .find(|tab| tab.id == tab_id && tab.bot.is_some())
-                .with_context(|| format!("bot {tab_id} does not exist"))?;
-            tab.bot = Some(spec);
+            state.bot_workspace_mut(bot_id)?.bot = Some(spec);
             self.commit_or_restore(&mut state, previous, &[])?;
         }
         for (pane_id, launch) in launches {
-            self.relaunch_bot(tab_id, pane_id, launch)?;
+            self.relaunch_bot(bot_id, pane_id, launch)?;
         }
         Ok(())
     }
@@ -437,7 +510,7 @@ impl SessionRegistry {
                 if find_pane_in_snapshot(&state.snapshot, pane_id).is_none() {
                     bail!("requester pane {pane_id} does not exist");
                 }
-                bot_tab_for_pane(&state.snapshot, pane_id)
+                bot_for_pane(&state.snapshot, pane_id)
             }
             None => None,
         };
@@ -513,7 +586,6 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
-                bot: None,
                 owner_bot,
                 layout: PaneLayout::Leaf { pane },
             });
@@ -547,15 +619,15 @@ impl SessionRegistry {
     /// Re-types a recovered bot pane's launch command into its fresh shell,
     /// resuming the pane's conversation when it is known. Agent discovery can
     /// take seconds, so this runs off the recovery path.
-    pub(crate) fn relaunch_recovered_bot(&self, tab_id: Uuid, pane_id: Uuid) {
+    pub(crate) fn relaunch_recovered_bot(&self, bot_id: Uuid, pane_id: Uuid) {
         let registry = self.clone();
         let spawned = thread::Builder::new()
             .name("hh-bot-relaunch".to_owned())
             .spawn(move || {
                 let launched = (|| {
-                    let target = registry.state.read().bot_target(tab_id)?;
+                    let target = registry.state.read().bot_target(bot_id)?;
                     let launch = registry.prepare_bot_launch(
-                        tab_id,
+                        bot_id,
                         &target.name,
                         target.project_dir.as_deref(),
                         &target.spec,
@@ -564,22 +636,25 @@ impl SessionRegistry {
                     Ok::<_, anyhow::Error>((registry.pane(pane_id)?, launch))
                 })();
                 match launched {
-                    Ok((session, launch)) => registry.start_bot_agent(tab_id, session, launch),
+                    Ok((session, launch)) => registry.start_bot_agent(bot_id, session, launch),
                     Err(error) => registry
-                        .notify_bot(tab_id, &format!("could not start its agent: {error:#}")),
+                        .notify_bot(bot_id, &format!("could not start its agent: {error:#}")),
                 }
             });
         if let Err(error) = spawned {
-            self.notify_bot(tab_id, &format!("could not start its agent: {error:#}"));
+            self.notify_bot(bot_id, &format!("could not start its agent: {error:#}"));
         }
     }
 
-    /// Posts a message notification on the bot's pane, prefixed with its name.
-    pub(super) fn notify_bot(&self, tab_id: Uuid, message: &str) {
+    /// Posts a message notification on the bot's active thread pane,
+    /// prefixed with its name.
+    pub(super) fn notify_bot(&self, bot_id: Uuid, message: &str) {
         let mut state = self.state.write();
-        if let Ok(target) = state.bot_target(tab_id) {
+        if let Ok(target) = state.bot_target(bot_id)
+            && let Some(pane_id) = target.active_pane
+        {
             state.append_notification(
-                target.active_pane,
+                pane_id,
                 NotificationKind::Message,
                 Some(format!("{} {message}", target.name)),
                 crate::now_ms(),
@@ -591,14 +666,14 @@ impl SessionRegistry {
     /// the user when a custom home kept its own `AGENTS.md`.
     pub(super) fn start_bot_agent(
         &self,
-        tab_id: Uuid,
+        bot_id: Uuid,
         session: Arc<PtySession>,
         launch: PreparedLaunch,
     ) {
         type_when_ready(session, launch.command);
         if !launch.context_written {
             self.notify_bot(
-                tab_id,
+                bot_id,
                 &format!(
                     "did not get its instructions: {} already has its own AGENTS.md.",
                     launch.home.display()
@@ -619,7 +694,7 @@ impl SessionRegistry {
 
     pub(super) fn prepare_bot_launch(
         &self,
-        tab_id: Uuid,
+        bot_id: Uuid,
         name: &str,
         project_dir: Option<&str>,
         spec: &BotSpec,
@@ -630,7 +705,7 @@ impl SessionRegistry {
             agents = self.coding_agents(true)?;
         }
         let bot = BotLaunch {
-            tab_id,
+            bot_id,
             name,
             project_dir,
             spec,
@@ -641,32 +716,30 @@ impl SessionRegistry {
 
     /// Terminates one bot pane's terminal, respawns the same pane in a fresh
     /// shell in the bot's home and types the launch command into it.
-    fn relaunch_bot(&self, tab_id: Uuid, pane_id: Uuid, launch: PreparedLaunch) -> Result<()> {
-        let (workspace_id, previous) = {
+    fn relaunch_bot(&self, bot_id: Uuid, pane_id: Uuid, launch: PreparedLaunch) -> Result<()> {
+        let previous = {
             let state = self.state.read();
-            let target = state.bot_target(tab_id)?;
+            let target = state.bot_target(bot_id)?;
             if !target.panes.contains(&pane_id) {
-                bail!("pane {pane_id} is not a terminal of bot {tab_id}");
+                bail!("pane {pane_id} is not a thread of bot {bot_id}");
             }
-            let previous = state
+            state
                 .panes
                 .get(&pane_id)
                 .and_then(RuntimePane::terminal)
-                .map(|terminal| Arc::clone(&terminal.session));
-            (target.workspace_id, previous)
+                .map(|terminal| Arc::clone(&terminal.session))
         };
         if let Some(previous) = previous {
             previous
                 .terminate_and_wait()
                 .context("terminate the bot terminal")?;
         }
-        let session =
-            self.spawn_local_transport(pane_id, workspace_id, Some(tab_id), &launch.home)?;
+        let session = self.spawn_local_transport(pane_id, bot_id, Some(bot_id), &launch.home)?;
         let mut state = self.state.write();
-        if !state.bot_target(tab_id)?.panes.contains(&pane_id) {
+        if !state.bot_target(bot_id)?.panes.contains(&pane_id) {
             drop(state);
             let _ = session.terminate_and_wait();
-            bail!("bot {tab_id} changed while restarting");
+            bail!("bot {bot_id} changed while restarting");
         }
         let replaced = state.panes.insert(
             pane_id,
@@ -679,32 +752,8 @@ impl SessionRegistry {
         let bytes = encode_desired_state(&state)?;
         drop(state);
         drop(replaced);
-        self.start_bot_agent(tab_id, session, launch);
+        self.start_bot_agent(bot_id, session, launch);
         self.write_snapshot(&bytes)
-    }
-
-    /// The Bots workspace, created and persisted on first use.
-    fn ensure_bots_workspace(&self) -> Result<Uuid> {
-        let mut state = self.state.write();
-        if let Some(workspace) = state
-            .snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.is_bots())
-        {
-            return Ok(workspace.id);
-        }
-        let previous = state.snapshot.clone();
-        let workspace_id = Uuid::new_v4();
-        let order = next_workspace_order(&state.snapshot.workspaces, false);
-        state.snapshot.workspaces.push(empty_local_workspace(
-            workspace_id,
-            BOTS_WORKSPACE_TITLE.to_owned(),
-            order,
-            WorkspaceKind::Bots,
-        ));
-        self.commit_or_restore(&mut state, previous, &[])?;
-        Ok(workspace_id)
     }
 
     /// The workstation a bot's workers default to: the one it owns, or a new
@@ -716,25 +765,12 @@ impl SessionRegistry {
             .snapshot
             .workspaces
             .iter()
-            .find(|workspace| !workspace.is_bots() && workspace.owner_bot == Some(bot))
+            .find(|workspace| !workspace.is_bot() && workspace.owner_bot == Some(bot))
         {
             return Ok(workspace.id);
         }
-        let (name, working_dir) = state
-            .snapshot
-            .workspaces
-            .iter()
-            .flat_map(|workspace| &workspace.tabs)
-            .find(|tab| tab.id == bot)
-            .map(|tab| {
-                (
-                    tab.custom_title
-                        .clone()
-                        .unwrap_or_else(|| tab.title.clone()),
-                    tab.project_dir.clone(),
-                )
-            })
-            .with_context(|| format!("bot {bot} does not exist"))?;
+        let target = state.bot_target(bot)?;
+        let (name, working_dir) = (target.name, target.project_dir);
         if workstation_count(&state.snapshot) >= MAX_WORKSPACES {
             bail!("workstation limit of {MAX_WORKSPACES} reached");
         }
@@ -799,6 +835,7 @@ fn empty_local_workspace(id: Uuid, title: String, order: u32, kind: WorkspaceKin
         instructions: None,
         owner_bot: None,
         custom_icon: None,
+        bot: None,
         tabs: Vec::new(),
     }
 }

@@ -375,7 +375,6 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
-                bot: None,
                 owner_bot: None,
                 layout: PaneLayout::Leaf {
                     pane: Pane {

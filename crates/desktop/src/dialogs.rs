@@ -667,6 +667,25 @@ impl HhApp {
         confirmation: &WorkspaceDeleteConfirmation,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if confirmation.bot {
+            return self.confirm_dialog(
+                div()
+                    .text_sm()
+                    .text_color(rgb(THEME.muted))
+                    .child(
+                        "This permanently removes the bot and ends its agent and its open threads.",
+                    )
+                    .into_any_element(),
+                DialogSpec {
+                    title: format!("Delete bot {}?", confirmation.title),
+                    confirm_label: "Delete bot",
+                    confirm_tone: DialogTone::Danger,
+                    confirm_id: "confirm-workspace-delete",
+                    action: DialogAction::DeleteWorkspace,
+                },
+                cx,
+            );
+        }
         let message = if confirmation.active_terminal_count == 0 {
             "This removes the saved workstation metadata from this machine. No active terminal process will be ended.".to_owned()
         } else {
@@ -703,23 +722,6 @@ impl HhApp {
         confirmation: &TabCloseConfirmation,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if confirmation.is_bot {
-            return self.confirm_dialog(
-                div()
-                    .text_sm()
-                    .text_color(rgb(THEME.muted))
-                    .child("This permanently removes the bot and ends its agent and terminal.")
-                    .into_any_element(),
-                DialogSpec {
-                    title: format!("Delete bot {}?", confirmation.title),
-                    confirm_label: "Delete bot",
-                    confirm_tone: DialogTone::Danger,
-                    confirm_id: "confirm-tab-close",
-                    action: DialogAction::CloseTab,
-                },
-                cx,
-            );
-        }
         let kind = if confirmation.is_project {
             "project"
         } else {

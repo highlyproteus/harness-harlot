@@ -33,7 +33,7 @@ pub(crate) enum AgentAction {
 pub(crate) enum BotCommand {
     /// Records the agent session the calling bot pane now shows.
     ReportSession { session: String },
-    /// The calling bot pane, its bot and the bot's live and active panes.
+    /// The calling bot pane, its bot (workspace) and the bot's live and active thread panes.
     Info,
 }
 

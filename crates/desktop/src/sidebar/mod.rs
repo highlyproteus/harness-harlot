@@ -3,8 +3,8 @@ use crate::appearance::workstation_banner_artwork;
 use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     SidebarSection, banner_fit_size, click_suppression_active, composite_rgb, element_key,
-    find_pane, identity_detail, identity_label, readable_text_color, render_bell_icon,
-    render_robot_icon, render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
+    find_pane, identity_detail, readable_text_color, render_bell_icon, render_robot_icon,
+    render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
     workstation_banner_header_height,
 };
 use crate::view_models::{
@@ -556,7 +556,8 @@ impl HhApp {
         let drag_tab_id = tab_id.filter(|_| activity.is_none());
         let selected = self.layout.focused_pane == Some(pane_id);
         let input = cx.entity();
-        let drag_title = identity_label(pane).to_owned();
+        let label = self.pane_label(pane);
+        let drag_title = label.clone();
         let drop_above = !from_group
             && tab_id.is_some_and(|tab_id| {
                 self.sidebar.tab_drop_preview.is_some_and(|preview| {
@@ -629,7 +630,7 @@ impl HhApp {
                     return;
                 }
                 if let Some(tab_id) = tab_id.filter(|_| bot_row) {
-                    this.open_bot(tab_id, cx);
+                    this.open_bot_pane(workspace_id, tab_id, pane_id, cx);
                 } else if let Some(tab_id) = tab_id {
                     this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
                 } else {
@@ -707,9 +708,10 @@ impl HhApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    match tab_id.filter(|_| bot_row) {
-                        Some(tab_id) => this.open_bot_menu(tab_id, event.position, cx),
-                        None => this.open_tab_menu(pane_id, event.position, cx),
+                    if bot_row {
+                        this.open_bot_menu(workspace_id, event.position, cx);
+                    } else {
+                        this.open_tab_menu(pane_id, event.position, cx);
                     }
                     cx.stop_propagation();
                 }),
@@ -741,7 +743,7 @@ impl HhApp {
                                 gpui::FontWeight::NORMAL
                             })
                             .text_color(rgb(row_text))
-                            .child(identity_label(pane).to_owned()),
+                            .child(label),
                     )
                     .when_some(activity.as_ref(), |element, activity| {
                         element.child(
@@ -818,7 +820,7 @@ impl HhApp {
                 snapshot
                     .workspaces
                     .iter()
-                    .filter(|workspace| !workspace.is_bots())
+                    .filter(|workspace| !workspace.is_bot())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();

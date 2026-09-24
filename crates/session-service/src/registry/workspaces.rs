@@ -125,8 +125,8 @@ impl SessionRegistry {
             .iter()
             .find(|workspace| workspace.id == workspace_id)
             .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-        if workspace.is_bots() {
-            bail!("the Bots workspace only holds bots");
+        if workspace.is_bot() {
+            bail!("a bot only holds its threads; open a new thread instead");
         }
         Ok(())
     }
@@ -274,6 +274,7 @@ impl SessionRegistry {
                 instructions: None,
                 owner_bot: None,
                 custom_icon: None,
+                bot: None,
                 tabs: vec![Tab {
                     owner_thread: None,
                     id: tab_id,
@@ -284,7 +285,6 @@ impl SessionRegistry {
                     custom_icon: None,
                     parent_tab: None,
                     pinned: false,
-                    bot: None,
                     owner_bot: None,
                     layout: PaneLayout::Leaf { pane },
                 }],
@@ -382,6 +382,7 @@ impl SessionRegistry {
             instructions: None,
             owner_bot: None,
             custom_icon: None,
+            bot: None,
             tabs: vec![Tab {
                 owner_thread: None,
                 id: ids.tab,
@@ -392,7 +393,6 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
-                bot: None,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             }],
@@ -577,28 +577,28 @@ impl SessionRegistry {
         after: bool,
     ) -> Result<()> {
         let mut state = self.state.write();
-        let source_pinned = state
+        let (source_pinned, source_kind) = state
             .snapshot
             .workspaces
             .iter()
             .find(|workspace| workspace.id == workspace_id)
-            .with_context(|| format!("workstation {workspace_id} does not exist"))?
-            .pinned;
-        let target_pinned = state
+            .map(|workspace| (workspace.pinned, workspace.kind))
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+        let (target_pinned, target_kind) = state
             .snapshot
             .workspaces
             .iter()
             .find(|workspace| workspace.id == target_workspace_id)
-            .with_context(|| format!("workstation {target_workspace_id} does not exist"))?
-            .pinned;
-        if source_pinned != target_pinned {
+            .map(|workspace| (workspace.pinned, workspace.kind))
+            .with_context(|| format!("workstation {target_workspace_id} does not exist"))?;
+        if source_pinned != target_pinned || source_kind != target_kind {
             bail!("workstations can only be reordered within the same group");
         }
         let mut ordered = state
             .snapshot
             .workspaces
             .iter()
-            .filter(|workspace| workspace.pinned == source_pinned)
+            .filter(|workspace| workspace.pinned == source_pinned && workspace.kind == source_kind)
             .map(|workspace| (workspace.id, workspace.order))
             .collect::<Vec<_>>();
         ordered.sort_by_key(|(_, order)| *order);
@@ -807,7 +807,6 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
-                bot: None,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             });
@@ -862,7 +861,7 @@ impl SessionRegistry {
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
                 .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-            if !workspace.is_bots() && workstation_count(&state.snapshot) <= 1 {
+            if !workspace.is_bot() && workstation_count(&state.snapshot) <= 1 {
                 bail!("the last workstation cannot be deleted");
             }
             let pane_ids = pane_ids_for_workspace(workspace);
@@ -902,15 +901,14 @@ impl SessionRegistry {
             .iter()
             .position(|workspace| workspace.id == workspace_id)
             .with_context(|| format!("workstation {workspace_id} disappeared while deleting"))?;
-        if !state.snapshot.workspaces[index].is_bots() && workstation_count(&state.snapshot) <= 1 {
+        if !state.snapshot.workspaces[index].is_bot() && workstation_count(&state.snapshot) <= 1 {
             bail!("the last workstation cannot be deleted");
         }
         let removed_workspace = state.snapshot.workspaces.remove(index);
         let removed_bots = removed_workspace
-            .tabs
-            .iter()
-            .filter(|tab| tab.bot.is_some())
-            .map(|tab| tab.id)
+            .is_bot()
+            .then_some(workspace_id)
+            .into_iter()
             .collect::<HashSet<_>>();
         forget_bots(
             &mut state.snapshot,

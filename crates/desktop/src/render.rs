@@ -30,7 +30,11 @@ impl HhApp {
             Modal::WorkspaceRename(editor) => Some(self.render_rename_dialog(
                 Some(("workspace-rename-input", editor.replace_on_type)),
                 format!("{}{}", editor.value, self.editor.ime_preedit),
-                "Rename workstation",
+                if editor.bot {
+                    "Rename bot"
+                } else {
+                    "Rename workstation"
+                },
                 "save-workspace-rename",
                 DialogAction::RenameWorkspace,
                 cx,
@@ -47,11 +51,7 @@ impl HhApp {
             Modal::GroupRename(editor) => Some(self.render_rename_dialog(
                 Some(("group-rename-input", editor.replace_on_type)),
                 format!("{}{}", editor.value, self.editor.ime_preedit),
-                if editor.bot {
-                    "Rename bot"
-                } else {
-                    "Rename group"
-                },
+                "Rename group",
                 "save-group-rename",
                 DialogAction::RenameTab,
                 cx,

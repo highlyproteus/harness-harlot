@@ -137,7 +137,7 @@ pub(super) struct WorkspaceMenu {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BotMenu {
-    pub(super) tab_id: Uuid,
+    pub(super) bot_id: Uuid,
     pub(super) position: Point<Pixels>,
     pub(super) agents_open: bool,
 }
@@ -145,7 +145,7 @@ pub(super) struct BotMenu {
 /// Right-click menu of one bot thread row.
 #[derive(Clone, Debug)]
 pub(super) struct BotThreadMenu {
-    pub(super) tab_id: Uuid,
+    pub(super) bot_id: Uuid,
     pub(super) thread_id: String,
     pub(super) pinned: bool,
     pub(super) position: Point<Pixels>,
@@ -229,8 +229,6 @@ pub(super) struct GroupRenameEditor {
     pub(super) tab_id: Uuid,
     pub(super) value: String,
     pub(super) replace_on_type: bool,
-    /// Renames a bot rather than a group; only the dialog copy differs.
-    pub(super) bot: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -283,7 +281,6 @@ pub(super) struct TabCloseConfirmation {
     pub(super) tab_id: Uuid,
     pub(super) title: String,
     pub(super) is_project: bool,
-    pub(super) is_bot: bool,
     pub(super) child_count: usize,
     pub(super) terminal_count: usize,
 }
@@ -293,6 +290,8 @@ pub(super) struct WorkspaceRenameEditor {
     pub(super) workspace_id: Uuid,
     pub(super) value: String,
     pub(super) replace_on_type: bool,
+    /// Renames a bot rather than a workstation; only the dialog copy differs.
+    pub(super) bot: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -300,6 +299,8 @@ pub(super) struct WorkspaceDeleteConfirmation {
     pub(super) workspace_id: Uuid,
     pub(super) title: String,
     pub(super) active_terminal_count: u32,
+    /// Deletes a bot rather than a workstation; only the dialog copy differs.
+    pub(super) bot: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::process::{fallback_cwd, shell_title, valid_local_cwd};
 use crate::pty::{PtySession, RawPaneEvent};
-use crate::registry::bots::{bot_spawn_dir, bot_tab_for_pane};
+use crate::registry::bots::{bot_for_pane, bot_spawn_dir};
 use crate::registry::identity::{
     refresh_process_metadata, refresh_runtime_metadata, set_pane_runtime_label,
 };
@@ -647,6 +647,11 @@ fn discover_managed_tmux(state_dir: &Path) -> (Option<TmuxServer>, Option<String
     }
 }
 
+/// The managed tmux session holding the windows of workspace `workspace_id`.
+fn tmux_session_name(workspace_id: Uuid) -> String {
+    format!("hh-{workspace_id}")
+}
+
 fn ensure_tmux_client(
     server: &TmuxServer,
     workspace_id: Uuid,
@@ -663,7 +668,7 @@ fn ensure_tmux_client(
             .entry(workspace_id)
             .or_insert_with(|| Arc::new(Mutex::new(HashMap::new()))),
     );
-    let client = TmuxControlClient::spawn(server, &format!("hh-{workspace_id}"), sinks)?;
+    let client = TmuxControlClient::spawn(server, &tmux_session_name(workspace_id), sinks)?;
     clients.insert(workspace_id, Arc::clone(&client));
     Ok(client)
 }
@@ -748,11 +753,11 @@ impl SessionRegistry {
             }
             let workspace_id = workspace_id_for_pane(&recovered.snapshot, pane_id)
                 .context("recovered pane has no workspace")?;
-            let bot_tab = bot_tab_for_pane(&recovered.snapshot, pane_id);
+            let bot_id = bot_for_pane(&recovered.snapshot, pane_id);
             let mut reattached = false;
             let saved_cwd = recovered.cwd_by_pane.remove(&pane_id);
-            let cwd = bot_tab
-                .and_then(|tab| bot_spawn_dir(&recovered.snapshot, Some(&bots_dir), tab))
+            let cwd = bot_id
+                .and_then(|bot| bot_spawn_dir(&recovered.snapshot, Some(&bots_dir), bot))
                 .or_else(|| saved_cwd.filter(|cwd| valid_local_cwd(cwd)))
                 .unwrap_or_else(|| fallback.clone());
             let managed =
@@ -762,6 +767,14 @@ impl SessionRegistry {
                             if let Some((window_id, tmux_pane_id)) =
                                 recovered.tmux_by_pane.remove(&pane_id)
                             {
+                                if recovered.legacy_tmux_workspace.contains_key(&pane_id) {
+                                    // A migrated bot thread: its window still
+                                    // lives in the retired Bots session.
+                                    let _ = client.move_window_to_session(
+                                        &window_id,
+                                        &tmux_session_name(workspace_id),
+                                    );
+                                }
                                 let existing = client.list_panes()?.into_iter().find(
                                     |(window, pane, _, _)| {
                                         window == &window_id && pane == &tmux_pane_id
@@ -778,7 +791,7 @@ impl SessionRegistry {
                                     );
                                 }
                             }
-                            PtySession::spawn_tmux(pane_id, workspace_id, bot_tab, &cwd, &client)
+                            PtySession::spawn_tmux(pane_id, workspace_id, bot_id, &cwd, &client)
                         })
                 });
             let reattached = reattached && matches!(managed, Some(Ok(_)));
@@ -786,14 +799,14 @@ impl SessionRegistry {
                 Some(Ok(session)) => Ok(session),
                 Some(Err(error)) => {
                     tmux_failures.push((pane_id, format!("{error:#}")));
-                    PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd)
+                    PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)
                 }
-                None => PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd),
+                None => PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd),
             };
             match session {
                 Ok(session) => {
-                    if let Some(tab_id) = bot_tab.filter(|_| !reattached) {
-                        fresh_bot_panes.push((tab_id, pane_id));
+                    if let Some(bot_id) = bot_id.filter(|_| !reattached) {
+                        fresh_bot_panes.push((bot_id, pane_id));
                     }
                     panes.insert(
                         pane_id,
@@ -814,6 +827,16 @@ impl SessionRegistry {
                     terminate_runtime_panes(&panes);
                     return Err(error).context("recreate fresh shell for recovered pane");
                 }
+            }
+        }
+        let legacy_sessions = recovered
+            .legacy_tmux_workspace
+            .values()
+            .copied()
+            .collect::<HashSet<_>>();
+        if let Some(client) = tmux_clients.values().next() {
+            for legacy in legacy_sessions {
+                let _ = client.kill_named_session(&tmux_session_name(legacy));
             }
         }
         let referenced_windows = panes
@@ -893,8 +916,8 @@ impl SessionRegistry {
             browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
         };
         registry.persist()?;
-        for (tab_id, pane_id) in fresh_bot_panes {
-            registry.relaunch_recovered_bot(tab_id, pane_id);
+        for (bot_id, pane_id) in fresh_bot_panes {
+            registry.relaunch_recovered_bot(bot_id, pane_id);
         }
         Ok(registry)
     }
@@ -1168,16 +1191,16 @@ impl SessionRegistry {
         &self,
         pane_id: Uuid,
         workspace_id: Uuid,
-        bot_tab: Option<Uuid>,
+        bot_id: Option<Uuid>,
         cwd: &Path,
     ) -> Result<Arc<PtySession>> {
         if self.state.read().tmux.is_some() {
             match self.client_for_workspace(workspace_id).and_then(|client| {
-                PtySession::spawn_tmux(pane_id, workspace_id, bot_tab, cwd, &client)
+                PtySession::spawn_tmux(pane_id, workspace_id, bot_id, cwd, &client)
             }) {
                 Ok(session) => return Ok(session),
                 Err(error) => {
-                    let session = PtySession::spawn_local(pane_id, workspace_id, bot_tab, cwd)?;
+                    let session = PtySession::spawn_local(pane_id, workspace_id, bot_id, cwd)?;
                     append_tmux_notification(
                         &mut self.state.write(),
                         format!("tmux window could not be created; using a plain shell: {error:#}"),
@@ -1186,7 +1209,7 @@ impl SessionRegistry {
                 }
             }
         }
-        PtySession::spawn_local(pane_id, workspace_id, bot_tab, cwd)
+        PtySession::spawn_local(pane_id, workspace_id, bot_id, cwd)
     }
 
     pub(crate) fn spawn_pane_for_workspace(

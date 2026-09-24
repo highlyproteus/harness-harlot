@@ -39,7 +39,7 @@ impl HhApp {
             .map(|workspace| {
                 (
                     workspace.id,
-                    workspace.is_bots(),
+                    workspace.is_bot(),
                     workspace_tab_set(workspace, self.sidebar.workspace_tab_scope).scope,
                     workspace.tabs.is_empty(),
                 )
@@ -47,8 +47,9 @@ impl HhApp {
         else {
             return;
         };
+        // A bot's new tab is a new thread.
         if bots {
-            self.begin_bot_creation(cx);
+            self.open_bot_thread(workspace_id, None, cx);
             return;
         }
         if empty {
@@ -322,7 +323,6 @@ impl HhApp {
                 tab_id,
                 value: label,
                 replace_on_type: true,
-                bot: false,
             });
             cx.notify();
         }
@@ -403,7 +403,6 @@ impl HhApp {
                         .clone()
                         .unwrap_or_else(|| tab.title.clone()),
                     is_project: tab.project_dir.is_some(),
-                    is_bot: tab.bot.is_some(),
                     child_count,
                     terminal_count: panes.len(),
                 })

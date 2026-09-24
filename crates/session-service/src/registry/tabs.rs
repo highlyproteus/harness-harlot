@@ -11,7 +11,7 @@ use crate::layout::{
 use crate::persistence;
 use crate::persistence::{MAX_TABS_PER_WORKSPACE, validate_title};
 use crate::process::local_spawn_dir;
-use crate::registry::bots::forget_bots;
+use crate::registry::bots::prune_bot_threads;
 use crate::registry::workspaces::remember_recent_color;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -180,7 +180,6 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab,
                 pinned: false,
-                bot: None,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             };
@@ -242,13 +241,14 @@ impl SessionRegistry {
         let mut state = self.state.write();
         let now = crate::now_ms();
         let did_activate = state.snapshot.workspaces.iter_mut().any(|workspace| {
-            workspace.tabs.iter_mut().any(|tab| {
-                let activated = activate_tab(&mut tab.layout, pane_id);
-                if activated && let Some(spec) = &mut tab.bot {
-                    spec.thread_panes.entry(pane_id).or_default().activated_ms = now;
-                }
-                activated
-            })
+            let activated = workspace
+                .tabs
+                .iter_mut()
+                .any(|tab| activate_tab(&mut tab.layout, pane_id));
+            if activated && let Some(spec) = &mut workspace.bot {
+                spec.thread_panes.entry(pane_id).or_default().activated_ms = now;
+            }
+            activated
         });
         if !did_activate {
             bail!("pane tab {pane_id} does not exist");
@@ -330,6 +330,7 @@ impl SessionRegistry {
         pane_id: Uuid,
         placement: DropPlacement,
     ) -> Result<()> {
+        self.state.read().refuse_bot_pane(pane_id)?;
         let replacement_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(pane_id)?;
         let workspace_id = self.workspace_for_pane(pane_id)?;
@@ -587,7 +588,6 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: resolved_parent,
                 pinned: false,
-                bot: None,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             },
@@ -691,21 +691,11 @@ impl SessionRegistry {
                 .collect::<Vec<_>>();
             let terminal_count = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
             let workspace = &mut state.snapshot.workspaces[workspace_index];
-            let removed_bots = workspace
-                .tabs
-                .iter()
-                .filter(|tab| tab.bot.is_some() && tab_ids.contains(&tab.id))
-                .map(|tab| tab.id)
-                .collect::<HashSet<_>>();
             workspace.tabs.retain(|tab| !tab_ids.contains(&tab.id));
             workspace.active_terminal_count = workspace
                 .active_terminal_count
                 .saturating_sub(terminal_count);
-            forget_bots(
-                &mut state.snapshot,
-                &removed_bots,
-                self.bots_dir().ok().as_deref(),
-            );
+            prune_bot_threads(workspace);
             for pane_id in pane_ids {
                 state.panes.remove(&pane_id);
             }

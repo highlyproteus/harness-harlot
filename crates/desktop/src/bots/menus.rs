@@ -1,161 +1,27 @@
-//! Bot surfaces: the main-area bot view, its context menu, and the New bot
-//! agent picker.
+//! Bot menus: the bot card's context menu, a saved thread's pin menu, and
+//! the New bot agent picker.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AppContext as _, Context, InteractiveElement, IntoElement, ParentElement, Pixels,
+    AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Pixels,
     StatefulInteractiveElement, Styled, div, px, rgb,
 };
-use hh_protocol::{Tab, TerminalProfile, Workspace};
+use hh_protocol::TerminalProfile;
 
-use super::{bot_name, bot_pane};
-use crate::helpers::{element_key, find_pane, render_terminal_profile_icon};
+use crate::helpers::{element_key, render_terminal_profile_icon};
 use crate::menus::{anchored_menu, menu_separator};
-use crate::view_models::{BotMenu, BotThreadMenu, Modal, TooltipView};
-use crate::{HhApp, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
+use crate::view_models::{BotMenu, BotThreadMenu, Modal};
+use crate::{HhApp, THEME};
 
 impl HhApp {
-    /// The Bots workspace in the main area: a slim header over the selected
-    /// bot's terminal, without a tab strip.
-    pub(crate) fn render_bot_view(
-        &self,
-        workspace: &Workspace,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let tab = self
-            .layout
-            .focused_pane
-            .and_then(|pane_id| {
-                workspace
-                    .tabs
-                    .iter()
-                    .find(|tab| find_pane(&tab.layout, pane_id).is_some())
-            })
-            .or_else(|| workspace.tabs.first())
-            .filter(|tab| tab.bot.is_some());
-        let header = div()
-            .h(px(WORKSPACE_TAB_STRIP_HEIGHT))
-            .flex_none()
-            .px(px(12.0))
-            .border_b_1()
-            .border_color(rgb(THEME.border_strong))
-            .bg(rgb(THEME.surface))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .font_family(".SystemUIFont");
-        let header = match tab {
-            Some(tab) => {
-                let tab_id = tab.id;
-                let agent = tab.bot.as_ref().map(|bot| bot.agent).unwrap_or_default();
-                let home = format!("Home: {}", bot_home_label(tab));
-                header
-                    .child(render_terminal_profile_icon(agent, THEME.muted, 18.0))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child(bot_name(tab).to_owned()),
-                    )
-                    .child(
-                        div()
-                            .id(("bot-agent", element_key(tab_id)))
-                            .flex_1()
-                            .truncate()
-                            .text_xs()
-                            .text_color(rgb(THEME.dim))
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView { text: home.clone() }).into()
-                            })
-                            .child(agent.display_name()),
-                    )
-                    .child(
-                        div()
-                            .id(("restart-bot", element_key(tab_id)))
-                            .flex_none()
-                            .px(px(9.0))
-                            .py(px(3.0))
-                            .rounded(px(5.0))
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(rgb(THEME.border))
-                            .text_xs()
-                            .text_color(rgb(THEME.foreground))
-                            .hover(|element| element.border_color(rgb(THEME.accent)))
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.restart_bot(tab_id, cx)),
-                            )
-                            .child("Restart"),
-                    )
-            }
-            None => header.child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(THEME.foreground))
-                    .child("Bots"),
-            ),
-        };
-        let content = match tab.and_then(bot_pane) {
-            Some(pane) => self.render_terminal(std::slice::from_ref(pane), pane.id, false, cx),
-            None => self.render_no_bot_selected(cx),
-        };
-        div()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .h_full()
-            .flex_1()
-            .bg(rgb(THEME.terminal))
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(div().min_h(px(0.0)).flex_1().child(content))
-            .into_any_element()
-    }
-
-    fn render_no_bot_selected(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(10.0))
-            .font_family(".SystemUIFont")
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(THEME.muted))
-                    .child("Pick a bot in the sidebar, or create one."),
-            )
-            .child(
-                div()
-                    .id("empty-bots-new-bot")
-                    .px(px(16.0))
-                    .py(px(8.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .bg(rgb(THEME.accent))
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xffffff))
-                    .on_click(cx.listener(|this, _, _, cx| this.begin_bot_creation(cx)))
-                    .child("New bot"),
-            )
-            .into_any_element()
-    }
-
     pub(crate) fn render_bot_menu(
         &self,
         menu: BotMenu,
         menu_max_height: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tab_id = menu.tab_id;
-        let key = element_key(tab_id);
-        let bot = self.bot_tab(tab_id).and_then(|tab| tab.bot.as_ref());
+        let bot_id = menu.bot_id;
+        let key = element_key(bot_id);
+        let bot = self.bot_spec(bot_id);
         let current_agent = bot.map(|bot| bot.agent);
         let custom_home = bot.is_some_and(|bot| bot.home.is_some());
         let agents: Vec<AnyElement> = if !menu.agents_open {
@@ -192,7 +58,7 @@ impl HhApp {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.editor.modal = Modal::None;
                             if !current {
-                                this.set_bot_agent(tab_id, profile, cx);
+                                this.set_bot_agent(bot_id, profile, cx);
                             }
                             cx.notify();
                         }))
@@ -221,7 +87,7 @@ impl HhApp {
                     ("rename-bot-menu", key),
                     "Rename…",
                     cx,
-                    move |this, cx| this.begin_bot_rename(tab_id, cx),
+                    move |this, cx| this.begin_bot_rename(bot_id, cx),
                 ))
                 .child(
                     div()
@@ -246,13 +112,13 @@ impl HhApp {
                     ("restart-bot-menu", key),
                     "Restart",
                     cx,
-                    move |this, cx| this.restart_bot(tab_id, cx),
+                    move |this, cx| this.restart_bot(bot_id, cx),
                 ))
                 .child(self.create_menu_item(
                     ("set-bot-home-menu", key),
                     "Set home folder…",
                     cx,
-                    move |this, cx| this.begin_bot_home_edit(tab_id, cx),
+                    move |this, cx| this.begin_bot_home_edit(bot_id, cx),
                 ))
                 .when(custom_home, |element| {
                     element.child(self.create_menu_item(
@@ -261,7 +127,7 @@ impl HhApp {
                         cx,
                         move |this, cx| {
                             this.editor.modal = Modal::None;
-                            this.set_bot_home(tab_id, None, cx);
+                            this.set_bot_home(bot_id, None, cx);
                         },
                     ))
                 })
@@ -279,7 +145,7 @@ impl HhApp {
                         .text_color(rgb(THEME.danger))
                         .hover(|element| element.bg(rgb(THEME.accent_soft)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.begin_tab_close(tab_id, cx);
+                            this.begin_bot_delete(bot_id, cx);
                         }))
                         .child("Delete…"),
                 ),
@@ -292,12 +158,12 @@ impl HhApp {
         menu: &BotThreadMenu,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (tab_id, pinned) = (menu.tab_id, menu.pinned);
+        let (bot_id, pinned) = (menu.bot_id, menu.pinned);
         let thread_id = menu.thread_id.clone();
         anchored_menu(
             menu.position,
             div()
-                .id(("bot-thread-menu", element_key(tab_id)))
+                .id(("bot-thread-menu", element_key(bot_id)))
                 .w(px(180.0))
                 .py(px(5.0))
                 .rounded(px(7.0))
@@ -311,7 +177,7 @@ impl HhApp {
                     if pinned { "Unpin" } else { "Pin" },
                     cx,
                     move |this, cx| {
-                        this.set_bot_thread_pinned(tab_id, thread_id.clone(), !pinned, cx);
+                        this.set_bot_thread_pinned(bot_id, thread_id.clone(), !pinned, cx);
                     },
                 )),
         )
@@ -389,23 +255,5 @@ impl HhApp {
                     .child(profile.display_name())
             }))
             .into_any_element()
-    }
-}
-
-/// The folder a bot's terminal starts in: its custom home, else the default
-/// `<state>/bots/<tab id>`.
-fn bot_home_label(tab: &Tab) -> String {
-    match tab.bot.as_ref().and_then(|bot| bot.home.clone()) {
-        Some(home) => home,
-        None => hh_protocol::state_directory().map_or_else(
-            || "default bot folder".to_owned(),
-            |state| {
-                state
-                    .join("bots")
-                    .join(tab.id.to_string())
-                    .display()
-                    .to_string()
-            },
-        ),
     }
 }

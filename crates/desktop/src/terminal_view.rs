@@ -14,10 +14,9 @@ use crate::commands::AppCommand;
 use crate::elements::{TerminalGridElement, TerminalPointerElement};
 use crate::helpers::{
     IDENTITY_MARK_SIZE, effective_split_ratio, element_key, find_pane, identity_detail,
-    identity_label, split_child_dimensions, split_control_id, split_element_key,
-    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
-    terminal_tab_secondary_label, workspace_layout_for_focused_pane, workspace_tab_standalone_pane,
-    zoom_projection,
+    split_child_dimensions, split_control_id, split_element_key, split_placement_at,
+    split_target_for_drag, split_target_for_drag_ids, terminal_tab_secondary_label,
+    workspace_layout_for_focused_pane, workspace_tab_standalone_pane, zoom_projection,
 };
 use crate::view_models::{
     DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag, SearchEditor, SplitControlId,
@@ -35,10 +34,13 @@ impl HhApp {
     ) -> AnyElement {
         let merge_preview = self.layout.drag_hover.merges_into(active);
         let active_accent = self.terminal_accent(active).as_rgb();
-        let terminal_controls = panes
-            .iter()
-            .find(|pane| pane.id == active)
-            .is_some_and(|pane| pane.kind.is_terminal());
+        // Bot threads open only through the bot: no new panes or splits here.
+        let bot = self.pane_is_bot(active);
+        let terminal_controls = !bot
+            && panes
+                .iter()
+                .find(|pane| pane.id == active)
+                .is_some_and(|pane| pane.kind.is_terminal());
         div()
             .id(("pane-tab-strip", element_key(active)))
             .h(px(PANE_HEADER_HEIGHT))
@@ -89,7 +91,7 @@ impl HhApp {
                     .flex()
                     .children(self.render_pane_header_controls(panes, active, cx)),
             )
-            .when(browser_command_available(), |element| {
+            .when(!bot && browser_command_available(), |element| {
                 element.child(self.pane_control(
                     active,
                     "new-browser-tab",
@@ -143,7 +145,7 @@ impl HhApp {
             .iter()
             .map(|pane| {
                 let pane_id = pane.id;
-                let label = identity_label(pane);
+                let label = self.pane_label(pane);
                 let input = cx.entity();
                 let secondary_label = terminal_tab_secondary_label(pane).map(str::to_owned);
                 let selected = pane_id == active;
@@ -156,7 +158,7 @@ impl HhApp {
                 let close_tooltip = format!("Close {label}…");
                 let drag = PaneDrag {
                     pane_id,
-                    title: label.to_owned(),
+                    title: label.clone(),
                     position: Point::default(),
                 };
                 div()
@@ -242,7 +244,7 @@ impl HhApp {
                             } else {
                                 rgb(THEME.muted)
                             })
-                            .child(label.to_owned()),
+                            .child(label),
                     )
                     .when_some(secondary_label, |element, label| {
                         element.child(
@@ -422,11 +424,9 @@ impl HhApp {
             .pane_states
             .get(&active)
             .is_some_and(|state| state.exited);
-        // A bot tab is a single pane; nothing may split into it.
         let drop_target = self
             .layout
             .dragging_pane
-            .filter(|_| !self.pane_is_bot(active))
             .and_then(|source| split_target_for_drag(source, panes, active));
         let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
         let tab_pane_ids = pane_ids.clone();
@@ -972,8 +972,8 @@ impl HhApp {
                 .into_any_element();
         };
         if matches!(self.editor.modal, Modal::AppearanceSettings) {
-            // Settings replaces the whole main area: no tab strip, bot
-            // header, or pane stays visible behind it.
+            // Settings replaces the whole main area: no tab strip or pane
+            // stays visible behind it.
             return div()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
@@ -986,10 +986,8 @@ impl HhApp {
         let Some(workspace) = self.active_workspace_in(snapshot) else {
             return div().size_full().bg(rgb(THEME.terminal)).into_any_element();
         };
-        if workspace.is_bots() {
-            return self.render_bot_view(workspace, cx);
-        }
         let workspace_id = workspace.id;
+        let bot = workspace.is_bot();
         let empty_workspace_uses_ssh =
             matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. });
         let open_terminal_binding = self.binding_label(AppCommand::NewTab);
@@ -1054,7 +1052,7 @@ impl HhApp {
                                 .font_family(".SystemUIFont")
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(rgb(THEME.foreground))
-                                .child("No terminals open"),
+                                .child(if bot { "No open threads" } else { "No terminals open" }),
                         )
                         .child(
                             div()
@@ -1062,7 +1060,9 @@ impl HhApp {
                                 .text_sm()
                                 .text_color(rgb(THEME.muted))
                                 .text_center()
-                                .child(if empty_workspace_uses_ssh {
+                                .child(if bot {
+                                    "Start a new thread with this bot, or resume a saved one from the sidebar."
+                                } else if empty_workspace_uses_ssh {
                                     "Open a fresh remote terminal with this workstation's saved system OpenSSH destination."
                                 } else {
                                     "This workstation is saved and ready when you want another local shell."
@@ -1082,18 +1082,24 @@ impl HhApp {
                                 .text_color(rgb(0xffffff))
                                 .hover(|element| element.bg(rgb(THEME.ansi[4])))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_workspace_terminal(workspace_id, cx)
+                                    if bot {
+                                        this.open_bot_thread(workspace_id, None, cx);
+                                    } else {
+                                        this.open_workspace_terminal(workspace_id, cx);
+                                    }
                                 }))
-                                .child("Open Terminal"),
+                                .child(if bot { "New Thread" } else { "Open Terminal" }),
                         )
                         .child(
                             div()
                                 .font_family("SF Mono")
                                 .text_xs()
                                 .text_color(rgb(THEME.dim))
-                                .child(format!(
-                                    "Press {open_terminal_binding} to open a terminal"
-                                )),
+                                .child(if bot {
+                                    format!("Press {open_terminal_binding} to start a thread")
+                                } else {
+                                    format!("Press {open_terminal_binding} to open a terminal")
+                                }),
                         ),
                 )
                 .into_any_element()

@@ -21,13 +21,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   folder** is where its workers open by default, and **Set home folder…** in a
   bot's context menu moves the bot elsewhere without overwriting your own
   `AGENTS.md`. The per-agent prompt launch flags are gone.
-- Each bot in the Bots sidebar shows how many worker tabs it has opened and a
-  status chip per worker; clicking a chip opens that worker's tab.
-- Added threads for omp bots: the Bots sidebar lists each bot's saved omp
-  conversations under the bot, pinned first and newest next, with ＋ for a new
-  thread. Recent threads stay live in their own terminal and older ones reopen
-  with `omp --resume`; `/new` and `/resume` typed in omp become the current
-  thread, and worker updates go only to the thread that opened the worker.
+- Each bot is its own space with thread tabs you can split and rearrange like a
+  workstation: the Bots sidebar shows it as a workstation card whose tabs are
+  its open threads, with ＋ for a new thread tab. omp bots list their saved
+  conversations below the open tabs, pinned first and newest next. Up to five
+  threads stay open and older ones reopen with `omp --resume`; `/new` and
+  `/resume` typed in omp become that tab's thread, and worker updates go only
+  to the thread that opened the worker.
   Threads are stored in the bot's folder and deleted with the bot. Added
   `hh bot report-session` and `hh bot info` for the omp plugin.
 - Added a bundled omp plugin for bots with native Harness Harlot tools and worker
@@ -64,11 +64,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sidebar, the same way the bell and robot switch it. The ⚙ button toggles
   Settings and closing it returns to the workstation or bot shown before. The ＋
   menu also offers New Bot.
-- Bumped the desktop/service wire protocol from 35 to 42 for bots, bot threads, workers, bot home folders,
-  status timestamps, coding-agent discovery, Gallery panes, browser command
-  execution, and the removed history archive requests; desktop and service must be upgraded together. Session snapshots
-  move to schema 14; existing snapshots load with former Assistant workspaces
-  and panes removed.
+- Bumped the desktop/service wire protocol from 35 to 43 for bots, bot
+  workspaces and threads, workers, bot home folders, status timestamps,
+  coding-agent discovery, Gallery panes, browser command execution, and the
+  removed history archive requests; desktop and service must be upgraded
+  together. Session snapshots move to schema 15; existing snapshots load with
+  former Assistant workspaces and panes removed, and the shared Bots workspace
+  becomes one space per bot with each of its threads in its own tab.
 
 ### Removed
 

@@ -81,7 +81,7 @@ pub(crate) fn reconcile_updates(
             sidebar.active_workspace = snapshot
                 .workspaces
                 .iter()
-                .find(|workspace| !workspace.is_bots() && workspace_is_selectable(workspace))
+                .find(|workspace| !workspace.is_bot() && workspace_is_selectable(workspace))
                 .map(|workspace| workspace.id);
         }
         let visible = sidebar
@@ -450,13 +450,13 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_active_workspace_falls_back_to_a_workstation_never_the_bots_workspace() {
+    fn a_missing_active_workspace_falls_back_to_a_workstation_never_a_bot() {
         let mut snapshot = snapshot_with_revision(3);
-        let mut bots = snapshot.workspaces[0].clone();
-        bots.id = Uuid::new_v4();
-        bots.kind = hh_protocol::WorkspaceKind::Bots;
+        let mut bot = snapshot.workspaces[0].clone();
+        bot.id = Uuid::new_v4();
+        bot.kind = hh_protocol::WorkspaceKind::Bot;
         let workstation = snapshot.workspaces[0].id;
-        snapshot.workspaces.insert(0, bots);
+        snapshot.workspaces.insert(0, bot);
         let mut session = session_state();
         let mut sidebar = sidebar();
         sidebar.active_workspace = Some(Uuid::new_v4());

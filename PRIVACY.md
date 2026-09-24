@@ -36,15 +36,15 @@ operating-system permissions.
 The omp plugin reports worker status changes (needs input, needs approval,
 done) with a short excerpt of that worker's screen into the bot conversation
 (thread) that opened the worker, so the bot can tell you about them. It also
-tells Harness Harlot the omp session id each bot terminal shows, so the Bots
+tells Harness Harlot the omp session id each bot thread tab shows, so the Bots
 sidebar can list the bot's threads.
 
 ## Local storage
 
 The session snapshot records each bot's name, agent, project folder, custom
-home folder, and instructions, which worker tabs a bot and which of its threads
-created, the omp session ids of the bot's open threads, and the threads you
-pinned. It stores no terminal output, credentials, or conversation content. Bot terminals keep their output
+home folder, and instructions, its open thread tabs and their layout, which
+worker tabs a bot and which of its threads created, the omp session ids of the
+bot's open threads, and the threads you pinned. It stores no terminal output, credentials, or conversation content. Bot terminals keep their output
 in the private HH tmux server like other local terminals; Harness Harlot keeps
 no disk archive of terminal output.
 

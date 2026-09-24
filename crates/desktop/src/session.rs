@@ -260,9 +260,7 @@ impl HhApp {
                 self.layout
                     .scroll_residual
                     .retain(|id, _| self.session.screens.contains_key(id));
-                let (reassert_tab, thread_focus) =
-                    self.settle_bot_thread_open(outcome.reassert_tab);
-                if let Some(pane_id) = reassert_tab {
+                if let Some(pane_id) = outcome.reassert_tab {
                     self.dispatch_control(ClientRequest::ActivateTab { pane_id });
                 }
                 if outcome.notifications_need_refresh {
@@ -270,7 +268,8 @@ impl HhApp {
                 }
                 self.sync_dock_badge();
                 let mut state_changed = outcome.state_changed;
-                if let Some(pane_id) = thread_focus.or(outcome.focus_resync) {
+                self.refresh_changed_bot_threads();
+                if let Some(pane_id) = outcome.focus_resync {
                     state_changed |= self.focus_pane_with_snapshot(pane_id, cx);
                 }
                 self.session.stream_diagnostics = diagnostics;
@@ -338,6 +337,7 @@ impl HhApp {
         if needs_activation {
             self.dispatch(ClientRequest::ActivateTab { pane_id });
         }
+        self.note_bot_pane_focus(pane_id);
         if self
             .pane_metadata(pane_id)
             .is_some_and(|pane| !pane.kind.is_terminal())

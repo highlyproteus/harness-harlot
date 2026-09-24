@@ -18,13 +18,16 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 14;
+const SCHEMA_VERSION: u16 = 15;
 /// Snapshots older than this still carry the retired Harbor Blue defaults.
 const DARK_GRAY_DEFAULTS_SCHEMA_VERSION: u16 = 13;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 pub(crate) const MAX_WORKSPACES: usize = 16;
 pub(crate) const MAX_TABS_PER_WORKSPACE: usize = 32;
+pub(crate) const MAX_BOTS: usize = 32;
+/// Title of a thread tab created by the per-bot workspace migration.
+const MIGRATED_THREAD_TAB_TITLE: &str = "New thread";
 const MAX_PANES: usize = 32;
 const MAX_LAYOUT_DEPTH: usize = 16;
 pub(crate) const MAX_TITLE_CHARS: usize = 80;
@@ -38,6 +41,9 @@ pub(crate) struct RecoveredState {
     pub cwd_by_pane: HashMap<Uuid, PathBuf>,
     pub tmux_by_pane: HashMap<Uuid, (String, String)>,
     pub offline_panes: HashSet<Uuid>,
+    /// Panes migrated out of the retired shared Bots workspace, mapped to
+    /// that workspace's id: their tmux windows still live in its session.
+    pub legacy_tmux_workspace: HashMap<Uuid, Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +102,7 @@ impl SnapshotStore {
         let mut desired: DesiredState =
             serde_json::from_slice(&bytes).context("decode recovery snapshot")?;
         desired.drop_legacy_assistants();
+        desired.split_legacy_bots();
         desired.validate()?;
         Ok(desired.into_runtime())
     }
@@ -256,6 +263,9 @@ struct DesiredState {
     #[expect(dead_code, reason = "parsed only so pre-removal snapshots still load")]
     tmux: RetiredTmuxSettings,
     workspaces: Vec<DesiredWorkspace>,
+    /// Filled by `split_legacy_bots`; see `RecoveredState::legacy_tmux_workspace`.
+    #[serde(skip)]
+    legacy_tmux_workspace: HashMap<Uuid, Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -283,16 +293,21 @@ struct DesiredWorkspace {
     owner_bot: Option<Uuid>,
     #[serde(default)]
     custom_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bot: Option<BotSpec>,
     tabs: Vec<DesiredTab>,
 }
 
 /// Persisted workspace kinds, including the removed Assistant kind that
-/// schema-13 snapshots may contain until `drop_legacy_assistants` runs.
+/// schema-13 snapshots may contain until `drop_legacy_assistants` runs, and
+/// the retired shared Bots workspace of schema-14 snapshots, split into one
+/// Bot workspace per bot by `split_legacy_bots`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DesiredWorkspaceKind {
     #[default]
     Workstation,
+    Bot,
     Bots,
     Assistant,
 }
@@ -314,7 +329,9 @@ struct DesiredTab {
     parent_tab: Option<Uuid>,
     #[serde(default)]
     pinned: bool,
-    #[serde(default)]
+    /// A bot tab of the retired shared Bots workspace (schema 14). Never
+    /// written back.
+    #[serde(default, skip_serializing)]
     bot: Option<BotSpec>,
     #[serde(default)]
     owner_bot: Option<Uuid>,
@@ -448,8 +465,82 @@ impl DesiredState {
                 instructions: None,
                 owner_bot: None,
                 custom_icon: None,
+                bot: None,
                 tabs: Vec::new(),
             });
+        }
+    }
+
+    /// Splits the retired shared Bots workspace of a schema-14 snapshot into
+    /// one Bot workspace per bot tab. The bot keeps its tab id as its
+    /// workspace id, so its home folder, threads and every `owner_bot`
+    /// reference stay valid; each of its thread panes becomes its own tab.
+    fn split_legacy_bots(&mut self) {
+        while let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.kind == DesiredWorkspaceKind::Bots)
+        {
+            let legacy = self.workspaces.remove(index);
+            for tab in legacy.tabs {
+                let Some(spec) = tab.bot else {
+                    continue;
+                };
+                let name = tab.custom_title.unwrap_or(tab.title);
+                let mut panes = Vec::new();
+                tab.layout.into_panes(&mut panes);
+                let tabs = panes
+                    .into_iter()
+                    .map(|mut pane| {
+                        if pane.tmux_window.is_some() {
+                            self.legacy_tmux_workspace.insert(pane.id, legacy.id);
+                        }
+                        // Bot panes carried the bot's name; threads show their own.
+                        if pane.custom_title.as_deref() == Some(name.as_str()) {
+                            pane.custom_title = None;
+                            "Terminal".clone_into(&mut pane.title);
+                        }
+                        DesiredTab {
+                            id: Uuid::new_v4(),
+                            title: MIGRATED_THREAD_TAB_TITLE.to_owned(),
+                            custom_title: None,
+                            project_dir: None,
+                            color: None,
+                            custom_icon: None,
+                            parent_tab: None,
+                            pinned: false,
+                            bot: None,
+                            owner_bot: None,
+                            owner_thread: None,
+                            layout: DesiredLayout::Leaf { pane },
+                        }
+                    })
+                    .collect();
+                let order = self
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| !workspace.pinned)
+                    .map(|workspace| workspace.order)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                self.workspaces.push(DesiredWorkspace {
+                    id: tab.id,
+                    title: name,
+                    color: tab.color,
+                    pinned: false,
+                    pin_order: 0,
+                    order,
+                    connection: WorkspaceConnection::Local,
+                    working_dir: tab.project_dir,
+                    kind: DesiredWorkspaceKind::Bot,
+                    instructions: None,
+                    owner_bot: None,
+                    custom_icon: tab.custom_icon,
+                    bot: Some(spec),
+                    tabs,
+                });
+            }
         }
     }
 
@@ -484,11 +575,12 @@ impl DesiredState {
                     working_dir: workspace.working_dir.clone(),
                     kind: match workspace.kind {
                         WorkspaceKind::Workstation => DesiredWorkspaceKind::Workstation,
-                        WorkspaceKind::Bots => DesiredWorkspaceKind::Bots,
+                        WorkspaceKind::Bot => DesiredWorkspaceKind::Bot,
                     },
                     instructions: workspace.instructions.clone(),
                     owner_bot: workspace.owner_bot,
                     custom_icon: workspace.custom_icon.clone(),
+                    bot: workspace.bot.clone(),
                     tabs: workspace
                         .tabs
                         .iter()
@@ -502,7 +594,7 @@ impl DesiredState {
                                 custom_icon: tab.custom_icon.clone(),
                                 parent_tab: tab.parent_tab,
                                 pinned: tab.pinned,
-                                bot: tab.bot.clone(),
+                                bot: None,
                                 owner_bot: tab.owner_bot,
                                 owner_thread: tab.owner_thread,
                                 layout: DesiredLayout::from_runtime(
@@ -526,6 +618,7 @@ impl DesiredState {
             assistant: None,
             tmux: RetiredTmuxSettings::default(),
             workspaces,
+            legacy_tmux_workspace: HashMap::new(),
         })
     }
 
@@ -545,67 +638,69 @@ impl DesiredState {
         let workspaces = self
             .workspaces
             .into_iter()
-            .map(|workspace| Workspace {
-                id: workspace.id,
-                title: workspace.title,
-                color: workspace.color,
-                pinned: workspace.pinned,
-                pin_order: workspace.pin_order,
-                order: workspace.order,
-                active_terminal_count: 0,
-                connection: match workspace.connection {
-                    WorkspaceConnection::Local => WorkspaceConnection::Local,
-                    WorkspaceConnection::SystemSsh { destination, .. } => {
-                        WorkspaceConnection::SystemSsh {
-                            destination,
-                            status: WorkspaceConnectionStatus::Offline,
-                        }
-                    }
-                },
-                working_dir: workspace.working_dir,
-                kind: match workspace.kind {
-                    DesiredWorkspaceKind::Workstation => WorkspaceKind::Workstation,
-                    DesiredWorkspaceKind::Bots => WorkspaceKind::Bots,
-                    DesiredWorkspaceKind::Assistant => {
-                        unreachable!("legacy assistant workspaces are dropped before recovery")
-                    }
-                },
-                instructions: workspace.instructions,
-                owner_bot: workspace.owner_bot,
-                custom_icon: workspace.custom_icon,
-                tabs: workspace
+            .map(|workspace| {
+                let tabs = workspace
                     .tabs
                     .into_iter()
-                    .map(|tab| {
-                        let layout = tab.layout.into_runtime(
+                    .map(|tab| Tab {
+                        layout: tab.layout.into_runtime(
                             &mut cwd_by_pane,
                             &mut tmux_by_pane,
                             &mut offline_panes,
-                        );
-                        let bot = tab.bot.map(|mut bot| {
-                            // Threads of panes that did not survive live on
-                            // only as saved sessions.
-                            let mut live = Vec::new();
-                            collect_pane_ids(&layout, &mut live);
-                            bot.thread_panes.retain(|pane_id, _| live.contains(pane_id));
-                            bot
-                        });
-                        Tab {
-                            id: tab.id,
-                            title: tab.title,
-                            custom_title: tab.custom_title,
-                            project_dir: tab.project_dir,
-                            color: tab.color,
-                            custom_icon: tab.custom_icon,
-                            parent_tab: tab.parent_tab,
-                            pinned: tab.pinned,
-                            bot,
-                            owner_bot: tab.owner_bot,
-                            owner_thread: tab.owner_thread,
-                            layout,
-                        }
+                        ),
+                        id: tab.id,
+                        title: tab.title,
+                        custom_title: tab.custom_title,
+                        project_dir: tab.project_dir,
+                        color: tab.color,
+                        custom_icon: tab.custom_icon,
+                        parent_tab: tab.parent_tab,
+                        pinned: tab.pinned,
+                        owner_bot: tab.owner_bot,
+                        owner_thread: tab.owner_thread,
                     })
-                    .collect(),
+                    .collect::<Vec<_>>();
+                let bot = workspace.bot.map(|mut bot| {
+                    // Threads of panes that did not survive live on only as
+                    // saved sessions.
+                    let mut live = Vec::new();
+                    for tab in &tabs {
+                        collect_pane_ids(&tab.layout, &mut live);
+                    }
+                    bot.thread_panes.retain(|pane_id, _| live.contains(pane_id));
+                    bot
+                });
+                Workspace {
+                    id: workspace.id,
+                    title: workspace.title,
+                    color: workspace.color,
+                    pinned: workspace.pinned,
+                    pin_order: workspace.pin_order,
+                    order: workspace.order,
+                    active_terminal_count: 0,
+                    connection: match workspace.connection {
+                        WorkspaceConnection::Local => WorkspaceConnection::Local,
+                        WorkspaceConnection::SystemSsh { destination, .. } => {
+                            WorkspaceConnection::SystemSsh {
+                                destination,
+                                status: WorkspaceConnectionStatus::Offline,
+                            }
+                        }
+                    },
+                    working_dir: workspace.working_dir,
+                    kind: match workspace.kind {
+                        DesiredWorkspaceKind::Workstation => WorkspaceKind::Workstation,
+                        DesiredWorkspaceKind::Bot => WorkspaceKind::Bot,
+                        DesiredWorkspaceKind::Bots | DesiredWorkspaceKind::Assistant => {
+                            unreachable!("legacy workspaces are migrated before recovery")
+                        }
+                    },
+                    instructions: workspace.instructions,
+                    owner_bot: workspace.owner_bot,
+                    custom_icon: workspace.custom_icon,
+                    bot,
+                    tabs,
+                }
             })
             .collect();
         RecoveredState {
@@ -619,6 +714,7 @@ impl DesiredState {
             cwd_by_pane,
             tmux_by_pane,
             offline_panes,
+            legacy_tmux_workspace: self.legacy_tmux_workspace,
         }
     }
 
@@ -642,8 +738,11 @@ impl DesiredState {
         if workstations == 0 || workstations > MAX_WORKSPACES {
             bail!("snapshot must contain 1 to {MAX_WORKSPACES} workstations");
         }
-        if count_kind(DesiredWorkspaceKind::Bots) > 1 {
-            bail!("snapshot must contain at most one Bots workspace");
+        if count_kind(DesiredWorkspaceKind::Bots) > 0 {
+            bail!("the legacy Bots workspace must be split before validation");
+        }
+        if count_kind(DesiredWorkspaceKind::Bot) > MAX_BOTS {
+            bail!("snapshot must contain at most {MAX_BOTS} bots");
         }
         if count_kind(DesiredWorkspaceKind::Assistant) > 0 {
             bail!("legacy assistant workspaces must be dropped before validation");
@@ -675,6 +774,15 @@ impl DesiredState {
             if workspace.tabs.len() > MAX_TABS_PER_WORKSPACE {
                 bail!("workstation must contain at most {MAX_TABS_PER_WORKSPACE} tabs");
             }
+            if workspace.bot.is_some() != (workspace.kind == DesiredWorkspaceKind::Bot) {
+                bail!(
+                    "workspace {} must carry a bot exactly when it is a bot",
+                    workspace.id
+                );
+            }
+            if let Some(bot) = &workspace.bot {
+                validate_bot(bot)?;
+            }
             let tabs_by_id = workspace
                 .tabs
                 .iter()
@@ -692,24 +800,11 @@ impl DesiredState {
                 if let Some(icon) = &tab.custom_icon {
                     validate_custom_icon_id(icon)?;
                 }
-                if tab.bot.is_some() != (workspace.kind == DesiredWorkspaceKind::Bots) {
+                if tab.bot.is_some() {
                     bail!(
-                        "tab {} must be a bot exactly when it is in the Bots workspace",
+                        "legacy bot tab {} must be migrated before validation",
                         tab.id
                     );
-                }
-                if tab.bot.as_ref().is_some_and(|bot| {
-                    bot.instructions.as_deref().is_some_and(|instructions| {
-                        instructions.chars().count() > MAX_INSTRUCTIONS_CHARS
-                    })
-                }) {
-                    bail!("bot instructions too long");
-                }
-                if let Some(home) = tab.bot.as_ref().and_then(|bot| bot.home.as_deref()) {
-                    validate_workspace_dir(home).map_err(anyhow::Error::from)?;
-                }
-                if let Some(bot) = &tab.bot {
-                    validate_bot_threads(bot)?;
                 }
                 if let Some(parent_id) = tab.parent_tab {
                     let valid_parent = parent_id != tab.id
@@ -816,6 +911,18 @@ impl DesiredLayout {
                 first: Box::new(first.into_runtime(cwd_by_pane, tmux_by_pane, offline_panes)),
                 second: Box::new(second.into_runtime(cwd_by_pane, tmux_by_pane, offline_panes)),
             },
+        }
+    }
+
+    /// Every pane of this layout, in layout order.
+    fn into_panes(self, panes: &mut Vec<DesiredPane>) {
+        match self {
+            Self::Leaf { pane } => panes.push(pane),
+            Self::Stack { panes: stacked, .. } => panes.extend(stacked),
+            Self::Split { first, second, .. } => {
+                first.into_panes(panes);
+                second.into_panes(panes);
+            }
         }
     }
 
@@ -1063,7 +1170,17 @@ fn legacy_custom_title(title: &str) -> Option<String> {
 /// Most pinned or live threads a persisted bot may list.
 const MAX_BOT_THREAD_ENTRIES: usize = 500;
 
-fn validate_bot_threads(bot: &BotSpec) -> Result<()> {
+fn validate_bot(bot: &BotSpec) -> Result<()> {
+    if bot
+        .instructions
+        .as_deref()
+        .is_some_and(|instructions| instructions.chars().count() > MAX_INSTRUCTIONS_CHARS)
+    {
+        bail!("bot instructions too long");
+    }
+    if let Some(home) = bot.home.as_deref() {
+        validate_workspace_dir(home).map_err(anyhow::Error::from)?;
+    }
     if bot.pinned_threads.len() > MAX_BOT_THREAD_ENTRIES
         || bot.thread_panes.len() > MAX_BOT_THREAD_ENTRIES
     {

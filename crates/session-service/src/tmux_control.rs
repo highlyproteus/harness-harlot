@@ -379,6 +379,31 @@ impl TmuxControlClient {
         Ok(())
     }
 
+    /// Moves window `window_id`, which may live in another session of this
+    /// server, into session `session_name`, keeping its processes.
+    pub(crate) fn move_window_to_session(&self, window_id: &str, session_name: &str) -> Result<()> {
+        validate_target_id(window_id, '@', "window")?;
+        ensure_control_atom(session_name, "tmux session name")?;
+        self.run(
+            &format!(
+                "move-window -d -s {window_id} -t {}:",
+                shellquote(session_name)
+            ),
+            DEFAULT_COMMAND_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    /// Kills session `session_name` of this server and every window in it.
+    pub(crate) fn kill_named_session(&self, session_name: &str) -> Result<()> {
+        ensure_control_atom(session_name, "tmux session name")?;
+        self.run(
+            &format!("kill-session -t {}", shellquote(session_name)),
+            DEFAULT_COMMAND_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn rename_window(&self, window_id: &str, name: &str) -> Result<()> {
         validate_target_id(window_id, '@', "window")?;
         validate_title(name, "tmux window")?;

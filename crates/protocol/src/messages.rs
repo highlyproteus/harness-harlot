@@ -46,8 +46,8 @@ pub enum ClientRequest {
     SetBotSettings {
         settings: BotSettings,
     },
-    /// Creates a bot tab in the reserved `Bots` workspace (created on demand)
-    /// and launches the agent's own interface in its terminal.
+    /// Creates a bot workspace with one thread tab and launches the agent's
+    /// own interface in its terminal.
     CreateBot {
         name: Option<String>,
         agent: TerminalProfile,
@@ -55,34 +55,35 @@ pub enum ClientRequest {
         working_dir: Option<String>,
         instructions: Option<String>,
     },
-    /// Replaces the bot's agent and relaunches its terminal.
+    /// Replaces the bot's agent and relaunches its terminal. `bot_id` is the
+    /// bot workspace id, like every bot request below.
     SetBotAgent {
-        tab_id: Uuid,
+        bot_id: Uuid,
         agent: TerminalProfile,
     },
-    /// Terminates the bot's terminal and launches its agent again.
+    /// Terminates the bot's active thread and launches its agent again.
     RestartBot {
-        tab_id: Uuid,
+        bot_id: Uuid,
     },
     /// Sets the bot's home folder (None restores the default) and relaunches
     /// its terminal there.
     SetBotHome {
-        tab_id: Uuid,
+        bot_id: Uuid,
         home: Option<String>,
     },
     /// Lists the bot's threads: saved agent sessions plus live panes, pinned
     /// first, then most recently updated.
     ListBotThreads {
-        tab_id: Uuid,
+        bot_id: Uuid,
     },
-    /// Shows a thread in the bot's terminal: activates the live pane showing
-    /// it or resumes it in a new pane. `None` starts a new thread.
+    /// Shows a thread of the bot: focuses the live pane showing it or resumes
+    /// it in a new thread tab. `None` starts a new thread tab.
     OpenBotThread {
-        tab_id: Uuid,
+        bot_id: Uuid,
         thread_id: Option<String>,
     },
     SetBotThreadPinned {
-        tab_id: Uuid,
+        bot_id: Uuid,
         thread_id: String,
         pinned: bool,
     },
@@ -437,6 +438,11 @@ pub enum ServiceResponse {
     BotThreads {
         threads: Vec<BotThread>,
     },
+    /// The pane (and its tab) showing the thread `OpenBotThread` opened.
+    BotThreadOpened {
+        tab_id: Uuid,
+        pane_id: Uuid,
+    },
     WorkerCreated {
         workspace_id: Uuid,
         tab_id: Uuid,
@@ -616,12 +622,12 @@ mod tests {
             ),
             (
                 ClientRequest::SetBotHome {
-                    tab_id,
+                    bot_id: tab_id,
                     home: Some("/srv/bots/hive3".to_owned()),
                 },
                 serde_json::json!({
                     "type": "set_bot_home",
-                    "tab_id": tab_id,
+                    "bot_id": tab_id,
                     "home": "/srv/bots/hive3",
                 }),
             ),
@@ -811,43 +817,55 @@ mod tests {
     }
     #[test]
     fn bot_thread_messages_use_stable_snake_case_tags_and_round_trip() {
-        let tab_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let bot_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let tab_id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
         let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
         assert_request_json_round_trips([
             (
-                ClientRequest::ListBotThreads { tab_id },
-                serde_json::json!({"type": "list_bot_threads", "tab_id": tab_id}),
+                ClientRequest::ListBotThreads { bot_id },
+                serde_json::json!({"type": "list_bot_threads", "bot_id": bot_id}),
             ),
             (
                 ClientRequest::OpenBotThread {
-                    tab_id,
+                    bot_id,
                     thread_id: Some("0193-abc".to_owned()),
                 },
                 serde_json::json!({
                     "type": "open_bot_thread",
-                    "tab_id": tab_id,
+                    "bot_id": bot_id,
                     "thread_id": "0193-abc",
                 }),
             ),
             (
                 ClientRequest::OpenBotThread {
-                    tab_id,
+                    bot_id,
                     thread_id: None,
                 },
-                serde_json::json!({"type": "open_bot_thread", "tab_id": tab_id, "thread_id": null}),
+                serde_json::json!({"type": "open_bot_thread", "bot_id": bot_id, "thread_id": null}),
             ),
             (
                 ClientRequest::SetBotThreadPinned {
-                    tab_id,
+                    bot_id,
                     thread_id: "0193-abc".to_owned(),
                     pinned: true,
                 },
                 serde_json::json!({
                     "type": "set_bot_thread_pinned",
-                    "tab_id": tab_id,
+                    "bot_id": bot_id,
                     "thread_id": "0193-abc",
                     "pinned": true,
                 }),
+            ),
+            (
+                ClientRequest::SetBotAgent {
+                    bot_id,
+                    agent: TerminalProfile::Omp,
+                },
+                serde_json::json!({"type": "set_bot_agent", "bot_id": bot_id, "agent": "omp"}),
+            ),
+            (
+                ClientRequest::RestartBot { bot_id },
+                serde_json::json!({"type": "restart_bot", "bot_id": bot_id}),
             ),
             (
                 ClientRequest::ReportBotSession {
@@ -868,6 +886,7 @@ mod tests {
                 updated_ms: 1_700_000_000_000,
                 pinned: true,
                 pane_id: Some(pane_id),
+                tab_id: Some(tab_id),
             }],
         };
         let encoded = serde_json::to_value(&response).unwrap();
@@ -881,12 +900,23 @@ mod tests {
                     "updated_ms": 1_700_000_000_000_u64,
                     "pinned": true,
                     "pane_id": pane_id,
+                    "tab_id": tab_id,
                 }],
             })
         );
         assert_eq!(
             serde_json::from_value::<ServiceResponse>(encoded).unwrap(),
             response
+        );
+        let opened = ServiceResponse::BotThreadOpened { tab_id, pane_id };
+        let encoded = serde_json::to_value(&opened).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type": "bot_thread_opened", "tab_id": tab_id, "pane_id": pane_id})
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceResponse>(encoded).unwrap(),
+            opened
         );
     }
 

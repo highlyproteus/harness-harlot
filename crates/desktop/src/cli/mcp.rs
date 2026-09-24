@@ -410,7 +410,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "terminal_list",
-            "List workstations, their terminal tabs and panes with live status (needs_approval, needs_input, attention, working, done, idle) and exit state. The Bots workspace is excluded. mine=true lists only the workers created by the calling bot.",
+            "List workstations, their terminal tabs and panes with live status (needs_approval, needs_input, attention, working, done, idle) and exit state. Bot workspaces are excluded. mine=true lists only the workers created by the calling bot.",
             properties(&[("mine", "boolean")]),
         ),
         tool(

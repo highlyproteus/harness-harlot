@@ -355,12 +355,12 @@ impl PtySession {
     pub(crate) fn spawn_local(
         pane_id: Uuid,
         workspace_id: Uuid,
-        bot_tab: Option<Uuid>,
+        bot_id: Option<Uuid>,
         cwd: &Path,
     ) -> Result<Arc<Self>> {
         let shell = configured_shell();
         let mut command = local_shell_command(pane_id, cwd);
-        apply_agent_env(&mut command, workspace_id, bot_tab);
+        apply_agent_env(&mut command, workspace_id, bot_id);
         Self::spawn_command(pane_id, command, &format!("configured shell {shell}"))
     }
 
@@ -409,12 +409,12 @@ impl PtySession {
     pub(crate) fn spawn_tmux(
         pane_id: Uuid,
         workspace_id: Uuid,
-        bot_tab: Option<Uuid>,
+        bot_id: Option<Uuid>,
         cwd: &Path,
         client: &Arc<TmuxControlClient>,
     ) -> Result<Arc<Self>> {
         let pane_id_text = pane_id.to_string();
-        let agent_env = agent_env(workspace_id, bot_tab);
+        let agent_env = agent_env(workspace_id, bot_id);
         let mut window_env = vec![
             (hh_protocol::pane_id_env(), pane_id_text.as_str()),
             ("COLORTERM", "truecolor"),

@@ -1,5 +1,5 @@
 //! Saved bot threads: the omp session files in a bot's HH-owned session
-//! directory `<state>/bots/<tab>/threads`.
+//! directory `<state>/bots/<bot id>/threads`.
 //!
 //! omp names each session `<timestamp>_<sessionId>.jsonl`. Current files start
 //! with a fixed-width title slot line followed by the session header; legacy
@@ -42,15 +42,15 @@ pub(crate) fn valid_session_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-/// The session directory of bot `tab_id`; it lives in the bot's default home
+/// The session directory of bot `bot_id`; it lives in the bot's default home
 /// even when the bot uses a custom home, so deleting the bot deletes it.
-pub(crate) fn threads_directory(bots_dir: &Path, tab_id: Uuid) -> PathBuf {
-    bots_dir.join(tab_id.to_string()).join(THREADS_DIR)
+pub(crate) fn threads_directory(bots_dir: &Path, bot_id: Uuid) -> PathBuf {
+    bots_dir.join(bot_id.to_string()).join(THREADS_DIR)
 }
 
-/// Creates the owner-only session directory of bot `tab_id`.
-pub(crate) fn prepare_threads_directory(bots_dir: &Path, tab_id: Uuid) -> Result<PathBuf> {
-    let threads = threads_directory(bots_dir, tab_id);
+/// Creates the owner-only session directory of bot `bot_id`.
+pub(crate) fn prepare_threads_directory(bots_dir: &Path, bot_id: Uuid) -> Result<PathBuf> {
+    let threads = threads_directory(bots_dir, bot_id);
     for directory in [bots_dir, threads.parent().unwrap_or(bots_dir), &threads] {
         hh_protocol::ensure_private_directory(directory)
             .with_context(|| format!("prepare bot directory {}", directory.display()))?;

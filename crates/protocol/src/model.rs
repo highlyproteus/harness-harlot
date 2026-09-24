@@ -31,10 +31,10 @@ pub struct BotSettings {
     pub default_agent: Option<TerminalProfile>,
 }
 
-/// Launch configuration of a bot tab. Bots live in the single reserved
-/// `WorkspaceKind::Bots` workspace; each bot is one tab whose terminals run
-/// the configured agent CLI's own interface. An omp bot's tab is a stack of
-/// live thread panes, one omp conversation each.
+/// Launch configuration of a bot. Each bot is its own `WorkspaceKind::Bot`
+/// workspace whose terminals run the configured agent CLI's own interface.
+/// An omp bot's tabs hold its live thread panes, one omp conversation each;
+/// the user may split and rearrange them like any workstation tab.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BotSpec {
     pub agent: TerminalProfile,
@@ -42,7 +42,7 @@ pub struct BotSpec {
     #[serde(default)]
     pub instructions: Option<String>,
     /// Custom home folder the bot's terminal starts in; None uses the default
-    /// `<state>/bots/<tab id>/`.
+    /// `<state>/bots/<bot id>/`.
     #[serde(default)]
     pub home: Option<String>,
     /// Saved thread (agent session) ids the user pinned to the top.
@@ -76,6 +76,9 @@ pub struct BotThread {
     pub pinned: bool,
     /// The live pane showing this thread.
     pub pane_id: Option<Uuid>,
+    /// The bot tab containing the live pane.
+    #[serde(default)]
+    pub tab_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -159,7 +162,6 @@ impl SessionSnapshot {
             custom_icon: None,
             parent_tab: None,
             pinned: false,
-            bot: None,
             owner_bot: None,
             owner_thread: None,
             layout: PaneLayout::Leaf { pane },
@@ -184,6 +186,7 @@ impl SessionSnapshot {
                 instructions: None,
                 owner_bot: None,
                 custom_icon: None,
+                bot: None,
                 tabs: vec![tab],
             }],
         }
@@ -213,17 +216,21 @@ pub struct Workspace {
     pub kind: WorkspaceKind,
     #[serde(default)]
     pub instructions: Option<String>,
-    /// Bot tab whose delegated workers default to this workstation.
+    /// Bot whose delegated workers default to this workstation.
     #[serde(default)]
     pub owner_bot: Option<Uuid>,
     #[serde(default)]
     pub custom_icon: Option<String>,
+    /// Present exactly on `WorkspaceKind::Bot` workspaces.
+    #[serde(default)]
+    pub bot: Option<BotSpec>,
     pub tabs: Vec<Tab>,
 }
 
 impl Workspace {
-    pub fn is_bots(&self) -> bool {
-        self.kind == WorkspaceKind::Bots
+    /// Whether this workspace is a bot; bots are never workstations.
+    pub fn is_bot(&self) -> bool {
+        self.kind == WorkspaceKind::Bot
     }
 }
 
@@ -311,8 +318,8 @@ pub enum TmuxScanScope {
 pub enum WorkspaceKind {
     #[default]
     Workstation,
-    /// The single reserved workspace holding bot tabs; never shown as a workstation.
-    Bots,
+    /// A bot: its tabs are the bot's live threads; never shown as a workstation.
+    Bot,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -357,10 +364,7 @@ pub struct Tab {
     pub parent_tab: Option<Uuid>,
     #[serde(default)]
     pub pinned: bool,
-    /// Present only on bot tabs inside the `Bots` workspace.
-    #[serde(default)]
-    pub bot: Option<BotSpec>,
-    /// Bot tab that created this worker tab through `CreateWorker`.
+    /// Bot that created this worker tab through `CreateWorker`.
     #[serde(default)]
     pub owner_bot: Option<Uuid>,
     /// Bot pane (thread) that created this worker tab through `CreateWorker`.
@@ -627,9 +631,18 @@ mod bot_thread_tests {
 
         let mut snapshot = SessionSnapshot::seeded();
         assert_eq!(snapshot.workspaces[0].tabs[0].owner_thread, None);
+        assert_eq!(snapshot.workspaces[0].bot, None);
         snapshot.workspaces[0].tabs[0].owner_thread = Some(pane);
-        let restored: SessionSnapshot =
-            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        let mut bot = snapshot.workspaces[0].clone();
+        bot.id = Uuid::new_v4();
+        bot.kind = WorkspaceKind::Bot;
+        bot.bot = Some(spec);
+        snapshot.workspaces.push(bot);
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(encoded["workspaces"][1]["kind"], "bot");
+        assert_eq!(encoded["workspaces"][1]["bot"]["agent"], "omp");
+        let restored: SessionSnapshot = serde_json::from_value(encoded).unwrap();
         assert_eq!(restored, snapshot);
+        assert!(restored.workspaces[1].is_bot() && !restored.workspaces[0].is_bot());
     }
 }

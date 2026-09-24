@@ -12,7 +12,7 @@ use crate::persistence;
 use crate::persistence::{MAX_TABS_PER_WORKSPACE, MAX_TITLE_CHARS, validate_title};
 use crate::process::{fallback_cwd, local_spawn_dir, shell_title};
 use crate::pty::PtySession;
-use crate::registry::bots::{bot_spawn_dir, bot_tab_for_pane, forget_bots};
+use crate::registry::bots::{bot_for_pane, bot_spawn_dir, prune_bot_threads};
 use crate::registry::identity::{
     refresh_workspace_activity, resolve_pane_identity, set_pane_runtime_label,
 };
@@ -74,6 +74,7 @@ impl SessionRegistry {
                 bail!("pane limit of {MAX_PANES} reached");
             }
             state.require_terminal_layout_pane(target_pane)?;
+            state.refuse_bot_pane(target_pane)?;
         }
         let new_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(target_pane)?;
@@ -130,6 +131,7 @@ impl SessionRegistry {
                 bail!("pane limit of {MAX_PANES} reached");
             }
             state.require_terminal_layout_pane(target_pane)?;
+            state.refuse_bot_pane(target_pane)?;
             let (workspace, tab) = state
                 .snapshot
                 .workspaces
@@ -207,6 +209,7 @@ impl SessionRegistry {
         let title = browser_title(&url, None);
         let pane_id = Uuid::new_v4();
         let mut state = self.state.write();
+        state.refuse_bot_pane(target_pane)?;
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
@@ -253,6 +256,7 @@ impl SessionRegistry {
     pub fn create_group_gallery(&self, target_pane: Uuid, activate: bool) -> Result<Uuid> {
         let pane_id = Uuid::new_v4();
         let mut state = self.state.write();
+        state.refuse_bot_pane(target_pane)?;
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
@@ -395,7 +399,6 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
-                bot: None,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             });
@@ -441,6 +444,7 @@ impl SessionRegistry {
                 bail!("pane limit of {MAX_PANES} reached");
             }
             state.terminal_pane(target_pane)?;
+            state.refuse_bot_pane(target_pane)?;
             if !state
                 .snapshot
                 .workspaces
@@ -539,7 +543,6 @@ impl SessionRegistry {
             custom_icon: None,
             parent_tab: None,
             pinned: false,
-            bot: None,
             owner_bot: None,
             layout: PaneLayout::Leaf {
                 pane: Pane {
@@ -596,7 +599,6 @@ impl SessionRegistry {
             custom_icon: None,
             parent_tab: None,
             pinned: false,
-            bot: None,
             owner_bot: None,
             layout: PaneLayout::Leaf {
                 pane: Pane {
@@ -846,7 +848,6 @@ impl SessionRegistry {
 
         let mut state = self.state.write();
         let mut did_close = false;
-        let mut removed_bot = None;
         for workspace in &mut state.snapshot.workspaces {
             let Some(tab_index) = workspace
                 .tabs
@@ -856,9 +857,6 @@ impl SessionRegistry {
                 continue;
             };
             let (_, remaining) = detach_pane(workspace.tabs[tab_index].layout.clone(), pane_id);
-            if let Some(spec) = &mut workspace.tabs[tab_index].bot {
-                spec.thread_panes.remove(&pane_id);
-            }
             if let Some(remaining) = remaining {
                 workspace.tabs[tab_index].layout = remaining;
             } else {
@@ -868,10 +866,8 @@ impl SessionRegistry {
                         tab.parent_tab = None;
                     }
                 }
-                if removed_tab.bot.is_some() {
-                    removed_bot = Some(removed_tab.id);
-                }
             }
+            prune_bot_threads(workspace);
             if was_terminal {
                 workspace.active_terminal_count = workspace.active_terminal_count.saturating_sub(1);
             }
@@ -881,11 +877,6 @@ impl SessionRegistry {
         if !did_close {
             bail!("pane {pane_id} disappeared while closing");
         }
-        forget_bots(
-            &mut state.snapshot,
-            &removed_bot.into_iter().collect(),
-            self.bots_dir().ok().as_deref(),
-        );
         let removed = state.panes.remove(&pane_id);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
@@ -904,7 +895,7 @@ impl SessionRegistry {
     /// session that no longer exists fails here instead of registering a fake
     /// live tab.
     pub fn reattach_pane(&self, pane_id: Uuid) -> Result<()> {
-        let (kind, cwd, workspace_id, managed_tmux, bot_tab) = {
+        let (kind, cwd, workspace_id, managed_tmux, bot_id) = {
             let state = self.state.read();
             let runtime = state.terminal_pane(pane_id)?;
             if runtime.exit_status.is_none() {
@@ -912,11 +903,11 @@ impl SessionRegistry {
             }
             let workspace_id = workspace_id_for_pane(&state.snapshot, pane_id)
                 .with_context(|| format!("pane {pane_id} has no workstation"))?;
-            let bot_tab = bot_tab_for_pane(&state.snapshot, pane_id);
+            let bot_id = bot_for_pane(&state.snapshot, pane_id);
             // A bot's fresh shell always starts in its home.
-            let cwd = bot_tab
-                .and_then(|tab| {
-                    bot_spawn_dir(&state.snapshot, self.bots_dir().ok().as_deref(), tab)
+            let cwd = bot_id
+                .and_then(|bot| {
+                    bot_spawn_dir(&state.snapshot, self.bots_dir().ok().as_deref(), bot)
                 })
                 .unwrap_or_else(|| runtime.last_valid_cwd.clone());
             (
@@ -924,20 +915,18 @@ impl SessionRegistry {
                 cwd,
                 workspace_id,
                 runtime.session.tmux_ids().is_some(),
-                bot_tab,
+                bot_id,
             )
         };
         let session = match &kind {
             RuntimePaneKind::Local if managed_tmux => PtySession::spawn_tmux(
                 pane_id,
                 workspace_id,
-                bot_tab,
+                bot_id,
                 &cwd,
                 &self.client_for_workspace(workspace_id)?,
             )?,
-            RuntimePaneKind::Local => {
-                PtySession::spawn_local(pane_id, workspace_id, bot_tab, &cwd)?
-            }
+            RuntimePaneKind::Local => PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)?,
             RuntimePaneKind::SystemSsh { host } => {
                 PtySession::spawn_ssh(pane_id, workspace_id, host, None)?
             }
@@ -969,8 +958,8 @@ impl SessionRegistry {
         drop(state);
         let _ = previous.terminate_and_wait();
         drop(previous);
-        if let Some(tab_id) = bot_tab {
-            self.relaunch_recovered_bot(tab_id, pane_id);
+        if let Some(bot_id) = bot_id {
+            self.relaunch_recovered_bot(bot_id, pane_id);
         }
         self.write_snapshot(&bytes)
     }

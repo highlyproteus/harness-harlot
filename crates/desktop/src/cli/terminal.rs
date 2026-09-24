@@ -77,29 +77,40 @@ pub(super) fn execute_bot(context: &AgentContext, command: &BotCommand) -> Resul
         BotCommand::Info => {
             let session = Session::fetch(&mut client()?)?;
             let bot = session.caller_bot(context)?;
-            let tab = session
+            let workspace = session
                 .snapshot
                 .workspaces
                 .iter()
-                .flat_map(|workspace| &workspace.tabs)
-                .find(|tab| tab.id == bot)
+                .find(|workspace| workspace.id == bot)
                 .context("the calling bot disappeared")?;
+            let spec = workspace
+                .bot
+                .as_ref()
+                .context("the calling bot disappeared")?;
+            let panes = workspace
+                .tabs
+                .iter()
+                .flat_map(|tab| layout_panes(&tab.layout))
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>();
+            // The active thread is the one the user activated last.
+            let active_pane = panes.iter().copied().rev().max_by_key(|pane_id| {
+                spec.thread_panes
+                    .get(pane_id)
+                    .map_or(0, |thread| thread.activated_ms)
+            });
+            let tab_id = context
+                .pane_id
+                .and_then(|pane_id| session.locate(pane_id).map(|location| location.tab.id));
             Ok(json!({
-                "tab_id": tab.id,
+                "bot_id": bot,
+                "name": workspace.title,
+                "tab_id": tab_id,
                 "pane_id": context.pane_id,
-                "active_pane": active_pane(&tab.layout),
-                "panes": layout_panes(&tab.layout).iter().map(|pane| pane.id).collect::<Vec<_>>(),
+                "active_pane": active_pane,
+                "panes": panes,
             }))
         }
-    }
-}
-
-/// The pane a tab shows: a stack's active pane, the first of a split.
-fn active_pane(layout: &PaneLayout) -> Uuid {
-    match layout {
-        PaneLayout::Leaf { pane } => pane.id,
-        PaneLayout::Stack { active, .. } => *active,
-        PaneLayout::Split { first, .. } => active_pane(first),
     }
 }
 
@@ -168,7 +179,7 @@ impl Session {
         })
     }
 
-    /// The bot tab whose terminal runs the caller (`HH_PANE_ID`).
+    /// The bot (workspace) whose thread pane runs the caller (`HH_PANE_ID`).
     fn caller_bot(&self, context: &AgentContext) -> Result<Uuid> {
         let pane_id = context.pane_id.context(format!(
             "this command needs the calling pane; run inside a bot terminal or pass --pane (sets {})",
@@ -178,10 +189,10 @@ impl Session {
             .locate(pane_id)
             .with_context(|| format!("unknown calling pane {pane_id}"))?;
         ensure!(
-            location.tab.bot.is_some(),
+            location.workspace.is_bot(),
             "the calling pane {pane_id} is not a bot terminal"
         );
-        Ok(location.tab.id)
+        Ok(location.workspace.id)
     }
 }
 
@@ -215,7 +226,7 @@ fn list(context: &AgentContext, mine: bool) -> Result<Value> {
         .snapshot
         .workspaces
         .iter()
-        .filter(|workspace| !workspace.is_bots())
+        .filter(|workspace| !workspace.is_bot())
         .filter_map(|workspace| {
             let tabs = workspace
                 .tabs
@@ -274,7 +285,7 @@ fn new_terminal(context: &AgentContext, request: &NewTerminal) -> Result<Value> 
         (None, Some(current)) => snapshot(&mut client)?
             .workspaces
             .iter()
-            .any(|workspace| workspace.id == current && !workspace.is_bots())
+            .any(|workspace| workspace.id == current && !workspace.is_bot())
             .then_some(current),
         (None, None) => None,
     };

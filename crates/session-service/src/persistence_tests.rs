@@ -75,13 +75,12 @@ fn deliberately_empty_local_workspace_round_trips_without_creating_a_terminal() 
 }
 
 #[test]
-fn bots_workspace_bot_tabs_and_owners_round_trip() {
+fn bot_workspaces_and_owners_round_trip() {
     let directory = test_directory("bots");
     let store = SnapshotStore::new(directory.join("sessions.json"));
     let mut snapshot = SessionSnapshot::seeded();
     snapshot.bots.default_agent = Some(TerminalProfile::Claude);
     let bot_id = Uuid::new_v4();
-    let bots_workspace_id = Uuid::new_v4();
     let mut bot_pane = crate::layout::pane_fixture(Uuid::new_v4());
     bot_pane.profile_override = Some(TerminalProfile::Omp);
     let live_thread = hh_protocol::BotThreadPane {
@@ -102,27 +101,29 @@ fn bots_workspace_bot_tabs_and_owners_round_trip() {
     snapshot.workspaces[0].owner_bot = Some(bot_id);
     snapshot.workspaces[0].tabs[0].owner_bot = Some(bot_id);
     snapshot.workspaces[0].tabs[0].owner_thread = Some(bot_pane.id);
-    let mut bots = snapshot.workspaces[0].clone();
-    bots.id = bots_workspace_id;
-    bots.kind = WorkspaceKind::Bots;
-    bots.owner_bot = None;
-    bots.tabs = vec![Tab {
+    let mut bot = snapshot.workspaces[0].clone();
+    bot.id = bot_id;
+    bot.title = "Hive3".to_owned();
+    bot.kind = WorkspaceKind::Bot;
+    bot.bot = Some(spec.clone());
+    bot.owner_bot = None;
+    bot.working_dir = Some("/tmp".to_owned());
+    bot.tabs = vec![Tab {
         owner_thread: None,
-        id: bot_id,
-        title: "Hive3".to_owned(),
+        id: Uuid::new_v4(),
+        title: "New thread".to_owned(),
         custom_title: None,
-        project_dir: Some("/tmp".to_owned()),
+        project_dir: None,
         color: None,
         custom_icon: None,
         parent_tab: None,
         pinned: false,
-        bot: Some(spec.clone()),
         owner_bot: None,
         layout: PaneLayout::Leaf {
             pane: bot_pane.clone(),
         },
     }];
-    snapshot.workspaces.push(bots);
+    snapshot.workspaces.push(bot);
     let mut cwd_by_pane = cwd_map(&snapshot);
     cwd_by_pane.insert(bot_pane.id, std::env::temp_dir());
 
@@ -136,21 +137,249 @@ fn bots_workspace_bot_tabs_and_owners_round_trip() {
         recovered.workspaces[0].tabs[0].owner_thread,
         Some(bot_pane.id)
     );
-    let bots = &recovered.workspaces[1];
-    assert!(bots.is_bots());
-    assert_eq!(bots.id, bots_workspace_id);
+    assert_eq!(recovered.workspaces[0].bot, None);
+    let bot = &recovered.workspaces[1];
+    assert!(bot.is_bot());
+    assert_eq!(bot.id, bot_id);
+    assert_eq!(bot.title, "Hive3");
     let mut live_spec = spec.clone();
     live_spec.thread_panes = [(bot_pane.id, live_thread)].into();
     assert_eq!(
-        bots.tabs[0].bot.as_ref(),
+        bot.bot.as_ref(),
         Some(&live_spec),
         "threads of panes that are gone are dropped"
     );
-    assert_eq!(bots.tabs[0].project_dir.as_deref(), Some("/tmp"));
-    let PaneLayout::Leaf { pane } = &bots.tabs[0].layout else {
-        panic!("bot tab is not a leaf");
+    assert_eq!(bot.working_dir.as_deref(), Some("/tmp"));
+    let PaneLayout::Leaf { pane } = &bot.tabs[0].layout else {
+        panic!("thread tab is not a leaf");
     };
     assert_eq!(pane.profile_override, Some(TerminalProfile::Omp));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// A schema-14 snapshot as the previous release wrote it: one shared Bots
+/// workspace whose bot tabs hold their thread panes in a stack.
+fn schema_v14_bots_snapshot(ids: &[Uuid; 10], cwd: &str) -> String {
+    let ids = ids.map(|id| id.to_string());
+    let [
+        workstation,
+        worker_tab,
+        worker_pane,
+        bots,
+        hive,
+        first,
+        second,
+        nova,
+        nova_pane,
+        other,
+    ] = &ids;
+    serde_json::json!({
+        "schema_version": 14,
+        "revision": 41,
+        "appearance": {},
+        "bots": {"default_agent": "omp"},
+        "workspaces": [
+            {
+                "id": workstation, "title": "Workstation 1", "order": 1,
+                "kind": "workstation", "owner_bot": hive,
+                "tabs": [{
+                    "id": worker_tab, "title": "api-fix", "custom_title": "api-fix",
+                    "owner_bot": hive, "owner_thread": second,
+                    "layout": {"kind": "leaf", "pane": {
+                        "id": worker_pane, "kind": {"type": "terminal"},
+                        "title": "Terminal", "local_cwd": cwd,
+                    }},
+                }],
+            },
+            {
+                "id": bots, "title": "Bots", "order": 2, "kind": "bots",
+                "tabs": [
+                    {
+                        "id": hive, "title": "Hive3", "custom_title": "Hive 3",
+                        "project_dir": "/srv/app",
+                        "bot": {
+                            "agent": "omp", "instructions": "Prefer small PRs",
+                            "home": "/tmp", "pinned_threads": ["0193-pinned"],
+                            "thread_panes": {
+                                first: {"session": "0193-first", "activated_ms": 7},
+                                second: {"session": null, "activated_ms": 9},
+                            },
+                        },
+                        "layout": {"kind": "stack", "active": second, "panes": [
+                            {
+                                "id": first, "kind": {"type": "terminal"},
+                                "title": "Hive 3", "custom_title": "Hive 3",
+                                "profile_override": "omp", "local_cwd": cwd,
+                                "tmux_window": "@3", "tmux_pane": "%4",
+                            },
+                            {
+                                "id": second, "kind": {"type": "terminal"},
+                                "title": "Hive 3", "custom_title": "Hive 3",
+                                "profile_override": "omp", "local_cwd": cwd,
+                            },
+                        ]},
+                    },
+                    {
+                        "id": nova, "title": "Hermes",
+                        "bot": {"agent": "hermes"},
+                        "layout": {"kind": "leaf", "pane": {
+                            "id": nova_pane, "kind": {"type": "terminal"},
+                            "title": "Hermes", "custom_title": "Hermes",
+                            "profile_override": "hermes", "local_cwd": cwd,
+                        }},
+                    },
+                ],
+            },
+            {
+                "id": other, "title": "Workstation 2", "order": 3,
+                "kind": "workstation", "tabs": [],
+            },
+        ],
+    })
+    .to_string()
+}
+
+#[test]
+fn schema_v14_shared_bots_workspace_splits_into_one_workspace_per_bot() {
+    let directory = test_directory("legacy-bots");
+    create_owner_only_directory(&directory);
+    let path = directory.join("sessions.json");
+    let ids: [Uuid; 10] = std::array::from_fn(|_| Uuid::new_v4());
+    let [
+        workstation,
+        worker_tab,
+        _,
+        bots,
+        hive,
+        first,
+        second,
+        nova,
+        nova_pane,
+        _,
+    ] = ids;
+    let cwd = std::env::temp_dir();
+    fs::write(&path, schema_v14_bots_snapshot(&ids, cwd.to_str().unwrap())).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let store = SnapshotStore::new(path.clone());
+
+    let recovered = store
+        .load_or_quarantine()
+        .unwrap()
+        .expect("a valid schema-14 snapshot is migrated, never quarantined");
+
+    assert_eq!(
+        fs::read_dir(&directory).unwrap().count(),
+        1,
+        "nothing was quarantined"
+    );
+    let snapshot = &recovered.snapshot;
+    assert_eq!(snapshot.bots.default_agent, Some(TerminalProfile::Omp));
+    assert!(
+        snapshot
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != bots)
+    );
+    let kinds = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| (workspace.id, workspace.kind))
+        .collect::<Vec<_>>();
+    assert_eq!(kinds[0], (workstation, WorkspaceKind::Workstation));
+    assert_eq!(kinds[2], (hive, WorkspaceKind::Bot));
+    assert_eq!(kinds[3], (nova, WorkspaceKind::Bot));
+    assert_eq!(
+        snapshot.workspaces[0].owner_bot,
+        Some(hive),
+        "owner references keep pointing at the bot, now its workspace"
+    );
+    let worker = &snapshot.workspaces[0].tabs[0];
+    assert_eq!(worker.id, worker_tab);
+    assert_eq!(
+        (worker.owner_bot, worker.owner_thread),
+        (Some(hive), Some(second))
+    );
+
+    let hive_workspace = &snapshot.workspaces[2];
+    assert_eq!(
+        hive_workspace.title, "Hive 3",
+        "the rename becomes the name"
+    );
+    assert_eq!(hive_workspace.working_dir.as_deref(), Some("/srv/app"));
+    assert!(!hive_workspace.pinned);
+    assert!(
+        hive_workspace.order > snapshot.workspaces[1].order,
+        "migrated bots follow the existing workspaces"
+    );
+    let spec = hive_workspace.bot.as_ref().unwrap();
+    assert_eq!(spec.agent, TerminalProfile::Omp);
+    assert_eq!(spec.instructions.as_deref(), Some("Prefer small PRs"));
+    assert_eq!(spec.home.as_deref(), Some("/tmp"));
+    assert_eq!(spec.pinned_threads, ["0193-pinned"]);
+    assert_eq!(
+        spec.thread_panes[&first].session.as_deref(),
+        Some("0193-first")
+    );
+    assert_eq!(spec.thread_panes[&second].activated_ms, 9);
+    let thread_tabs = hive_workspace
+        .tabs
+        .iter()
+        .map(|tab| match &tab.layout {
+            PaneLayout::Leaf { pane } => (tab.title.as_str(), pane.id, pane.custom_title.clone()),
+            _ => panic!("every stacked thread becomes its own single-pane tab"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thread_tabs,
+        [("New thread", first, None), ("New thread", second, None)]
+    );
+    assert!(
+        hive_workspace
+            .tabs
+            .iter()
+            .all(|tab| tab.id != hive && tab.id != first && tab.id != second)
+    );
+    assert_eq!(
+        recovered.tmux_by_pane.get(&first),
+        Some(&("@3".to_owned(), "%4".to_owned()))
+    );
+    assert_eq!(
+        recovered.legacy_tmux_workspace,
+        HashMap::from([(first, bots)]),
+        "the migrated tmux window is adopted from the retired Bots session"
+    );
+
+    let nova_workspace = &snapshot.workspaces[3];
+    assert_eq!(nova_workspace.title, "Hermes");
+    assert_eq!(nova_workspace.tabs.len(), 1);
+    assert_eq!(
+        nova_workspace.bot.as_ref().unwrap().agent,
+        TerminalProfile::Hermes
+    );
+    let PaneLayout::Leaf { pane } = &nova_workspace.tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    assert_eq!(pane.id, nova_pane);
+
+    // The migrated state writes back as schema 15 and loads unchanged.
+    let bytes = SnapshotStore::encode_with_offline(
+        snapshot,
+        &recovered.cwd_by_pane,
+        &recovered.tmux_by_pane,
+        &recovered.offline_panes,
+    )
+    .unwrap();
+    let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(written["schema_version"], 15);
+    assert_eq!(written["workspaces"][2]["kind"], "bot");
+    assert!(written["workspaces"][2]["tabs"][0].get("bot").is_none());
+    store.write_snapshot(&bytes).unwrap();
+    let reloaded = store.load().unwrap();
+    assert!(reloaded.legacy_tmux_workspace.is_empty());
+    assert_eq!(
+        reloaded.snapshot.workspaces[2].tabs,
+        snapshot.workspaces[2].tabs
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -692,22 +921,18 @@ fn overlong_bot_instructions_are_rejected() {
         &HashSet::new(),
     )
     .unwrap();
-    let mut bots = desired.workspaces[0].clone();
-    bots.id = Uuid::new_v4();
-    bots.kind = DesiredWorkspaceKind::Bots;
-    bots.tabs[0].id = Uuid::new_v4();
-    bots.tabs[0].bot = Some(BotSpec {
+    let mut bot = desired.workspaces[0].clone();
+    bot.id = Uuid::new_v4();
+    bot.kind = DesiredWorkspaceKind::Bot;
+    bot.tabs.clear();
+    bot.bot = Some(BotSpec {
         pinned_threads: Vec::new(),
         thread_panes: std::collections::BTreeMap::default(),
         agent: TerminalProfile::Omp,
         instructions: Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1)),
         home: None,
     });
-    let DesiredLayout::Leaf { pane } = &mut bots.tabs[0].layout else {
-        panic!("expected leaf");
-    };
-    pane.id = Uuid::new_v4();
-    desired.workspaces.push(bots);
+    desired.workspaces.push(bot);
     assert_eq!(
         desired.validate().unwrap_err().to_string(),
         "bot instructions too long"
