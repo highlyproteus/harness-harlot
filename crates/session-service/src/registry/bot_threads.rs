@@ -2,7 +2,9 @@
 //! process showing one saved conversation of the bot.
 use super::bots::{BotTarget, bot_for_pane, local_terminal_runtime, thread_tab};
 use super::{RegistryState, SessionRegistry};
-use crate::bots::{SavedThread, saved_threads, threads_directory, valid_session_id};
+use crate::bots::{
+    SavedThread, delete_saved_thread, saved_threads, threads_directory, valid_session_id,
+};
 use crate::layout::{activate_tab, find_pane_in_snapshot, layout_contains};
 use crate::persistence::MAX_TABS_PER_WORKSPACE;
 use anyhow::{Context, Result, bail};
@@ -160,6 +162,48 @@ impl SessionRegistry {
             (false, true) => spec.pinned_threads.retain(|pin| pin != thread_id),
             _ => return Ok(()),
         }
+        self.commit_or_restore(&mut state, previous, &[])
+    }
+
+    /// Deletes thread `thread_id` of the bot: closes every live pane showing
+    /// it (tabs left empty go too), deletes its saved conversation and drops
+    /// its pin. A fresh thread without a session (`pane:<id>`) only closes
+    /// its pane.
+    pub fn delete_bot_thread(&self, bot_id: Uuid, thread_id: &str) -> Result<()> {
+        let target = self.state.read().bot_target(bot_id)?;
+        if let Some(pane) = thread_id.strip_prefix(PANE_THREAD_PREFIX) {
+            let pane_id = Uuid::parse_str(pane)
+                .ok()
+                .filter(|pane_id| target.panes.contains(pane_id))
+                .with_context(|| format!("thread {thread_id} is no longer open"))?;
+            return self.close_pane(pane_id);
+        }
+        require_omp(&target, bot_id)?;
+        if !valid_session_id(thread_id) {
+            bail!("invalid thread id {thread_id:?}");
+        }
+        let live = target
+            .panes
+            .iter()
+            .copied()
+            .filter(|pane_id| target.session_of(*pane_id) == Some(thread_id))
+            .collect::<Vec<_>>();
+        for pane_id in &live {
+            self.close_pane(*pane_id)?;
+        }
+        let deleted =
+            delete_saved_thread(&threads_directory(&self.bots_dir()?, bot_id), thread_id)?;
+        let mut state = self.state.write();
+        let previous = state.snapshot.clone();
+        let spec = state.bot_spec_mut(bot_id)?;
+        let pinned = spec.pinned_threads.iter().any(|pin| pin == thread_id);
+        if !pinned {
+            if live.is_empty() && deleted == 0 {
+                bail!("bot {bot_id} has no thread {thread_id}");
+            }
+            return Ok(());
+        }
+        spec.pinned_threads.retain(|pin| pin != thread_id);
         self.commit_or_restore(&mut state, previous, &[])
     }
 

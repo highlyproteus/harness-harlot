@@ -206,6 +206,7 @@ pub(crate) fn handle_request(
         | ClientRequest::ListBotThreads { .. }
         | ClientRequest::OpenBotThread { .. }
         | ClientRequest::SetBotThreadPinned { .. }
+        | ClientRequest::DeleteBotThread { .. }
         | ClientRequest::ReportBotSession { .. }
         | ClientRequest::GetCodingAgents => handle_bots_request(sessions, request),
     }
@@ -769,6 +770,10 @@ fn handle_bots_request(
             pinned,
         } => {
             sessions.set_bot_thread_pinned(bot_id, &thread_id, pinned)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::DeleteBotThread { bot_id, thread_id } => {
+            sessions.delete_bot_thread(bot_id, &thread_id)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::ReportBotSession {

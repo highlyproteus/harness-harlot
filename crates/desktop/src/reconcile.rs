@@ -230,6 +230,7 @@ mod tests {
             notifications: Vec::new(),
             notifications_latest_id: 0,
             dock_badge: None,
+            pane_views: crate::notifications::PaneViews::default(),
             last_delivery: HashMap::new(),
             window_active: true,
             stream_diagnostics: StreamDiagnostics::default(),

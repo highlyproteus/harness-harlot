@@ -17,6 +17,7 @@ use std::rc::Rc;
 use crate::helpers::{
     hsv_to_rgb, selection_span, terminal_point_clamped, terminal_run_display_text,
 };
+use crate::tab_chrome::PaneIndicator;
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{DialogTextEditor, WorkspaceCreationField, WorkspaceCreationStep};
 use crate::{HhApp, THEME};
@@ -33,11 +34,12 @@ pub(crate) struct SidebarPaneRowContext {
     pub(crate) activity: Option<ActivityRow>,
 }
 
-/// The status badge and location line of one Notifications row.
+/// The status symbol, unread dot, and location line of one Notifications row.
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityRow {
-    pub(crate) badge: &'static str,
-    pub(crate) badge_color: u32,
+    /// Replaces the row's tab indicator; see `notification_indicator`.
+    pub(crate) indicator: PaneIndicator,
+    pub(crate) unread: bool,
     pub(crate) location: String,
     pub(crate) bot: bool,
 }

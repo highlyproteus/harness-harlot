@@ -7,7 +7,7 @@ use crate::helpers::{
     render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
     workstation_banner_header_height,
 };
-use crate::tab_chrome::render_pane_indicator;
+use crate::tab_chrome::{render_pane_indicator, render_unread_dot};
 use crate::view_models::{
     CreateMenu, CreateMenuTarget, Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView,
     UpdateRestartConfirmation,
@@ -553,6 +553,12 @@ impl HhApp {
         } = row;
         let pane_id = pane.id;
         let bot_row = activity.as_ref().is_some_and(|activity| activity.bot);
+        // A thread row in a bot card: × deletes the thread, and only the
+        // active thread is highlighted; the rest use the plain row colors.
+        let bot_thread = activity
+            .is_none()
+            .then(|| self.bot_for_pane(pane_id))
+            .flatten();
         // Notifications rows jump to their pane but never drag-reorder.
         let drag_tab_id = tab_id.filter(|_| activity.is_none());
         let selected = self.layout.focused_pane == Some(pane_id);
@@ -575,13 +581,27 @@ impl HhApp {
         let pane_accent = user_color
             .unwrap_or_else(|| self.terminal_accent(pane_id))
             .as_rgb();
+        let plain = bot_thread.is_some() && !selected;
         let row_background = user_color.map_or(
             composite_rgb(pane_accent, THEME.sidebar, TAB_COLOR_ALPHA),
             |color| color.as_rgb(),
         );
-        let row_text = readable_text_color(row_background);
-        let indicator = self.pane_indicator(pane);
-        let close_tooltip = format!("Close {label}…");
+        let row_text = if plain {
+            THEME.foreground
+        } else {
+            readable_text_color(row_background)
+        };
+        let indicator = activity
+            .as_ref()
+            .map_or_else(|| self.pane_indicator(pane), |activity| activity.indicator);
+        let unread = activity.as_ref().map(|activity| activity.unread);
+        let (close_tooltip, close_thread) = match bot_thread {
+            Some(bot_id) => (
+                "Delete thread…".to_owned(),
+                Some((bot_id, self.live_thread_id(bot_id, pane_id), label.clone())),
+            ),
+            None => (format!("Close {label}…"), None),
+        };
         div()
             .id(("workspace-tab", element_key(pane_id)))
             .ml(px(indent))
@@ -594,10 +614,12 @@ impl HhApp {
             .flex()
             .items_center()
             .gap(px(7.0))
-            .bg(user_color.map_or(
-                rgba(rgba_with_alpha(pane_accent, TAB_COLOR_ALPHA)),
-                |color| rgb(color.as_rgb()),
-            ))
+            .when(!plain, |element| {
+                element.bg(user_color.map_or(
+                    rgba(rgba_with_alpha(pane_accent, TAB_COLOR_ALPHA)),
+                    |color| rgb(color.as_rgb()),
+                ))
+            })
             .border_t(if drop_above { px(2.0) } else { px(0.0) })
             .border_b(if drop_below { px(2.0) } else { px(0.0) })
             .border_color(rgb(if drop_above || drop_below {
@@ -606,7 +628,12 @@ impl HhApp {
                 row_text
             }))
             .when(selected, |element| element.border_1())
-            .hover(|element| element.border_1().border_color(rgb(row_text)))
+            .when(plain, |element| {
+                element.hover(|element| element.bg(rgb(THEME.elevated)))
+            })
+            .when(!plain, |element| {
+                element.hover(|element| element.border_1().border_color(rgb(row_text)))
+            })
             .tooltip(move |_, cx| {
                 let text = input
                     .read(cx)
@@ -760,27 +787,20 @@ impl HhApp {
                         )
                     }),
             )
-            .when_some(activity, |element, activity| {
-                element.child(
-                    div()
-                        .flex_none()
-                        .px(px(5.0))
-                        .py(px(1.0))
-                        .rounded(px(4.0))
-                        .bg(rgb(activity.badge_color))
-                        .font_family(".SystemUIFont")
-                        .text_size(px(9.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(readable_text_color(activity.badge_color)))
-                        .child(activity.badge),
-                )
+            .when_some(unread, |element, unread| {
+                element.child(render_unread_dot(unread))
             })
             .child(render_pane_indicator(indicator))
             .child(self.render_close_button(
                 ("close-workspace-tab", element_key(pane_id)),
                 row_text,
                 close_tooltip,
-                move |this, cx| this.begin_close(pane_id, cx),
+                move |this, cx| match close_thread.clone() {
+                    Some((bot_id, thread_id, title)) => {
+                        this.begin_bot_thread_delete(bot_id, thread_id, title, cx);
+                    }
+                    None => this.begin_close(pane_id, cx),
+                },
                 cx,
             ))
             .into_any_element()

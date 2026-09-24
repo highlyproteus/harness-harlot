@@ -617,6 +617,18 @@ impl HhApp {
                 cx.stop_propagation();
                 return;
             }
+            Modal::BotThreadDelete(_) => {
+                match keystroke.key.as_str() {
+                    "enter" => self.confirm_bot_thread_delete(cx),
+                    "escape" => {
+                        self.editor.modal = Modal::None;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+                cx.stop_propagation();
+                return;
+            }
             Modal::TmuxPicker(_) => {
                 match keystroke.key.as_str() {
                     "enter" => self.open_selected_tmux_sessions(cx),

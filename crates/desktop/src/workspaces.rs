@@ -258,6 +258,7 @@ impl HhApp {
                 workspace_scope_for_tab(workspace, tab_id)
             });
         self.sidebar.dismissed_workspace_tabs.remove(&tab_id);
+        self.mark_pane_viewed(pane_id);
         self.select_workspace_tab(workspace_id, pane_id, cx);
         self.sidebar.workspace_tab_scope = scope;
         cx.notify();

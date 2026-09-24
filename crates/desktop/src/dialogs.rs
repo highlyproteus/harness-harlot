@@ -114,6 +114,9 @@ impl HhApp {
                                             this.submit_dir_editor(cx);
                                         }
                                         DialogAction::CloseTab => this.confirm_tab_close(cx),
+                                        DialogAction::DeleteBotThread => {
+                                            this.confirm_bot_thread_delete(cx);
+                                        }
                                         DialogAction::InstallUpdate => {
                                             this.confirm_update_restart(cx)
                                         }

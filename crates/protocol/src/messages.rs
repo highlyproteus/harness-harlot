@@ -87,6 +87,12 @@ pub enum ClientRequest {
         thread_id: String,
         pinned: bool,
     },
+    /// Deletes a thread of the bot: closes every live pane showing it and
+    /// removes its saved conversation and its pin.
+    DeleteBotThread {
+        bot_id: Uuid,
+        thread_id: String,
+    },
     /// Sent by a bot's agent when its pane switches to another session.
     ReportBotSession {
         pane_id: Uuid,
@@ -854,6 +860,17 @@ mod tests {
                     "bot_id": bot_id,
                     "thread_id": "0193-abc",
                     "pinned": true,
+                }),
+            ),
+            (
+                ClientRequest::DeleteBotThread {
+                    bot_id,
+                    thread_id: "0193-abc".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "delete_bot_thread",
+                    "bot_id": bot_id,
+                    "thread_id": "0193-abc",
                 }),
             ),
             (

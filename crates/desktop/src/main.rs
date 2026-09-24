@@ -229,6 +229,8 @@ struct SessionState {
     notifications_latest_id: u64,
     /// Last Needs-you count sent to the Dock, so polling never re-sends it.
     dock_badge: Option<usize>,
+    /// When the user last viewed each pane, for the Notifications unread dot.
+    pane_views: notifications::PaneViews,
     /// When each pane's screen was last applied, used to pace on-screen panes
     /// other than the focused one.
     last_delivery: HashMap<Uuid, Instant>,
@@ -267,6 +269,7 @@ impl SessionState {
             notifications: Vec::new(),
             notifications_latest_id: 0,
             dock_badge: None,
+            pane_views: notifications::PaneViews::new(bots::now_ms()),
             last_delivery: HashMap::new(),
             window_active,
             stream_diagnostics: StreamDiagnostics::default(),
@@ -611,10 +614,11 @@ impl HhApp {
         cx.observe_window_activation(window, |this, window, cx| {
             this.session.window_active = window.is_window_active();
             if this.session.window_active {
+                this.mark_focused_pane_viewed();
+                cx.notify();
                 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
                 {
                     this.browser.reassert_focus = true;
-                    cx.notify();
                 }
             } else {
                 this.cancel_sidebar_resize(window, cx);

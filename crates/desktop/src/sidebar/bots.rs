@@ -38,7 +38,8 @@ impl HhApp {
             .child(
                 div()
                     .h(px(34.0))
-                    .px(px(12.0))
+                    .pl(px(12.0))
+                    .pr(px(8.0))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -54,18 +55,29 @@ impl HhApp {
                     .child(
                         div()
                             .id("new-bot")
-                            .px(px(8.0))
-                            .py(px(3.0))
+                            .flex_none()
+                            .w(px(22.0))
+                            .h(px(22.0))
                             .rounded(px(5.0))
                             .cursor_pointer()
+                            .bg(rgb(THEME.surface))
                             .border_1()
                             .border_color(rgb(THEME.border))
                             .font_family(".SystemUIFont")
-                            .text_xs()
+                            .text_sm()
                             .text_color(rgb(THEME.foreground))
                             .hover(|element| element.border_color(rgb(THEME.accent)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| TooltipView {
+                                    text: "New bot".to_owned(),
+                                })
+                                .into()
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.begin_bot_creation(cx)))
-                            .child("＋ New bot"),
+                            .child("＋"),
                     ),
             )
             .child(
@@ -92,7 +104,7 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// Right-click or "…" on a card: the bot menu for bots, else the
+    /// Right-click or "⋮" on a card: the bot menu for bots, else the
     /// workstation menu.
     pub(crate) fn open_card_menu(
         &mut self,
@@ -142,7 +154,7 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// The bot's saved threads as dimmed tab-style rows below its live tabs,
+    /// The bot's saved threads as tab-style rows below its live tabs,
     /// scrolling with a bottom fade past `THREAD_ROWS_VISIBLE` rows.
     pub(crate) fn render_saved_thread_rows(
         &self,
@@ -193,8 +205,8 @@ impl HhApp {
         )
     }
 
-    /// One saved thread: agent icon, title, pin, and age. Clicking resumes it
-    /// in a new tab; right-click pins or unpins it.
+    /// One saved thread: agent icon, title, pin, age, and a × that deletes
+    /// it. Clicking resumes it in a new tab; right-click pins or unpins it.
     fn render_saved_thread_row(
         &self,
         bot_id: Uuid,
@@ -208,6 +220,8 @@ impl HhApp {
             .clone()
             .unwrap_or_else(|| crate::bots::NEW_THREAD_TITLE.to_owned());
         let open_id = thread.id.clone();
+        let delete_id = thread.id.clone();
+        let delete_title = title.clone();
         let menu_thread = thread.clone();
         div()
             .id(gpui::ElementId::Name(
@@ -225,8 +239,8 @@ impl HhApp {
             .gap(px(7.0))
             .font_family(".SystemUIFont")
             .text_xs()
-            .text_color(rgb(THEME.dim))
-            .hover(|element| element.bg(rgb(THEME.elevated)).text_color(rgb(THEME.muted)))
+            .text_color(rgb(THEME.foreground))
+            .hover(|element| element.bg(rgb(THEME.elevated)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_bot_thread(bot_id, Some(open_id.clone()), cx);
                 cx.stop_propagation();
@@ -246,8 +260,7 @@ impl HhApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .opacity(0.6)
-                    .child(render_terminal_profile_icon(agent, THEME.dim, 13.0)),
+                    .child(render_terminal_profile_icon(agent, THEME.foreground, 13.0)),
             )
             .child(div().min_w(px(0.0)).flex_1().truncate().child(title))
             .when(thread.pinned, |element| {
@@ -258,9 +271,22 @@ impl HhApp {
                     .flex_none()
                     .child(relative_time(now, thread.updated_ms)),
             )
-            // A saved thread has no pane: its status slot stays empty and it
-            // gets no ×, since there is nothing live to close.
+            // A saved thread has no pane, so its status slot stays empty.
             .child(render_pane_indicator(PaneIndicator::None))
+            .child(self.render_close_button(
+                gpui::ElementId::Name(format!("delete-saved-thread-{}", thread.id).into()),
+                THEME.foreground,
+                "Delete thread…".to_owned(),
+                move |this, cx| {
+                    this.begin_bot_thread_delete(
+                        bot_id,
+                        delete_id.clone(),
+                        delete_title.clone(),
+                        cx,
+                    );
+                },
+                cx,
+            ))
             .into_any_element()
     }
 }

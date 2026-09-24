@@ -30,6 +30,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   to the thread that opened the worker.
   Threads are stored in the bot's folder and deleted with the bot. Added
   `hh bot report-session` and `hh bot info` for the omp plugin.
+- The × on every bot thread row, open or saved, deletes the thread after one
+  confirmation: its open panes close and its saved conversation is removed, so
+  it no longer returns to the saved list. Threads closed automatically past the
+  five-open limit still move to the saved list.
 - Added a bundled omp plugin for bots with native Harness Harlot tools and worker
   status reports, and attach the `hh mcp` server automatically to Claude Code and
   Codex bots.
@@ -52,9 +56,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Every tab and terminal — top-bar tabs, pane header tabs, sidebar tab rows,
   window ring chips, and bot thread rows — now has an always-visible × that
-  closes it with the usual confirmation (saved bot threads have none), and one
-  status slot: a spinner while running, an orange dot when it needs you, and
-  empty space otherwise. Notifications badges use the same colors.
+  closes it with the usual confirmation, and one status slot: a spinner while
+  running, an orange dot when it needs you, and empty space otherwise.
+- Bot thread rows use the normal row colors instead of a dimmed style; only the
+  current thread is highlighted. The Bots header's New bot button is now a
+  small ＋ icon, and menu buttons show a vertical ⋮.
 - Show each split window in the workstation sidebar as a ring of terminal chips,
   with no header row or collapse menu, instead of a nested row per terminal:
   the map keeps the window's proportions and each split's real size, so
@@ -64,20 +70,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   drag it out to its own tab, or right-click it for the tab menu. Drag the ring
   to reorder the window and right-click it for the window menu.
 - Rebuilt Notifications around live status: tabs and bots are grouped as Needs
-  you, Running, and Done, newest first, using the real tab rows with status
-  badges. The bell and Dock badges count items that need you.
+  you, Running, and Done, newest first, using the real tab rows. Each row shows
+  a status symbol (a spinner while running, an orange dot when it needs you, a
+  green dot when done or exited) and a blue dot until you view that pane after
+  its latest change. The bell and Dock badges count items that need you.
 - Rebuilt Settings as a surface that fills the whole main area. While it is
   open, its Appearance / Bots / Updates section list replaces the left
   sidebar, the same way the bell and robot switch it. The ⚙ button toggles
   Settings and closing it returns to the workstation or bot shown before. The ＋
   menu also offers New Bot.
-- Bumped the desktop/service wire protocol from 35 to 43 for bots, bot
-  workspaces and threads, workers, bot home folders, status timestamps,
-  coding-agent discovery, Gallery panes, browser command execution, and the
-  removed history archive requests; desktop and service must be upgraded
-  together. Session snapshots move to schema 15; existing snapshots load with
-  former Assistant workspaces and panes removed, and the shared Bots workspace
-  becomes one space per bot with each of its threads in its own tab.
+- Bumped the desktop/service wire protocol from 35 to 44 for bots, bot
+  workspaces and threads, bot thread deletion, workers, bot home folders,
+  status timestamps, coding-agent discovery, Gallery panes, browser command
+  execution, and the removed history archive requests; desktop and service
+  must be upgraded together. Session snapshots move to schema 15; existing
+  snapshots load with former Assistant workspaces and panes removed, and the
+  shared Bots workspace becomes one space per bot with each of its threads in
+  its own tab.
 
 ### Removed
 

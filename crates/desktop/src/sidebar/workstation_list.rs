@@ -779,7 +779,14 @@ impl HhApp {
         } else {
             THEME.border
         };
-        let close_tooltip = format!("Close {title}…");
+        // In a bot, a chip is a thread: × deletes it.
+        let (close_tooltip, close_thread) = match self.bot_for_pane(pane_id) {
+            Some(bot_id) => (
+                "Delete thread…".to_owned(),
+                Some((bot_id, self.live_thread_id(bot_id, pane_id), title.clone())),
+            ),
+            None => (format!("Close {title}…"), None),
+        };
         let tooltip = match activity_section(pane.status, exited) {
             Some(_) => format!(
                 "{} — {}",
@@ -862,7 +869,12 @@ impl HhApp {
                 ("close-group-pane-chip", element_key(pane_id)),
                 THEME.foreground,
                 close_tooltip,
-                move |this, cx| this.begin_close(pane_id, cx),
+                move |this, cx| match close_thread.clone() {
+                    Some((bot_id, thread_id, title)) => {
+                        this.begin_bot_thread_delete(bot_id, thread_id, title, cx);
+                    }
+                    None => this.begin_close(pane_id, cx),
+                },
                 cx,
             ))
             .into_any_element()
@@ -893,7 +905,7 @@ impl HhApp {
                     cx.stop_propagation();
                 }),
             )
-            .child("…")
+            .child("⋮")
             .into_any_element()
     }
 
@@ -1320,7 +1332,7 @@ impl HhApp {
                     cx.stop_propagation();
                 }),
             )
-            .child("…")
+            .child("⋮")
             .into_any_element()
     }
 }

@@ -10,7 +10,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -108,6 +108,46 @@ pub(crate) fn saved_threads(directory: &Path) -> Vec<SavedThread> {
         });
     }
     threads
+}
+
+/// Deletes saved session `id` from `directory`: every regular session file
+/// whose header names `id`, plus the artifacts directory named after it
+/// (`<timestamp>_<id>/`). Symlinks are never followed and nothing outside
+/// `directory` is touched. Returns how many session files were deleted.
+pub(crate) fn delete_saved_thread(directory: &Path, id: &str) -> Result<usize> {
+    if !valid_session_id(id) {
+        bail!("invalid thread id {id:?}");
+    }
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => bail!("{} is not a thread directory", directory.display()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", directory.display()));
+        }
+    }
+    let entries =
+        fs::read_dir(directory).with_context(|| format!("list {}", directory.display()))?;
+    let mut deleted = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != SESSION_FILE_EXTENSION)
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || read_header(&path).is_none_or(|(session, _)| session != id)
+        {
+            continue;
+        }
+        fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+        deleted += 1;
+        let artifacts = path.with_extension("");
+        if fs::symlink_metadata(&artifacts).is_ok_and(|metadata| metadata.is_dir()) {
+            fs::remove_dir_all(&artifacts)
+                .with_context(|| format!("delete {}", artifacts.display()))?;
+        }
+    }
+    Ok(deleted)
 }
 
 /// The session id and title from the start of a session file.
@@ -254,6 +294,42 @@ mod tests {
     #[test]
     fn a_missing_directory_has_no_threads() {
         assert!(saved_threads(&std::env::temp_dir().join(Uuid::new_v4().to_string())).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_thread_removes_only_its_files_and_never_follows_symlinks() {
+        let directory = directory();
+        let outside = std::env::temp_dir().join(format!("hh-outside-{}", Uuid::new_v4()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "x").unwrap();
+        let session = |id: &str| format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n");
+        write_session(&directory, "2026-01-01_aaa.jsonl", &session("aaa"), 1);
+        fs::create_dir_all(directory.join("2026-01-01_aaa").join("nested")).unwrap();
+        write_session(&directory, "2026-01-02_bbb.jsonl", &session("bbb"), 1);
+        std::os::unix::fs::symlink(outside.join("keep.txt"), directory.join("2026_ccc.jsonl"))
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, directory.join("2026_ddd")).unwrap();
+        write_session(&directory, "2026_ddd.jsonl", &session("ddd"), 1);
+
+        assert_eq!(delete_saved_thread(&directory, "aaa").unwrap(), 1);
+        assert!(!directory.join("2026-01-01_aaa.jsonl").exists());
+        assert!(!directory.join("2026-01-01_aaa").exists());
+        assert!(directory.join("2026-01-02_bbb.jsonl").exists());
+        // A symlinked session file is not a session; a symlinked artifacts
+        // directory is left alone and its target untouched.
+        assert_eq!(delete_saved_thread(&directory, "ccc").unwrap(), 0);
+        assert!(fs::symlink_metadata(directory.join("2026_ccc.jsonl")).is_ok());
+        assert_eq!(delete_saved_thread(&directory, "ddd").unwrap(), 1);
+        assert!(outside.join("keep.txt").exists());
+        for invalid in ["", "../bbb", "bbb/../bbb", "a b"] {
+            assert!(delete_saved_thread(&directory, invalid).is_err());
+        }
+        assert_eq!(
+            delete_saved_thread(&directory.join("missing"), "aaa").unwrap(),
+            0
+        );
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]

@@ -151,6 +151,14 @@ pub(super) struct BotThreadMenu {
     pub(super) position: Point<Pixels>,
 }
 
+/// Asks before deleting one bot thread and its saved conversation.
+#[derive(Clone, Debug)]
+pub(super) struct BotThreadDeleteConfirmation {
+    pub(super) bot_id: Uuid,
+    pub(super) thread_id: String,
+    pub(super) title: String,
+}
+
 /// What the left sidebar lists: workstations, live pane activity, or bots.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum SidebarMode {
@@ -976,6 +984,7 @@ pub(super) enum DialogAction {
     ClosePane,
     ConfirmDirEditor,
     CloseTab,
+    DeleteBotThread,
 }
 pub(super) struct DialogSpec {
     pub(super) title: String,
@@ -1008,6 +1017,7 @@ pub(super) enum Modal {
     GroupMenu(GroupMenu),
     BotMenu(BotMenu),
     BotThreadMenu(BotThreadMenu),
+    BotThreadDelete(BotThreadDeleteConfirmation),
     WorkspaceConnectionInfo(WorkspaceConnectionInfo),
     AppearanceSettings,
 }

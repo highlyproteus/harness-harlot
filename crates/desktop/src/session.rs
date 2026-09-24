@@ -269,6 +269,7 @@ impl HhApp {
                 self.sync_dock_badge();
                 let mut state_changed = outcome.state_changed;
                 self.refresh_changed_bot_threads();
+                self.mark_focused_pane_viewed();
                 if let Some(pane_id) = outcome.focus_resync {
                     state_changed |= self.focus_pane_with_snapshot(pane_id, cx);
                 }
@@ -338,6 +339,7 @@ impl HhApp {
             self.dispatch(ClientRequest::ActivateTab { pane_id });
         }
         self.note_bot_pane_focus(pane_id);
+        self.mark_pane_viewed(pane_id);
         if self
             .pane_metadata(pane_id)
             .is_some_and(|pane| !pane.kind.is_terminal())

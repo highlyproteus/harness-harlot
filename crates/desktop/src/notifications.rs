@@ -139,6 +139,48 @@ pub(crate) fn bots_needing_you(
         .count()
 }
 
+/// Whether a pane's latest status change is unread: newer than the last time
+/// the user viewed the pane.
+pub(crate) const fn is_unread(status_changed_at_ms: u64, last_viewed_ms: u64) -> bool {
+    status_changed_at_ms > last_viewed_ms
+}
+
+/// When the user last viewed each pane (focused it, clicked its
+/// Notifications row, or opened its bot thread), in epoch ms. Desktop-local
+/// and not persisted: a pane not viewed since launch counts as viewed at
+/// launch, so a restart does not mark every finished pane unread.
+#[derive(Debug, Default)]
+pub(crate) struct PaneViews {
+    launched_ms: u64,
+    viewed_ms: HashMap<Uuid, u64>,
+}
+
+impl PaneViews {
+    pub(crate) fn new(launched_ms: u64) -> Self {
+        Self {
+            launched_ms,
+            viewed_ms: HashMap::new(),
+        }
+    }
+
+    /// Records a view of `pane_id` at `at_ms`; a later view is never undone.
+    pub(crate) fn mark(&mut self, pane_id: Uuid, at_ms: u64) {
+        let viewed = self.viewed_ms.entry(pane_id).or_insert(at_ms);
+        *viewed = (*viewed).max(at_ms);
+    }
+
+    pub(crate) fn last_viewed_ms(&self, pane_id: Uuid) -> u64 {
+        self.viewed_ms
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(self.launched_ms)
+    }
+
+    pub(crate) fn is_unread(&self, pane: &Pane) -> bool {
+        is_unread(pane.status_changed_at_ms, self.last_viewed_ms(pane.id))
+    }
+}
+
 impl HhApp {
     pub(crate) fn refresh_notifications(&mut self) {
         self.dispatch_with(
@@ -180,6 +222,36 @@ impl HhApp {
         })
     }
 
+    /// Records that the user viewed pane `pane_id` now. Its latest status
+    /// change counts as seen even if the service clock runs ahead.
+    pub(crate) fn mark_pane_viewed(&mut self, pane_id: Uuid) {
+        let changed_ms = self
+            .session
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.tabs)
+                    .find_map(|tab| crate::helpers::find_pane(&tab.layout, pane_id))
+            })
+            .map_or(0, |pane| pane.status_changed_at_ms);
+        self.session
+            .pane_views
+            .mark(pane_id, crate::bots::now_ms().max(changed_ms));
+    }
+
+    /// The focused pane of an active window is being looked at, so its
+    /// status changes are seen as they arrive.
+    pub(crate) fn mark_focused_pane_viewed(&mut self) {
+        if self.session.window_active
+            && let Some(pane_id) = self.layout.focused_pane
+        {
+            self.mark_pane_viewed(pane_id);
+        }
+    }
+
     pub(crate) fn sync_dock_badge(&mut self) {
         let count = self.needs_you_count();
         if self.session.dock_badge == Some(count) {
@@ -211,7 +283,7 @@ impl HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivitySection, activity_entries, bots_needing_you};
+    use super::{ActivitySection, PaneViews, activity_entries, bots_needing_you, is_unread};
     use hh_protocol::{
         PaneLayout, PaneStatus, PaneStreamState, SessionSnapshot, Tab, Workspace, WorkspaceKind,
     };
@@ -236,6 +308,28 @@ mod tests {
         bot.kind = WorkspaceKind::Bot;
         bot.tabs = tabs;
         bot
+    }
+
+    #[test]
+    fn a_status_change_is_unread_until_the_pane_is_viewed_after_it() {
+        assert!(is_unread(20, 10));
+        assert!(
+            !is_unread(10, 10),
+            "a change at the viewing instant is seen"
+        );
+        assert!(!is_unread(5, 10));
+
+        let pane = Uuid::new_v4();
+        let mut views = PaneViews::new(100);
+        assert_eq!(
+            views.last_viewed_ms(pane),
+            100,
+            "unviewed panes date from launch"
+        );
+        views.mark(pane, 300);
+        views.mark(pane, 200);
+        assert_eq!(views.last_viewed_ms(pane), 300, "an older view never wins");
+        assert_eq!(views.last_viewed_ms(Uuid::new_v4()), 100);
     }
 
     #[test]

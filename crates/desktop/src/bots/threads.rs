@@ -6,15 +6,19 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gpui::{Context, Pixels, Point};
+use gpui::{AnyElement, Context, IntoElement, ParentElement, Pixels, Point, Styled, div, rgb};
 use hh_protocol::{BotSpec, BotThread, ClientRequest, Pane, ServiceResponse, Tab, TerminalProfile};
 use uuid::Uuid;
 
 use crate::HhApp;
+use crate::THEME;
 use crate::helpers::{
     WorkspaceTabScope, find_pane, identity_label, visible_panes, workspace_tab_standalone_pane,
 };
-use crate::view_models::{BotThreadMenu, Modal, SidebarMode};
+use crate::view_models::{
+    BotThreadDeleteConfirmation, BotThreadMenu, DialogAction, DialogSpec, DialogTone, Modal,
+    SidebarMode,
+};
 
 /// How often the thread lists refresh while Bots mode is shown.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -219,6 +223,7 @@ impl HhApp {
                         this.sidebar.workspace_tab_scope = WorkspaceTabScope::Workstation;
                         this.layout.last_sizes.clear();
                         this.focus_created_pane(bot_id, pane_id, cx);
+                        this.mark_pane_viewed(pane_id);
                         this.refresh_bot_threads(bot_id);
                     }
                     Ok(response) => this.report_unexpected(&response),
@@ -276,6 +281,86 @@ impl HhApp {
             }),
         );
         cx.notify();
+    }
+
+    /// The thread live bot pane `pane_id` shows: its agent session, else the
+    /// `pane:<id>` id of a fresh thread with no saved conversation yet.
+    pub(crate) fn live_thread_id(&self, bot_id: Uuid, pane_id: Uuid) -> String {
+        self.bot_spec(bot_id)
+            .and_then(|bot| bot.thread_panes.get(&pane_id))
+            .and_then(|thread| thread.session.clone())
+            .unwrap_or_else(|| format!("pane:{pane_id}"))
+    }
+
+    /// The × on a bot thread row: asks before deleting the thread.
+    pub(crate) fn begin_bot_thread_delete(
+        &mut self,
+        bot_id: Uuid,
+        thread_id: String,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.color_picker = None;
+        self.editor.modal = Modal::BotThreadDelete(BotThreadDeleteConfirmation {
+            bot_id,
+            thread_id,
+            title,
+        });
+        cx.notify();
+    }
+
+    /// Deletes the confirmed thread: the service closes its panes and
+    /// removes its saved conversation, so it leaves the list for good.
+    pub(crate) fn confirm_bot_thread_delete(&mut self, cx: &mut Context<Self>) {
+        let Modal::BotThreadDelete(confirmation) = std::mem::take(&mut self.editor.modal) else {
+            return;
+        };
+        let BotThreadDeleteConfirmation {
+            bot_id, thread_id, ..
+        } = confirmation;
+        self.dispatch_with(
+            ClientRequest::DeleteBotThread {
+                bot_id,
+                thread_id: thread_id.clone(),
+            },
+            Box::new(move |this, cx, result| {
+                match result {
+                    Ok(ServiceResponse::Ack) => {
+                        if let Some(threads) = this.bot_threads.lists.get_mut(&bot_id) {
+                            threads.retain(|thread| thread.id != thread_id);
+                        }
+                        this.layout.last_sizes.clear();
+                        this.refresh_bot_threads(bot_id);
+                    }
+                    Ok(response) => this.report_unexpected(&response),
+                    Err(error) => this.report(&error),
+                }
+                cx.notify();
+            }),
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn render_bot_thread_delete_dialog(
+        &self,
+        confirmation: &BotThreadDeleteConfirmation,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.confirm_dialog(
+            div()
+                .text_sm()
+                .text_color(rgb(THEME.muted))
+                .child("Its conversation is removed.")
+                .into_any_element(),
+            DialogSpec {
+                title: format!("Delete thread '{}'?", confirmation.title),
+                confirm_label: "Delete thread",
+                confirm_tone: DialogTone::Danger,
+                confirm_id: "confirm-bot-thread-delete",
+                action: DialogAction::DeleteBotThread,
+            },
+            cx,
+        )
     }
 
     pub(crate) fn open_bot_thread_menu(

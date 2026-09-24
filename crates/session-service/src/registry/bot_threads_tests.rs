@@ -569,6 +569,73 @@ fn pins_persist_and_only_saved_threads_can_be_pinned() {
 }
 
 #[test]
+fn deleting_threads_closes_their_panes_and_removes_their_conversations() {
+    let fixture = Fixture::new();
+    let registry = &fixture.registry;
+    let (bot_id, _, first) = registry
+        .create_bot(Some("Hive3"), TerminalProfile::Omp, None, None)
+        .unwrap();
+    let threads_dir = fixture.threads_dir(bot_id);
+    let ids = |registry: &SessionRegistry| {
+        registry
+            .list_bot_threads(bot_id)
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>()
+    };
+
+    // A saved, pinned thread loses its file, artifacts, list entry and pin.
+    fixture.save_thread(bot_id, "s-saved", "Saved");
+    std::fs::create_dir(threads_dir.join("2026-01-01_s-saved")).unwrap();
+    registry
+        .set_bot_thread_pinned(bot_id, "s-saved", true)
+        .unwrap();
+    registry.delete_bot_thread(bot_id, "s-saved").unwrap();
+    assert!(!threads_dir.join("2026-01-01_s-saved.jsonl").exists());
+    assert!(!threads_dir.join("2026-01-01_s-saved").exists());
+    assert!(spec(registry, bot_id).pinned_threads.is_empty());
+    assert_eq!(ids(registry), [pane_thread_id(first)]);
+
+    // A live thread's pane and emptied tab close; it is not listed as saved.
+    registry.report_bot_session(first, "s-live").unwrap();
+    fixture.save_thread(bot_id, "s-live", "Live");
+    let (second_tab, second) = registry.open_bot_thread(bot_id, None).unwrap();
+    registry.delete_bot_thread(bot_id, "s-live").unwrap();
+    assert!(registry.pane(first).is_err(), "the pane's process ended");
+    assert_eq!(thread_tabs(registry, bot_id), [(second_tab, vec![second])]);
+    assert!(!threads_dir.join("2026-01-01_s-live.jsonl").exists());
+    assert!(!spec(registry, bot_id).thread_panes.contains_key(&first));
+    assert_eq!(ids(registry), [pane_thread_id(second)]);
+
+    // A fresh thread without a session only closes its pane.
+    let (_, third) = registry.open_bot_thread(bot_id, None).unwrap();
+    registry
+        .delete_bot_thread(bot_id, &pane_thread_id(third))
+        .unwrap();
+    assert_eq!(thread_tabs(registry, bot_id), [(second_tab, vec![second])]);
+
+    // Ids that are invalid, unknown or name a session outside the bot's
+    // threads directory are refused and delete nothing.
+    let outside = threads_dir.parent().unwrap().join("2026-01-01_s-out.jsonl");
+    std::fs::write(&outside, "{\"type\":\"session\",\"id\":\"s-out\"}\n").unwrap();
+    for invalid in [
+        "s-out",
+        "../2026-01-01_s-out",
+        "",
+        "s-missing",
+        "pane:00000000-0000-0000-0000-000000000000",
+    ] {
+        assert!(
+            registry.delete_bot_thread(bot_id, invalid).is_err(),
+            "{invalid:?}"
+        );
+    }
+    assert!(outside.exists());
+    assert_eq!(live(registry, bot_id).0, [second]);
+}
+
+#[test]
 fn workers_record_the_thread_pane_that_opened_them() {
     let fixture = Fixture::new();
     let registry = &fixture.registry;
