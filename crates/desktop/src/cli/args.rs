@@ -20,12 +20,21 @@ pub(crate) struct AgentCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AgentAction {
+    Bot(BotCommand),
     Browser(BrowserCommand),
     Gallery(GalleryCommand),
     Terminal(TerminalCommand),
     Workstation(WorkstationCommand),
     Mcp,
     Skill(SkillCommand),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BotCommand {
+    /// Records the agent session the calling bot pane now shows.
+    ReportSession { session: String },
+    /// The calling bot pane, its bot and the bot's live and active panes.
+    Info,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -208,6 +217,7 @@ pub(crate) fn parse_agent_command(arguments: &[String]) -> Result<AgentCommand> 
         bail!("missing agent command");
     };
     let action = match surface.as_str() {
+        "bot" => AgentAction::Bot(parse_bot(arguments)?),
         "browser" => AgentAction::Browser(parse_browser(arguments)?),
         "gallery" => AgentAction::Gallery(parse_gallery(arguments)?),
         "terminal" => AgentAction::Terminal(parse_terminal(arguments)?),
@@ -279,6 +289,26 @@ fn parse_env_uuid(name: &str) -> Result<Option<Uuid>> {
 
 fn parse_uuid_flag(flag: &str, value: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("{flag} must be a UUID"))
+}
+
+fn parse_bot(arguments: &[String]) -> Result<BotCommand> {
+    let Some((command, arguments)) = arguments.split_first() else {
+        bail!("missing bot command");
+    };
+    match command.as_str() {
+        "report-session" => {
+            let options = Options::scan(arguments, &["--session"], &[])?;
+            options.positionals::<0>("hh bot report-session --session ID [--pane ID]")?;
+            Ok(BotCommand::ReportSession {
+                session: options
+                    .single("--session")?
+                    .context("bot report-session requires --session ID")?
+                    .to_owned(),
+            })
+        }
+        "info" => no_arguments(arguments, BotCommand::Info),
+        _ => bail!("unknown bot command {command}"),
+    }
 }
 
 fn parse_browser(arguments: &[String]) -> Result<BrowserCommand> {
@@ -757,6 +787,17 @@ mod tests {
             })
         );
         assert!(parse(&["workstation", "new"]).is_err());
+        assert_eq!(
+            parse(&["bot", "report-session", "--session", "0193-abc"]).unwrap(),
+            AgentAction::Bot(BotCommand::ReportSession {
+                session: "0193-abc".to_owned(),
+            })
+        );
+        assert!(parse(&["bot", "report-session"]).is_err());
+        assert_eq!(
+            parse(&["bot", "info"]).unwrap(),
+            AgentAction::Bot(BotCommand::Info)
+        );
         assert!(parse(&["terminal", "list", "--all"]).is_err());
         assert!(parse(&["terminal", "focus"]).is_err());
     }

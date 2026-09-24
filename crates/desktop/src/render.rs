@@ -75,6 +75,7 @@ impl HhApp {
             Modal::CreateMenu(menu) => Some(self.render_create_menu(*menu, cx)),
             Modal::GroupMenu(menu) => Some(self.render_group_menu(*menu, menu_max_height, cx)),
             Modal::BotMenu(menu) => Some(self.render_bot_menu(*menu, menu_max_height, cx)),
+            Modal::BotThreadMenu(menu) => Some(self.render_bot_thread_menu(menu, cx)),
             Modal::WorkspaceConnectionInfo(info) => {
                 Some(self.render_workspace_connection_info(info, cx))
             }
@@ -155,6 +156,7 @@ impl Render for HhApp {
                             | Modal::CreateMenu(_)
                             | Modal::GroupMenu(_)
                             | Modal::BotMenu(_)
+                            | Modal::BotThreadMenu(_)
                             | Modal::WorkspaceConnectionInfo(_)
                     ) {
                         this.editor.modal = Modal::None;

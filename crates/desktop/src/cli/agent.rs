@@ -23,6 +23,7 @@ const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn execute(command: &AgentCommand) -> Result<Value> {
     match &command.action {
+        AgentAction::Bot(bot) => terminal::execute_bot(&command.context, bot),
         AgentAction::Browser(browser) => execute_browser(&command.context, browser),
         AgentAction::Gallery(gallery) => execute_gallery(&command.context, gallery),
         AgentAction::Terminal(terminal_command) => {

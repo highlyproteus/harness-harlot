@@ -483,6 +483,7 @@ struct HhApp {
     editor: EditorUi,
     gallery: GalleryUi,
     coding_agents: bots::CodingAgentsState,
+    bot_threads: bots::BotThreadsState,
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     browser: BrowserUi,
 }
@@ -599,6 +600,7 @@ impl HhApp {
             editor: EditorUi::new(workspace_input_focus),
             gallery: GalleryUi::new(),
             coding_agents: bots::CodingAgentsState::default(),
+            bot_threads: bots::BotThreadsState::default(),
             #[cfg(all(target_os = "macos", feature = "browser"))]
             browser: BrowserUi::new(browser_parent_view),
             #[cfg(all(target_os = "linux", feature = "browser"))]

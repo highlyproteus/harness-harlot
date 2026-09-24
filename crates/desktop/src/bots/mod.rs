@@ -15,7 +15,10 @@ use crate::view_models::{BotMenu, GroupRenameEditor, Modal, SidebarMode, Workspa
 use crate::{HhApp, max_pane_status};
 
 mod settings;
+mod threads;
 mod view;
+
+pub(crate) use threads::{BotThreadsState, has_threads, now_ms, relative_time};
 
 /// Installed coding agents reported by the session service.
 #[derive(Debug, Default)]
@@ -181,6 +184,7 @@ impl HhApp {
                 if !self.coding_agents.loaded {
                     self.refresh_coding_agents(cx);
                 }
+                self.start_bot_threads_refresh(cx);
             }
         }
         cx.notify();
@@ -219,15 +223,18 @@ impl HhApp {
 
     /// Shows one bot's terminal in the main area.
     pub(crate) fn open_bot(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        let Some((workspace_id, pane_id)) = self.bots_workspace().and_then(|workspace| {
+        let Some((workspace_id, pane_id, threaded)) = self.bots_workspace().and_then(|workspace| {
             let tab = workspace.tabs.iter().find(|tab| tab.id == tab_id)?;
-            Some((workspace.id, bot_pane(tab)?.id))
+            Some((workspace.id, bot_pane(tab)?.id, has_threads(tab)))
         }) else {
             return;
         };
         self.remember_return_workstation();
         self.editor.modal = Modal::None;
         self.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+        if threaded {
+            self.refresh_bot_threads(tab_id);
+        }
     }
 
     /// Shows one of a bot's worker tabs; the sidebar stays on Bots so the
@@ -254,6 +261,7 @@ impl HhApp {
         self.sidebar.sidebar_mode = SidebarMode::Bots;
         self.sidebar.sidebar_visible = true;
         self.focus_created_pane(workspace_id, pane_id, cx);
+        self.start_bot_threads_refresh(cx);
     }
 
     pub(crate) fn begin_bot_creation(&mut self, cx: &mut Context<Self>) {
@@ -480,6 +488,8 @@ mod tests {
             },
         );
         bot_tab.bot = Some(BotSpec {
+            pinned_threads: Vec::new(),
+            thread_panes: std::collections::BTreeMap::default(),
             agent: TerminalProfile::Omp,
             instructions: None,
             home: None,

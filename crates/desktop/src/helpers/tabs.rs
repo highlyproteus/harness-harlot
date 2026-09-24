@@ -379,6 +379,7 @@ mod tests {
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
         workspace.tabs = vec![
             hh_protocol::Tab {
+                owner_thread: None,
                 bot: None,
                 owner_bot: None,
 
@@ -393,6 +394,7 @@ mod tests {
                 layout: PaneLayout::Leaf { pane: make_pane(1) },
             },
             hh_protocol::Tab {
+                owner_thread: None,
                 bot: None,
                 owner_bot: None,
 
@@ -407,6 +409,7 @@ mod tests {
                 layout: PaneLayout::Leaf { pane: make_pane(2) },
             },
             hh_protocol::Tab {
+                owner_thread: None,
                 bot: None,
                 owner_bot: None,
 
@@ -424,6 +427,7 @@ mod tests {
                 },
             },
             hh_protocol::Tab {
+                owner_thread: None,
                 bot: None,
                 owner_bot: None,
 
@@ -489,6 +493,7 @@ mod tests {
         };
         let make_leaf_tab =
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>| hh_protocol::Tab {
+                owner_thread: None,
                 bot: None,
                 owner_bot: None,
 
@@ -512,6 +517,7 @@ mod tests {
         workspace.tabs = vec![
             make_leaf_tab(10, 1, None),
             hh_protocol::Tab {
+                owner_thread: None,
                 bot: None,
                 owner_bot: None,
 
@@ -582,6 +588,7 @@ mod tests {
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
         workspace.tabs = vec![
             hh_protocol::Tab {
+                owner_thread: None,
                 bot: None,
                 owner_bot: None,
 
@@ -599,6 +606,7 @@ mod tests {
                 },
             },
             hh_protocol::Tab {
+                owner_thread: None,
                 bot: None,
                 owner_bot: None,
 
@@ -656,6 +664,7 @@ mod tests {
         let make_tab =
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>, parent_tab: Option<Uuid>| {
                 hh_protocol::Tab {
+                    owner_thread: None,
                     bot: None,
                     owner_bot: None,
 
@@ -733,6 +742,7 @@ mod tests {
         let make_tab =
             |tab_id: u128, pane_id: u128, project_dir: Option<&str>, parent_tab: Option<Uuid>| {
                 hh_protocol::Tab {
+                    owner_thread: None,
                     bot: None,
                     owner_bot: None,
 
@@ -821,6 +831,7 @@ mod tests {
             custom_icon: None,
         };
         let mut tab = hh_protocol::Tab {
+            owner_thread: None,
             bot: None,
             owner_bot: None,
 
@@ -935,6 +946,7 @@ mod tests {
             custom_icon: None,
             tabs: vec![
                 hh_protocol::Tab {
+                    owner_thread: None,
                     bot: None,
                     owner_bot: None,
 
@@ -951,6 +963,7 @@ mod tests {
                     },
                 },
                 hh_protocol::Tab {
+                    owner_thread: None,
                     bot: None,
                     owner_bot: None,
 

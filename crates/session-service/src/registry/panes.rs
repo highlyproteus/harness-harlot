@@ -386,6 +386,7 @@ impl SessionRegistry {
                 custom_icon: None,
             };
             workspace.tabs.push(Tab {
+                owner_thread: None,
                 id: Uuid::new_v4(),
                 title: tab_title,
                 custom_title: None,
@@ -529,6 +530,7 @@ impl SessionRegistry {
             bail!("workstation tab limit of {MAX_TABS_PER_WORKSPACE} reached");
         }
         workspace.tabs.push(Tab {
+            owner_thread: None,
             id: Uuid::new_v4(),
             title: title.clone(),
             custom_title: None,
@@ -585,6 +587,7 @@ impl SessionRegistry {
             bail!("workstation tab limit of {MAX_TABS_PER_WORKSPACE} reached");
         }
         workspace.tabs.push(Tab {
+            owner_thread: None,
             id: Uuid::new_v4(),
             title: "Gallery".to_owned(),
             custom_title: None,
@@ -853,6 +856,9 @@ impl SessionRegistry {
                 continue;
             };
             let (_, remaining) = detach_pane(workspace.tabs[tab_index].layout.clone(), pane_id);
+            if let Some(spec) = &mut workspace.tabs[tab_index].bot {
+                spec.thread_panes.remove(&pane_id);
+            }
             if let Some(remaining) = remaining {
                 workspace.tabs[tab_index].layout = remaining;
             } else {
@@ -964,7 +970,7 @@ impl SessionRegistry {
         let _ = previous.terminate_and_wait();
         drop(previous);
         if let Some(tab_id) = bot_tab {
-            self.relaunch_recovered_bot(tab_id);
+            self.relaunch_recovered_bot(tab_id, pane_id);
         }
         self.write_snapshot(&bytes)
     }

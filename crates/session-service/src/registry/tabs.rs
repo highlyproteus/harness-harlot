@@ -171,6 +171,7 @@ impl SessionRegistry {
                 "ssh".clone_into(&mut pane.shell);
             }
             let tab = Tab {
+                owner_thread: None,
                 id: Uuid::new_v4(),
                 title: pane.title.clone(),
                 custom_title,
@@ -239,11 +240,15 @@ impl SessionRegistry {
 
     pub fn activate_tab(&self, pane_id: Uuid) -> Result<()> {
         let mut state = self.state.write();
+        let now = crate::now_ms();
         let did_activate = state.snapshot.workspaces.iter_mut().any(|workspace| {
-            workspace
-                .tabs
-                .iter_mut()
-                .any(|tab| activate_tab(&mut tab.layout, pane_id))
+            workspace.tabs.iter_mut().any(|tab| {
+                let activated = activate_tab(&mut tab.layout, pane_id);
+                if activated && let Some(spec) = &mut tab.bot {
+                    spec.thread_panes.entry(pane_id).or_default().activated_ms = now;
+                }
+                activated
+            })
         });
         if !did_activate {
             bail!("pane tab {pane_id} does not exist");
@@ -573,6 +578,7 @@ impl SessionRegistry {
         workspace.tabs.insert(
             insertion_index,
             Tab {
+                owner_thread: None,
                 id: Uuid::new_v4(),
                 title: pane.title.clone(),
                 custom_title: None,

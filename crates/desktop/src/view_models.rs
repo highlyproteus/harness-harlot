@@ -142,6 +142,15 @@ pub(super) struct BotMenu {
     pub(super) agents_open: bool,
 }
 
+/// Right-click menu of one bot thread row.
+#[derive(Clone, Debug)]
+pub(super) struct BotThreadMenu {
+    pub(super) tab_id: Uuid,
+    pub(super) thread_id: String,
+    pub(super) pinned: bool,
+    pub(super) position: Point<Pixels>,
+}
+
 /// What the left sidebar lists: workstations, live pane activity, or bots.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum SidebarMode {
@@ -997,6 +1006,7 @@ pub(super) enum Modal {
     CreateMenu(CreateMenu),
     GroupMenu(GroupMenu),
     BotMenu(BotMenu),
+    BotThreadMenu(BotThreadMenu),
     WorkspaceConnectionInfo(WorkspaceConnectionInfo),
     AppearanceSettings,
 }

@@ -203,6 +203,10 @@ pub(crate) fn handle_request(
         | ClientRequest::RestartBot { .. }
         | ClientRequest::SetBotHome { .. }
         | ClientRequest::CreateWorker { .. }
+        | ClientRequest::ListBotThreads { .. }
+        | ClientRequest::OpenBotThread { .. }
+        | ClientRequest::SetBotThreadPinned { .. }
+        | ClientRequest::ReportBotSession { .. }
         | ClientRequest::GetCodingAgents => handle_bots_request(sessions, request),
     }
 }
@@ -751,6 +755,28 @@ fn handle_bots_request(
                 tab_id,
                 pane_id,
             })
+        }
+        ClientRequest::ListBotThreads { tab_id } => Ok(ServiceResponse::BotThreads {
+            threads: sessions.list_bot_threads(tab_id)?,
+        }),
+        ClientRequest::OpenBotThread { tab_id, thread_id } => {
+            sessions.open_bot_thread(tab_id, thread_id.as_deref())?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::SetBotThreadPinned {
+            tab_id,
+            thread_id,
+            pinned,
+        } => {
+            sessions.set_bot_thread_pinned(tab_id, &thread_id, pinned)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ReportBotSession {
+            pane_id,
+            session_id,
+        } => {
+            sessions.report_bot_session(pane_id, &session_id)?;
+            Ok(ServiceResponse::Ack)
         }
         ClientRequest::GetCodingAgents => Ok(ServiceResponse::CodingAgents {
             agents: sessions.coding_agents(true)?,

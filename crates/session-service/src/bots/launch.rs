@@ -14,6 +14,8 @@ use anyhow::{Context, Result, bail};
 use hh_protocol::{BotSpec, CodingAgent, TerminalProfile};
 use uuid::Uuid;
 
+use super::threads::{prepare_threads_directory, valid_session_id};
+
 const COORDINATOR_PROMPT: &str = include_str!("../../bundled/bot-prompt.md");
 const OMP_EXTENSION: &[u8] = include_bytes!("../../bundled/hh-omp.ts");
 const OMP_EXTENSION_FILE: &str = "hh-omp.ts";
@@ -30,6 +32,8 @@ pub(crate) struct BotLaunch<'a> {
     pub(crate) name: &'a str,
     pub(crate) project_dir: Option<&'a str>,
     pub(crate) spec: &'a BotSpec,
+    /// Saved agent session to resume; only omp bots have threads.
+    pub(crate) resume: Option<&'a str>,
 }
 
 /// A prepared bot launch: the command line to type and the folder its shell
@@ -95,6 +99,14 @@ pub(crate) fn prepare_launch(
             let extension = bots_dir.join(OMP_EXTENSION_FILE);
             write_if_changed(&extension, OMP_EXTENSION)?;
             argv.extend(["-e".to_owned(), utf8_path(&extension)?]);
+            let threads = prepare_threads_directory(bots_dir, bot.tab_id)?;
+            argv.extend(["--session-dir".to_owned(), utf8_path(&threads)?]);
+            if let Some(session) = bot.resume {
+                if !valid_session_id(session) {
+                    bail!("invalid thread id {session:?}");
+                }
+                argv.extend(["--resume".to_owned(), session.to_owned()]);
+            }
         }
         TerminalProfile::Claude => {
             if let Some(hh_cli) = hh_cli {
@@ -233,7 +245,7 @@ fn context_file(bot: &BotLaunch<'_>) -> String {
     if let Some(project_dir) = bot.project_dir {
         prompt.push_str("Your project folder: ");
         prompt.push_str(project_dir);
-        prompt.push_str(". Threads you open go there by default.\n");
+        prompt.push_str(". Workers you open go there by default.\n");
     }
     if let Some(instructions) = bot.spec.instructions.as_deref() {
         prompt.push_str("\n## Standing instructions from the user\n");
@@ -312,6 +324,8 @@ mod tests {
 
     fn spec(agent: TerminalProfile, home: Option<&Path>) -> BotSpec {
         BotSpec {
+            pinned_threads: Vec::new(),
+            thread_panes: std::collections::BTreeMap::default(),
             agent,
             instructions: Some("Prefer small PRs.".to_owned()),
             home: home.map(|home| home.to_str().unwrap().to_owned()),
@@ -324,6 +338,7 @@ mod tests {
             name: "Hive3",
             project_dir: Some("/srv/app"),
             spec,
+            resume: None,
         };
         prepare_launch(&bot, &agents(), bots_dir, hh_cli)
     }
@@ -339,15 +354,58 @@ mod tests {
     }
 
     #[test]
-    fn omp_loads_only_the_extension() {
+    fn omp_loads_the_extension_and_keeps_its_threads_in_the_bot_folder() {
+        use std::os::unix::fs::PermissionsExt as _;
         let directory = bots_dir();
         let command = command_for(TerminalProfile::Omp, &directory, None);
         let extension = directory.join(OMP_EXTENSION_FILE);
+        let threads = home(&directory).join("threads");
         assert_eq!(
             command,
-            format!("/opt/bin/omp -e '{}'", extension.display())
+            format!(
+                "/opt/bin/omp -e '{}' --session-dir '{}'",
+                extension.display(),
+                threads.display()
+            )
         );
         assert_eq!(fs::read(&extension).unwrap(), OMP_EXTENSION);
+        assert_eq!(
+            fs::metadata(&threads).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let custom = bots_dir();
+        fs::create_dir_all(&custom).unwrap();
+        let spec = spec(TerminalProfile::Omp, Some(&custom));
+        let bot = BotLaunch {
+            tab_id: Uuid::nil(),
+            name: "Hive3",
+            project_dir: None,
+            spec: &spec,
+            resume: Some("0193-abc"),
+        };
+        let launch = prepare_launch(&bot, &agents(), &directory, None).unwrap();
+        assert_eq!(
+            launch.home, custom,
+            "the shell still starts in the custom home"
+        );
+        assert_eq!(
+            launch.command,
+            format!(
+                "/opt/bin/omp -e '{}' --session-dir '{}' --resume 0193-abc",
+                extension.display(),
+                threads.display()
+            ),
+            "threads stay in the HH-owned bot folder"
+        );
+        let bot = BotLaunch {
+            resume: Some("x; rm -rf /"),
+            ..bot
+        };
+        assert!(prepare_launch(&bot, &agents(), &directory, None).is_err());
+        remove_bot_files(&directory, Uuid::nil());
+        assert!(!threads.exists(), "deleting the bot deletes its threads");
+        fs::remove_dir_all(custom).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -416,7 +474,7 @@ mod tests {
             assert!(context.contains("Your name is \"Hive3\""));
             assert!(
                 context.contains(
-                    "Your project folder: /srv/app. Threads you open go there by default."
+                    "Your project folder: /srv/app. Workers you open go there by default."
                 )
             );
             assert!(context.ends_with("Prefer small PRs.\n"));
@@ -427,6 +485,8 @@ mod tests {
     #[test]
     fn agents_md_teaches_the_harness_harlot_cli() {
         let spec = BotSpec {
+            pinned_threads: Vec::new(),
+            thread_panes: std::collections::BTreeMap::default(),
             agent: TerminalProfile::Hermes,
             instructions: None,
             home: None,
@@ -436,6 +496,7 @@ mod tests {
             name: "Hive3",
             project_dir: None,
             spec: &spec,
+            resume: None,
         });
         assert!(context.contains("the CLI at `$HH_CLI` (always set in your terminal)"));
         assert!(context.contains(

@@ -5,6 +5,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::bots::valid_session_id;
+use crate::layout::collect_pane_ids;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     AppearanceColor, AppearanceSettings, BotSettings, BotSpec, MAX_BROWSER_URL_LEN, Pane, PaneKind,
@@ -316,6 +318,8 @@ struct DesiredTab {
     bot: Option<BotSpec>,
     #[serde(default)]
     owner_bot: Option<Uuid>,
+    #[serde(default)]
+    owner_thread: Option<Uuid>,
     layout: DesiredLayout,
 }
 
@@ -500,6 +504,7 @@ impl DesiredState {
                                 pinned: tab.pinned,
                                 bot: tab.bot.clone(),
                                 owner_bot: tab.owner_bot,
+                                owner_thread: tab.owner_thread,
                                 layout: DesiredLayout::from_runtime(
                                     &tab.layout,
                                     cwd_by_pane,
@@ -571,22 +576,34 @@ impl DesiredState {
                 tabs: workspace
                     .tabs
                     .into_iter()
-                    .map(|tab| Tab {
-                        id: tab.id,
-                        title: tab.title,
-                        custom_title: tab.custom_title,
-                        project_dir: tab.project_dir,
-                        color: tab.color,
-                        custom_icon: tab.custom_icon,
-                        parent_tab: tab.parent_tab,
-                        pinned: tab.pinned,
-                        bot: tab.bot,
-                        owner_bot: tab.owner_bot,
-                        layout: tab.layout.into_runtime(
+                    .map(|tab| {
+                        let layout = tab.layout.into_runtime(
                             &mut cwd_by_pane,
                             &mut tmux_by_pane,
                             &mut offline_panes,
-                        ),
+                        );
+                        let bot = tab.bot.map(|mut bot| {
+                            // Threads of panes that did not survive live on
+                            // only as saved sessions.
+                            let mut live = Vec::new();
+                            collect_pane_ids(&layout, &mut live);
+                            bot.thread_panes.retain(|pane_id, _| live.contains(pane_id));
+                            bot
+                        });
+                        Tab {
+                            id: tab.id,
+                            title: tab.title,
+                            custom_title: tab.custom_title,
+                            project_dir: tab.project_dir,
+                            color: tab.color,
+                            custom_icon: tab.custom_icon,
+                            parent_tab: tab.parent_tab,
+                            pinned: tab.pinned,
+                            bot,
+                            owner_bot: tab.owner_bot,
+                            owner_thread: tab.owner_thread,
+                            layout,
+                        }
                     })
                     .collect(),
             })
@@ -690,6 +707,9 @@ impl DesiredState {
                 }
                 if let Some(home) = tab.bot.as_ref().and_then(|bot| bot.home.as_deref()) {
                     validate_workspace_dir(home).map_err(anyhow::Error::from)?;
+                }
+                if let Some(bot) = &tab.bot {
+                    validate_bot_threads(bot)?;
                 }
                 if let Some(parent_id) = tab.parent_tab {
                     let valid_parent = parent_id != tab.id
@@ -1038,6 +1058,31 @@ fn legacy_custom_title(title: &str) -> Option<String> {
             !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
         });
     (!generated).then(|| title.to_owned())
+}
+
+/// Most pinned or live threads a persisted bot may list.
+const MAX_BOT_THREAD_ENTRIES: usize = 500;
+
+fn validate_bot_threads(bot: &BotSpec) -> Result<()> {
+    if bot.pinned_threads.len() > MAX_BOT_THREAD_ENTRIES
+        || bot.thread_panes.len() > MAX_BOT_THREAD_ENTRIES
+    {
+        bail!("bot lists too many threads");
+    }
+    let sessions = bot
+        .thread_panes
+        .values()
+        .filter_map(|thread| thread.session.as_deref());
+    if !bot
+        .pinned_threads
+        .iter()
+        .map(String::as_str)
+        .chain(sessions)
+        .all(valid_session_id)
+    {
+        bail!("bot thread id is invalid");
+    }
+    Ok(())
 }
 
 fn validate_id(id: Uuid, ids: &mut HashSet<Uuid>) -> Result<()> {

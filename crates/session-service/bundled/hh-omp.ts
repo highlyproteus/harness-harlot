@@ -1,7 +1,8 @@
 // Harness Harlot extension for omp bots. Every tool shells out to the
 // Harness Harlot CLI (`$HH_CLI … --json`) so the Rust CLI stays the single
-// implementation. A watcher tells the bot when one of its workers needs the
-// user or finishes.
+// implementation. Each bot thread is one omp process in its own pane: it
+// reports its session to Harness Harlot, and a watcher tells it when one of
+// the workers it opened needs the user or finishes.
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -43,8 +44,17 @@ type WorkerPane = {
   exited: boolean;
 };
 
-type WorkerTab = { tab_id: string; title: string; panes: WorkerPane[] };
+type WorkerTab = {
+  tab_id: string;
+  title: string;
+  /** Bot pane (thread) that opened the worker. */
+  owner_thread?: string | null;
+  /** Whether that pane is still open. */
+  owner_thread_live?: boolean;
+  panes: WorkerPane[];
+};
 type Workstation = { workstation_id: string; title: string; tabs: WorkerTab[] };
+type BotInfo = { tab_id: string; active_pane: string };
 
 /** Worker states the watcher reports. `busy` covers working and idle. */
 type Category = "busy" | "needs-you" | "done" | "exited";
@@ -116,7 +126,7 @@ export default function harnessHarlot(pi: ExtensionAPI): void {
     name: "hh_terminal_list",
     label: "List terminals",
     description:
-      "List workstations, their terminal tabs and panes with live status (working, needs_approval, needs_input, attention, done, idle), exit state and owner bot. mine=true lists only the workers you created.",
+      "List workstations, their terminal tabs and panes with live status (working, needs_approval, needs_input, attention, done, idle), exit state, owner bot and owner thread. mine=true lists only the workers your bot created, from any of its threads.",
     parameters: terminalListParams,
     approval: "read",
     async execute(_id, params, signal) {
@@ -389,11 +399,38 @@ export default function harnessHarlot(pi: ExtensionAPI): void {
     },
   });
 
-  // ------------------------------------------------------------ worker watcher
-
-  // Only bot terminals carry HH_BOT_TAB_ID; `terminal list --mine` resolves the
-  // bot from HH_PANE_ID.
+  // Only bot terminals carry HH_BOT_TAB_ID; the CLI resolves the bot pane from
+  // HH_PANE_ID.
   if (!process.env.HH_BOT_TAB_ID) return;
+  const ownPane = process.env.HH_PANE_ID;
+
+  // ----------------------------------------------------------- thread session
+
+  /** Session last reported for this pane, so repeats stay quiet. */
+  let reportedSession: string | undefined;
+
+  /** Tells Harness Harlot which conversation this pane shows, after a start,
+   * `/new`, `/resume` or fork, so the Bots sidebar lists it as the thread. */
+  async function reportSession(ctx: ExtensionContext): Promise<void> {
+    const session = ctx.sessionManager.getSessionId();
+    if (!session || session === reportedSession) return;
+    try {
+      await hh(["bot", "report-session", "--session", session]);
+      reportedSession = session;
+    } catch (error) {
+      pi.logger.warn("Harness Harlot could not record the bot thread", { error: String(error) });
+    }
+  }
+
+  pi.on("session_switch", async (_event, ctx: ExtensionContext) => {
+    void reportSession(ctx);
+  });
+
+  pi.on("session_branch", async (_event, ctx: ExtensionContext) => {
+    void reportSession(ctx);
+  });
+
+  // ------------------------------------------------------------ worker watcher
 
   /** Last confirmed category per worker pane; unset until the first poll. */
   let stable: Map<string, Category> | undefined;
@@ -449,10 +486,18 @@ export default function harnessHarlot(pi: ExtensionAPI): void {
     polling = true;
     try {
       const workstations = (await hh(["terminal", "list", "--mine"])) as Workstation[];
+      // Each worker reports to the thread that opened it; workers whose thread
+      // is closed report to the bot's active thread, so no update is doubled.
+      const orphaned = (tab: WorkerTab) => tab.owner_thread !== ownPane && !tab.owner_thread_live;
+      let active = false;
+      if (workstations.some((workstation) => workstation.tabs.some(orphaned))) {
+        active = ((await hh(["bot", "info"])) as BotInfo).active_pane === ownPane;
+      }
       failing = false;
       const seen = new Map<string, { pane: WorkerPane; worker: string; workstation: string }>();
       for (const workstation of workstations) {
         for (const tab of workstation.tabs) {
+          if (tab.owner_thread !== ownPane && !(active && orphaned(tab))) continue;
           for (const pane of tab.panes) {
             seen.set(pane.pane_id, { pane, worker: tab.title, workstation: workstation.title });
           }
@@ -503,6 +548,7 @@ export default function harnessHarlot(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+    void reportSession(ctx);
     if (watching) return;
     watching = true;
     ctx.setInterval(() => poll(), WATCH_INTERVAL_MS);

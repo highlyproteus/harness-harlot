@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::model::{
-    AppearanceColor, BotSettings, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport,
-    TmuxScanScope, TmuxSession, TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
+    AppearanceColor, BotSettings, BotThread, PaneKind, SessionSnapshot, SplitAxis,
+    TerminalTransport, TmuxScanScope, TmuxSession, TmuxSessionAttachIssue, TmuxSessionId,
+    WorkspacePinMove,
 };
 use crate::profile::TerminalProfile;
 use crate::terminal::{
@@ -69,10 +70,32 @@ pub enum ClientRequest {
         tab_id: Uuid,
         home: Option<String>,
     },
+    /// Lists the bot's threads: saved agent sessions plus live panes, pinned
+    /// first, then most recently updated.
+    ListBotThreads {
+        tab_id: Uuid,
+    },
+    /// Shows a thread in the bot's terminal: activates the live pane showing
+    /// it or resumes it in a new pane. `None` starts a new thread.
+    OpenBotThread {
+        tab_id: Uuid,
+        thread_id: Option<String>,
+    },
+    SetBotThreadPinned {
+        tab_id: Uuid,
+        thread_id: String,
+        pinned: bool,
+    },
+    /// Sent by a bot's agent when its pane switches to another session.
+    ReportBotSession {
+        pane_id: Uuid,
+        session_id: String,
+    },
     /// Opens a worker terminal tab in a workstation and optionally types
     /// `command` into its shell once the shell is spawned. When
     /// `requester_pane` is a bot pane, the tab records that bot as
-    /// `owner_bot`, and `workspace_id: None` targets the bot's own
+    /// `owner_bot` and the pane as `owner_thread`, and `workspace_id: None`
+    /// targets the bot's own
     /// workstation (created on demand, titled after the bot). Without a bot
     /// requester, `workspace_id` is required.
     CreateWorker {
@@ -410,6 +433,9 @@ pub enum ServiceResponse {
         workspace_id: Uuid,
         tab_id: Uuid,
         pane_id: Uuid,
+    },
+    BotThreads {
+        threads: Vec<BotThread>,
     },
     WorkerCreated {
         workspace_id: Uuid,
@@ -783,6 +809,87 @@ mod tests {
 
         assert_request_json_round_trips(cases);
     }
+    #[test]
+    fn bot_thread_messages_use_stable_snake_case_tags_and_round_trip() {
+        let tab_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        assert_request_json_round_trips([
+            (
+                ClientRequest::ListBotThreads { tab_id },
+                serde_json::json!({"type": "list_bot_threads", "tab_id": tab_id}),
+            ),
+            (
+                ClientRequest::OpenBotThread {
+                    tab_id,
+                    thread_id: Some("0193-abc".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "open_bot_thread",
+                    "tab_id": tab_id,
+                    "thread_id": "0193-abc",
+                }),
+            ),
+            (
+                ClientRequest::OpenBotThread {
+                    tab_id,
+                    thread_id: None,
+                },
+                serde_json::json!({"type": "open_bot_thread", "tab_id": tab_id, "thread_id": null}),
+            ),
+            (
+                ClientRequest::SetBotThreadPinned {
+                    tab_id,
+                    thread_id: "0193-abc".to_owned(),
+                    pinned: true,
+                },
+                serde_json::json!({
+                    "type": "set_bot_thread_pinned",
+                    "tab_id": tab_id,
+                    "thread_id": "0193-abc",
+                    "pinned": true,
+                }),
+            ),
+            (
+                ClientRequest::ReportBotSession {
+                    pane_id,
+                    session_id: "0193-abc".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "report_bot_session",
+                    "pane_id": pane_id,
+                    "session_id": "0193-abc",
+                }),
+            ),
+        ]);
+        let response = ServiceResponse::BotThreads {
+            threads: vec![BotThread {
+                id: "0193-abc".to_owned(),
+                title: Some("Fix login".to_owned()),
+                updated_ms: 1_700_000_000_000,
+                pinned: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "type": "bot_threads",
+                "threads": [{
+                    "id": "0193-abc",
+                    "title": "Fix login",
+                    "updated_ms": 1_700_000_000_000_u64,
+                    "pinned": true,
+                    "pane_id": pane_id,
+                }],
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceResponse>(encoded).unwrap(),
+            response
+        );
+    }
+
     #[test]
     fn shutdown_service_request_uses_stable_snake_case_tag_and_round_trips() {
         assert_request_json_round_trips([(

@@ -10,7 +10,7 @@ use hh_protocol::{Tab, TerminalProfile, Workspace};
 use super::{bot_name, bot_pane};
 use crate::helpers::{element_key, find_pane, render_terminal_profile_icon};
 use crate::menus::{anchored_menu, menu_separator};
-use crate::view_models::{BotMenu, Modal, TooltipView};
+use crate::view_models::{BotMenu, BotThreadMenu, Modal, TooltipView};
 use crate::{HhApp, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
 
 impl HhApp {
@@ -283,6 +283,37 @@ impl HhApp {
                         }))
                         .child("Delete…"),
                 ),
+        )
+    }
+
+    /// Right-click menu of a thread row: pin or unpin it.
+    pub(crate) fn render_bot_thread_menu(
+        &self,
+        menu: &BotThreadMenu,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (tab_id, pinned) = (menu.tab_id, menu.pinned);
+        let thread_id = menu.thread_id.clone();
+        anchored_menu(
+            menu.position,
+            div()
+                .id(("bot-thread-menu", element_key(tab_id)))
+                .w(px(180.0))
+                .py(px(5.0))
+                .rounded(px(7.0))
+                .bg(rgb(THEME.elevated))
+                .border_1()
+                .border_color(rgb(THEME.border_strong))
+                .shadow_lg()
+                .occlude()
+                .child(self.create_menu_item(
+                    "pin-bot-thread-menu",
+                    if pinned { "Unpin" } else { "Pin" },
+                    cx,
+                    move |this, cx| {
+                        this.set_bot_thread_pinned(tab_id, thread_id.clone(), !pinned, cx);
+                    },
+                )),
         )
     }
 

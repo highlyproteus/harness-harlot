@@ -366,6 +366,7 @@ impl SessionRegistry {
                 _ => bail!("tmux transport no longer matches its workstation"),
             }
             workspace.tabs.push(Tab {
+                owner_thread: None,
                 id: Uuid::new_v4(),
                 title: tmux_session.name.clone(),
                 custom_title: None,

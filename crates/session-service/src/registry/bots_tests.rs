@@ -123,7 +123,7 @@ fn a_bot_starts_in_its_home_with_its_agents_md() {
     let context = agents_md(&home);
     assert!(context.contains("Your name is \"Hive3\""));
     assert!(context.contains(&format!(
-        "Your project folder: {project}. Threads you open go there by default."
+        "Your project folder: {project}. Workers you open go there by default."
     )));
     assert!(context.ends_with("## Standing instructions from the user\nBe brief\n"));
     let snapshot = registry.snapshot().unwrap();
@@ -137,13 +137,18 @@ fn a_bot_starts_in_its_home_with_its_agents_md() {
     assert_eq!(bots.tabs[0].id, tab_id);
     assert_eq!(bots.tabs[0].title, "Hive3");
     assert_eq!(bots.tabs[0].project_dir.as_deref(), Some(project.as_str()));
+    let mut spec = bots.tabs[0].bot.clone().unwrap();
+    let thread = spec.thread_panes.remove(&pane_id).unwrap();
+    assert_eq!(thread.session, None);
     assert_eq!(
-        bots.tabs[0].bot,
-        Some(BotSpec {
+        spec,
+        BotSpec {
             agent: TerminalProfile::Hermes,
             instructions: Some("Be brief".to_owned()),
             home: None,
-        })
+            pinned_threads: Vec::new(),
+            thread_panes: std::collections::BTreeMap::default(),
+        }
     );
     let pane = find_pane_in_snapshot(&snapshot, pane_id).unwrap();
     assert_eq!(pane.profile_override, Some(TerminalProfile::Hermes));

@@ -1,6 +1,6 @@
-//! The Bots sidebar: one row per bot with chips for its worker tabs, plus the
-//! New bot button.
-use crate::bots::{BotWorker, bot_name, bot_pane, bot_workers};
+//! The Bots sidebar: one card per bot with its threads (omp bots) and chips
+//! for its worker tabs, plus the New bot button.
+use crate::bots::{BotWorker, bot_name, bot_pane, bot_workers, has_threads, now_ms, relative_time};
 use crate::helpers::{element_key, find_pane, render_terminal_profile_icon};
 use crate::notifications::{ActivitySection, activity_badge, activity_section};
 use crate::view_models::TooltipView;
@@ -8,9 +8,16 @@ use crate::{HhApp, THEME, pane_status_color};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, AppContext, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
+    ParentElement, StatefulInteractiveElement, Styled, div, linear_color_stop, linear_gradient, px,
+    rgb, rgba,
 };
-use hh_protocol::Tab;
+use hh_protocol::{BotThread, Tab};
+
+/// Height of one thread row; the list shows at most `THREAD_ROWS_VISIBLE`.
+const THREAD_ROW_HEIGHT: f32 = 22.0;
+const THREAD_ROWS_VISIBLE: usize = 15;
+/// Height of `THREAD_ROWS_VISIBLE` thread rows.
+const THREAD_LIST_MAX_HEIGHT: f32 = THREAD_ROW_HEIGHT * 15.0;
 
 impl HhApp {
     pub(crate) fn render_sidebar_bots(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -30,14 +37,13 @@ impl HhApp {
         let rows = self
             .bots_workspace()
             .map(|workspace| {
-                let showing_bots = self.sidebar.active_workspace == Some(workspace.id);
                 workspace
                     .tabs
                     .iter()
                     .filter(|tab| tab.bot.is_some())
                     .map(|tab| {
                         let owned = workers.get(&tab.id).map_or(&[][..], Vec::as_slice);
-                        self.render_bot_row(tab, owned, showing_bots, cx)
+                        self.render_bot_row(tab, owned, cx)
                     })
                     .collect::<Vec<_>>()
             })
@@ -112,20 +118,13 @@ impl HhApp {
         &self,
         tab: &Tab,
         workers: &[BotWorker<'_>],
-        showing_bots: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab_id = tab.id;
         let agent = tab.bot.as_ref().map(|bot| bot.agent).unwrap_or_default();
         let pane = bot_pane(tab);
-        let selected =
-            showing_bots && pane.is_some_and(|pane| self.layout.focused_pane == Some(pane.id));
-        let exited = pane.is_some_and(|pane| {
-            self.session
-                .pane_states
-                .get(&pane.id)
-                .is_some_and(|state| state.exited)
-        });
+        let selected = self.bot_is_selected(tab);
+        let exited = pane.is_some_and(|pane| self.pane_exited(pane.id));
         let status = pane.map(|pane| pane.status).unwrap_or_default();
         let dot = if exited {
             THEME.dim
@@ -137,6 +136,21 @@ impl HhApp {
             0 => agent.display_name().to_owned(),
             1 => format!("{} · 1 worker", agent.display_name()),
             count => format!("{} · {count} workers", agent.display_name()),
+        };
+        let threaded = has_threads(tab);
+        let expanded = self.bot_threads_expanded(tab);
+        let threads = if expanded {
+            self.render_bot_threads(
+                tab,
+                if selected {
+                    THEME.accent_soft
+                } else {
+                    THEME.sidebar
+                },
+                cx,
+            )
+        } else {
+            None
         };
         let chips = workers
             .iter()
@@ -213,8 +227,33 @@ impl HhApp {
                                 })
                                 .into()
                             }),
-                    ),
+                    )
+                    .child(Self::bot_card_button(
+                        ("new-bot-thread", element_key(tab_id)),
+                        "＋",
+                        "New thread",
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_bot_thread(tab_id, None, cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .when(threaded, |element| {
+                        element.child(Self::bot_card_button(
+                            ("bot-threads-toggle", element_key(tab_id)),
+                            if expanded { "⌄" } else { "›" },
+                            if expanded {
+                                "Hide threads"
+                            } else {
+                                "Show threads"
+                            },
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_bot_threads(tab_id, cx);
+                                cx.stop_propagation();
+                            }),
+                        ))
+                    }),
             )
+            .children(threads)
             .when(!chips.is_empty(), |element| {
                 element.child(
                     div()
@@ -225,6 +264,182 @@ impl HhApp {
                         .children(chips),
                 )
             })
+            .into_any_element()
+    }
+
+    fn pane_exited(&self, pane_id: uuid::Uuid) -> bool {
+        self.session
+            .pane_states
+            .get(&pane_id)
+            .is_some_and(|state| state.exited)
+    }
+
+    /// A small square icon button on a bot card.
+    fn bot_card_button(
+        id: impl Into<gpui::ElementId>,
+        glyph: &'static str,
+        tooltip: &'static str,
+        on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex_none()
+            .w(px(18.0))
+            .h(px(18.0))
+            .rounded(px(4.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .font_family(".SystemUIFont")
+            .text_xs()
+            .text_color(rgb(THEME.muted))
+            .hover(|element| {
+                element
+                    .bg(rgb(THEME.border))
+                    .text_color(rgb(THEME.foreground))
+            })
+            .on_click(on_click)
+            .tooltip(move |_, cx| {
+                cx.new(|_| TooltipView {
+                    text: tooltip.to_owned(),
+                })
+                .into()
+            })
+            .child(glyph)
+            .into_any_element()
+    }
+
+    /// The bot's thread rows in a list capped at `THREAD_ROWS_VISIBLE` rows,
+    /// fading at the bottom when it scrolls. `bg` is the card background.
+    fn render_bot_threads(&self, tab: &Tab, bg: u32, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let threads = self.bot_threads.lists.get(&tab.id)?;
+        if threads.is_empty() {
+            return None;
+        }
+        let current = bot_pane(tab).map(|pane| pane.id);
+        let now = now_ms();
+        let rows = threads
+            .iter()
+            .enumerate()
+            .map(|(index, thread)| self.render_bot_thread_row(tab, thread, index, current, now, cx))
+            .collect::<Vec<_>>();
+        let overflows = threads.len() > THREAD_ROWS_VISIBLE;
+        Some(
+            div()
+                .relative()
+                .pl(px(28.0))
+                .child(
+                    div()
+                        .id("bot-threads")
+                        .max_h(px(THREAD_LIST_MAX_HEIGHT))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .children(rows),
+                )
+                .when(overflows, |element| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(px(THREAD_ROW_HEIGHT))
+                            .bg(linear_gradient(
+                                180.0,
+                                linear_color_stop(rgba(bg << 8), 0.0),
+                                linear_color_stop(rgb(bg), 1.0),
+                            )),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// One thread: live dot, title, pin, and age. Clicking shows it in the
+    /// bot's terminal; right-click pins or unpins it.
+    fn render_bot_thread_row(
+        &self,
+        tab: &Tab,
+        thread: &BotThread,
+        index: usize,
+        current: Option<uuid::Uuid>,
+        now: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tab_id = tab.id;
+        let is_current = thread.pane_id.is_some() && thread.pane_id == current;
+        let live = thread
+            .pane_id
+            .and_then(|pane_id| find_pane(&tab.layout, pane_id))
+            .map(|pane| {
+                if self.pane_exited(pane.id) {
+                    THEME.dim
+                } else {
+                    pane_status_color(pane.status).unwrap_or(THEME.border_strong)
+                }
+            });
+        let title = thread
+            .title
+            .clone()
+            .unwrap_or_else(|| "New thread".to_owned());
+        let open_id = thread.id.clone();
+        let menu_thread = thread.clone();
+        div()
+            .id(("bot-thread", index))
+            .h(px(THREAD_ROW_HEIGHT))
+            .flex_none()
+            .px(px(6.0))
+            .rounded(px(4.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_pointer()
+            .font_family(".SystemUIFont")
+            .text_xs()
+            .when(is_current, |element| element.bg(rgb(THEME.elevated)))
+            .hover(|element| element.bg(rgb(THEME.elevated)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_bot_thread(tab_id, Some(open_id.clone()), cx);
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_bot_thread_menu(tab_id, &menu_thread, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded_full()
+                    .when_some(live, |element, color| element.bg(rgb(color))),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .text_color(rgb(if is_current {
+                        THEME.foreground
+                    } else {
+                        THEME.muted
+                    }))
+                    .child(title),
+            )
+            .when(thread.pinned, |element| {
+                element.child(div().flex_none().text_color(rgb(THEME.dim)).child("📌"))
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(THEME.dim))
+                    .child(relative_time(now, thread.updated_ms)),
+            )
             .into_any_element()
     }
 

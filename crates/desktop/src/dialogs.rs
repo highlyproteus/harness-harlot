@@ -402,7 +402,7 @@ impl HhApp {
                         "workspace-working-dir-input",
                         field,
                         WorkspaceCreationField::WorkingDir,
-                        "Threads open here by default",
+                        "Workers open here by default",
                         "SF Mono",
                         cx,
                     ))

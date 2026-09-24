@@ -84,18 +84,30 @@ fn bots_workspace_bot_tabs_and_owners_round_trip() {
     let bots_workspace_id = Uuid::new_v4();
     let mut bot_pane = crate::layout::pane_fixture(Uuid::new_v4());
     bot_pane.profile_override = Some(TerminalProfile::Omp);
+    let live_thread = hh_protocol::BotThreadPane {
+        session: Some("0193-live".to_owned()),
+        activated_ms: 42,
+    };
     let spec = BotSpec {
+        pinned_threads: vec!["0193-pinned".to_owned()],
+        thread_panes: [
+            (bot_pane.id, live_thread.clone()),
+            (Uuid::new_v4(), hh_protocol::BotThreadPane::default()),
+        ]
+        .into(),
         agent: TerminalProfile::Omp,
         instructions: Some("Prefer small PRs".to_owned()),
         home: Some("/tmp".to_owned()),
     };
     snapshot.workspaces[0].owner_bot = Some(bot_id);
     snapshot.workspaces[0].tabs[0].owner_bot = Some(bot_id);
+    snapshot.workspaces[0].tabs[0].owner_thread = Some(bot_pane.id);
     let mut bots = snapshot.workspaces[0].clone();
     bots.id = bots_workspace_id;
     bots.kind = WorkspaceKind::Bots;
     bots.owner_bot = None;
     bots.tabs = vec![Tab {
+        owner_thread: None,
         id: bot_id,
         title: "Hive3".to_owned(),
         custom_title: None,
@@ -120,10 +132,20 @@ fn bots_workspace_bot_tabs_and_owners_round_trip() {
     assert_eq!(recovered.bots, snapshot.bots);
     assert_eq!(recovered.workspaces[0].owner_bot, Some(bot_id));
     assert_eq!(recovered.workspaces[0].tabs[0].owner_bot, Some(bot_id));
+    assert_eq!(
+        recovered.workspaces[0].tabs[0].owner_thread,
+        Some(bot_pane.id)
+    );
     let bots = &recovered.workspaces[1];
     assert!(bots.is_bots());
     assert_eq!(bots.id, bots_workspace_id);
-    assert_eq!(bots.tabs[0].bot.as_ref(), Some(&spec));
+    let mut live_spec = spec.clone();
+    live_spec.thread_panes = [(bot_pane.id, live_thread)].into();
+    assert_eq!(
+        bots.tabs[0].bot.as_ref(),
+        Some(&live_spec),
+        "threads of panes that are gone are dropped"
+    );
     assert_eq!(bots.tabs[0].project_dir.as_deref(), Some("/tmp"));
     let PaneLayout::Leaf { pane } = &bots.tabs[0].layout else {
         panic!("bot tab is not a leaf");
@@ -675,6 +697,8 @@ fn overlong_bot_instructions_are_rejected() {
     bots.kind = DesiredWorkspaceKind::Bots;
     bots.tabs[0].id = Uuid::new_v4();
     bots.tabs[0].bot = Some(BotSpec {
+        pinned_threads: Vec::new(),
+        thread_panes: std::collections::BTreeMap::default(),
         agent: TerminalProfile::Omp,
         instructions: Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1)),
         home: None,

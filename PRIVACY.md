@@ -34,14 +34,17 @@ model provider. Worker programs are separate local processes with their normal
 operating-system permissions.
 
 The omp plugin reports worker status changes (needs input, needs approval,
-done) with a short excerpt of that worker's screen into the bot's conversation
-so the bot can tell you about them.
+done) with a short excerpt of that worker's screen into the bot conversation
+(thread) that opened the worker, so the bot can tell you about them. It also
+tells Harness Harlot the omp session id each bot terminal shows, so the Bots
+sidebar can list the bot's threads.
 
 ## Local storage
 
 The session snapshot records each bot's name, agent, project folder, custom
-home folder, and instructions, plus which worker tabs a bot created. It stores no terminal
-output, credentials, or conversation content. Bot terminals keep their output
+home folder, and instructions, which worker tabs a bot and which of its threads
+created, the omp session ids of the bot's open threads, and the threads you
+pinned. It stores no terminal output, credentials, or conversation content. Bot terminals keep their output
 in the private HH tmux server like other local terminals; Harness Harlot keeps
 no disk archive of terminal output.
 
@@ -50,6 +53,12 @@ directory. It holds the generated `AGENTS.md` and whatever notes the agent
 writes there; Harness Harlot stores no terminal output in it. Deleting a bot
 deletes its default home folder. A custom home folder you choose is never
 deleted, and an `AGENTS.md` you wrote there yourself is never overwritten.
+
+omp bots keep their thread transcripts (omp's own session files, including
+titles and the full conversation) in a `threads` folder inside the bot's
+owner-only default home folder, even when the bot uses a custom home folder.
+omp writes them; Harness Harlot reads only the first few kilobytes of each to
+list thread titles. Deleting the bot deletes its threads.
 
 Harness Harlot also writes the bundled omp plugin and each bot's MCP launch
 configuration (containing only the `hh` executable path) to its owner-only

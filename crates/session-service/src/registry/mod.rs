@@ -36,6 +36,7 @@ use crate::registry::streaming::DiagnosticsSampler;
 use crate::tmux_control::{PaneSinks, TmuxControlClient, TmuxServer};
 pub use remote::{TmuxAttachmentResult, TmuxScanResult};
 
+mod bot_threads;
 mod bots;
 mod identity;
 mod panes;
@@ -792,7 +793,7 @@ impl SessionRegistry {
             match session {
                 Ok(session) => {
                     if let Some(tab_id) = bot_tab.filter(|_| !reattached) {
-                        fresh_bot_panes.push(tab_id);
+                        fresh_bot_panes.push((tab_id, pane_id));
                     }
                     panes.insert(
                         pane_id,
@@ -892,8 +893,8 @@ impl SessionRegistry {
             browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
         };
         registry.persist()?;
-        for tab_id in fresh_bot_panes {
-            registry.relaunch_recovered_bot(tab_id);
+        for (tab_id, pane_id) in fresh_bot_panes {
+            registry.relaunch_recovered_bot(tab_id, pane_id);
         }
         Ok(registry)
     }

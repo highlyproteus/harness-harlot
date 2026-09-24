@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use super::agent::{absolute_path, client, snapshot};
 use super::args::{
-    AgentContext, NewTerminal, TerminalCommand, TerminalInput, TerminalKey, WaitRequest, WaitUntil,
-    WorkstationCommand,
+    AgentContext, BotCommand, NewTerminal, TerminalCommand, TerminalInput, TerminalKey,
+    WaitRequest, WaitUntil, WorkstationCommand,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -58,6 +58,48 @@ pub(super) fn execute_terminal(context: &AgentContext, command: &TerminalCommand
 pub(super) fn execute_workstation(command: &WorkstationCommand) -> Result<Value> {
     match command {
         WorkstationCommand::New { cwd, title } => new_workstation(cwd, title.clone()),
+    }
+}
+
+pub(super) fn execute_bot(context: &AgentContext, command: &BotCommand) -> Result<Value> {
+    match command {
+        BotCommand::ReportSession { session } => {
+            let pane_id = context.pane_id.context(format!(
+                "report-session needs the bot pane; run inside a bot terminal or pass --pane (sets {})",
+                hh_protocol::PANE_ID_ENV
+            ))?;
+            acknowledge(&ClientRequest::ReportBotSession {
+                pane_id,
+                session_id: session.clone(),
+            })?;
+            Ok(json!({ "pane_id": pane_id, "session_id": session, "ok": true }))
+        }
+        BotCommand::Info => {
+            let session = Session::fetch(&mut client()?)?;
+            let bot = session.caller_bot(context)?;
+            let tab = session
+                .snapshot
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .find(|tab| tab.id == bot)
+                .context("the calling bot disappeared")?;
+            Ok(json!({
+                "tab_id": tab.id,
+                "pane_id": context.pane_id,
+                "active_pane": active_pane(&tab.layout),
+                "panes": layout_panes(&tab.layout).iter().map(|pane| pane.id).collect::<Vec<_>>(),
+            }))
+        }
+    }
+}
+
+/// The pane a tab shows: a stack's active pane, the first of a split.
+fn active_pane(layout: &PaneLayout) -> Uuid {
+    match layout {
+        PaneLayout::Leaf { pane } => pane.id,
+        PaneLayout::Stack { active, .. } => *active,
+        PaneLayout::Split { first, .. } => active_pane(first),
     }
 }
 
@@ -129,7 +171,7 @@ impl Session {
     /// The bot tab whose terminal runs the caller (`HH_PANE_ID`).
     fn caller_bot(&self, context: &AgentContext) -> Result<Uuid> {
         let pane_id = context.pane_id.context(format!(
-            "--mine needs the calling pane; run inside a bot terminal or pass --pane (sets {})",
+            "this command needs the calling pane; run inside a bot terminal or pass --pane (sets {})",
             hh_protocol::PANE_ID_ENV
         ))?;
         let location = self
@@ -200,6 +242,10 @@ fn list(context: &AgentContext, mine: bool) -> Result<Value> {
                             "title": tab.title,
                             "cwd": tab_cwd(workspace, tab),
                             "owner_bot": tab.owner_bot,
+                            "owner_thread": tab.owner_thread,
+                            "owner_thread_live": tab
+                                .owner_thread
+                                .is_some_and(|pane| session.locate(pane).is_some()),
                             "panes": panes,
                         })
                     })

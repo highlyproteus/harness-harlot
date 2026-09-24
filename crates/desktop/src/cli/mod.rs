@@ -49,7 +49,7 @@ where
         [command, arguments @ ..]
             if matches!(
                 command.as_str(),
-                "browser" | "gallery" | "terminal" | "workstation" | "mcp" | "skill"
+                "bot" | "browser" | "gallery" | "terminal" | "workstation" | "mcp" | "skill"
             ) =>
         {
             let mut agent_arguments = Vec::with_capacity(arguments.len() + 1);
@@ -246,7 +246,8 @@ pub(crate) fn run_cli_or_request_desktop() -> Result<bool> {
             AgentAction::Skill(SkillCommand::Path) => {
                 println!("{}", skill::source_path().display());
             }
-            AgentAction::Browser(_)
+            AgentAction::Bot(_)
+            | AgentAction::Browser(_)
             | AgentAction::Gallery(_)
             | AgentAction::Terminal(_)
             | AgentAction::Workstation(_) => {

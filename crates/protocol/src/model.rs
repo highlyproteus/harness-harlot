@@ -1,6 +1,6 @@
 //! Desired-state model: snapshots, workspaces, tabs, panes, and tmux types.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -32,8 +32,9 @@ pub struct BotSettings {
 }
 
 /// Launch configuration of a bot tab. Bots live in the single reserved
-/// `WorkspaceKind::Bots` workspace; each bot is one tab whose terminal runs
-/// the configured agent CLI's own interface.
+/// `WorkspaceKind::Bots` workspace; each bot is one tab whose terminals run
+/// the configured agent CLI's own interface. An omp bot's tab is a stack of
+/// live thread panes, one omp conversation each.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BotSpec {
     pub agent: TerminalProfile,
@@ -44,6 +45,37 @@ pub struct BotSpec {
     /// `<state>/bots/<tab id>/`.
     #[serde(default)]
     pub home: Option<String>,
+    /// Saved thread (agent session) ids the user pinned to the top.
+    #[serde(default)]
+    pub pinned_threads: Vec<String>,
+    /// Live thread panes of this bot, keyed by pane id.
+    #[serde(default)]
+    pub thread_panes: BTreeMap<Uuid, BotThreadPane>,
+}
+
+/// What one live bot pane shows.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotThreadPane {
+    /// Agent session id the pane shows, once known.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Epoch milliseconds the pane was last activated; 0 = never.
+    #[serde(default)]
+    pub activated_ms: u64,
+}
+
+/// One thread of a bot: a saved or live agent conversation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotThread {
+    /// Agent session id, or `pane:<pane id>` for a live pane whose session is
+    /// not known yet.
+    pub id: String,
+    pub title: Option<String>,
+    /// Epoch milliseconds of the last change.
+    pub updated_ms: u64,
+    pub pinned: bool,
+    /// The live pane showing this thread.
+    pub pane_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -129,6 +161,7 @@ impl SessionSnapshot {
             pinned: false,
             bot: None,
             owner_bot: None,
+            owner_thread: None,
             layout: PaneLayout::Leaf { pane },
         };
 
@@ -330,6 +363,9 @@ pub struct Tab {
     /// Bot tab that created this worker tab through `CreateWorker`.
     #[serde(default)]
     pub owner_bot: Option<Uuid>,
+    /// Bot pane (thread) that created this worker tab through `CreateWorker`.
+    #[serde(default)]
+    pub owner_thread: Option<Uuid>,
     pub layout: PaneLayout,
 }
 
@@ -554,6 +590,46 @@ mod tests {
         let restored: SessionSnapshot =
             serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
 
+        assert_eq!(restored, snapshot);
+    }
+}
+
+#[cfg(test)]
+mod bot_thread_tests {
+    use super::*;
+
+    #[test]
+    fn bot_specs_and_tabs_without_thread_fields_still_load_and_new_fields_round_trip() {
+        let legacy: BotSpec = serde_json::from_value(serde_json::json!({"agent": "omp"})).unwrap();
+        assert!(legacy.pinned_threads.is_empty());
+        assert!(legacy.thread_panes.is_empty());
+
+        let pane = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let spec = BotSpec {
+            agent: TerminalProfile::Omp,
+            instructions: None,
+            home: None,
+            pinned_threads: vec!["0193-abc".to_owned()],
+            thread_panes: BTreeMap::from([(
+                pane,
+                BotThreadPane {
+                    session: Some("0193-abc".to_owned()),
+                    activated_ms: 7,
+                },
+            )]),
+        };
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            encoded["thread_panes"],
+            serde_json::json!({ pane.to_string(): {"session": "0193-abc", "activated_ms": 7} })
+        );
+        assert_eq!(serde_json::from_value::<BotSpec>(encoded).unwrap(), spec);
+
+        let mut snapshot = SessionSnapshot::seeded();
+        assert_eq!(snapshot.workspaces[0].tabs[0].owner_thread, None);
+        snapshot.workspaces[0].tabs[0].owner_thread = Some(pane);
+        let restored: SessionSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
         assert_eq!(restored, snapshot);
     }
 }

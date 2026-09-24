@@ -275,6 +275,7 @@ impl SessionRegistry {
                 owner_bot: None,
                 custom_icon: None,
                 tabs: vec![Tab {
+                    owner_thread: None,
                     id: tab_id,
                     title: "Terminals".to_owned(),
                     custom_title: None,
@@ -382,6 +383,7 @@ impl SessionRegistry {
             owner_bot: None,
             custom_icon: None,
             tabs: vec![Tab {
+                owner_thread: None,
                 id: ids.tab,
                 title: "Remote".to_owned(),
                 custom_title: None,
@@ -796,6 +798,7 @@ impl SessionRegistry {
                 custom_icon: None,
             };
             workspace.tabs.push(Tab {
+                owner_thread: None,
                 id: Uuid::new_v4(),
                 title: "Remote".to_owned(),
                 custom_title: None,
