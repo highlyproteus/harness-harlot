@@ -4,6 +4,135 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::profile::TerminalProfile;
+/// Service-owned assistant process state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AssistantStatus {
+    Starting,
+    Idle,
+    Streaming,
+    Compacting,
+    /// pi exited; restarting respawns it on the same session file.
+    Exited {
+        message: String,
+    },
+    /// pi could not be started.
+    Unavailable {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssistantEntry {
+    User {
+        text: String,
+        image_count: u32,
+        timestamp_ms: u64,
+    },
+    Assistant {
+        text: String,
+        final_: bool,
+        timestamp_ms: u64,
+    },
+    ToolCall {
+        tool_call_id: String,
+        tool_name: String,
+        summary: String,
+        output: String,
+        done: bool,
+        is_error: bool,
+        target_pane: Option<Uuid>,
+    },
+    Notice {
+        message: String,
+        level: AssistantNoticeLevel,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantNoticeLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssistantApproval {
+    pub request_id: String,
+    pub title: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssistantThreadView {
+    pub pane_id: Uuid,
+    pub revision: u64,
+    pub status: AssistantStatus,
+    pub model: Option<String>,
+    pub entries: Vec<AssistantEntry>,
+    /// Entries dropped from the front to honour `MAX_ASSISTANT_ENTRIES`.
+    pub truncated_entries: u32,
+    pub pending_approval: Option<AssistantApproval>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssistantImage {
+    pub mime_type: String,
+    pub base64: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssistantModel {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CodingAgent {
+    pub profile: TerminalProfile,
+    /// Command name as found on the login PATH, e.g. "claude".
+    pub command: String,
+    /// Canonical absolute executable path, for display only.
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrowserAction {
+    Navigate {
+        url: String,
+    },
+    Back,
+    Forward,
+    Reload,
+    /// Raw Chrome `DevTools` Protocol call executed against the pane's browser.
+    DevTools {
+        method: String,
+        params: serde_json::Value,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BrowserCommandRequest {
+    pub request_id: u64,
+    pub pane_id: Uuid,
+    pub action: BrowserAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrowserCommandOutcome {
+    /// `result` is the CDP `result` object for `DevTools`, `null` for the other actions.
+    Ok {
+        result: serde_json::Value,
+    },
+    Error {
+        message: String,
+    },
+}
 
 /// Ephemeral activity state projected by the local session service.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

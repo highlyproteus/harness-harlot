@@ -97,6 +97,36 @@ pub(crate) fn command_with_terminal_env(
     command
 }
 
+/// Environment exported to local terminal agents.
+pub(crate) fn agent_env(workspace_id: Uuid) -> Vec<(&'static str, String)> {
+    let mut env = vec![(hh_protocol::WORKSPACE_ID_ENV, workspace_id.to_string())];
+    if let Ok(path) = hh_protocol::socket_path() {
+        env.push((hh_protocol::SOCKET_ENV, path.to_string_lossy().into_owned()));
+    }
+    if let Some(path) = hh_protocol::gallery_directory(workspace_id) {
+        let _ = hh_protocol::ensure_private_directory(&path);
+        env.push((
+            hh_protocol::GALLERY_DIR_ENV,
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    if let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("hh")))
+        .filter(|path| path.is_file())
+    {
+        env.push((hh_protocol::CLI_ENV, path.to_string_lossy().into_owned()));
+    }
+    env
+}
+
+pub(crate) fn apply_agent_env(command: &mut CommandBuilder, workspace_id: Uuid) {
+    command.env_remove(hh_protocol::CLI_ENV);
+    for (key, value) in agent_env(workspace_id) {
+        command.env(key, value);
+    }
+}
+
 pub(crate) fn system_ssh_binary() -> Result<PathBuf> {
     for path in [Path::new("/usr/bin/ssh"), Path::new("/bin/ssh")] {
         if is_trusted_executable_file(path) {

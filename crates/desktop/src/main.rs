@@ -40,6 +40,7 @@ mod cli;
 mod commands;
 mod dialogs;
 mod elements;
+mod gallery;
 mod helpers;
 mod history_settings;
 mod image_transfer;
@@ -75,6 +76,7 @@ use browser::configure_linux_browser_backend;
 use browser::native_nsview;
 use browser::{BrowserUrlEditor, prepare_cef_process};
 use commands::{AppConfig, ROOT_KEY_CONTEXT, ResolvedKeymap};
+use gallery::GalleryUi;
 use helpers::{
     WorkspaceTabScope, default_sidebar_width, gpui_binding, migrated_sidebar_width,
     next_terminal_poll_delay_ms, product_name,
@@ -86,8 +88,8 @@ use ui_state::UiStateStore;
 use updates::{UpdateCheckState, automatic_update_check_interval, automatic_update_checks_enabled};
 use view_models::{
     ArchivedView, AssistantComposer, ColorPickerState, DragHoverState, HistoryEditor, Modal,
-    PaneDrag, ResizeDrag, SelectionAutoscroll, SelectionDrag, SidebarResizeLifecycle,
-    SplitControlId, TabDropPreview, WorkspaceDropPreview,
+    PaneDrag, ResizeDrag, SelectionAutoscroll, SelectionDrag, SettingsSection,
+    SidebarResizeLifecycle, SplitControlId, TabDropPreview, WorkspaceDropPreview,
 };
 
 actions!(
@@ -97,6 +99,7 @@ actions!(
         ToggleSidebar,
         NewTab,
         NewBrowserTab,
+        NewGalleryTab,
         TerminalZoomIn,
         TerminalZoomOut,
         SplitRight,
@@ -390,11 +393,13 @@ impl LayoutUi {
 
 struct EditorUi {
     modal: Modal,
+    settings_section: SettingsSection,
     history_editor: Option<HistoryEditor>,
     history_clear_confirmation: Option<HistoryClearScope>,
     color_picker: Option<ColorPickerState>,
     browser_url_editor: Option<BrowserUrlEditor>,
     assistant_composer: Option<AssistantComposer>,
+    agent_skill_status: Option<String>,
     ime_preedit: String,
     workspace_input_focus: [FocusHandle; 4],
     workspace_input_layouts: [Option<ShapedLine>; 4],
@@ -409,11 +414,13 @@ impl EditorUi {
     fn new(workspace_input_focus: [FocusHandle; 4]) -> Self {
         Self {
             modal: Modal::None,
+            settings_section: SettingsSection::default(),
             history_editor: None,
             history_clear_confirmation: None,
             color_picker: None,
             browser_url_editor: None,
             assistant_composer: None,
+            agent_skill_status: None,
             ime_preedit: String::new(),
             workspace_input_focus,
             workspace_input_layouts: [None, None, None, None],
@@ -434,6 +441,7 @@ struct BrowserUi {
     browser_runtime_error: Option<String>,
     cef_shutdown_subscription: Option<gpui::Subscription>,
     reassert_focus: bool,
+    deferred_commands: Vec<(hh_protocol::BrowserCommandRequest, Instant)>,
 }
 
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -447,6 +455,7 @@ impl BrowserUi {
             browser_runtime_error: None,
             cef_shutdown_subscription: None,
             reassert_focus: false,
+            deferred_commands: Vec::new(),
         }
     }
 
@@ -458,6 +467,7 @@ impl BrowserUi {
             browser_runtime_error: None,
             cef_shutdown_subscription: None,
             reassert_focus: false,
+            deferred_commands: Vec::new(),
         }
     }
 }
@@ -476,7 +486,8 @@ struct HhApp {
     sidebar: SidebarUi,
     layout: LayoutUi,
     editor: EditorUi,
-    voice: voice::VoiceUi,
+    gallery: GalleryUi,
+    assistant: voice::AssistantUi,
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     browser: BrowserUi,
 }
@@ -591,7 +602,8 @@ impl HhApp {
             ),
             layout: LayoutUi::new(),
             editor: EditorUi::new(workspace_input_focus),
-            voice: voice::VoiceUi::new(),
+            gallery: GalleryUi::new(),
+            assistant: voice::AssistantUi::new(),
             #[cfg(all(target_os = "macos", feature = "browser"))]
             browser: BrowserUi::new(browser_parent_view),
             #[cfg(all(target_os = "linux", feature = "browser"))]
@@ -617,7 +629,7 @@ impl HhApp {
                 }
             }));
         }
-        app.voice.quit_subscription = Some(cx.on_app_quit(|this, _| {
+        app.assistant.quit_subscription = Some(cx.on_app_quit(|this, _| {
             this.shutdown_voice();
             async {}
         }));
@@ -748,8 +760,8 @@ impl HhApp {
 /// reachable. The service is deliberately detached from the desktop lifetime:
 /// closing or replacing the app UI never asks it to stop, preserving active
 /// terminal sessions. Protocol-changing updates stop it with
-/// `hh-update-tool install --restart-service` after user confirmation and rely
-/// on desired-state recovery to reopen fresh shells in their last directories.
+/// `hh-update-tool install --restart-service` after user confirmation; local
+/// terminals reattach through HH's private tmux server when available.
 fn ensure_bundled_session_service() {
     if std::env::var_os("HH_DISABLE_BUNDLED_SERVICE").is_some()
         || SessionClient::connect()

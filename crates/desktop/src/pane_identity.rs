@@ -262,15 +262,36 @@ impl HhApp {
                 .into_any_element();
         }
         if pane.kind.is_assistant() {
-            let active = self.voice.sessions.get(&pane.id).is_some_and(|session| {
-                !crate::voice::assistant_session_is_idle(session)
-                    && !matches!(session.engine_state, hh_voice::EngineState::Error(_))
-            });
+            let active = self
+                .assistant
+                .panes
+                .get(&pane.id)
+                .is_some_and(crate::voice::assistant_pane_is_active);
             return div()
                 .w(px(8.0))
                 .h(px(8.0))
                 .rounded_full()
                 .bg(rgb(if active { THEME.ansi[2] } else { THEME.dim }))
+                .into_any_element();
+        }
+        if pane.kind.is_gallery() {
+            return div()
+                .relative()
+                .w(px(IDENTITY_MARK_SIZE))
+                .h(px(IDENTITY_MARK_SIZE))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(rgb(frame_color))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(3.0))
+                        .right(px(3.0))
+                        .bottom(px(4.0))
+                        .h(px(7.0))
+                        .rounded(px(2.0))
+                        .bg(rgb(fallback_color)),
+                )
                 .into_any_element();
         }
 

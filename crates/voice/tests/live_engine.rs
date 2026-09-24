@@ -1,6 +1,5 @@
-//! Manual live probe: runs the conversational Voice engine against the
-//! Realtime API using saved non-secret settings and `HH_OPENAI_API_KEY`,
-//! printing every UI event.
+//! Manual live probe: runs the voice relay against the Realtime API using
+//! saved non-secret settings and `HH_OPENAI_API_KEY`, printing every UI event.
 use std::time::{Duration, Instant};
 
 use hh_voice::{
@@ -9,7 +8,7 @@ use hh_voice::{
 };
 
 #[test]
-#[ignore = "requires HH_OPENAI_API_KEY, a running hh-service, and network access"]
+#[ignore = "requires HH_OPENAI_API_KEY, audio devices, and network access"]
 fn live_engine_reports_state_transitions() {
     let settings = VoiceSettings::load().expect("load voice settings and environment overrides");
     assert!(
@@ -33,9 +32,10 @@ fn live_engine_reports_state_transitions() {
                 .is_some_and(|started: Instant| started.elapsed() >= Duration::from_secs(5))
         {
             assert!(!spoke_unprompted, "assistant spoke unprompted at startup");
-            engine.send(VoiceCommand::SendUserText(
-                "Reply with exactly: playback progress verified.".to_owned(),
-            ));
+            engine.send(VoiceCommand::RelayAssistantText {
+                entry: Some(0),
+                text: "Reply with exactly: playback progress verified.".to_owned(),
+            });
             prompted = true;
         }
         match ui_rx.try_recv() {
@@ -65,10 +65,19 @@ fn live_engine_reports_state_transitions() {
                 saw_progress = true;
                 last_progress = Some(Instant::now());
             }
-            Ok(VoiceUiEvent::AssistantTranscript { text, final_: true }) => {
+            Ok(VoiceUiEvent::AssistantTranscript {
+                entry,
+                text,
+                final_: true,
+            }) => {
+                assert_eq!(entry, Some(0));
                 println!(
                     "{:?}",
-                    VoiceUiEvent::AssistantTranscript { text, final_: true }
+                    VoiceUiEvent::AssistantTranscript {
+                        entry,
+                        text,
+                        final_: true
+                    }
                 );
                 assistant_final = true;
             }

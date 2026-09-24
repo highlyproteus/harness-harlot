@@ -154,6 +154,16 @@ impl SessionClient {
             valid: true,
         })
     }
+    /// Changes the deadline used by subsequent blocking response reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the socket option cannot be updated.
+    pub fn set_read_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .context("set session socket read timeout")
+    }
 
     /// Reports whether the previous socket location still has a listening
     /// service, even when its protocol is too old for this desktop.

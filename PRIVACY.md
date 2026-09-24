@@ -1,107 +1,105 @@
-# Voice Mode privacy and data handling
+# Assistant and Voice Mode privacy and data handling
 
-Effective: August 28, 2026
+Effective: September 18, 2026
 
-This document describes the data behavior of Voice Mode in Harness Harlot. It
-covers the application as distributed by this project; OpenAI, an optional
-Honcho server, the operating system, and terminal programs have their own terms
-and data practices.
+This document describes the data behavior of Assistant panes and optional Voice
+Mode in Harness Harlot. The selected pi model provider, OpenAI, the operating
+system, terminal programs, browsers, and any coding agents launched in terminals
+have their own terms and data practices.
+
+## Assistant orchestration
+
+Each Assistant pane runs a local, service-owned `pi --mode rpc` subprocess. pi
+connects to the model provider selected in its own configuration. Harness Harlot
+starts pi with built-in tools, skills, prompt templates, themes, and context-file
+loading disabled, then loads only the bundled HH workspace extension.
+
+Depending on what you ask the Assistant to do, the selected pi model provider
+may receive:
+
+- typed messages and attached PNG, JPEG, or WebP images;
+- the Assistant system prompt, configured operator instructions, configured
+  coding-agent command, and resolved working directory;
+- workspace, window, pane, browser URL, process-status, and terminal-screen
+  information returned by HH tools; and
+- tool arguments, results, errors, and subsequent Assistant messages.
+
+The HH extension can list and create workstations, windows, terminal panes, and
+browser panes; read terminal screens; send terminal input; wait for terminal
+state; close panes; and focus panes. It has no direct filesystem or shell tool.
+A command or coding agent launched inside a terminal is a separate local
+program and has whatever operating-system permissions that program normally
+has.
+
+`Full` access automatically approves guarded HH actions. `Confirm` requires an
+inline Allow/Deny decision before the extension sends terminal input, closes a
+pane, or creates a terminal with a command. Model text, tool output, terminal
+content, and voice output do not themselves approve a pending action.
+
+Provider handling and retention of Assistant data are governed by pi's selected
+provider and account configuration. pi manages its own provider credentials;
+Harness Harlot does not copy them into Voice settings.
 
 ## Voice Mode is optional
 
-Voice Mode is inactive until you use an Assistant pane. Typing a message,
-attaching an image, or reopening a saved thread may connect the Assistant to
-OpenAI, but those actions do not grant microphone access. Microphone capture
-hardware is not enumerated, configured, or opened until you use the visible
-start-voice control. Muting, suspending, or stopping the Assistant disables
-capture, and a later text-only start revokes any earlier microphone consent.
+Voice Mode is inactive until you use the visible start-voice control in an
+Assistant pane. Typing a message or attaching an image does not grant microphone
+access. Microphone capture hardware is not opened until voice starts. Muting,
+suspending, or stopping Voice Mode disables capture.
 
-## Data sent to OpenAI
+When Voice Mode is active, Harness Harlot uses the OpenAI Realtime API only as a
+speech relay. It may send:
 
-When an Assistant is connected, Harness Harlot uses the OpenAI Realtime API.
-Depending on what you choose to do, it may send:
-
-- typed messages and attached images;
 - microphone audio captured after explicit voice start;
-- a non-path conversation label, configured Assistant instructions, and a
-  bounded prior-conversation summary; and
-- optional Honcho memory context when you separately enable Honcho.
+- the Assistant workspace title in the relay instructions; and
+- bounded final Assistant text prefixed as an orchestrator update so Realtime
+  can speak it.
 
-Harness Harlot does not send terminal output, terminal notifications, OSC
-payloads, pane contents, filesystem paths, directory listings, Git state, or
-workspace control data to the Voice provider. It advertises no provider tools
-or tool-choice capability. Historical or unsolicited provider function calls
-fail locally and cannot invoke an RPC, approval, terminal action, filesystem
-operation, or memory query.
+OpenAI returns input transcripts plus generated relay text and audio. Final user
+transcripts are forwarded to the pi orchestrator. Realtime advertises no HH
+tools and cannot invoke or approve HH actions. It does not receive attached
+images or raw HH tool results directly, but final Assistant text sent for speech
+can contain information that the orchestrator chose to report.
 
-OpenAI returns generated text, audio, and transcripts. OpenAI's handling and
-retention of sent data are governed by the terms and settings of the OpenAI
-account associated with `HH_OPENAI_API_KEY`.
-
-Voice is conversation-only. The model cannot inspect or control terminals,
-panes, workstations, tabs, projects, threads, directories, filesystems, Git,
-agents, or local memory. Voice has no approval UI, and model output, speech,
-terminal content, restored context, or prior summaries cannot authorize an
-action.
-
-## Optional Honcho memory
-
-Honcho memory is disabled by default. If you configure it, Harness Harlot sends
-accepted user and assistant text turns to the Honcho server you selected. At
-session start, the application may request a bounded memory preamble and place
-that text in the conversational provider context. The model cannot issue its
-own Honcho recall or deletion requests.
-
-Remote Honcho endpoints must use HTTPS. Plain HTTP is accepted only for a
-parsed loopback destination such as `localhost`, `127.0.0.1`, or `::1`.
-Redirects are disabled for Honcho requests so credentials and conversation data
-are never forwarded to another origin.
-
-Honcho data retention and deletion are controlled by that Honcho deployment.
-Deleting or clearing local Harness Harlot threads does not delete a remote
-Honcho server's copy. Use that server's administrative controls to inspect or
-delete remote data.
+OpenAI's handling and retention of Voice data are governed by the terms and
+settings of the account associated with `HH_OPENAI_API_KEY`.
 
 ## Local storage
 
 Harness Harlot stores non-secret Voice settings in its owner-only application
-state directory. OpenAI API keys and Honcho bearer tokens are deliberately not
-serialized to the settings file. Supply them to future launches through:
+state directory. The OpenAI API key is not serialized; supply it through:
 
 ```text
 HH_OPENAI_API_KEY
-HH_HONCHO_BEARER
 ```
 
-Saved Assistant threads contain bounded text turns, titles, conversation and
-workspace identifiers, conversation labels, and session summaries. They do not
-contain microphone audio, attached image bytes, terminal output, filesystem
-paths, provider credentials, tool calls, or approval records. Thread files are
-owner-only regular files, opened without following symbolic links, and bounded
-to 8 MiB and 10,000 records per thread.
+Retired Honcho settings are accepted only to migrate older settings files, then
+ignored and omitted from future writes. Harness Harlot no longer sends
+conversation data to Honcho and no longer stores its previous local
+conversation-thread or summary format.
 
-Default local thread retention keeps at most 200 threads, 90 days of activity,
-and 64 MiB in total, deleting the oldest or expired files when a limit is
-exceeded. The Assistant history UI labels its controls as local-only. Delete,
-clear-all, and retention revoke active writers before removing files and sync
-the containing directory before reporting success. Session summaries live in
-those same retained thread files, so local controls cover summaries as well as
-visible turns.
-
-This disclosure is included in macOS and Linux packages and is linked from the
-Voice settings panel.
+pi session files live under the owner-only Assistant state directory so an
+Assistant pane can resume its newest session after a service restart. Those
+files may contain user and Assistant messages, attached-image data, tool calls,
+tool results, terminal excerpts, browser URLs, and working-directory paths.
+Closing the Assistant pane, tab, or workspace removes that pane's local pi
+session directory. pi and the selected provider may have additional independent
+retention behavior.
 
 Attached images are read only after you select them. Harness Harlot rejects
 symbolic links, non-regular or foreign-owned files, oversized input, mismatched
 file signatures, and invalid image decodes before sending accepted PNG, JPEG,
-or WebP data to OpenAI.
+or WebP data to pi.
 
 ## Terminal and filesystem boundary
 
-Voice has no terminal or filesystem capability. Terminal output and OSC
-notifications remain local and do not become model context. Ordinary terminal,
-workspace, browser, and file-transfer features remain human-operated desktop
-features outside the Voice provider boundary.
+HH tool requests cross the versioned, owner-only local Unix socket and are
+validated by the session service. The pi subprocess receives only the bundled
+HH extension; it does not receive Harness Harlot's internal process handles,
+tmux control connection, provider secrets, or SSH credentials. Terminal
+content explicitly read by an HH tool can become model context, and commands
+typed into a terminal can operate on local files according to that terminal
+program's permissions.
 
 ## Security and questions
 

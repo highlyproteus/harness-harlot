@@ -12,13 +12,18 @@ use gpui::{
 };
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use gpui::{AppContext, Image, ImageFormat};
-use hh_protocol::{ClientRequest, DropPlacement, Pane, PaneKind, ServiceResponse};
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+use hh_protocol::BrowserAction;
+use hh_protocol::{
+    BrowserCommandOutcome, BrowserCommandRequest, ClientRequest, DropPlacement, Pane, PaneKind,
+    ServiceResponse,
+};
 #[cfg(all(target_os = "macos", feature = "browser"))]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use std::cell::RefCell;
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(all(target_os = "macos", feature = "browser"))]
 use std::ffi::c_void;
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -67,6 +72,7 @@ pub(crate) struct BrowserShared {
     pub(crate) dirty: bool,
     pub(crate) popup_requests: Vec<String>,
     pub(crate) focus_requested: bool,
+    pub(crate) dev_tools_results: Vec<(i32, bool, Vec<u8>)>,
 }
 
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -82,6 +88,8 @@ pub(crate) struct BrowserPaneView {
     pub(crate) focused: bool,
     pub(crate) visible: bool,
     pub(crate) bounds: Rc<RefCell<Option<(hh_cef_view::BrowserRect, f32)>>>,
+    pub(crate) cdp_pending: HashMap<i32, u64>,
+    pub(crate) next_cdp_id: i32,
 }
 
 #[cfg(all(target_os = "macos", feature = "browser"))]
@@ -632,6 +640,7 @@ impl HhApp {
                 dirty: false,
                 popup_requests: Vec::new(),
                 focus_requested: false,
+                dev_tools_results: Vec::new(),
             }));
             let address_state = Rc::clone(&shared);
             let title_state = Rc::clone(&shared);
@@ -639,6 +648,7 @@ impl HhApp {
             let loading_state = Rc::clone(&shared);
             let popup_state = Rc::clone(&shared);
             let focus_state = Rc::clone(&shared);
+            let dev_tools_state = Rc::clone(&shared);
             let callbacks = hh_cef_view::Callbacks {
                 on_got_focus: Box::new(move || {
                     let mut state = focus_state.borrow_mut();
@@ -685,6 +695,11 @@ impl HhApp {
                         state.dirty = true;
                     }
                 }),
+                on_dev_tools_result: Box::new(move |message_id, success, result| {
+                    let mut state = dev_tools_state.borrow_mut();
+                    state.dev_tools_results.push((message_id, success, result));
+                    state.dirty = true;
+                }),
             };
             let rect = hh_cef_view::BrowserRect {
                 x: 0.0,
@@ -712,6 +727,8 @@ impl HhApp {
                 bounds: Rc::new(RefCell::new(None)),
                 pending_state: None,
                 in_flight_state: None,
+                cdp_pending: HashMap::new(),
+                next_cdp_id: 1,
             });
             cx.notify();
         }
@@ -840,6 +857,200 @@ impl HhApp {
         }
         changed
     }
+
+    fn post_browser_command_result(&mut self, request_id: u64, outcome: BrowserCommandOutcome) {
+        self.dispatch(ClientRequest::BrowserCommandResult {
+            request_id,
+            outcome,
+        });
+    }
+
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+    fn execute_browser_command(
+        &mut self,
+        command: BrowserCommandRequest,
+        deadline: std::time::Instant,
+        cx: &mut Context<Self>,
+    ) {
+        let BrowserCommandRequest {
+            request_id,
+            pane_id,
+            action,
+        } = command;
+        let Some(view) = self.browser.browser_views.get_mut(&pane_id) else {
+            if std::time::Instant::now() >= deadline {
+                self.post_browser_command_result(
+                    request_id,
+                    BrowserCommandOutcome::Error {
+                        message: "browser pane did not become ready".to_owned(),
+                    },
+                );
+            } else {
+                self.focus_pane_with_snapshot(pane_id, cx);
+                self.browser.deferred_commands.push((
+                    BrowserCommandRequest {
+                        request_id,
+                        pane_id,
+                        action,
+                    },
+                    deadline,
+                ));
+            }
+            return;
+        };
+        if matches!(&action, BrowserAction::DevTools { .. }) && !view.pane.is_created() {
+            if std::time::Instant::now() >= deadline {
+                self.post_browser_command_result(
+                    request_id,
+                    BrowserCommandOutcome::Error {
+                        message: "browser pane did not become ready".to_owned(),
+                    },
+                );
+            } else {
+                self.browser.deferred_commands.push((
+                    BrowserCommandRequest {
+                        request_id,
+                        pane_id,
+                        action,
+                    },
+                    deadline,
+                ));
+            }
+            return;
+        }
+        let outcome = match action {
+            BrowserAction::Navigate { url } => {
+                view.pane.navigate(&url);
+                Some(BrowserCommandOutcome::Ok {
+                    result: serde_json::Value::Null,
+                })
+            }
+            BrowserAction::Back => {
+                view.pane.back();
+                Some(BrowserCommandOutcome::Ok {
+                    result: serde_json::Value::Null,
+                })
+            }
+            BrowserAction::Forward => {
+                view.pane.forward();
+                Some(BrowserCommandOutcome::Ok {
+                    result: serde_json::Value::Null,
+                })
+            }
+            BrowserAction::Reload => {
+                view.pane.reload();
+                Some(BrowserCommandOutcome::Ok {
+                    result: serde_json::Value::Null,
+                })
+            }
+            BrowserAction::DevTools { method, params } => {
+                let message_id = view.next_cdp_id;
+                view.next_cdp_id = view.next_cdp_id.checked_add(1).unwrap_or(1);
+                match serde_json::to_vec(&serde_json::json!({
+                    "id": message_id,
+                    "method": method,
+                    "params": params,
+                })) {
+                    Ok(message) => {
+                        view.cdp_pending.insert(message_id, request_id);
+                        if view.pane.send_dev_tools_message(&message) {
+                            None
+                        } else {
+                            view.cdp_pending.remove(&message_id);
+                            Some(BrowserCommandOutcome::Error {
+                                message: "browser is not ready".to_owned(),
+                            })
+                        }
+                    }
+                    Err(error) => Some(BrowserCommandOutcome::Error {
+                        message: format!("could not encode DevTools call: {error}"),
+                    }),
+                }
+            }
+        };
+        if let Some(outcome) = outcome {
+            self.post_browser_command_result(request_id, outcome);
+        }
+    }
+
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+    pub(crate) fn run_browser_commands(
+        &mut self,
+        commands: Vec<BrowserCommandRequest>,
+        cx: &mut Context<Self>,
+    ) {
+        for command in commands {
+            self.execute_browser_command(
+                command,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+                cx,
+            );
+        }
+    }
+
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+    pub(crate) fn poll_browser_commands(&mut self, cx: &mut Context<Self>) {
+        let deferred = std::mem::take(&mut self.browser.deferred_commands);
+        for (command, deadline) in deferred {
+            self.execute_browser_command(command, deadline, cx);
+        }
+        let mut completed = Vec::new();
+        for view in self.browser.browser_views.values_mut() {
+            let results = {
+                let mut shared = view.shared.borrow_mut();
+                std::mem::take(&mut shared.dev_tools_results)
+            };
+            for (message_id, success, bytes) in results {
+                let Some(request_id) = view.cdp_pending.remove(&message_id) else {
+                    continue;
+                };
+                let outcome = if bytes.len() > 3 * 1024 * 1024 {
+                    BrowserCommandOutcome::Error {
+                        message: "result exceeds 3 MiB".to_owned(),
+                    }
+                } else {
+                    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Ok(result) if success && result.get("error").is_none() => {
+                            BrowserCommandOutcome::Ok { result }
+                        }
+                        Ok(result) => BrowserCommandOutcome::Error {
+                            message: result
+                                .pointer("/error/message")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("DevTools call failed")
+                                .to_owned(),
+                        },
+                        Err(_) => BrowserCommandOutcome::Error {
+                            message: "DevTools call failed".to_owned(),
+                        },
+                    }
+                };
+                completed.push((request_id, outcome));
+            }
+        }
+        for (request_id, outcome) in completed {
+            self.post_browser_command_result(request_id, outcome);
+        }
+    }
+
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
+    pub(crate) fn run_browser_commands(
+        &mut self,
+        commands: Vec<BrowserCommandRequest>,
+        _cx: &mut Context<Self>,
+    ) {
+        for command in commands {
+            self.post_browser_command_result(
+                command.request_id,
+                BrowserCommandOutcome::Error {
+                    message: "embedded browser support is unavailable".to_owned(),
+                },
+            );
+        }
+    }
+
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), feature = "browser")))]
+    pub(crate) fn poll_browser_commands(&mut self, _cx: &mut Context<Self>) {}
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     pub(crate) fn flush_browser_state_updates(&mut self, cx: &mut Context<Self>) {
@@ -1127,7 +1338,7 @@ impl HhApp {
                 self.pane_metadata(pane_id)
                     .and_then(|pane| match pane.kind {
                         PaneKind::Browser { url } => Some(url),
-                        PaneKind::Terminal | PaneKind::Assistant => None,
+                        PaneKind::Terminal | PaneKind::Assistant | PaneKind::Gallery => None,
                     })
             })
     }
@@ -1137,7 +1348,7 @@ impl HhApp {
         self.pane_metadata(pane_id)
             .and_then(|pane| match pane.kind {
                 PaneKind::Browser { url } => Some(url),
-                PaneKind::Terminal | PaneKind::Assistant => None,
+                PaneKind::Terminal | PaneKind::Assistant | PaneKind::Gallery => None,
             })
     }
 
@@ -1154,7 +1365,7 @@ impl HhApp {
         let url =
             match &pane.kind {
                 PaneKind::Browser { url } => url.clone(),
-                PaneKind::Terminal | PaneKind::Assistant => {
+                PaneKind::Terminal | PaneKind::Assistant | PaneKind::Gallery => {
                     // A kind mismatch must degrade, never crash the render path.
                     return div()
                         .size_full()
@@ -1298,7 +1509,7 @@ impl HhApp {
         let url =
             match &pane.kind {
                 PaneKind::Browser { url } => url.clone(),
-                PaneKind::Terminal | PaneKind::Assistant => {
+                PaneKind::Terminal | PaneKind::Assistant | PaneKind::Gallery => {
                     // A kind mismatch must degrade, never crash the render path.
                     return div()
                         .size_full()

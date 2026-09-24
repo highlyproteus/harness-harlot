@@ -8,14 +8,15 @@ use crate::history::{
     TerminalHistoryPage,
 };
 use crate::model::{
-    AppearanceColor, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport, TmuxScanScope,
-    TmuxSession, TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
+    AppearanceColor, AssistantSettings, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport,
+    TmuxScanScope, TmuxSession, TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
 };
 use crate::profile::TerminalProfile;
 use crate::terminal::{
-    DropPlacement, PaneRevisionCursor, PaneStreamState, SessionNotification, StreamDiagnostics,
-    TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen,
-    TerminalSelectionKind,
+    AssistantImage, AssistantModel, AssistantThreadView, BrowserAction, BrowserCommandOutcome,
+    BrowserCommandRequest, CodingAgent, DropPlacement, PaneRevisionCursor, PaneStreamState,
+    SessionNotification, StreamDiagnostics, TerminalModifiers, TerminalMouseAction,
+    TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
 };
 
 /// Exact pane identity and transport approved by a trusted caller. The service
@@ -41,9 +42,45 @@ pub enum ClientRequest {
     GetUpdates {
         snapshot_revision: Option<u64>,
         pane_revisions: Vec<PaneRevisionCursor>,
+        #[serde(default)]
+        assistant_revisions: Vec<PaneRevisionCursor>,
         subscribed_panes: Vec<Uuid>,
         notifications_after: u64,
+        #[serde(default)]
+        browser_executor: bool,
     },
+    AssistantPrompt {
+        pane_id: Uuid,
+        text: String,
+        #[serde(default)]
+        images: Vec<AssistantImage>,
+    },
+    AssistantAbort {
+        pane_id: Uuid,
+    },
+    AssistantRestart {
+        pane_id: Uuid,
+    },
+    AssistantApprovalResponse {
+        pane_id: Uuid,
+        request_id: String,
+        allow: bool,
+    },
+    GetAssistantThread {
+        pane_id: Uuid,
+    },
+    GetAssistantModels {
+        pane_id: Uuid,
+    },
+    SetAssistantModel {
+        pane_id: Uuid,
+        provider: String,
+        model_id: String,
+    },
+    SetAssistantSettings {
+        settings: AssistantSettings,
+    },
+    GetCodingAgents,
     GetNotifications,
     MarkNotificationsRead {
         ids: Vec<u64>,
@@ -75,6 +112,25 @@ pub enum ClientRequest {
     CreateGroupBrowser {
         target_pane: Uuid,
         url: Option<String>,
+    },
+    CreateGalleryTab {
+        workspace_id: Uuid,
+    },
+    CreateGroupGallery {
+        target_pane: Uuid,
+    },
+    AddGalleryImage {
+        workspace_id: Uuid,
+        origin_pane: Option<Uuid>,
+        source: String,
+    },
+    BrowserCommand {
+        pane_id: Uuid,
+        action: BrowserAction,
+    },
+    BrowserCommandResult {
+        request_id: u64,
+        outcome: BrowserCommandOutcome,
     },
     CreateAssistantTab {
         workspace_id: Uuid,
@@ -365,7 +421,11 @@ pub enum ServiceResponse {
         screens: Vec<TerminalScreen>,
         pane_states: Vec<PaneStreamState>,
         notifications: Vec<SessionNotification>,
+        #[serde(default)]
+        assistant_threads: Vec<AssistantThreadView>,
         diagnostics: StreamDiagnostics,
+        #[serde(default)]
+        browser_commands: Vec<BrowserCommandRequest>,
     },
     Notifications {
         items: Vec<SessionNotification>,
@@ -374,8 +434,24 @@ pub enum ServiceResponse {
         screen: TerminalScreen,
         diagnostics: StreamDiagnostics,
     },
+    AssistantThread {
+        view: AssistantThreadView,
+    },
+    AssistantModels {
+        models: Vec<AssistantModel>,
+    },
+    CodingAgents {
+        agents: Vec<CodingAgent>,
+    },
     PaneCreated {
         pane_id: Uuid,
+    },
+    GalleryImageAdded {
+        path: String,
+        pane_id: Uuid,
+    },
+    BrowserCommandResult {
+        outcome: BrowserCommandOutcome,
     },
     WorkspaceCreated {
         workspace_id: Uuid,
@@ -454,6 +530,80 @@ mod tests {
                     "type": "create_browser_tab",
                     "workspace_id": workspace_id,
                     "url": "https://example.com",
+                }),
+            ),
+            (
+                ClientRequest::CreateGroupBrowser {
+                    target_pane: pane_id,
+                    url: Some("https://example.com/group".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "create_group_browser",
+                    "target_pane": pane_id,
+                    "url": "https://example.com/group",
+                }),
+            ),
+            (
+                ClientRequest::CreateGalleryTab { workspace_id },
+                serde_json::json!({
+                    "type": "create_gallery_tab",
+                    "workspace_id": workspace_id,
+                }),
+            ),
+            (
+                ClientRequest::CreateGroupGallery {
+                    target_pane: pane_id,
+                },
+                serde_json::json!({
+                    "type": "create_group_gallery",
+                    "target_pane": pane_id,
+                }),
+            ),
+            (
+                ClientRequest::AddGalleryImage {
+                    workspace_id,
+                    origin_pane: Some(pane_id),
+                    source: "/tmp/image.png".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "add_gallery_image",
+                    "workspace_id": workspace_id,
+                    "origin_pane": pane_id,
+                    "source": "/tmp/image.png",
+                }),
+            ),
+            (
+                ClientRequest::BrowserCommand {
+                    pane_id,
+                    action: BrowserAction::DevTools {
+                        method: "Runtime.evaluate".to_owned(),
+                        params: serde_json::json!({"expression": "1+1"}),
+                    },
+                },
+                serde_json::json!({
+                    "type": "browser_command",
+                    "pane_id": pane_id,
+                    "action": {
+                        "type": "dev_tools",
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": "1+1"},
+                    },
+                }),
+            ),
+            (
+                ClientRequest::BrowserCommandResult {
+                    request_id: 7,
+                    outcome: BrowserCommandOutcome::Ok {
+                        result: serde_json::json!({"value": 2}),
+                    },
+                },
+                serde_json::json!({
+                    "type": "browser_command_result",
+                    "request_id": 7,
+                    "outcome": {
+                        "type": "ok",
+                        "result": {"value": 2},
+                    },
                 }),
             ),
             (
@@ -553,6 +703,12 @@ mod tests {
                     "tab_id": tab_id,
                 }),
             ),
+            (
+                ClientRequest::GetCodingAgents,
+                serde_json::json!({
+                    "type": "get_coding_agents",
+                }),
+            ),
         ];
 
         assert_request_json_round_trips(cases);
@@ -645,6 +801,71 @@ mod tests {
         ];
 
         assert_request_json_round_trips(cases);
+    }
+    #[test]
+    fn assistant_prompt_with_image_round_trips() {
+        let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let request = ClientRequest::AssistantPrompt {
+            pane_id,
+            text: "Describe this".to_owned(),
+            images: vec![AssistantImage {
+                mime_type: "image/png".to_owned(),
+                base64: "aGVsbG8=".to_owned(),
+            }],
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "type": "assistant_prompt",
+                "pane_id": pane_id,
+                "text": "Describe this",
+                "images": [{
+                    "mime_type": "image/png",
+                    "base64": "aGVsbG8="
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ClientRequest>(encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn updates_with_assistant_thread_round_trips() {
+        let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let response = ServiceResponse::Updates {
+            session_revision: 7,
+            snapshot: None,
+            screens: Vec::new(),
+            pane_states: Vec::new(),
+            notifications: Vec::new(),
+            assistant_threads: vec![AssistantThreadView {
+                pane_id,
+                revision: 3,
+                status: crate::terminal::AssistantStatus::Idle,
+                model: Some("openai/gpt-5".to_owned()),
+                entries: vec![crate::terminal::AssistantEntry::Assistant {
+                    text: "Done".to_owned(),
+                    final_: true,
+                    timestamp_ms: 42,
+                }],
+                truncated_entries: 0,
+                pending_approval: None,
+            }],
+            diagnostics: StreamDiagnostics::default(),
+            browser_commands: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded["assistant_threads"][0]["entries"][0]["final_"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceResponse>(encoded).unwrap(),
+            response
+        );
     }
 
     #[test]

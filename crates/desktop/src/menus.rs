@@ -139,6 +139,22 @@ impl HhApp {
         self.editor.modal = Modal::None;
         cx.notify();
     }
+    pub(crate) fn new_group_gallery(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        let Some(target_pane) = self.group_metadata(tab_id).map(|(_, pane_id)| pane_id) else {
+            self.editor.modal = Modal::None;
+            cx.notify();
+            return;
+        };
+        let Some(workspace_id) = self.workspace_id_for_pane(target_pane) else {
+            return;
+        };
+        self.create_gallery(
+            workspace_id,
+            ClientRequest::CreateGroupGallery { target_pane },
+            cx,
+        );
+    }
+
     pub(crate) fn toggle_tab_identity_picker(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
         if let Modal::TabMenu(menu) = &mut self.editor.modal
             && menu.pane_id == pane_id
@@ -248,6 +264,17 @@ impl HhApp {
                             "New Browser",
                             cx,
                             move |this, cx| this.new_browser_tab_in(workspace_id, cx),
+                        ))
+                    },
+                )
+                .when_some(
+                    workspace_id.filter(|_| !is_assistant),
+                    |element, workspace_id| {
+                        element.child(self.create_menu_item(
+                            ("new-gallery-from-tab-menu", element_key(pane_id)),
+                            "New Gallery",
+                            cx,
+                            move |this, cx| this.new_gallery_tab_in(workspace_id, cx),
                         ))
                     },
                 )
@@ -411,6 +438,7 @@ impl HhApp {
                             PaneKind::Browser { .. } => "Close Browser…",
                             PaneKind::Assistant => "Close Assistant…",
                             PaneKind::Terminal => "Close Terminal…",
+                            PaneKind::Gallery => "Close Gallery…",
                         }),
                 ),
         )
@@ -506,6 +534,14 @@ impl HhApp {
                             this.new_browser_tab(cx);
                         },
                     ));
+                    items.push(self.create_menu_item(
+                        "create-new-gallery",
+                        "New Gallery",
+                        cx,
+                        |this, cx| {
+                            this.new_gallery_tab(cx);
+                        },
+                    ));
                 }
                 items
             }
@@ -521,6 +557,9 @@ impl HhApp {
                 }),
                 self.create_menu_item("strip-add-browser", "Add Browser", cx, move |this, cx| {
                     this.add_browser_to_context(workspace_id, target_tab, cx);
+                }),
+                self.create_menu_item("strip-add-gallery", "Add Gallery", cx, move |this, cx| {
+                    this.add_gallery_to_context(workspace_id, target_tab, cx);
                 }),
                 self.create_menu_item("strip-add-group", "Add Group", cx, move |this, cx| {
                     this.add_group_to_context(workspace_id, target_tab, cx);
@@ -618,6 +657,12 @@ impl HhApp {
                         move |this, cx| this.new_group_browser(tab_id, cx),
                     ))
                 })
+                .child(self.create_menu_item(
+                    ("new-gallery-in-group", element_key(tab_id)),
+                    "New Gallery",
+                    cx,
+                    move |this, cx| this.new_group_gallery(tab_id, cx),
+                ))
                 .when_some(
                     workspace_id.filter(|_| is_project && !has_parent),
                     |element, workspace_id| {
@@ -796,6 +841,12 @@ impl HhApp {
                                 }))
                                 .child("New Browser"),
                         )
+                        .child(self.create_menu_item(
+                            ("new-workspace-gallery-menu", key),
+                            "New Gallery",
+                            cx,
+                            move |this, cx| this.new_workspace_gallery(workspace_id, cx),
+                        ))
                         .child(self.create_menu_item(
                             ("new-workspace-terminal-menu", key),
                             "New Terminal",

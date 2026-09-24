@@ -323,6 +323,7 @@ pub(crate) async fn poll_once(this: &WeakEntity<HhApp>, cx: &mut AsyncApp) -> Op
         this.ensure_visible_browser_views(cx);
         this.sync_pty_sizes(cx);
         this.flush_browser_state_updates(cx);
+        this.poll_browser_commands(cx);
         if state_changed {
             cx.notify();
         }

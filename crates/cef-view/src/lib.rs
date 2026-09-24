@@ -25,6 +25,7 @@ pub struct Callbacks {
     pub on_loading_state: Box<dyn Fn(bool, bool, bool)>,
     pub on_popup_request: Box<dyn Fn(String)>,
     pub on_got_focus: Box<dyn Fn()>,
+    pub on_dev_tools_result: Box<dyn Fn(i32, bool, Vec<u8>)>,
 }
 
 impl std::fmt::Debug for Callbacks {
@@ -116,4 +117,10 @@ impl BrowserPane {
     pub fn stop(&self) {}
     pub fn focus(&self, _: bool) {}
     pub fn close(&self) {}
+    pub fn send_dev_tools_message(&self, _: &[u8]) -> bool {
+        false
+    }
+    pub fn is_created(&self) -> bool {
+        false
+    }
 }

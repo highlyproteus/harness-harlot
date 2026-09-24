@@ -9,7 +9,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use uuid::Uuid;
 
 #[test]
-fn daemon_restart_recreates_fresh_shells_from_safe_desired_state() {
+fn daemon_restart_restores_layout_and_working_directories() {
     let directory = test_directory("restart");
     let path = directory.join("sessions.json");
     let expected_cwd = std::env::temp_dir();
@@ -25,8 +25,6 @@ fn daemon_restart_recreates_fresh_shells_from_safe_desired_state() {
         .unwrap();
     wait_for_process_cwd(&registry, first, &expected_cwd);
     let second = registry.create_pane(first, SplitAxis::Horizontal).unwrap();
-    let old_first_pid = registry.pane_process_id(first).unwrap().unwrap();
-    let old_second_pid = registry.pane_process_id(second).unwrap().unwrap();
     registry.persist().unwrap();
     drop(registry);
 
@@ -45,16 +43,8 @@ fn daemon_restart_recreates_fresh_shells_from_safe_desired_state() {
     assert_eq!(left.id, first);
     assert_eq!(left.title, "Recovered editor");
     assert_eq!(right.id, second);
-    assert!(left.shell.contains("recovered with a fresh shell"));
-    assert!(right.shell.contains("recovered with a fresh shell"));
-    assert_ne!(
-        recovered.pane_process_id(first).unwrap(),
-        Some(old_first_pid)
-    );
-    assert_ne!(
-        recovered.pane_process_id(second).unwrap(),
-        Some(old_second_pid)
-    );
+    assert!(recovered.pane_process_id(first).unwrap().is_some());
+    assert!(recovered.pane_process_id(second).unwrap().is_some());
     wait_for_process_cwd(&recovered, first, &expected_cwd);
 
     drop(recovered);
@@ -125,6 +115,66 @@ fn browser_tabs_round_trip_without_a_pty_and_reject_terminal_operations() {
     assert!(
         recovered
             .write_input(browser_id, b"ignored")
+            .unwrap_err()
+            .to_string()
+            .contains("not a terminal")
+    );
+
+    drop(recovered);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn gallery_tabs_round_trip_without_a_pty() {
+    let directory = test_directory("gallery");
+    let path = directory.join("sessions.json");
+    let registry = SessionRegistry::persistent(&path).unwrap();
+    let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+    let gallery_id = registry.create_gallery_tab(workspace_id).unwrap();
+
+    let split_error = registry
+        .create_pane(gallery_id, SplitAxis::Horizontal)
+        .unwrap_err();
+    assert!(
+        split_error
+            .to_string()
+            .contains("gallery panes cannot host terminals")
+    );
+    assert!(
+        registry
+            .write_input(gallery_id, b"ignored")
+            .unwrap_err()
+            .to_string()
+            .contains("not a terminal")
+    );
+    let updates = registry.pane_updates(None, &[], &[], false, 0).unwrap();
+    assert!(
+        updates
+            .screens
+            .iter()
+            .all(|screen| screen.pane_id != gallery_id)
+    );
+    assert!(updates.pane_states.iter().any(|state| {
+        state.pane_id == gallery_id && state.revision == 0 && !state.subscribed && !state.exited
+    }));
+    registry.persist().unwrap();
+    drop(registry);
+
+    let recovered = SessionRegistry::persistent(&path).unwrap();
+    let snapshot = recovered.snapshot().unwrap();
+    let pane = snapshot.workspaces[0]
+        .tabs
+        .iter()
+        .find_map(|tab| match &tab.layout {
+            PaneLayout::Leaf { pane } if pane.id == gallery_id => Some(pane),
+            _ => None,
+        })
+        .expect("recovered gallery tab");
+    assert_eq!(pane.title, "Gallery");
+    assert_eq!(pane.kind, PaneKind::Gallery);
+    assert!(
+        recovered
+            .write_input(gallery_id, b"ignored")
             .unwrap_err()
             .to_string()
             .contains("not a terminal")

@@ -20,6 +20,9 @@ pub(crate) fn identity_detail(pane: &Pane) -> String {
     if pane.kind.is_assistant() {
         return "Voice assistant".to_owned();
     }
+    if pane.kind.is_gallery() {
+        return "Workstation image gallery".to_owned();
+    }
     let detection_detail = match pane.identity.source {
         hh_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
         hh_protocol::TerminalIdentitySource::UserProfile => "User-selected local profile",

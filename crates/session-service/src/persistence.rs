@@ -7,15 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    AppearanceColor, AppearanceSettings, MAX_BROWSER_URL_LEN, Pane, PaneKind, PaneLayout,
-    SessionSnapshot, SplitAxis, Tab, TerminalIdentity, TerminalProfile, Workspace,
+    AppearanceColor, AppearanceSettings, AssistantSettings, MAX_BROWSER_URL_LEN, Pane, PaneKind,
+    PaneLayout, SessionSnapshot, SplitAxis, Tab, TerminalIdentity, TerminalProfile, Workspace,
     WorkspaceConnection, WorkspaceConnectionStatus, WorkspaceKind, validate_ssh_host,
     validate_workspace_dir,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 12;
+const SCHEMA_VERSION: u16 = 13;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
 pub(crate) const MAX_WORKSPACES: usize = 16;
@@ -31,6 +31,7 @@ pub(crate) const MAX_RECENT_COLORS: usize = 8;
 pub(crate) struct RecoveredState {
     pub snapshot: SessionSnapshot,
     pub cwd_by_pane: HashMap<Uuid, PathBuf>,
+    pub tmux_by_pane: HashMap<Uuid, (String, String)>,
     pub offline_panes: HashSet<Uuid>,
 }
 
@@ -91,9 +92,11 @@ impl SnapshotStore {
     pub(crate) fn encode_with_offline(
         snapshot: &SessionSnapshot,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
+        tmux_by_pane: &HashMap<Uuid, (String, String)>,
         offline_panes: &HashSet<Uuid>,
     ) -> Result<Vec<u8>> {
-        let desired = DesiredState::from_runtime(snapshot, cwd_by_pane, offline_panes)?;
+        let desired =
+            DesiredState::from_runtime(snapshot, cwd_by_pane, tmux_by_pane, offline_panes)?;
         desired.validate()?;
         let bytes = serde_json::to_vec(&desired).context("encode recovery snapshot")?;
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
@@ -161,7 +164,8 @@ impl SnapshotStore {
 
     #[cfg(test)]
     fn save(&self, snapshot: &SessionSnapshot, cwd_by_pane: &HashMap<Uuid, PathBuf>) -> Result<()> {
-        let bytes = Self::encode_with_offline(snapshot, cwd_by_pane, &HashSet::new())?;
+        let bytes =
+            Self::encode_with_offline(snapshot, cwd_by_pane, &HashMap::new(), &HashSet::new())?;
         self.write_snapshot(&bytes)
     }
 
@@ -231,6 +235,8 @@ struct DesiredState {
     revision: u64,
     #[serde(default)]
     appearance: AppearanceSettings,
+    #[serde(default)]
+    assistant: AssistantSettings,
     #[serde(default, skip_serializing)]
     #[expect(dead_code, reason = "parsed only so pre-removal snapshots still load")]
     tmux: RetiredTmuxSettings,
@@ -319,12 +325,17 @@ struct DesiredPane {
     #[serde(default)]
     custom_icon: Option<String>,
     local_cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tmux_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tmux_pane: Option<String>,
 }
 
 impl DesiredState {
     fn from_runtime(
         snapshot: &SessionSnapshot,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
+        tmux_by_pane: &HashMap<Uuid, (String, String)>,
         offline_panes: &HashSet<Uuid>,
     ) -> Result<Self> {
         let workspaces = snapshot
@@ -369,6 +380,7 @@ impl DesiredState {
                                 layout: DesiredLayout::from_runtime(
                                     &tab.layout,
                                     cwd_by_pane,
+                                    tmux_by_pane,
                                     allow_offline,
                                     offline_panes,
                                 )?,
@@ -382,6 +394,7 @@ impl DesiredState {
             schema_version: SCHEMA_VERSION,
             revision: snapshot.revision,
             appearance: snapshot.appearance.clone(),
+            assistant: snapshot.assistant.clone(),
             tmux: RetiredTmuxSettings::default(),
             workspaces,
         })
@@ -398,6 +411,7 @@ impl DesiredState {
             }
         }
         let mut cwd_by_pane = HashMap::new();
+        let mut tmux_by_pane = HashMap::new();
         let mut offline_panes = HashSet::new();
         let workspaces = self
             .workspaces
@@ -435,9 +449,11 @@ impl DesiredState {
                         custom_icon: tab.custom_icon,
                         parent_tab: tab.parent_tab,
                         pinned: tab.pinned,
-                        layout: tab
-                            .layout
-                            .into_runtime(&mut cwd_by_pane, &mut offline_panes),
+                        layout: tab.layout.into_runtime(
+                            &mut cwd_by_pane,
+                            &mut tmux_by_pane,
+                            &mut offline_panes,
+                        ),
                     })
                     .collect(),
             })
@@ -446,10 +462,12 @@ impl DesiredState {
             snapshot: SessionSnapshot {
                 revision: self.revision.saturating_add(1),
                 appearance,
+                assistant: self.assistant,
                 terminal_transports: std::collections::HashMap::new(),
                 workspaces,
             },
             cwd_by_pane,
+            tmux_by_pane,
             offline_panes,
         }
     }
@@ -535,6 +553,7 @@ impl DesiredLayout {
     fn from_runtime(
         layout: &PaneLayout,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
+        tmux_by_pane: &HashMap<Uuid, (String, String)>,
         allow_offline: bool,
         offline_panes: &HashSet<Uuid>,
     ) -> Result<Self> {
@@ -543,6 +562,7 @@ impl DesiredLayout {
                 pane: DesiredPane::from_runtime(
                     pane,
                     cwd_by_pane,
+                    tmux_by_pane,
                     allow_offline || offline_panes.contains(&pane.id),
                 )?,
             },
@@ -553,6 +573,7 @@ impl DesiredLayout {
                         DesiredPane::from_runtime(
                             pane,
                             cwd_by_pane,
+                            tmux_by_pane,
                             allow_offline || offline_panes.contains(&pane.id),
                         )
                     })
@@ -570,12 +591,14 @@ impl DesiredLayout {
                 first: Box::new(Self::from_runtime(
                     first,
                     cwd_by_pane,
+                    tmux_by_pane,
                     allow_offline,
                     offline_panes,
                 )?),
                 second: Box::new(Self::from_runtime(
                     second,
                     cwd_by_pane,
+                    tmux_by_pane,
                     allow_offline,
                     offline_panes,
                 )?),
@@ -586,16 +609,17 @@ impl DesiredLayout {
     fn into_runtime(
         self,
         cwd_by_pane: &mut HashMap<Uuid, PathBuf>,
+        tmux_by_pane: &mut HashMap<Uuid, (String, String)>,
         offline_panes: &mut HashSet<Uuid>,
     ) -> PaneLayout {
         match self {
             Self::Leaf { pane } => PaneLayout::Leaf {
-                pane: pane.into_runtime(cwd_by_pane, offline_panes),
+                pane: pane.into_runtime(cwd_by_pane, tmux_by_pane, offline_panes),
             },
             Self::Stack { panes, active } => PaneLayout::Stack {
                 panes: panes
                     .into_iter()
-                    .map(|pane| pane.into_runtime(cwd_by_pane, offline_panes))
+                    .map(|pane| pane.into_runtime(cwd_by_pane, tmux_by_pane, offline_panes))
                     .collect(),
                 active,
             },
@@ -607,8 +631,8 @@ impl DesiredLayout {
             } => PaneLayout::Split {
                 axis,
                 ratio,
-                first: Box::new(first.into_runtime(cwd_by_pane, offline_panes)),
-                second: Box::new(second.into_runtime(cwd_by_pane, offline_panes)),
+                first: Box::new(first.into_runtime(cwd_by_pane, tmux_by_pane, offline_panes)),
+                second: Box::new(second.into_runtime(cwd_by_pane, tmux_by_pane, offline_panes)),
             },
         }
     }
@@ -656,6 +680,7 @@ impl DesiredPane {
     fn from_runtime(
         pane: &Pane,
         cwd_by_pane: &HashMap<Uuid, PathBuf>,
+        tmux_by_pane: &HashMap<Uuid, (String, String)>,
         allow_offline: bool,
     ) -> Result<Self> {
         let local_cwd = matches!(pane.kind, PaneKind::Terminal)
@@ -672,19 +697,24 @@ impl DesiredPane {
                 .clone()
                 .unwrap_or_else(|| match &pane.kind {
                     PaneKind::Terminal => "Terminal".to_owned(),
-                    PaneKind::Browser { .. } | PaneKind::Assistant => pane.title.clone(),
+                    PaneKind::Browser { .. } | PaneKind::Assistant | PaneKind::Gallery => {
+                        pane.title.clone()
+                    }
                 }),
             color: pane.color,
             custom_title: pane.custom_title.clone(),
             profile_override: pane.profile_override,
             custom_icon: pane.custom_icon.clone(),
             local_cwd,
+            tmux_window: tmux_by_pane.get(&pane.id).map(|(window, _)| window.clone()),
+            tmux_pane: tmux_by_pane.get(&pane.id).map(|(_, pane)| pane.clone()),
         })
     }
 
     fn into_runtime(
         self,
         cwd_by_pane: &mut HashMap<Uuid, PathBuf>,
+        tmux_by_pane: &mut HashMap<Uuid, (String, String)>,
         offline_panes: &mut HashSet<Uuid>,
     ) -> Pane {
         if matches!(self.kind, PaneKind::Terminal) {
@@ -693,6 +723,9 @@ impl DesiredPane {
             } else {
                 offline_panes.insert(self.id);
             }
+        }
+        if let (Some(window_id), Some(pane_id)) = (&self.tmux_window, &self.tmux_pane) {
+            tmux_by_pane.insert(self.id, (window_id.clone(), pane_id.clone()));
         }
         let custom_title = self.custom_title.or_else(|| {
             matches!(self.kind, PaneKind::Terminal)
@@ -705,7 +738,9 @@ impl DesiredPane {
                 PaneKind::Terminal => self
                     .profile_override
                     .map(|profile| profile.display_name().to_owned()),
-                PaneKind::Browser { .. } | PaneKind::Assistant => Some(self.title.clone()),
+                PaneKind::Browser { .. } | PaneKind::Assistant | PaneKind::Gallery => {
+                    Some(self.title.clone())
+                }
             })
             .unwrap_or_else(|| "Terminal".to_owned());
         Pane {
@@ -731,6 +766,23 @@ impl DesiredPane {
         if let Some(custom_icon) = &self.custom_icon {
             validate_custom_icon_id(custom_icon)?;
         }
+        let has_tmux = match (&self.tmux_window, &self.tmux_pane) {
+            (Some(window), Some(pane))
+                if window.len() >= 2
+                    && window.starts_with('@')
+                    && window[1..].bytes().all(|byte| byte.is_ascii_digit())
+                    && pane.len() >= 2
+                    && pane.starts_with('%')
+                    && pane[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                true
+            }
+            (None, None) => false,
+            _ => bail!("persisted tmux pane target is invalid"),
+        };
+        if has_tmux && !matches!(self.kind, PaneKind::Terminal) {
+            bail!("only terminal panes may persist tmux targets");
+        }
         match &self.kind {
             PaneKind::Terminal => {}
             PaneKind::Browser { url } => {
@@ -754,6 +806,11 @@ impl DesiredPane {
             PaneKind::Assistant => {
                 if self.local_cwd.is_some() {
                     bail!("assistant panes may not persist terminal CWD metadata");
+                }
+            }
+            PaneKind::Gallery => {
+                if self.local_cwd.is_some() {
+                    bail!("gallery panes may not persist terminal CWD metadata");
                 }
             }
         }
@@ -1158,8 +1215,13 @@ mod tests {
     #[test]
     fn schema_six_harbor_blue_defaults_migrate_to_dark_gray() {
         let snapshot = SessionSnapshot::seeded();
-        let mut desired =
-            DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot), &HashSet::new()).unwrap();
+        let mut desired = DesiredState::from_runtime(
+            &snapshot,
+            &cwd_map(&snapshot),
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
         desired.schema_version = 6;
         desired.appearance.default_terminal_accent = AppearanceColor::HARBOR_BLUE;
         desired.appearance.default_workspace_color = AppearanceColor::HARBOR_BLUE;
@@ -1244,6 +1306,7 @@ mod tests {
         let rewritten = DesiredState::from_runtime(
             &recovered.snapshot,
             &recovered.cwd_by_pane,
+            &HashMap::new(),
             &HashSet::new(),
         )
         .unwrap();
@@ -1319,8 +1382,13 @@ mod tests {
     #[test]
     fn invalid_ratio_and_duplicate_ids_are_rejected() {
         let snapshot = SessionSnapshot::seeded();
-        let mut desired =
-            DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot), &HashSet::new()).unwrap();
+        let mut desired = DesiredState::from_runtime(
+            &snapshot,
+            &cwd_map(&snapshot),
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
         let pane = match &desired.workspaces[0].tabs[0].layout {
             DesiredLayout::Leaf { pane } => pane.clone(),
             _ => panic!("expected leaf"),
@@ -1333,12 +1401,46 @@ mod tests {
         };
         assert!(desired.validate().is_err());
     }
+    #[test]
+    fn managed_tmux_targets_round_trip_and_require_a_complete_pair() {
+        let snapshot = SessionSnapshot::seeded();
+        let pane_id = crate::layout::first_pane_id(&snapshot).unwrap();
+        let tmux_by_pane = HashMap::from([(pane_id, ("@12".to_owned(), "%34".to_owned()))]);
+        let desired = DesiredState::from_runtime(
+            &snapshot,
+            &cwd_map(&snapshot),
+            &tmux_by_pane,
+            &HashSet::new(),
+        )
+        .unwrap();
+        desired.validate().unwrap();
+        let recovered = desired.into_runtime();
+        assert_eq!(recovered.tmux_by_pane, tmux_by_pane);
+
+        let mut invalid = DesiredState::from_runtime(
+            &snapshot,
+            &cwd_map(&snapshot),
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let DesiredLayout::Leaf { pane } = &mut invalid.workspaces[0].tabs[0].layout else {
+            panic!("expected leaf");
+        };
+        pane.tmux_window = Some("@12".to_owned());
+        assert!(invalid.validate().is_err());
+    }
 
     #[test]
     fn overlong_assistant_instructions_are_rejected() {
         let snapshot = SessionSnapshot::seeded();
-        let mut desired =
-            DesiredState::from_runtime(&snapshot, &cwd_map(&snapshot), &HashSet::new()).unwrap();
+        let mut desired = DesiredState::from_runtime(
+            &snapshot,
+            &cwd_map(&snapshot),
+            &HashMap::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
         desired.workspaces[0].kind = WorkspaceKind::Assistant;
         desired.workspaces[0].instructions = Some("x".repeat(MAX_INSTRUCTIONS_CHARS + 1));
         assert!(

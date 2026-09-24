@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 const OUTBOUND_CAPACITY: usize = 256;
+#[cfg(test)]
 const SEND_ACK_TIMEOUT: Duration = Duration::from_secs(6);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(1);
@@ -43,10 +44,16 @@ pub(crate) enum ClientEvent {
     #[serde(rename = "response.create")]
     ResponseCreate {
         #[serde(skip_serializing_if = "Option::is_none")]
-        response: Option<Value>,
+        response: Option<ResponseCreateOptions>,
     },
     #[serde(rename = "response.cancel")]
     ResponseCancel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResponseCreateOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -164,7 +171,7 @@ impl SessionConfig {
                     turn_detection: TurnDetectionConfig {
                         detection_type: "semantic_vad".to_owned(),
                         eagerness: "auto".to_owned(),
-                        create_response: true,
+                        create_response: false,
                         interrupt_response: true,
                     },
                 },
@@ -330,6 +337,7 @@ fn forward_inbound(
     }
 }
 
+#[cfg(test)]
 pub(crate) type RecoverableSendResult =
     std::result::Result<(), (anyhow::Error, Option<ClientEvent>)>;
 
@@ -373,6 +381,7 @@ impl DeliveryState {
         self.0.store(DELIVERY_DELIVERED, Ordering::Release);
     }
 
+    #[cfg(test)]
     fn cancel_before_delivery(&self) -> bool {
         self.0
             .compare_exchange(
@@ -434,21 +443,6 @@ impl RealtimeHandle {
         send_recoverable_with_outbound(&self.outbound, event)
     }
 
-    pub(crate) fn send_recoverable_async(
-        &self,
-        event: ClientEvent,
-    ) -> Result<Receiver<RecoverableSendResult>> {
-        let outbound = self.outbound.clone();
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("hh-realtime-send".to_owned())
-            .spawn(move || {
-                let _ = result_tx.send(send_recoverable_with_outbound(&outbound, event));
-            })
-            .context("spawn Realtime acknowledgement waiter")?;
-        Ok(result_rx)
-    }
-
     pub(crate) fn shutdown(mut self) {
         self.shutdown_requested.store(true, Ordering::Release);
         self.shutdown_wake.notify_one();
@@ -465,6 +459,7 @@ impl RealtimeHandle {
     }
 }
 
+#[cfg(test)]
 fn send_recoverable_with_outbound(
     outbound: &tokio::sync::mpsc::Sender<WsCommand>,
     event: ClientEvent,
@@ -1116,7 +1111,7 @@ mod tests {
                             "turn_detection": {
                                 "type": "semantic_vad",
                                 "eagerness": "auto",
-                                "create_response": true,
+                                "create_response": false,
                                 "interrupt_response": true
                             }
                         },

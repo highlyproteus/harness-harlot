@@ -99,6 +99,7 @@ struct BrowserState {
     pending_url: Option<String>,
     presentation: BrowserPresentation,
     favicon_url: Option<String>,
+    dev_tools_registration: Option<Registration>,
 }
 
 wrap_client! {
@@ -241,6 +242,36 @@ wrap_display_handler! {
     }
 }
 
+wrap_dev_tools_message_observer! {
+    struct HhDevToolsMessageObserver {
+        callbacks: StdRc<Callbacks>,
+    }
+
+    impl DevToolsMessageObserver {
+        fn on_dev_tools_method_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            message_id: i32,
+            success: i32,
+            result: Option<&[u8]>,
+        ) {
+            (self.callbacks.on_dev_tools_result)(
+                message_id,
+                success != 0,
+                result.unwrap_or_default().to_vec(),
+            );
+        }
+
+        fn on_dev_tools_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            _method: Option<&CefString>,
+            _params: Option<&[u8]>,
+        ) {
+        }
+    }
+}
+
 fn binary_value_bytes(data: &BinaryValue, max_size: usize) -> Option<Vec<u8>> {
     let size = data.size();
     if size == 0 || size > max_size {
@@ -347,10 +378,15 @@ wrap_life_span_handler! {
             let Some(browser) = browser.cloned() else {
                 return;
             };
+            let dev_tools_registration = browser.host().and_then(|host| {
+                let mut observer = HhDevToolsMessageObserver::new(self.callbacks.clone());
+                host.add_dev_tools_message_observer(Some(&mut observer))
+            });
             let (parent, bounds, pending_url, visible, focused, close_requested) = {
                 let mut state = self.state.borrow_mut();
                 state.creation_pending = false;
                 state.browser = Some(browser.clone());
+                state.dev_tools_registration = dev_tools_registration;
                 (
                     state.parent,
                     state.pending_bounds.take(),
@@ -403,6 +439,7 @@ wrap_life_span_handler! {
             let mut state = self.state.borrow_mut();
             state.creation_pending = false;
             state.browser = None;
+            state.dev_tools_registration = None;
         }
     }
 }
@@ -499,6 +536,7 @@ impl BrowserPane {
                 close_requested: false,
             },
             favicon_url: None,
+            dev_tools_registration: None,
         }));
         let callbacks = StdRc::new(callbacks);
         let mut client = HhBrowserClient::new(state.clone(), callbacks);
@@ -602,6 +640,24 @@ impl BrowserPane {
         if !focused {
             platform::focus_parent(parent);
         }
+    }
+
+    /// Sends one raw CDP message. Returns false while the browser is being created.
+    pub fn send_dev_tools_message(&self, message: &[u8]) -> bool {
+        let browser = {
+            let state = self.state.borrow();
+            (!state.presentation.close_requested)
+                .then(|| state.browser.clone())
+                .flatten()
+        };
+        browser
+            .and_then(|browser| browser.host())
+            .is_some_and(|host| host.send_dev_tools_message(Some(message)) != 0)
+    }
+
+    pub fn is_created(&self) -> bool {
+        let state = self.state.borrow();
+        !state.presentation.close_requested && state.browser.is_some()
     }
 
     pub fn close(&self) {

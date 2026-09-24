@@ -11,7 +11,6 @@ use crate::layout::{
 use crate::persistence;
 use crate::persistence::{MAX_TABS_PER_WORKSPACE, validate_title};
 use crate::process::local_spawn_dir;
-use crate::pty::PtySession;
 use crate::registry::workspaces::remember_recent_color;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -326,8 +325,7 @@ impl SessionRegistry {
         let replacement_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(pane_id)?;
         let workspace_id = self.workspace_for_pane(pane_id)?;
-        let replacement_session =
-            PtySession::spawn_local(replacement_id, workspace_id, &cwd, &self.history)?;
+        let replacement_session = self.spawn_local_transport(replacement_id, workspace_id, &cwd)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -444,7 +442,7 @@ impl SessionRegistry {
         let pane = pane.with_context(|| format!("source pane {source_pane} does not exist"))?;
         let mut target_layout = workspace.tabs[target_location.1].layout.clone();
         let target_pane = first_layout_pane(&target_layout);
-        if !add_tab(&mut target_layout, target_pane, pane) {
+        if !add_tab(&mut target_layout, target_pane, pane, true) {
             bail!("target group {target_tab} cannot accept pane {source_pane}");
         }
         workspace.tabs[target_location.1].layout = target_layout;
@@ -632,7 +630,7 @@ impl SessionRegistry {
     }
 
     pub fn close_tab(&self, tab_id: Uuid) -> Result<()> {
-        let (sessions, bytes) = {
+        let (sessions, assistants, bytes) = {
             let mut state = self.state.write();
             let workspace_index = state
                 .snapshot
@@ -679,6 +677,10 @@ impl SessionRegistry {
                         .map(|terminal| Arc::clone(&terminal.session))
                 })
                 .collect::<Vec<_>>();
+            let assistants = pane_ids
+                .iter()
+                .filter_map(|pane_id| state.panes.get(pane_id)?.assistant().map(Arc::clone))
+                .collect::<Vec<_>>();
             let terminal_count = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
             let workspace = &mut state.snapshot.workspaces[workspace_index];
             workspace.tabs.retain(|tab| !tab_ids.contains(&tab.id));
@@ -690,12 +692,18 @@ impl SessionRegistry {
             }
             state.snapshot.revision = state.snapshot.revision.saturating_add(1);
             let bytes = encode_desired_state(&state)?;
-            (sessions, bytes)
+            (sessions, assistants, bytes)
         };
 
         let mut termination_errors = Vec::new();
         for session in sessions {
             if let Err(error) = session.terminate_and_wait() {
+                termination_errors.push(format!("{error:#}"));
+            }
+        }
+        for assistant in assistants {
+            assistant.shutdown();
+            if let Err(error) = assistant.remove_session_dir() {
                 termination_errors.push(format!("{error:#}"));
             }
         }

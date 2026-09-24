@@ -1,7 +1,7 @@
 //! Unix-socket RPC loop and request dispatch.
 use std::time::Duration;
 
-use crate::registry::SessionRegistry;
+use crate::registry::{PaneUpdateRequest, SessionRegistry};
 use anyhow::{Context, Result, bail, ensure};
 use hh_protocol::{
     ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, PaneRevisionCursor, ServiceResponse,
@@ -112,15 +112,19 @@ pub(crate) fn handle_request(
         | ClientRequest::MarkNotificationsRead { .. }
         | ClientRequest::ClearNotifications
         | ClientRequest::GetPaneSnapshot { .. }
-        | ClientRequest::GetAuthorizedPaneSnapshot { .. } => {
-            handle_streaming_request(sessions, request)
-        }
+        | ClientRequest::GetAuthorizedPaneSnapshot { .. }
+        | ClientRequest::GetAssistantThread { .. } => handle_streaming_request(sessions, request),
         ClientRequest::CreatePane { .. }
         | ClientRequest::CreateGroupTerminal { .. }
         | ClientRequest::CreateWorkspaceTerminal { .. }
         | ClientRequest::CreateWorkspaceTab { .. }
         | ClientRequest::CreateBrowserTab { .. }
         | ClientRequest::CreateGroupBrowser { .. }
+        | ClientRequest::CreateGalleryTab { .. }
+        | ClientRequest::CreateGroupGallery { .. }
+        | ClientRequest::AddGalleryImage { .. }
+        | ClientRequest::BrowserCommand { .. }
+        | ClientRequest::BrowserCommandResult { .. }
         | ClientRequest::CreateAssistantTab { .. }
         | ClientRequest::CreateGroupAssistant { .. }
         | ClientRequest::CreateWorkspaceGroup { .. }
@@ -200,6 +204,14 @@ pub(crate) fn handle_request(
         | ClientRequest::ClearHistory { .. }
         | ClientRequest::LoadHistoryPage { .. }
         | ClientRequest::SearchArchivedHistory { .. } => handle_history_request(sessions, request),
+        ClientRequest::AssistantPrompt { .. }
+        | ClientRequest::AssistantAbort { .. }
+        | ClientRequest::AssistantRestart { .. }
+        | ClientRequest::AssistantApprovalResponse { .. }
+        | ClientRequest::GetAssistantModels { .. }
+        | ClientRequest::SetAssistantModel { .. }
+        | ClientRequest::SetAssistantSettings { .. }
+        | ClientRequest::GetCodingAgents => handle_assistant_request(sessions, request),
     }
 }
 
@@ -217,13 +229,17 @@ fn handle_streaming_request(
         ClientRequest::GetUpdates {
             snapshot_revision,
             pane_revisions,
+            assistant_revisions,
             subscribed_panes,
             notifications_after,
+            browser_executor,
         } => handle_get_updates(
             sessions,
             snapshot_revision,
             &pane_revisions,
+            &assistant_revisions,
             &subscribed_panes,
+            browser_executor,
             notifications_after,
         ),
         ClientRequest::GetNotifications => Ok(ServiceResponse::Notifications {
@@ -245,6 +261,9 @@ fn handle_streaming_request(
                 diagnostics,
             })
         }
+        ClientRequest::GetAssistantThread { pane_id } => Ok(ServiceResponse::AssistantThread {
+            view: sessions.assistant_runtime(pane_id)?.view(),
+        }),
         _ => unreachable!("streaming request dispatched to the wrong handler"),
     }
 }
@@ -275,6 +294,35 @@ fn handle_panes_request(
             Ok(ServiceResponse::PaneCreated {
                 pane_id: sessions.create_group_browser(target_pane, url.as_deref())?,
             })
+        }
+        ClientRequest::CreateGalleryTab { workspace_id } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_gallery_tab(workspace_id)?,
+        }),
+        ClientRequest::CreateGroupGallery { target_pane } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_group_gallery(target_pane, true)?,
+        }),
+        ClientRequest::AddGalleryImage {
+            workspace_id,
+            origin_pane,
+            source,
+        } => {
+            let (path, pane_id) = sessions.add_gallery_image(workspace_id, origin_pane, &source)?;
+            Ok(ServiceResponse::GalleryImageAdded {
+                path: path.to_string_lossy().into_owned(),
+                pane_id,
+            })
+        }
+        ClientRequest::BrowserCommand { pane_id, action } => {
+            Ok(ServiceResponse::BrowserCommandResult {
+                outcome: sessions.browser_command(pane_id, action)?,
+            })
+        }
+        ClientRequest::BrowserCommandResult {
+            request_id,
+            outcome,
+        } => {
+            sessions.resolve_browser_command(request_id, outcome);
+            Ok(ServiceResponse::Ack)
         }
         ClientRequest::CreateAssistantTab { workspace_id } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.create_assistant_tab(workspace_id)?,
@@ -718,27 +766,86 @@ fn handle_history_request(
     }
 }
 
+fn handle_assistant_request(
+    sessions: &SessionRegistry,
+    request: ClientRequest,
+) -> Result<ServiceResponse> {
+    match request {
+        ClientRequest::AssistantPrompt {
+            pane_id,
+            text,
+            images,
+        } => {
+            sessions.assistant_runtime(pane_id)?.prompt(text, &images)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::AssistantAbort { pane_id } => {
+            sessions.assistant_runtime(pane_id)?.abort()?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::AssistantRestart { pane_id } => {
+            sessions.assistant_runtime(pane_id)?.restart();
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::AssistantApprovalResponse {
+            pane_id,
+            request_id,
+            allow,
+        } => {
+            sessions
+                .assistant_runtime(pane_id)?
+                .approval_response(&request_id, allow)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::GetAssistantModels { pane_id } => Ok(ServiceResponse::AssistantModels {
+            models: sessions.assistant_runtime(pane_id)?.models()?,
+        }),
+        ClientRequest::SetAssistantModel {
+            pane_id,
+            provider,
+            model_id,
+        } => {
+            sessions.set_assistant_model(pane_id, &provider, &model_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::SetAssistantSettings { settings } => {
+            sessions.set_assistant_settings(settings)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::GetCodingAgents => Ok(ServiceResponse::CodingAgents {
+            agents: sessions.coding_agents(true)?,
+        }),
+        _ => unreachable!("assistant request dispatched to the wrong handler"),
+    }
+}
+
 pub(crate) fn handle_get_updates(
     sessions: &SessionRegistry,
     snapshot_revision: Option<u64>,
     pane_revisions: &[PaneRevisionCursor],
+    assistant_revisions: &[PaneRevisionCursor],
     subscribed_panes: &[Uuid],
+    browser_executor: bool,
     notifications_after: u64,
 ) -> Result<ServiceResponse> {
-    let update = sessions.pane_updates(
+    let update = sessions.pane_updates_with_assistants(PaneUpdateRequest {
         snapshot_revision,
         pane_revisions,
+        assistant_revisions,
         subscribed_panes,
-        false,
+        browser_executor,
+        measure_bytes: false,
         notifications_after,
-    )?;
+    })?;
     Ok(ServiceResponse::Updates {
         session_revision: update.session_revision,
         snapshot: update.snapshot,
         screens: update.screens,
         pane_states: update.pane_states,
         notifications: update.notifications,
+        assistant_threads: update.assistant_threads,
         diagnostics: update.diagnostics,
+        browser_commands: update.browser_commands,
     })
 }
 
@@ -1459,5 +1566,42 @@ mod tests {
                 disposition: hh_protocol::DeliveryDisposition::DefinitelyUnsent,
             } if message.contains("terminal process has exited")
         ));
+    }
+    #[test]
+    fn assistant_settings_dispatch_updates_the_snapshot() {
+        let registry = SessionRegistry::new().unwrap();
+        let settings = hh_protocol::AssistantSettings {
+            access: hh_protocol::AssistantAccess::Confirm,
+            model: Some("provider/model".to_owned()),
+            preferred_agent: Some(hh_protocol::TerminalProfile::Omp),
+        };
+        let response = handle_request(
+            &registry,
+            ClientRequest::SetAssistantSettings {
+                settings: settings.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(response, ServiceResponse::Ack);
+        assert_eq!(registry.snapshot().unwrap().assistant, settings);
+    }
+
+    #[test]
+    fn coding_agents_dispatch_returns_a_list() {
+        let registry = SessionRegistry::new().unwrap();
+        let response = handle_request(&registry, ClientRequest::GetCodingAgents).unwrap();
+        assert!(matches!(response, ServiceResponse::CodingAgents { .. }));
+    }
+
+    #[test]
+    fn assistant_thread_dispatch_rejects_terminal_panes() {
+        let registry = SessionRegistry::new().unwrap();
+        let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+        let error = handle_request(&registry, ClientRequest::GetAssistantThread { pane_id })
+            .expect_err("terminal pane must not expose an assistant thread");
+        assert_eq!(
+            error.to_string(),
+            format!("pane {pane_id} is not an assistant")
+        );
     }
 }

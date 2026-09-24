@@ -1,6 +1,7 @@
 //! Stateless presentation helpers, grouped by concern.
 mod bindings;
 mod dnd;
+mod file_manager;
 mod geometry;
 mod history_ui;
 mod icons;
@@ -17,6 +18,7 @@ pub(crate) use dnd::{
     HeaderDropZone, click_suppression_active, header_drop_zone, split_placement_at,
     split_target_for_drag, split_target_for_drag_ids,
 };
+pub(crate) use file_manager::reveal_in_file_manager;
 pub(crate) use geometry::{
     banner_fit_size, collect_pane_sizes, composite_rgb, constrained_sidebar_width,
     default_sidebar_width, effective_split_ratio, find_split_rect, hsv_to_rgb,

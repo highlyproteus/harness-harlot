@@ -620,7 +620,9 @@ impl HhApp {
                         })
                         .into()
                     })
-                    .on_click(cx.listener(|this, _, _, cx| this.open_appearance_settings(cx)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_settings(crate::view_models::SettingsSection::Appearance, cx);
+                    }))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -641,6 +643,7 @@ impl HhApp {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn render_workspace_terminal_row(
         &self,
         pane: &Pane,
@@ -836,11 +839,12 @@ impl HhApp {
             )
             .when(pane.kind.is_assistant(), |element| {
                 let (mic_muted, speaker_muted) = self
-                    .voice
-                    .sessions
+                    .assistant
+                    .panes
                     .get(&pane_id)
-                    .map_or((false, false), |session| {
-                        (session.mic_muted, session.speaker_muted)
+                    .and_then(|pane| pane.voice.as_ref())
+                    .map_or((true, false), |voice| {
+                        (voice.mic_muted, voice.speaker_muted)
                     });
                 element
                     .child(

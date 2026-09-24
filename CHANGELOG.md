@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Added service-owned Assistant orchestration through `pi --mode rpc`, with
+  streaming tool activity, model selection, optional per-action confirmation,
+  and bundled HH tools for operating workstations, windows, terminals, and
+  browsers.
+- Added an HH-owned private tmux substrate for local terminals. Managed shells,
+  processes, and terminal output now survive desktop and session-service
+  restarts when tmux 3.2 or newer is available.
+- Added automatic coding-agent discovery. The session service resolves installed
+  agent CLIs on the login `PATH`, lists them in the orchestrator prompt, and
+  exposes them to Settings, where an optional preferred agent replaces the
+  hand-typed coding agent command.
+- Added workstation Galleries with drag-and-drop and picker imports, selected-image
+  previews, one-click Finder reveal, and private per-workstation image storage.
+- Added local browser automation for terminal agents through the `hh` CLI, a
+  stdio MCP server, the Assistant orchestrator, and an installable Harness Harlot
+  skill. Browser commands use the active desktop's embedded browser and can
+  navigate, read, evaluate, interact, capture screenshots, and call raw CDP.
+
+### Changed
+
+- Voice Mode now forwards final user transcripts to the Assistant orchestrator
+  and uses OpenAI Realtime only to speak bounded orchestrator updates. Removed
+  local conversation threads and Honcho memory integration.
+- Rebuilt Settings as a full-pane surface with an Appearance / Assistant / Voice
+  / History / Updates section list, and moved the Assistant model and
+  Full/Confirm controls out of the pane header into a composer toolbar.
+- Bumped the desktop/service wire protocol from 35 to 38 for Assistant thread
+  streaming, settings, coding-agent discovery, Gallery panes, and browser
+  command execution; desktop and service must be upgraded together.
+
+### Fixed
+
+- Keep the private tmux server alive when creating a second workstation after
+  resizing a terminal. Preserve captured terminal lines beginning with tmux
+  control keywords and extra panes in referenced windows during recovery.
+- Fall back to plain PTYs with a notification when managed tmux discovery fails,
+  including an invalid `HH_TMUX_BINARY`; track both service-bundled assets.
+- Read pi's nested streamed tool calls and top-level error status correctly,
+  bound retained tool output, and report entries dropped during recovery.
+- Preserve Assistant updates across service restarts, restore Working status
+  after active-run approvals, roll back failed assistant creation writes, and
+  stop pi even when shutdown persistence fails. Finish workspace deletion before
+  reporting session-directory cleanup errors.
+- Add the persisted Full/Confirm header toggle, restrict approval shortcuts to
+  Enter/Escape outside the composer, and retain drafts until prompt acknowledgement.
+- Attach voice transcripts to absolute Assistant entry identities, skip muted
+  replies without replay, and retain queued relays across reconnects while
+  waiting for user silence.
+
 ## [0.1.21] - 2026-09-18
 
 ### Fixed

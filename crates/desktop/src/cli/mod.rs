@@ -1,9 +1,15 @@
+mod agent;
+mod args;
+pub(crate) mod mcp;
+pub(crate) mod skill;
+
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
+use args::{AgentAction, AgentCommand, SkillCommand};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UpdateOptions {
@@ -12,13 +18,14 @@ pub(crate) struct UpdateOptions {
     pub(crate) channel: hh_updater::UpdateChannel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CliAction {
     LaunchDesktop,
     Update(UpdateOptions),
     Version,
     Doctor,
     InstallCli,
+    Agent(AgentCommand),
 }
 
 pub(crate) fn parse_cli_action<I, S>(arguments: I) -> Result<CliAction>
@@ -37,6 +44,14 @@ where
         [argument] if argument == "install-cli" => Ok(CliAction::InstallCli),
         [command, arguments @ ..] if command == "update" => {
             parse_update_options(arguments).map(CliAction::Update)
+        }
+        [command, arguments @ ..]
+            if matches!(command.as_str(), "browser" | "gallery" | "mcp" | "skill") =>
+        {
+            let mut agent_arguments = Vec::with_capacity(arguments.len() + 1);
+            agent_arguments.push(command.clone());
+            agent_arguments.extend_from_slice(arguments);
+            args::parse_agent_command(&agent_arguments).map(CliAction::Agent)
         }
         _ => bail!("unknown Harness Harlot command or arguments"),
     }
@@ -217,6 +232,21 @@ pub(crate) fn run_cli_or_request_desktop() -> Result<bool> {
             let link = install_cli_link(&current, &home)?;
             println!("installed {}", link.display());
         }
+        CliAction::Agent(command) => match &command.action {
+            AgentAction::Mcp => mcp::run(&command.context)?,
+            AgentAction::Skill(SkillCommand::Install) => {
+                for path in skill::install_default()? {
+                    println!("installed {}", path.display());
+                }
+            }
+            AgentAction::Skill(SkillCommand::Path) => {
+                println!("{}", skill::source_path().display());
+            }
+            AgentAction::Browser(_) | AgentAction::Gallery(_) => {
+                let result = agent::execute(&command)?;
+                agent::print_result(&result, command.context.json)?;
+            }
+        },
     }
     Ok(false)
 }

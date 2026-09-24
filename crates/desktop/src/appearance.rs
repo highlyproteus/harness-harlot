@@ -1,20 +1,116 @@
 //! Appearance settings, color pickers, and workstation banner art.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, Image, ImageFormat, InteractiveElement, IntoElement, PathPromptOptions,
+    AnyElement, AppContext, ClipboardItem, Context, Image, ImageFormat, InteractiveElement,
+    IntoElement, ParentElement, PathPromptOptions, StatefulInteractiveElement, Styled, StyledImage,
     div, img, px, rgb, rgba,
 };
-use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
-use hh_protocol::{AppearanceColor, ClientRequest, validate_workspace_dir};
+use hh_protocol::{AppearanceColor, AssistantAccess, ClientRequest, validate_workspace_dir};
 use std::sync::{Arc, LazyLock};
 
 use crate::elements::{HsvFieldElement, HsvFieldKind};
-use crate::helpers::{banner_fit_size, hsv_to_rgb, parse_hex_color, rgb_to_hsv};
-use crate::view_models::{ColorPickerState, ColorTarget, Modal, TooltipView};
+use crate::helpers::{
+    banner_fit_size, hsv_to_rgb, parse_hex_color, render_terminal_profile_icon, rgb_to_hsv,
+};
+use crate::view_models::{ColorPickerState, ColorTarget, Modal, SettingsSection, TooltipView};
+use crate::voice::{VOICE_PRIVACY_URL, VoiceSettingsField};
 use crate::{
     APPEARANCE_PRESETS, BUNDLED_BANNER_PIXEL_HEIGHT, BUNDLED_BANNER_PIXEL_WIDTH, HhApp,
     PANE_HEADER_HEIGHT, THEME,
 };
+
+/// Section title with its one-line explanation.
+fn settings_heading(title: &'static str, description: &'static str) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .font_family(".SystemUIFont")
+                .text_lg()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(THEME.foreground))
+                .child(title),
+        )
+        .child(
+            div()
+                .font_family(".SystemUIFont")
+                .text_sm()
+                .text_color(rgb(THEME.muted))
+                .child(description),
+        )
+        .into_any_element()
+}
+
+/// Label above a card inside one section panel.
+fn settings_section_title(title: &'static str) -> AnyElement {
+    div()
+        .font_family(".SystemUIFont")
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(THEME.muted))
+        .child(title)
+        .into_any_element()
+}
+
+fn settings_card(children: Vec<AnyElement>) -> AnyElement {
+    div()
+        .p(px(14.0))
+        .rounded(px(9.0))
+        .bg(rgb(THEME.surface))
+        .border_1()
+        .border_color(rgb(THEME.border))
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .children(children)
+        .into_any_element()
+}
+
+fn settings_row(title: &'static str, detail: Option<String>, trailing: AnyElement) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(12.0))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.foreground))
+                        .child(title),
+                )
+                .when_some(detail, |element, detail| {
+                    element.child(
+                        div()
+                            .truncate()
+                            .font_family("SF Mono")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child(detail),
+                    )
+                }),
+        )
+        .child(trailing)
+        .into_any_element()
+}
+
+fn radio_glyph(selected: bool) -> AnyElement {
+    div()
+        .font_family("SF Mono")
+        .text_sm()
+        .text_color(rgb(if selected { THEME.accent } else { THEME.dim }))
+        .child(if selected { "●" } else { "○" })
+        .into_any_element()
+}
 
 /// Budget the settings preview fits inside, borders excluded.
 pub(crate) const SETTINGS_BANNER_PREVIEW_MAX_WIDTH: f32 = 420.0;
@@ -227,16 +323,33 @@ impl HhApp {
         }
     }
 
-    pub(crate) fn open_appearance_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.editor.modal = Modal::AppearanceSettings;
+        self.editor.settings_section = section;
         self.editor.color_picker = None;
         self.editor.history_editor = None;
         self.editor.history_clear_confirmation = None;
         match crate::voice::VoiceSettingsEditor::load() {
-            Ok(editor) => self.voice.settings_editor = editor,
+            Ok(editor) => self.assistant.settings_editor = editor,
             Err(error) => self.report(&error),
         }
         self.refresh_history_status();
+        if section == SettingsSection::Assistant && !self.assistant.coding_agents.loaded {
+            self.refresh_coding_agents(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn select_settings_section(
+        &mut self,
+        section: SettingsSection,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.settings_section = section;
+        self.assistant.settings_editor.active_field = None;
+        if section == SettingsSection::Assistant && !self.assistant.coding_agents.loaded {
+            self.refresh_coding_agents(cx);
+        }
         cx.notify();
     }
 
@@ -795,12 +908,50 @@ impl HhApp {
     }
 
     pub(crate) fn render_appearance_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let appearance = self
-            .session
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.appearance.clone())
-            .unwrap_or_default();
+        let section = self.editor.settings_section;
+        let nav = SettingsSection::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let active = candidate == section;
+                div()
+                    .id(("settings-section", index))
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .when(active, |element| {
+                        element
+                            .bg(rgb(THEME.accent_soft))
+                            .text_color(rgb(THEME.foreground))
+                    })
+                    .when(!active, |element| {
+                        element
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| element.bg(rgb(THEME.elevated)))
+                    })
+                    .child(candidate.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_settings_section(candidate, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let panel = match section {
+            SettingsSection::Appearance => self.render_appearance_panel(cx),
+            SettingsSection::Assistant => self.render_assistant_panel(cx),
+            SettingsSection::Voice => self.render_voice_panel(cx),
+            SettingsSection::History => vec![
+                settings_heading("History", "Local terminal history archive."),
+                self.render_history_settings(cx),
+            ],
+            SettingsSection::Updates => vec![
+                settings_heading("Updates", "Signed automatic updates."),
+                self.render_update_settings(cx),
+            ],
+        };
         div()
             .id("settings-workspace-surface")
             .size_full()
@@ -861,60 +1012,537 @@ impl HhApp {
             )
             .child(
                 div()
-                    .id("settings-workspace-content")
                     .min_h(px(0.0))
                     .flex_1()
-                    .overflow_y_scroll()
-                    .px(px(24.0))
-                    .py(px(20.0))
-                    .child(
-                        div()
-                    .w_full()
                     .flex()
-                    .flex_col()
-                    .gap(px(14.0))
                     .child(
                         div()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child("Appearance"),
+                            .w(px(188.0))
+                            .flex_none()
+                            .bg(rgb(THEME.sidebar))
+                            .border_r_1()
+                            .border_color(rgb(THEME.border))
+                            .py(px(12.0))
+                            .px(px(8.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .children(nav),
                     )
                     .child(
                         div()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.muted))
-                            .child("Global defaults stay independent. Terminal accents never recolor workstations, and workstation colors never recolor terminals."),
-                    )
-                    .child(self.render_appearance_row(
-                        "Default terminal accent",
-                        "Focus rail, active tab, cursor, and terminal focus treatment",
-                        ColorTarget::DefaultTerminal,
-                        appearance.default_terminal_accent,
-                        cx,
-                    ))
-                    .child(self.render_appearance_row(
-                        "Default workstation color",
-                        "Selected workstation and workstation marker in the left rail",
-                        ColorTarget::DefaultWorkspace,
-                        appearance.default_workspace_color,
-                        cx,
-                    ))
-                    .child(self.render_workstation_banner_setting(cx))
-                    .child(
-                        div()
-                            .pt(px(2.0))
-                            .font_family("SF Mono")
-                            .text_xs()
-                            .text_color(rgb(THEME.dim))
-                            .child("Saved locally with session layout · no network or telemetry"),
-                    )
-                    .child(self.render_update_settings(cx))
-                    .child(self.render_history_settings(cx))
-                    .child(self.render_voice_settings_section(cx)),
+                            .id("settings-workspace-content")
+                            .min_h(px(0.0))
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .px(px(32.0))
+                            .py(px(24.0))
+                            .child(
+                                div()
+                                    .max_w(px(640.0))
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(18.0))
+                                    .children(panel),
+                            ),
                     ),
+            )
+            .into_any_element()
+    }
+
+    fn render_appearance_panel(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let appearance = self
+            .session
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.appearance.clone())
+            .unwrap_or_default();
+        vec![
+            settings_heading(
+                "Appearance",
+                "Global defaults stay independent. Terminal accents never recolor workstations, and workstation colors never recolor terminals.",
+            ),
+            settings_card(vec![
+                self.render_appearance_row(
+                    "Default terminal accent",
+                    "Focus rail, active tab, cursor, and terminal focus treatment",
+                    ColorTarget::DefaultTerminal,
+                    appearance.default_terminal_accent,
+                    cx,
+                ),
+                self.render_appearance_row(
+                    "Default workstation color",
+                    "Selected workstation and workstation marker in the left rail",
+                    ColorTarget::DefaultWorkspace,
+                    appearance.default_workspace_color,
+                    cx,
+                ),
+                self.render_workstation_banner_setting(cx),
+            ]),
+            div()
+                .font_family("SF Mono")
+                .text_xs()
+                .text_color(rgb(THEME.dim))
+                .child("Saved locally with session layout · no network or telemetry")
+                .into_any_element(),
+        ]
+    }
+
+    fn render_terminal_agents_setting(&self, cx: &mut Context<Self>) -> AnyElement {
+        let command = std::env::var_os(hh_protocol::CLI_ENV)
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("hh"));
+        let config = crate::cli::mcp::server_config(&command);
+        let config_text =
+            serde_json::to_string_pretty(&config).expect("static MCP configuration is valid");
+        let clipboard_text = config_text.clone();
+        let status = self.editor.agent_skill_status.clone().unwrap_or_else(|| {
+            "Installs the bundled Harness Harlot skill for Claude Code, Codex, and pi.".to_owned()
+        });
+        settings_card(vec![
+            settings_row(
+                "MCP server",
+                Some(format!("{} mcp", command.display())),
+                div()
+                    .id("copy-hh-mcp-config")
+                    .cursor_pointer()
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgb(THEME.border))
+                    .text_xs()
+                    .text_color(rgb(THEME.accent))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(clipboard_text.clone()));
+                        cx.stop_propagation();
+                    }))
+                    .child("Copy JSON")
+                    .into_any_element(),
+            ),
+            div()
+                .font_family("SF Mono")
+                .text_xs()
+                .text_color(rgb(THEME.muted))
+                .bg(rgb(THEME.terminal))
+                .border_1()
+                .border_color(rgb(THEME.border))
+                .rounded(px(6.0))
+                .p(px(10.0))
+                .child(config_text)
+                .into_any_element(),
+            settings_row(
+                "Agent skill",
+                Some(status),
+                div()
+                    .id("install-hh-agent-skill")
+                    .cursor_pointer()
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(rgb(THEME.border))
+                    .text_xs()
+                    .text_color(rgb(THEME.accent))
+                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.editor.agent_skill_status =
+                            Some(match crate::cli::skill::install_default() {
+                                Ok(paths) => {
+                                    format!("Installed in {} agent skill directories.", paths.len())
+                                }
+                                Err(error) => format!("Skill installation failed: {error:#}"),
+                            });
+                        cx.notify();
+                    }))
+                    .child("Install")
+                    .into_any_element(),
+            ),
+        ])
+    }
+
+    fn render_assistant_panel(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let assistant = self
+            .session
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.assistant.clone())
+            .unwrap_or_default();
+        let state = &self.assistant.coding_agents;
+        let mut agent_rows: Vec<AnyElement> = Vec::new();
+        if state.loading {
+            agent_rows.push(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.dim))
+                    .child("Scanning your login PATH…")
+                    .into_any_element(),
+            );
+        } else if let Some(error) = state.error.as_ref() {
+            agent_rows.push(
+                div()
+                    .font_family("SF Mono")
+                    .text_xs()
+                    .text_color(rgb(THEME.danger))
+                    .child(error.clone())
+                    .into_any_element(),
+            );
+            agent_rows.push(
+                div()
+                    .id("coding-agents-retry")
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.accent))
+                    .child("Retry")
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_coding_agents(cx)))
+                    .into_any_element(),
+            );
+        } else if state.loaded && state.agents.is_empty() {
+            agent_rows.push(settings_row(
+                "No coding agent CLIs were found on your login PATH",
+                Some(
+                    "Install omp, Claude Code, Codex, Gemini CLI, Aider, or another supported agent and click Rescan"
+                        .to_owned(),
+                ),
+                div().into_any_element(),
+            ));
+        } else {
+            agent_rows.push(
+                div()
+                    .id("coding-agent-auto")
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(radio_glyph(assistant.preferred_agent.is_none()))
+                    .child(settings_row(
+                        "Let the assistant choose",
+                        Some("Picks from the installed agents below".to_owned()),
+                        div().into_any_element(),
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_preferred_agent(None);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            agent_rows.extend(state.agents.iter().enumerate().map(|(index, agent)| {
+                let profile = agent.profile;
+                let selected = assistant.preferred_agent == Some(profile);
+                div()
+                    .id(("coding-agent", index))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(radio_glyph(selected))
+                    .child(render_terminal_profile_icon(profile, THEME.muted, 18.0))
+                    .child(settings_row(
+                        profile.display_name(),
+                        Some(agent.path.clone()),
+                        div().into_any_element(),
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_preferred_agent(Some(profile));
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }));
+        }
+        agent_rows.push(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .id("coding-agents-rescan")
+                        .cursor_pointer()
+                        .font_family(".SystemUIFont")
+                        .text_xs()
+                        .text_color(rgb(THEME.accent))
+                        .child("Rescan")
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_coding_agents(cx))),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .font_family(".SystemUIFont")
+                        .text_xs()
+                        .text_color(rgb(THEME.dim))
+                        .child(
+                            "Applies to assistants started after this change; restart a running assistant from its header.",
+                        ),
+                )
+                .into_any_element(),
+        );
+        vec![
+            settings_heading(
+                "Assistant",
+                "The assistant orchestrates coding agents in your terminals. It launches whichever installed agent fits the task unless you prefer one.",
+            ),
+            settings_section_title("Coding agents"),
+            settings_card(agent_rows),
+            settings_section_title("Terminal agents"),
+            self.render_terminal_agents_setting(cx),
+            settings_section_title("Permissions"),
+            settings_card(vec![settings_row(
+                "Guarded actions",
+                Some("Sending terminal input, closing panes, and launching commands".to_owned()),
+                self.settings_segmented(
+                    "assistant-access",
+                    &[
+                        (AssistantAccess::Full, "Full"),
+                        (AssistantAccess::Confirm, "Confirm"),
+                    ],
+                    assistant.access,
+                    |this, access, _| this.set_assistant_access(access),
+                    cx,
+                ),
+            )]),
+            settings_section_title("Model"),
+            settings_card(vec![
+                settings_row(
+                    "Default model",
+                    Some(
+                        assistant
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "pi default".to_owned()),
+                    ),
+                    div().into_any_element(),
+                ),
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.dim))
+                    .child("Change it from the model menu at the bottom of any Assistant.")
+                    .into_any_element(),
+            ]),
+        ]
+    }
+
+    fn render_voice_panel(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let editor = &self.assistant.settings_editor;
+        let api_key_display = if editor.api_key_input.is_empty() {
+            String::new()
+        } else {
+            let mut tail = editor
+                .api_key_input
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>();
+            tail.reverse();
+            format!("•••• {}", tail.into_iter().collect::<String>())
+        };
+        let model = match editor.settings.model.as_str() {
+            "gpt-realtime-2.1" => "gpt-realtime-2.1",
+            "gpt-realtime-2.1-mini" => "gpt-realtime-2.1-mini",
+            _ => "unsupported",
+        };
+        let model_detail = (model == "unsupported")
+            .then(|| format!("Unsupported saved value: {}", editor.settings.model));
+        let voice = match editor.settings.voice.as_str() {
+            "marin" => "marin",
+            "cedar" => "cedar",
+            "alloy" => "alloy",
+            _ => "unsupported",
+        };
+        let voice_detail = (voice == "unsupported")
+            .then(|| format!("Unsupported saved value: {}", editor.settings.voice));
+        let full_duplex = editor.settings.full_duplex;
+        vec![
+            settings_heading(
+                "Voice",
+                "Optional. Uses the OpenAI Realtime API to talk with the assistant; the microphone stays off until you start voice.",
+            ),
+            settings_section_title("Connection"),
+            settings_card(vec![
+                self.settings_text_input(
+                    "voice-api-key",
+                    "OpenAI API key",
+                    api_key_display,
+                    "Paste API key",
+                    VoiceSettingsField::ApiKey,
+                    cx,
+                ),
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.dim))
+                    .child("Used for this process only; it is not saved. Set HH_OPENAI_API_KEY for future launches.")
+                    .into_any_element(),
+            ]),
+            settings_section_title("Speech"),
+            settings_card(vec![
+                settings_row(
+                    "Realtime model",
+                    model_detail,
+                    self.settings_segmented(
+                        "voice-model",
+                        &[
+                            ("gpt-realtime-2.1", "Standard"),
+                            ("gpt-realtime-2.1-mini", "Mini"),
+                        ],
+                        model,
+                        |this, value, cx| this.set_voice_model(value, cx),
+                        cx,
+                    ),
+                ),
+                settings_row(
+                    "Voice",
+                    voice_detail,
+                    self.settings_segmented(
+                        "voice-voice",
+                        &[("marin", "Marin"), ("cedar", "Cedar"), ("alloy", "Alloy")],
+                        voice,
+                        |this, value, cx| this.set_voice(value, cx),
+                        cx,
+                    ),
+                ),
+                settings_row(
+                    "Full duplex",
+                    Some("Requires headphones".to_owned()),
+                    self.settings_segmented(
+                        "voice-full-duplex",
+                        &[(true, "On"), (false, "Off")],
+                        full_duplex,
+                        |this, value, cx| {
+                            if value != this.assistant.settings_editor.settings.full_duplex {
+                                this.toggle_full_duplex(cx);
+                            }
+                        },
+                        cx,
+                    ),
+                ),
+                self.settings_text_input(
+                    "voice-idle-timeout",
+                    "Idle timeout (seconds)",
+                    editor.idle_timeout_input.clone(),
+                    "0 disables; minimum 60",
+                    VoiceSettingsField::IdleTimeout,
+                    cx,
+                ),
+            ]),
+            div()
+                .font_family(".SystemUIFont")
+                .text_xs()
+                .text_color(rgb(THEME.dim))
+                .child("Changes apply to the next assistant session.")
+                .into_any_element(),
+            div()
+                .id("voice-privacy-disclosure")
+                .cursor_pointer()
+                .font_family(".SystemUIFont")
+                .text_xs()
+                .text_color(rgb(THEME.accent))
+                .child("Voice privacy and data handling")
+                .on_click(cx.listener(|_, _, _, cx| cx.open_url(VOICE_PRIVACY_URL)))
+                .into_any_element(),
+        ]
+    }
+
+    /// Pill group; the selected option carries the accent fill.
+    fn settings_segmented<T: Copy + PartialEq + 'static>(
+        &self,
+        id: &'static str,
+        options: &[(T, &'static str)],
+        current: T,
+        on_select: fn(&mut Self, T, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut group = div()
+            .rounded(px(6.0))
+            .bg(rgb(THEME.elevated))
+            .p(px(2.0))
+            .flex()
+            .gap(px(2.0));
+        for (index, (value, label)) in options.iter().enumerate() {
+            let value = *value;
+            let selected = value == current;
+            group = group.child(
+                div()
+                    .id((id, index))
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .when(selected, |element| {
+                        element
+                            .bg(rgb(THEME.accent_soft))
+                            .text_color(rgb(THEME.foreground))
+                    })
+                    .when(!selected, |element| element.text_color(rgb(THEME.muted)))
+                    .child(*label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        on_select(this, value, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        group.into_any_element()
+    }
+
+    /// Append/backspace/paste field; keyboard editing lives in
+    /// `handle_voice_settings_key`.
+    fn settings_text_input(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        value: String,
+        placeholder: &'static str,
+        field: VoiceSettingsField,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self.assistant.settings_editor.active_field == Some(field);
+        let empty = value.is_empty();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.muted))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(id)
+                    .h(px(36.0))
+                    .px(px(10.0))
+                    .rounded(px(6.0))
+                    .bg(rgb(THEME.terminal))
+                    .border_1()
+                    .border_color(rgb(if active {
+                        THEME.accent
+                    } else {
+                        THEME.border_strong
+                    }))
+                    .cursor_text()
+                    .flex()
+                    .items_center()
+                    .font_family("SF Mono")
+                    .text_sm()
+                    .text_color(rgb(if empty { THEME.dim } else { THEME.foreground }))
+                    .child(if empty { placeholder.to_owned() } else { value })
+                    .when(active, |element| {
+                        element.child(div().text_color(rgb(THEME.accent)).child("▮"))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.assistant.settings_editor.active_field = Some(field);
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }

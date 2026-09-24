@@ -14,6 +14,7 @@ pub enum AppCommand {
     ToggleSidebar,
     NewTab,
     NewBrowserTab,
+    NewGalleryTab,
     TerminalZoomIn,
     TerminalZoomOut,
     SplitRight,
@@ -33,7 +34,7 @@ pub enum AppCommand {
 }
 
 impl AppCommand {
-    const COUNT: usize = 20;
+    const COUNT: usize = 21;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +74,13 @@ pub const COMMAND_DESCRIPTORS: &[CommandDescriptor] = &[
         command: AppCommand::NewBrowserTab,
         id: "workspace.new-browser-tab",
         title: "New Browser Tab",
+        category: "Workstation",
+        default_bindings: &[],
+    },
+    CommandDescriptor {
+        command: AppCommand::NewGalleryTab,
+        id: "workspace.new-gallery-tab",
+        title: "New Gallery Tab",
         category: "Workstation",
         default_bindings: &[],
     },
@@ -219,6 +227,7 @@ const fn check_registry() {
                 || matches!(
                     descriptor.command,
                     AppCommand::NewBrowserTab
+                        | AppCommand::NewGalleryTab
                         | AppCommand::RetryTerminalInput
                         | AppCommand::ShowNotifications
                         | AppCommand::ShowSettings
@@ -553,7 +562,6 @@ mod tests {
         let matches = palette_matches("", usize::MAX);
         assert_eq!(matches.len(), COMMAND_DESCRIPTORS.len());
         assert_eq!(matches[0].command, AppCommand::NewWorkspace);
-        assert_eq!(matches[14].command, AppCommand::EqualizePanes);
 
         let matches = palette_matches("eq pane", 8);
         assert_eq!(

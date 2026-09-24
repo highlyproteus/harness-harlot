@@ -6,6 +6,8 @@
 //! plus the desired-state snapshot; [`serve_connection`] frames one
 //! authenticated client connection over a Unix-domain socket.
 
+mod assistant;
+mod gallery;
 mod history;
 mod layout;
 mod persistence;
@@ -14,6 +16,7 @@ mod pty;
 mod registry;
 mod rpc;
 mod tmux;
+mod tmux_control;
 
 pub use registry::{PaneUpdateBatch, SessionRegistry, TmuxAttachmentResult, TmuxScanResult};
 pub use rpc::serve_connection;

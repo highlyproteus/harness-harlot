@@ -97,9 +97,15 @@ fn cleanup_stale_clipboard_images(directory: &Path, now: SystemTime) -> Result<(
         if !name.starts_with("clipboard-") && !name.starts_with("upload-") {
             continue;
         }
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("inspect clipboard image {}", entry.path().display()))?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect clipboard image {}", entry.path().display())
+                });
+            }
+        };
         if !metadata.is_file() {
             continue;
         }
@@ -107,8 +113,14 @@ fn cleanup_stale_clipboard_images(directory: &Path, now: SystemTime) -> Result<(
             .modified()
             .with_context(|| format!("read clipboard image age {}", entry.path().display()))?;
         if now.duration_since(modified).unwrap_or_default() >= CLIPBOARD_IMAGE_RETENTION {
-            fs::remove_file(entry.path())
-                .with_context(|| format!("remove stale clipboard image {name}"))?;
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("remove stale clipboard image {name}"));
+                }
+            }
         }
     }
     Ok(())

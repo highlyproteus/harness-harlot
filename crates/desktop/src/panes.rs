@@ -614,17 +614,15 @@ impl HhApp {
             return;
         };
         if let Some(text) = self
-            .voice
-            .sessions
+            .assistant
+            .panes
             .get(&pane_id)
-            .and_then(|session| session.selected_transcript)
-            .and_then(|index| {
-                self.voice
-                    .sessions
-                    .get(&pane_id)
-                    .and_then(|session| session.transcript.get(index))
+            .and_then(|pane| {
+                let index = pane.selected_entry?;
+                pane.view.as_ref()?.entries.get(index)
             })
-            .map(|entry| entry.text.clone())
+            .map(crate::voice::assistant_entry_text)
+            .map(str::to_owned)
         {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;

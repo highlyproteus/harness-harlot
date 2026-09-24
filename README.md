@@ -60,10 +60,12 @@ hh update --check
 rollback, and relaunches Harness Harlot after a successful replacement on Linux
 and packaged community macOS builds. The sidebar Update button keeps the app
 open while downloading and asks once before restarting an incompatible terminal
-service. Running local terminals then reopen as fresh shells in their last
-directories; their programs stop, and SSH tabs stay offline until reconnected.
-For the CLI, use `hh update --restart-service` to authorize that restart, or end
-active terminal sessions first. Compatible service updates preserve live shells.
+service. Local terminals managed by the private HH tmux server resume with
+their running programs and output; unsupported or failed tmux recovery falls
+back to fresh shells in the last valid directories. SSH tabs stay offline until
+reconnected. For the CLI, use `hh update --restart-service` to authorize that
+restart, or end active terminal sessions first. Compatible service updates
+preserve live shells without restarting the service.
 Contributors can opt into the independently published main-branch feed with
 `hh update --channel edge`.
 
@@ -109,26 +111,68 @@ A group displays several terminals together in one view — and can include a br
 
 Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profile directory.
 
-## Voice Mode
+## Assistant and Voice Mode
 
-Assistant panes support typed messages, image attachments, and optional spoken
-conversation through the OpenAI Realtime API. Text and image actions can start
-an Assistant connection, but the microphone remains off until you use the
-visible start-voice control. Voice is conversation-only: it receives no provider
-tools or approval path and cannot inspect or control terminals, panes,
-workstations, files, Git, agents, or memory retrieval.
+Assistant panes run a service-owned `pi --mode rpc` orchestrator. Typed messages
+and image attachments go to the model provider configured in pi. The bundled
+extension gives pi only HH workspace tools: it can list and create workstations,
+windows, terminals, and browsers; read, send to, wait for, close, and focus
+panes; and launch a configured coding-agent command in a terminal. `Full`
+access auto-allows guarded actions; `Confirm` shows an inline Allow/Deny card
+before sending input, closing a pane, or launching a command.
+Choose `Full` or `Confirm` in the Assistant header; this setting survives service
+restarts. With the composer inactive, Enter allows the focused pane's pending
+action and Escape denies it. While composing, these keys retain their normal
+submit/close behavior; typing `y` or `n` never approves or denies an action.
+Prompt drafts and attachments remain in the composer until submission succeeds.
 
-OpenAI and optional Honcho credentials are not saved to the settings file. Set
-`HH_OPENAI_API_KEY` and, when needed, `HH_HONCHO_BEARER` in the launch
-environment. See [Voice Mode privacy and data handling](PRIVACY.md) for the data
-sent to providers, local retention limits, deletion controls, and workspace
-authorization boundaries.
+Voice Mode is optional and uses the OpenAI Realtime API as a relay. The
+microphone remains off until you use the visible start-voice control. Final
+speech transcripts are forwarded to pi, and only bounded final orchestrator
+updates are sent back to Realtime for speech. The Realtime session receives no
+HH tools and cannot authorize actions.
+Replies received while the speaker is muted or voice is suspended are skipped,
+not replayed when listening resumes. Spoken transcripts stay attached to the
+Assistant entry being voiced even as older entries leave the visible history.
+
+OpenAI credentials are not saved to the settings file. Set
+`HH_OPENAI_API_KEY` in the launch environment. pi manages credentials for its
+selected model provider. See [Assistant and Voice Mode privacy and data
+handling](PRIVACY.md) for provider and local-storage boundaries.
+
+## Browser automation and Galleries
+
+Harness Harlot terminals receive `HH_WORKSPACE_ID`, `HH_PANE_ID`,
+`HH_GALLERY_DIR`, and `HH_CLI`. The bundled `hh` command uses that context to
+control browser panes and publish images without exposing a remote network
+endpoint:
+
+```bash
+hh browser open https://example.com --json
+hh browser read body --pane BROWSER_PANE_ID --json
+hh browser screenshot --pane BROWSER_PANE_ID --json
+hh gallery add /absolute/path/to/image.png --json
+hh gallery list --json
+```
+
+`hh mcp` exposes the same operations as a stdio MCP server. `hh skill install`
+installs the bundled agent instructions for Claude Code, Codex, and pi. The
+Assistant settings show the MCP configuration and skill installer.
+
+Gallery images are copied into private per-workstation application storage.
+Opening or importing from a terminal creates or reuses a Gallery without taking
+focus from the terminal. The desktop Gallery supports file drops, previews, and
+revealing the selected image in Finder or the platform file manager.
 
 ## tmux
 
-- Scan the local or remote tmux server from the workstation menu and open selected sessions as tabs.
-- Sessions attach exactly like a hand-run `tmux attach-session`: tmux stays in charge of its own windows and panes, and detaching leaves the session running on the server.
-- Nothing is scanned in the background — only when you ask.
+- Local terminal panes use an HH-owned private tmux server when tmux 3.2 or
+  newer is installed, preserving processes and output across service restarts.
+- The managed server uses a private `hh` (`hh-dev` in development) socket and
+  does not alter the user's default tmux server.
+- The workstation menu can still scan an explicitly requested local or remote
+  tmux server and attach selected sessions as tabs. Nothing is scanned in the
+  background.
 
 ## Run locally
 

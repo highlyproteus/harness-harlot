@@ -146,7 +146,7 @@ impl HhApp {
 
     /// Enqueues a control-lane request with a typed continuation applied
     /// with the response on the UI thread, followed by one poll cycle.
-    pub(crate) fn dispatch_with(&mut self, request: ClientRequest, apply: ApplyFn) {
+    pub(crate) fn dispatch_with(&mut self, request: ClientRequest, apply: ApplyFn) -> bool {
         let one_way = PipelineJob::is_one_way(&request);
         if self
             .session
@@ -161,6 +161,9 @@ impl HhApp {
         {
             self.session.connection_error =
                 Some("control pipeline overloaded; newest request was not queued".to_owned());
+            false
+        } else {
+            true
         }
     }
 
@@ -185,6 +188,7 @@ impl HhApp {
 
     pub(crate) fn pane_update_request(&self) -> ClientRequest {
         let now = Instant::now();
+        let on_screen = self.on_screen_panes();
         let pane_revisions = self
             .session
             .screens
@@ -194,9 +198,26 @@ impl HhApp {
                 revision: screen.revision,
             })
             .collect();
+        let assistant_revisions = on_screen
+            .iter()
+            .copied()
+            .filter(|pane_id| {
+                self.pane_metadata(*pane_id)
+                    .is_some_and(|pane| pane.kind.is_assistant())
+            })
+            .map(|pane_id| PaneRevisionCursor {
+                pane_id,
+                revision: self
+                    .assistant
+                    .panes
+                    .get(&pane_id)
+                    .and_then(|pane| pane.view.as_ref())
+                    .map_or(0, |view| view.revision),
+            })
+            .collect();
         let subscribed_panes = paced_subscriptions(
             now,
-            &self.on_screen_panes(),
+            &on_screen,
             self.layout.focused_pane,
             &self.session.last_delivery,
             SECONDARY_PANE_INTERVAL,
@@ -208,8 +229,13 @@ impl HhApp {
                 .as_ref()
                 .map(|snapshot| snapshot.revision),
             pane_revisions,
+            assistant_revisions,
             subscribed_panes,
             notifications_after: self.session.notifications_latest_id,
+            browser_executor: cfg!(all(
+                any(target_os = "macos", target_os = "linux"),
+                feature = "browser"
+            )),
         }
     }
     pub(crate) fn apply_update_result(
@@ -223,8 +249,10 @@ impl HhApp {
                 snapshot,
                 screens,
                 pane_states,
+                assistant_threads,
                 notifications: notification_deltas,
                 diagnostics,
+                browser_commands,
             }) => {
                 let apply_started = Instant::now();
                 let outcome = reconcile_updates(
@@ -241,6 +269,11 @@ impl HhApp {
                     },
                     Instant::now(),
                 );
+                let mut assistant_changed = false;
+                for view in assistant_threads {
+                    assistant_changed |= self.apply_assistant_view(view);
+                }
+                self.run_browser_commands(browser_commands, cx);
                 self.terminal_shape_cache
                     .borrow_mut()
                     .retain(|id, _| self.session.screens.contains_key(id));
@@ -265,7 +298,7 @@ impl HhApp {
                         self.sync_dock_badge();
                     }
                 }
-                let mut state_changed = outcome.state_changed;
+                let mut state_changed = outcome.state_changed || assistant_changed;
                 if let Some(pane_id) = outcome.focus_resync {
                     state_changed |= self.focus_pane_with_snapshot(pane_id, cx);
                 }
@@ -300,7 +333,7 @@ impl HhApp {
                 }
             }
         }
-        self.prune_assistant_sessions(&live_assistants, cx);
+        self.prune_assistant_panes(&live_assistants, cx);
         if self
             .editor
             .browser_url_editor
@@ -351,6 +384,30 @@ impl HhApp {
             self.dispatch(ClientRequest::ActivateTab { pane_id });
         }
         let notifications_changed = self.auto_read_pane_notifications(pane_id, cx);
+        if self
+            .pane_metadata(pane_id)
+            .is_some_and(|pane| pane.kind.is_assistant())
+        {
+            let changed = self.layout.focused_pane != Some(pane_id);
+            self.layout.focused_pane = Some(pane_id);
+            self.session.connection_error = None;
+            if changed {
+                self.dispatch_stream_with(
+                    ClientRequest::GetAssistantThread { pane_id },
+                    Box::new(move |this, cx, result| match result {
+                        Ok(ServiceResponse::AssistantThread { view }) => {
+                            if this.apply_assistant_view(view) || notifications_changed {
+                                cx.notify();
+                            }
+                        }
+                        Ok(response) => this.report_unexpected(&response),
+                        Err(error) => this.report(&error),
+                    }),
+                );
+            }
+            self.ensure_visible_browser_views(cx);
+            return changed || notifications_changed;
+        }
         if self
             .pane_metadata(pane_id)
             .is_some_and(|pane| !pane.kind.is_terminal())

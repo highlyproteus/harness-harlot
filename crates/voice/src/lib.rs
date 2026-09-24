@@ -1,9 +1,7 @@
 mod audio;
 mod engine;
-mod memory;
 mod realtime;
 mod settings;
-pub mod threads;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,15 +11,10 @@ use std::time::Duration;
 use futures::SinkExt;
 use futures::channel::mpsc::Receiver;
 
-pub(crate) const MAX_ACCEPTED_USER_ITEMS: usize = 16;
 pub const VOICE_UI_EVENT_CAPACITY: usize = 64;
 const VOICE_UI_DISPATCH_CAPACITY: usize = 256;
 
-pub use settings::{HonchoSettings, VoiceSettings};
-pub use threads::{
-    Thread, ThreadGeneration, ThreadRecord, ThreadRole, ThreadSummary, adopt_thread, append_record,
-    list_threads, read_summary, read_thread,
-};
+pub use settings::VoiceSettings;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineState {
@@ -40,8 +33,7 @@ pub enum VoiceCommand {
     BargeIn,
     Suspend,
     Resume,
-    SendUserText(String),
-    SendUserImage { data_url: String },
+    RelayAssistantText { entry: Option<u64>, text: String },
     Shutdown,
 }
 
@@ -56,6 +48,7 @@ pub enum VoiceUiEvent {
         final_: bool,
     },
     AssistantTranscript {
+        entry: Option<u64>,
         text: String,
         final_: bool,
     },
@@ -73,9 +66,6 @@ pub enum VoiceUiEvent {
         output_tokens: u64,
     },
     MicLevel(f32),
-    SessionSummary {
-        text: String,
-    },
 }
 
 impl VoiceUiEvent {
@@ -187,7 +177,6 @@ pub fn voice_ui_channel() -> (VoiceUiSender, Receiver<VoiceUiEvent>) {
 #[derive(Debug)]
 pub struct VoiceEngineHandle {
     pub(crate) command_tx: std::sync::mpsc::SyncSender<VoiceCommand>,
-    pub(crate) accepted_user_items: Arc<AtomicUsize>,
     pub(crate) join: Option<JoinHandle<()>>,
 }
 
@@ -199,21 +188,7 @@ impl VoiceEngineHandle {
     /// Queues a command without blocking the caller.
     #[must_use]
     pub fn try_send(&self, command: VoiceCommand) -> bool {
-        let user_item = matches!(
-            command,
-            VoiceCommand::SendUserText(_) | VoiceCommand::SendUserImage { .. }
-        );
-        if user_item && !try_acquire_user_item(&self.accepted_user_items) {
-            return false;
-        }
-        if self.command_tx.try_send(command).is_ok() {
-            true
-        } else {
-            if user_item {
-                self.accepted_user_items.fetch_sub(1, Ordering::AcqRel);
-            }
-            false
-        }
+        self.command_tx.try_send(command).is_ok()
     }
 
     /// Whether the engine thread has already exited (startup failure or
@@ -236,36 +211,12 @@ impl VoiceEngineHandle {
             }
         }
     }
-
-    #[cfg(test)]
-    fn for_test(command_tx: std::sync::mpsc::SyncSender<VoiceCommand>) -> Self {
-        Self {
-            command_tx,
-            accepted_user_items: Arc::new(AtomicUsize::new(0)),
-            join: None,
-        }
-    }
 }
 
-fn try_acquire_user_item(accepted: &AtomicUsize) -> bool {
-    accepted
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < MAX_ACCEPTED_USER_ITEMS).then_some(current + 1)
-        })
-        .is_ok()
-}
-
-/// Where a voice-assistant pane is planted, plus the conversation summary
-/// persisted across suspends and app restarts.
+/// Display context for the Realtime relay persona.
 #[derive(Clone, Debug, Default)]
 pub struct AssistantContext {
-    pub workspace_id: Option<uuid::Uuid>,
-    pub pane_id: Option<uuid::Uuid>,
     pub workspace_title: String,
-    pub workspace_kind: hh_protocol::WorkspaceKind,
-    pub working_dir: Option<String>,
-    pub instructions: Option<String>,
-    pub prior_context: Option<String>,
 }
 
 /// Starts the dedicated voice assistant engine thread.
@@ -289,25 +240,22 @@ mod admission_tests {
     use futures::StreamExt;
 
     #[test]
-    fn seventeenth_user_turn_is_rejected_without_evicting_accepted_content() {
-        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(64);
-        let handle = VoiceEngineHandle::for_test(command_tx);
-
-        for index in 0..MAX_ACCEPTED_USER_ITEMS {
-            assert!(handle.try_send(VoiceCommand::SendUserText(index.to_string())));
-        }
-        assert!(!handle.try_send(VoiceCommand::SendUserText("overflow".to_owned())));
-
-        let accepted = command_rx
-            .try_iter()
-            .map(|command| match command {
-                VoiceCommand::SendUserText(text) => text,
-                other => panic!("unexpected command: {other:?}"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(accepted.len(), MAX_ACCEPTED_USER_ITEMS);
-        assert_eq!(accepted.first().map(String::as_str), Some("0"));
-        assert_eq!(accepted.last().map(String::as_str), Some("15"));
+    fn relay_command_admission_is_non_blocking() {
+        let (command_tx, command_rx) = std::sync::mpsc::sync_channel(1);
+        let handle = VoiceEngineHandle {
+            command_tx,
+            join: None,
+        };
+        let first = VoiceCommand::RelayAssistantText {
+            entry: Some(42),
+            text: "first".to_owned(),
+        };
+        assert!(handle.try_send(first.clone()));
+        assert!(!handle.try_send(VoiceCommand::RelayAssistantText {
+            entry: Some(43),
+            text: "overflow".to_owned(),
+        }));
+        assert_eq!(command_rx.try_recv(), Ok(first));
     }
 
     #[test]

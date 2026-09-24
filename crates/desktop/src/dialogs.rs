@@ -642,8 +642,8 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let terminals = confirmation.live_terminals.map_or_else(
-            || "Running terminals will reopen as fresh shells in their last directories; programs running in them will be stopped. SSH tabs stay offline until reconnected.".to_owned(),
-            |count| format!("{count} running terminal{} will reopen as fresh shells in their last directories; programs running in them will be stopped. SSH tabs stay offline until reconnected.", if count == 1 { "" } else { "s" }),
+            || "Local terminals managed by HH's private tmux server will resume after the service restart. Fallback terminals may reopen as fresh shells in their last directories. SSH tabs stay offline until reconnected.".to_owned(),
+            |count| format!("{count} running terminal{} will resume when managed by HH's private tmux server. Fallback terminals may reopen as fresh shells in their last directories. SSH tabs stay offline until reconnected.", if count == 1 { "" } else { "s" }),
         );
         let body = div()
             .font_family(".SystemUIFont")

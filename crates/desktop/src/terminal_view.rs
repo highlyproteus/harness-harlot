@@ -331,11 +331,12 @@ impl HhApp {
                     )
                     .when(pane.kind.is_assistant(), |element| {
                         let (mic_muted, speaker_muted) = self
-                            .voice
-                            .sessions
+                            .assistant
+                            .panes
                             .get(&pane_id)
-                            .map_or((false, false), |session| {
-                                (session.mic_muted, session.speaker_muted)
+                            .and_then(|pane| pane.voice.as_ref())
+                            .map_or((true, false), |voice| {
+                                (voice.mic_muted, voice.speaker_muted)
                             });
                         element
                             .child(
@@ -1157,6 +1158,8 @@ impl HhApp {
                         show_pane_header,
                         cx,
                     )
+                } else if pane.kind.is_gallery() {
+                    self.render_gallery_pane(pane, std::slice::from_ref(pane), show_pane_header, cx)
                 } else {
                     let active = pane.id;
                     self.render_terminal(std::slice::from_ref(pane), active, show_pane_header, cx)
@@ -1182,6 +1185,12 @@ impl HhApp {
                     .filter(|pane| pane.kind.is_assistant())
                 {
                     self.render_assistant_pane(pane, panes.as_slice(), show_pane_header, cx)
+                } else if let Some(pane) = panes
+                    .iter()
+                    .find(|pane| pane.id == *active)
+                    .filter(|pane| pane.kind.is_gallery())
+                {
+                    self.render_gallery_pane(pane, panes.as_slice(), show_pane_header, cx)
                 } else {
                     self.render_terminal(panes.as_slice(), *active, show_pane_header, cx)
                 }

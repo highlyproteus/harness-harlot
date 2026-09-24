@@ -1,5 +1,8 @@
 //! Pane streaming, notifications, and diagnostics sampling.
-use super::{PaneUpdateBatch, SessionRegistry, serialized_len, snapshot_with_runtime_transports};
+use super::{
+    PaneUpdateBatch, PaneUpdateRequest, SessionRegistry, serialized_len,
+    snapshot_with_runtime_transports,
+};
 use crate::registry::identity::refresh_runtime_metadata;
 use anyhow::{Result, bail};
 use hh_protocol::{
@@ -136,7 +139,34 @@ impl SessionRegistry {
         measure_bytes: bool,
         notifications_after: u64,
     ) -> Result<PaneUpdateBatch> {
-        if pane_revisions.len() > MAX_PANES || subscribed_panes.len() > MAX_PANES {
+        self.pane_updates_with_assistants(PaneUpdateRequest {
+            snapshot_revision,
+            pane_revisions,
+            assistant_revisions: &[],
+            subscribed_panes,
+            browser_executor: false,
+            measure_bytes,
+            notifications_after,
+        })
+    }
+
+    pub(crate) fn pane_updates_with_assistants(
+        &self,
+        request: PaneUpdateRequest<'_>,
+    ) -> Result<PaneUpdateBatch> {
+        let PaneUpdateRequest {
+            snapshot_revision,
+            pane_revisions,
+            assistant_revisions,
+            subscribed_panes,
+            browser_executor,
+            measure_bytes,
+            notifications_after,
+        } = request;
+        if pane_revisions.len() > MAX_PANES
+            || assistant_revisions.len() > MAX_PANES
+            || subscribed_panes.len() > MAX_PANES
+        {
             bail!("pane update request exceeds the {MAX_PANES}-pane limit");
         }
         let started = Instant::now();
@@ -196,12 +226,37 @@ impl SessionRegistry {
             .filter(|notification| notification.id > notifications_after)
             .cloned()
             .collect();
+        let assistant_threads = assistant_revisions
+            .iter()
+            .filter_map(|cursor| {
+                let runtime = state.panes.get(&cursor.pane_id)?.assistant()?;
+                let view = runtime.view();
+                (view.revision > cursor.revision).then_some(view)
+            })
+            .collect::<Vec<_>>();
         drop(state);
+        let browser_commands = if browser_executor {
+            self.take_browser_commands()
+        } else {
+            Vec::new()
+        };
 
         pane_states.sort_unstable_by_key(|pane| pane.pane_id);
         screens.sort_unstable_by_key(|screen| screen.pane_id);
         let (screens, withheld) = screens_within_budget(screens);
         preserve_withheld_cursors(&mut pane_states, &withheld, &known_revisions);
+        let mut response_bytes = screens.iter().try_fold(0_u64, |total, screen| {
+            Ok::<_, anyhow::Error>(total.saturating_add(serialized_len(screen)?))
+        })?;
+        let mut included_assistant_threads = Vec::with_capacity(assistant_threads.len());
+        for view in assistant_threads {
+            let size = serialized_len(&view)?;
+            if response_bytes.saturating_add(size) > RESPONSE_SCREEN_BUDGET_BYTES {
+                break;
+            }
+            response_bytes = response_bytes.saturating_add(size);
+            included_assistant_threads.push(view);
+        }
         let screens_queued = screens.len().saturating_add(withheld.len());
         let snapshot_bytes = if measure_bytes {
             snapshot
@@ -242,6 +297,8 @@ impl SessionRegistry {
             screens,
             pane_states,
             notifications,
+            assistant_threads: included_assistant_threads,
+            browser_commands,
             diagnostics,
         })
     }

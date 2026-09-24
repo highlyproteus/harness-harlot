@@ -3,6 +3,7 @@ use super::{
     InitialTerminalSpawn, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
     TerminalRuntimePane, encode_desired_state,
 };
+use crate::gallery::import_gallery_image;
 use crate::layout::{
     add_tab, detach_pane, find_pane_in_snapshot, find_pane_mut_in_snapshot, layout_contains,
     split_layout, workspace_id_for_pane,
@@ -22,7 +23,7 @@ use hh_protocol::{
     TerminalProfile, TerminalSelectionKind, WorkspaceConnection, WorkspaceConnectionStatus,
     normalize_browser_url, normalize_browser_url_or_default, validate_ssh_host,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -49,6 +50,19 @@ pub(crate) fn browser_title(url: &str, title: Option<&str>) -> String {
                 .and_then(|url| url.host_str().map(str::to_owned))
         })
         .unwrap_or_else(|| "Browser".to_owned())
+}
+
+fn first_gallery_pane(layout: &PaneLayout) -> Option<Uuid> {
+    match layout {
+        PaneLayout::Leaf { pane } => pane.kind.is_gallery().then_some(pane.id),
+        PaneLayout::Stack { panes, .. } => panes
+            .iter()
+            .find(|pane| pane.kind.is_gallery())
+            .map(|pane| pane.id),
+        PaneLayout::Split { first, second, .. } => {
+            first_gallery_pane(first).or_else(|| first_gallery_pane(second))
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -156,7 +170,7 @@ impl SessionRegistry {
                 workspace
                     .tabs
                     .iter_mut()
-                    .any(|tab| add_tab(&mut tab.layout, target_pane, pane.clone()))
+                    .any(|tab| add_tab(&mut tab.layout, target_pane, pane.clone(), true))
             });
             if !did_add {
                 bail!("target pane {target_pane} does not exist");
@@ -218,13 +232,54 @@ impl SessionRegistry {
             profile_override: None,
             custom_icon: None,
         };
-        if !add_tab(&mut tab.layout, target_pane, pane) {
+        if !add_tab(&mut tab.layout, target_pane, pane, true) {
             bail!("target pane {target_pane} does not exist");
         }
         state.panes.insert(
             pane_id,
             RuntimePane {
                 backend: RuntimePaneBackend::Browser,
+            },
+        );
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)?;
+        Ok(pane_id)
+    }
+
+    pub fn create_group_gallery(&self, target_pane: Uuid, activate: bool) -> Result<Uuid> {
+        let pane_id = Uuid::new_v4();
+        let mut state = self.state.write();
+        if state.panes.len() >= MAX_PANES {
+            bail!("pane limit of {MAX_PANES} reached");
+        }
+        let tab = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.tabs)
+            .find(|tab| layout_contains(&tab.layout, target_pane))
+            .with_context(|| format!("target pane {target_pane} does not exist"))?;
+        let pane = Pane {
+            id: pane_id,
+            kind: PaneKind::Gallery,
+            title: "Gallery".to_owned(),
+            shell: String::new(),
+            color: None,
+            identity: TerminalIdentity::default(),
+            status: PaneStatus::default(),
+            custom_title: None,
+            profile_override: None,
+            custom_icon: None,
+        };
+        if !add_tab(&mut tab.layout, target_pane, pane, activate) {
+            bail!("target pane {target_pane} does not exist");
+        }
+        state.panes.insert(
+            pane_id,
+            RuntimePane {
+                backend: RuntimePaneBackend::Gallery,
             },
         );
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
@@ -244,7 +299,7 @@ impl SessionRegistry {
     ) -> Result<InitialTerminalSpawn> {
         match connection {
             WorkspaceConnection::Local => Ok(InitialTerminalSpawn {
-                session: PtySession::spawn_local(pane_id, workspace_id, cwd, &self.history)?,
+                session: self.spawn_local_transport(pane_id, workspace_id, cwd)?,
                 kind: RuntimePaneKind::Local,
                 pane_title: "Terminal 1".to_owned(),
                 pane_shell: shell_title(),
@@ -421,7 +476,7 @@ impl SessionRegistry {
                 workspace
                     .tabs
                     .iter_mut()
-                    .any(|tab| add_tab(&mut tab.layout, target_pane, pane.clone()))
+                    .any(|tab| add_tab(&mut tab.layout, target_pane, pane.clone(), true))
             });
             if !did_add {
                 bail!("target pane {target_pane} does not exist");
@@ -509,8 +564,111 @@ impl SessionRegistry {
         Ok(pane_id)
     }
 
+    pub fn create_gallery_tab(&self, workspace_id: Uuid) -> Result<Uuid> {
+        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
+        let pane_id = Uuid::new_v4();
+        let mut state = self.state.write();
+        if state.panes.len() >= MAX_PANES {
+            bail!("pane limit of {MAX_PANES} reached");
+        }
+        let workspace = state
+            .snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+        if workspace.tabs.len() >= MAX_TABS_PER_WORKSPACE {
+            bail!("workstation tab limit of {MAX_TABS_PER_WORKSPACE} reached");
+        }
+        workspace.tabs.push(Tab {
+            id: Uuid::new_v4(),
+            title: "Gallery".to_owned(),
+            custom_title: None,
+            project_dir: None,
+            color: None,
+            custom_icon: None,
+            parent_tab: None,
+            pinned: false,
+            layout: PaneLayout::Leaf {
+                pane: Pane {
+                    id: pane_id,
+                    kind: PaneKind::Gallery,
+                    title: "Gallery".to_owned(),
+                    shell: String::new(),
+                    color: None,
+                    identity: TerminalIdentity::default(),
+                    status: PaneStatus::default(),
+                    custom_title: None,
+                    profile_override: None,
+                    custom_icon: None,
+                },
+            },
+        });
+        state.panes.insert(
+            pane_id,
+            RuntimePane {
+                backend: RuntimePaneBackend::Gallery,
+            },
+        );
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)?;
+        Ok(pane_id)
+    }
+
+    pub fn add_gallery_image(
+        &self,
+        workspace_id: Uuid,
+        origin_pane: Option<Uuid>,
+        source: &str,
+    ) -> Result<(PathBuf, Uuid)> {
+        let path = import_gallery_image(workspace_id, Path::new(source))?;
+        let (gallery_pane, group_origin) = {
+            let state = self.state.read();
+            let workspace = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+            let origin_tab = origin_pane.and_then(|origin| {
+                workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| layout_contains(&tab.layout, origin))
+            });
+            let gallery_pane = origin_tab
+                .and_then(|tab| first_gallery_pane(&tab.layout))
+                .or_else(|| {
+                    workspace
+                        .tabs
+                        .iter()
+                        .find_map(|tab| first_gallery_pane(&tab.layout))
+                });
+            (gallery_pane, origin_pane.filter(|_| origin_tab.is_some()))
+        };
+        let pane_id = match (gallery_pane, group_origin) {
+            (Some(pane_id), _) => pane_id,
+            (None, Some(origin_pane)) => self.create_group_gallery(origin_pane, false)?,
+            (None, None) => self.create_gallery_tab(workspace_id)?,
+        };
+        Ok((path, pane_id))
+    }
+
+    /// Creates an assistant tab and persists it before starting its runtime.
+    ///
+    /// # Panics
+    /// Panics if the new tab's workspace disappears while the registry write lock is held.
     pub fn create_assistant_tab(&self, workspace_id: Uuid) -> Result<Uuid> {
         let pane_id = Uuid::new_v4();
+        let new_tab_id = Uuid::new_v4();
+        let runtime = crate::assistant::thread::AssistantRuntime::new(
+            pane_id,
+            workspace_id,
+            Arc::clone(&self.assistant_discovery),
+            Arc::clone(&self.coding_agents),
+        )?;
         let mut state = self.state.write();
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
@@ -530,7 +688,7 @@ impl SessionRegistry {
             "Assistant".to_owned()
         };
         workspace.tabs.push(Tab {
-            id: Uuid::new_v4(),
+            id: new_tab_id,
             title: tab_title,
             custom_title: None,
             project_dir: None,
@@ -556,18 +714,44 @@ impl SessionRegistry {
         state.panes.insert(
             pane_id,
             RuntimePane {
-                backend: RuntimePaneBackend::Assistant,
+                backend: RuntimePaneBackend::Assistant(Arc::clone(&runtime)),
             },
         );
+        let previous_revision = state.snapshot.revision;
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
+        if let Err(error) = self.write_snapshot(&bytes) {
+            state
+                .snapshot
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == workspace_id)
+                .expect("assistant workspace remains")
+                .tabs
+                .retain(|tab| tab.id != new_tab_id);
+            state.panes.remove(&pane_id);
+            state.snapshot.revision = previous_revision;
+            return Err(error);
+        }
         drop(state);
-        self.write_snapshot(&bytes)?;
+        runtime.bind_registry(&self.state);
+        runtime.start();
         Ok(pane_id)
     }
 
+    /// Adds an assistant to the target pane's group and persists it before starting.
+    ///
+    /// # Panics
+    /// Panics if either pane disappears during rollback while the registry write lock is held.
     pub fn create_group_assistant(&self, target_pane: Uuid) -> Result<Uuid> {
         let pane_id = Uuid::new_v4();
+        let workspace_id = self.workspace_for_pane(target_pane)?;
+        let runtime = crate::assistant::thread::AssistantRuntime::new(
+            pane_id,
+            workspace_id,
+            Arc::clone(&self.assistant_discovery),
+            Arc::clone(&self.coding_agents),
+        )?;
         let mut state = self.state.write();
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
@@ -595,19 +779,35 @@ impl SessionRegistry {
             profile_override: None,
             custom_icon: None,
         };
-        if !add_tab(&mut tab.layout, target_pane, pane) {
+        if !add_tab(&mut tab.layout, target_pane, pane, true) {
             bail!("target pane {target_pane} does not exist");
         }
         state.panes.insert(
             pane_id,
             RuntimePane {
-                backend: RuntimePaneBackend::Assistant,
+                backend: RuntimePaneBackend::Assistant(Arc::clone(&runtime)),
             },
         );
+        let previous_revision = state.snapshot.revision;
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
+        if let Err(error) = self.write_snapshot(&bytes) {
+            let tab = state
+                .snapshot
+                .workspaces
+                .iter_mut()
+                .flat_map(|workspace| &mut workspace.tabs)
+                .find(|tab| layout_contains(&tab.layout, pane_id))
+                .expect("new assistant pane remains");
+            let (_, remaining) = detach_pane(tab.layout.clone(), pane_id);
+            tab.layout = remaining.expect("target pane remains");
+            state.panes.remove(&pane_id);
+            state.snapshot.revision = previous_revision;
+            return Err(error);
+        }
         drop(state);
-        self.write_snapshot(&bytes)?;
+        runtime.bind_registry(&self.state);
+        runtime.start();
         Ok(pane_id)
     }
 
@@ -640,6 +840,16 @@ impl SessionRegistry {
     pub fn rename_pane(&self, pane_id: Uuid, title: &str) -> Result<()> {
         let title = title.trim();
         validate_title(title, "terminal")?;
+        let terminal = self
+            .state
+            .read()
+            .panes
+            .get(&pane_id)
+            .and_then(RuntimePane::terminal)
+            .map(|terminal| Arc::clone(&terminal.session));
+        if let Some(terminal) = terminal {
+            terminal.rename_tmux_window(title)?;
+        }
         let mut state = self.state.write();
         let pane = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
             .with_context(|| format!("pane {pane_id} does not exist"))?;
@@ -740,7 +950,7 @@ impl SessionRegistry {
     }
 
     pub fn close_pane(&self, pane_id: Uuid) -> Result<()> {
-        let (session, was_terminal) = {
+        let (session, assistant, was_terminal) = {
             let mut state = self.state.write();
             let pane_exists = state.snapshot.workspaces.iter().any(|workspace| {
                 workspace
@@ -757,6 +967,7 @@ impl SessionRegistry {
             let session = runtime
                 .and_then(RuntimePane::terminal)
                 .map(|terminal| Arc::clone(&terminal.session));
+            let assistant = runtime.and_then(RuntimePane::assistant).map(Arc::clone);
             let shell_label = runtime
                 .and_then(RuntimePane::terminal)
                 .map(|terminal| terminal.kind.shell_label());
@@ -773,11 +984,17 @@ impl SessionRegistry {
                 drop(state);
                 self.write_snapshot(&bytes)?;
             }
-            (session, was_terminal)
+            (session, assistant, was_terminal)
         };
         if let Some(session) = session {
             session.terminate_and_wait()?;
         }
+        let assistant_cleanup_error = if let Some(assistant) = assistant {
+            assistant.shutdown();
+            assistant.remove_session_dir().err()
+        } else {
+            None
+        };
 
         let mut state = self.state.write();
         let mut did_close = false;
@@ -814,7 +1031,11 @@ impl SessionRegistry {
         let bytes = encode_desired_state(&state)?;
         drop(state);
         drop(removed);
-        self.write_snapshot(&bytes)
+        self.write_snapshot(&bytes)?;
+        if let Some(error) = assistant_cleanup_error {
+            return Err(error).context("remove assistant session directory");
+        }
+        Ok(())
     }
 
     /// Respawns one pane whose process exited, in place, keeping its tab,
@@ -827,7 +1048,7 @@ impl SessionRegistry {
     /// session that no longer exists fails here instead of registering a fake
     /// live tab.
     pub fn reattach_pane(&self, pane_id: Uuid) -> Result<()> {
-        let (kind, cwd, workspace_id) = {
+        let (kind, cwd, workspace_id, managed_tmux) = {
             let state = self.state.read();
             let runtime = state.terminal_pane(pane_id)?;
             if runtime.exit_status.is_none() {
@@ -839,9 +1060,17 @@ impl SessionRegistry {
                 runtime.kind.clone(),
                 runtime.last_valid_cwd.clone(),
                 workspace_id,
+                runtime.session.tmux_ids().is_some(),
             )
         };
         let session = match &kind {
+            RuntimePaneKind::Local if managed_tmux => PtySession::spawn_tmux(
+                pane_id,
+                workspace_id,
+                &cwd,
+                &self.client_for_workspace(workspace_id)?,
+                &self.history,
+            )?,
             RuntimePaneKind::Local => {
                 PtySession::spawn_local(pane_id, workspace_id, &cwd, &self.history)?
             }
@@ -874,9 +1103,6 @@ impl SessionRegistry {
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
-        // Terminate the previous transport only after releasing the state
-        // lock: teardown performs bounded thread joins and must never block
-        // the registry (mirrors `close_pane`).
         let _ = previous.terminate_and_wait();
         drop(previous);
         self.write_snapshot(&bytes)
@@ -1033,6 +1259,7 @@ mod tests {
     use crate::pty::{TEST_LOCAL_SSH_SEAM_ENABLED, validate_terminal_dimensions};
     use crate::registry::{SessionRegistry, create_owner_only_directory};
     use hh_protocol::DropPlacement;
+    use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::thread;
@@ -1460,5 +1687,110 @@ mod tests {
         assert_eq!(*axis, SplitAxis::Vertical);
         assert_eq!(first_pane_in_layout(top), second);
         assert_eq!(first_pane_in_layout(bottom), nested);
+    }
+    #[test]
+    fn failed_assistant_tab_persistence_rolls_back_snapshot_and_runtime() {
+        let directory =
+            std::env::temp_dir().join(format!("hh-assistant-tab-rollback-{}", Uuid::new_v4()));
+        create_owner_only_directory(&directory);
+        let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
+        let before = registry.snapshot().unwrap();
+        let workspace_id = before.workspaces[0].id;
+        registry
+            .store
+            .as_ref()
+            .unwrap()
+            .inject_failure_before_replace(true);
+
+        assert!(registry.create_assistant_tab(workspace_id).is_err());
+        assert_eq!(registry.snapshot().unwrap(), before);
+        assert_eq!(registry.state.read().panes.len(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_group_assistant_persistence_rolls_back_layout_and_runtime() {
+        let directory =
+            std::env::temp_dir().join(format!("hh-group-assistant-rollback-{}", Uuid::new_v4()));
+        create_owner_only_directory(&directory);
+        let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
+        let before = registry.snapshot().unwrap();
+        let target_pane = first_pane_id(&before).unwrap();
+        registry
+            .store
+            .as_ref()
+            .unwrap()
+            .inject_failure_before_replace(true);
+
+        assert!(registry.create_group_assistant(target_pane).is_err());
+        assert_eq!(registry.snapshot().unwrap(), before);
+        assert_eq!(registry.state.read().panes.len(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn add_gallery_image_opens_a_gallery_beside_the_origin_pane_without_activating_it() {
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0x64, 0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47,
+            0xba, 0x92, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let source = std::env::temp_dir().join(format!("hh-gallery-{}.png", Uuid::new_v4()));
+        fs::write(&source, PNG).unwrap();
+        let registry = SessionRegistry::new().unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let workspace_id = snapshot.workspaces[0].id;
+        let first_pane = first_pane_id(&snapshot).unwrap();
+
+        let (destination, gallery_pane) = registry
+            .add_gallery_image(workspace_id, Some(first_pane), source.to_str().unwrap())
+            .unwrap();
+
+        let snapshot = registry.snapshot().unwrap();
+        let PaneLayout::Stack { panes, active } = &snapshot.workspaces[0].tabs[0].layout else {
+            panic!("gallery should join the origin pane's tab");
+        };
+        assert_eq!(*active, first_pane);
+        assert!(
+            panes
+                .iter()
+                .any(|pane| { pane.id == gallery_pane && matches!(pane.kind, PaneKind::Gallery) })
+        );
+        assert!(destination.exists());
+        assert!(destination.starts_with(hh_protocol::gallery_directory(workspace_id).unwrap()));
+        assert_eq!(
+            destination.extension().and_then(|ext| ext.to_str()),
+            Some("png")
+        );
+
+        let (second_destination, reused_pane) = registry
+            .add_gallery_image(workspace_id, Some(first_pane), source.to_str().unwrap())
+            .unwrap();
+        assert_eq!(reused_pane, gallery_pane);
+
+        fs::remove_file(source).unwrap();
+        fs::remove_file(destination).unwrap();
+        if second_destination.exists() {
+            fs::remove_file(second_destination).unwrap();
+        }
+    }
+
+    #[test]
+    fn add_gallery_image_rejects_non_images() {
+        let source = std::env::temp_dir().join(format!("hh-gallery-{}.txt", Uuid::new_v4()));
+        fs::write(&source, b"not an image").unwrap();
+        let registry = SessionRegistry::new().unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let workspace_id = snapshot.workspaces[0].id;
+        let first_pane = first_pane_id(&snapshot).unwrap();
+
+        let error = registry
+            .add_gallery_image(workspace_id, Some(first_pane), source.to_str().unwrap())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not a PNG"));
+        fs::remove_file(source).unwrap();
     }
 }

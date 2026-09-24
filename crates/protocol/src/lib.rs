@@ -19,7 +19,7 @@
 /// version independently and MUST NOT force a wire bump. Because the
 /// handshake is strict equality, a bump orphans every live service until
 /// the desktop relaunches them.
-pub const PROTOCOL_VERSION: u16 = 35;
+pub const PROTOCOL_VERSION: u16 = 38;
 
 pub const MAX_SSH_HOST_LEN: usize = 253;
 pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;
@@ -27,6 +27,9 @@ pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;
 pub const MAX_BROWSER_URL_LEN: usize = 8 * 1024;
 pub const DEFAULT_BROWSER_URL: &str = "about:blank";
 pub const MAX_WORKSPACE_DIR_BYTES: usize = 4096;
+pub const MAX_ASSISTANT_ENTRIES: usize = 200;
+pub const MAX_ASSISTANT_PROMPT_CHARS: usize = 32 * 1024;
+pub const MAX_ASSISTANT_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
 pub const MAX_PANES: usize = 32;
 pub const MIN_TERMINAL_COLUMNS: u16 = 2;

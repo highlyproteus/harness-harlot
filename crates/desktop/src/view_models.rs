@@ -148,12 +148,6 @@ impl AssistantComposer {
         self.text.replace_range(selection, "");
         Some(selected)
     }
-
-    pub(super) fn all_selected(&self) -> bool {
-        self.selection
-            .as_ref()
-            .is_some_and(|selection| selection.start == 0 && selection.end == self.text.len())
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1057,6 +1051,38 @@ pub(super) enum Modal {
     GroupMenu(GroupMenu),
     WorkspaceConnectionInfo(WorkspaceConnectionInfo),
     AppearanceSettings,
+    AssistantModels,
+}
+
+/// One visible panel on the Settings page; the left list selects it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum SettingsSection {
+    #[default]
+    Appearance,
+    Assistant,
+    Voice,
+    History,
+    Updates,
+}
+
+impl SettingsSection {
+    pub(super) const ALL: [Self; 5] = [
+        Self::Appearance,
+        Self::Assistant,
+        Self::Voice,
+        Self::History,
+        Self::Updates,
+    ];
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Assistant => "Assistant",
+            Self::Voice => "Voice",
+            Self::History => "History",
+            Self::Updates => "Updates",
+        }
+    }
 }
 
 impl Modal {

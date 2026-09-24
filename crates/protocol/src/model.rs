@@ -15,11 +15,33 @@ pub struct SessionSnapshot {
     pub revision: u64,
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    #[serde(default)]
+    pub assistant: AssistantSettings,
     /// Ephemeral transport authority projected by the local session service.
     /// Missing entries are intentionally treated as unknown and fail closed.
     #[serde(default)]
     pub terminal_transports: HashMap<Uuid, TerminalTransport>,
     pub workspaces: Vec<Workspace>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantAccess {
+    #[default]
+    Full,
+    Confirm,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssistantSettings {
+    #[serde(default)]
+    pub access: AssistantAccess,
+    /// pi model as "provider/id"; None = pi's own default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Preferred installed coding agent; None lets the orchestrator choose among installed agents.
+    #[serde(default)]
+    pub preferred_agent: Option<TerminalProfile>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,6 +130,7 @@ impl SessionSnapshot {
         Self {
             revision: 0,
             appearance: AppearanceSettings::default(),
+            assistant: AssistantSettings::default(),
             terminal_transports: HashMap::new(),
             workspaces: vec![Workspace {
                 id: Uuid::new_v4(),
@@ -328,6 +351,7 @@ pub enum PaneKind {
         url: String,
     },
     Assistant,
+    Gallery,
 }
 
 impl PaneKind {
@@ -336,7 +360,7 @@ impl PaneKind {
     pub fn is_browser(&self) -> bool {
         match self {
             Self::Browser { .. } => true,
-            Self::Terminal | Self::Assistant => false,
+            Self::Terminal | Self::Assistant | Self::Gallery => false,
         }
     }
 
@@ -345,7 +369,7 @@ impl PaneKind {
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::Terminal => true,
-            Self::Browser { .. } | Self::Assistant => false,
+            Self::Browser { .. } | Self::Assistant | Self::Gallery => false,
         }
     }
 
@@ -354,7 +378,15 @@ impl PaneKind {
     pub fn is_assistant(&self) -> bool {
         match self {
             Self::Assistant => true,
-            Self::Terminal | Self::Browser { .. } => false,
+            Self::Terminal | Self::Browser { .. } | Self::Gallery => false,
+        }
+    }
+
+    /// Whether this pane renders an image gallery.
+    pub const fn is_gallery(&self) -> bool {
+        match self {
+            Self::Gallery => true,
+            Self::Terminal | Self::Browser { .. } | Self::Assistant => false,
         }
     }
 }
@@ -424,6 +456,16 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<PaneKind>(serde_json::to_value(&assistant).unwrap()).unwrap(),
             assistant
+        );
+
+        let gallery = PaneKind::Gallery;
+        assert_eq!(
+            serde_json::to_value(&gallery).unwrap(),
+            serde_json::json!({ "type": "gallery" })
+        );
+        assert_eq!(
+            serde_json::from_value::<PaneKind>(serde_json::to_value(&gallery).unwrap()).unwrap(),
+            gallery
         );
     }
 

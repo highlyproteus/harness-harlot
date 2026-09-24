@@ -1,8 +1,8 @@
 //! The root Render implementation.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent,
-    ParentElement, Render, Styled, Window, div, px, rgb,
+    AnyElement, Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseMoveEvent, ParentElement, Pixels, Render, Styled, Window, div, px, rgb,
 };
 
 use crate::HhApp;
@@ -14,40 +14,16 @@ use crate::input::browser_url_editor_is_active;
 use crate::view_models::{ColorTarget, DialogAction, Modal};
 use crate::{
     ConsumeChordPrefix, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp, NewBrowserTab,
-    NewTab, NewWorkspace, PaneDrag, ReattachPane, RetryTerminalInput, ShowCommandPalette,
-    ShowNotifications, ShowSettings, SplitDown, SplitRight, THEME, TerminalZoomIn, TerminalZoomOut,
-    TogglePaneZoom, ToggleSidebar, ToggleVoiceMic,
+    NewGalleryTab, NewTab, NewWorkspace, PaneDrag, ReattachPane, RetryTerminalInput,
+    ShowCommandPalette, ShowNotifications, ShowSettings, SplitDown, SplitRight, THEME,
+    TerminalZoomIn, TerminalZoomOut, TogglePaneZoom, ToggleSidebar, ToggleVoiceMic,
 };
 
-impl Render for HhApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.update_window_geometry(window);
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-        self.schedule_browser_presentation(window, cx);
-
-        // The workspace dialog has its own focus targets. A pointer click on
-        // the sidebar button must not leave native text input attached to the
-        // terminal behind the dialog.
-        if let Some(dialog) = self.editor.modal.workspace_creation() {
-            self.editor.workspace_input_focus[dialog.field.index()].focus(window);
-        } else if browser_url_editor_is_active(
-            self.editor
-                .browser_url_editor
-                .as_ref()
-                .map(|editor| editor.pane_id),
-            self.layout.focused_pane,
-        ) || self.editor.modal.pane_rename().is_some()
-            || self.editor.modal.workspace_rename().is_some()
-            || self.editor.modal.group_rename().is_some()
-            || self.editor.modal.dir_editor().is_some()
-        {
-            // Keep custom text editors on the root input route so native child
-            // views cannot consume replacement typing.
-            self.focus_handle.focus(window);
-        }
-        let menu_max_height = window.viewport_size().height - px(16.0);
-        let modal_element = match &self.editor.modal {
+impl HhApp {
+    fn render_modal(&self, menu_max_height: Pixels, cx: &mut Context<Self>) -> Option<AnyElement> {
+        match &self.editor.modal {
             Modal::None | Modal::AppearanceSettings | Modal::Search(_) => None,
+            Modal::AssistantModels => Some(self.render_assistant_models(cx)),
             Modal::CommandPalette(palette) => Some(self.render_command_palette(palette, cx)),
             Modal::WorkspaceCreation(dialog) => {
                 Some(self.render_workspace_creation_dialog(dialog, cx))
@@ -98,7 +74,38 @@ impl Render for HhApp {
             Modal::WorkspaceConnectionInfo(info) => {
                 Some(self.render_workspace_connection_info(info, cx))
             }
-        };
+        }
+    }
+}
+
+impl Render for HhApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.update_window_geometry(window);
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+        self.schedule_browser_presentation(window, cx);
+
+        // The workspace dialog has its own focus targets. A pointer click on
+        // the sidebar button must not leave native text input attached to the
+        // terminal behind the dialog.
+        if let Some(dialog) = self.editor.modal.workspace_creation() {
+            self.editor.workspace_input_focus[dialog.field.index()].focus(window);
+        } else if browser_url_editor_is_active(
+            self.editor
+                .browser_url_editor
+                .as_ref()
+                .map(|editor| editor.pane_id),
+            self.layout.focused_pane,
+        ) || self.editor.modal.pane_rename().is_some()
+            || self.editor.modal.workspace_rename().is_some()
+            || self.editor.modal.group_rename().is_some()
+            || self.editor.modal.dir_editor().is_some()
+        {
+            // Keep custom text editors on the root input route so native child
+            // views cannot consume replacement typing.
+            self.focus_handle.focus(window);
+        }
+        let menu_max_height = window.viewport_size().height - px(16.0);
+        let modal_element = self.render_modal(menu_max_height, cx);
 
         div()
             .key_context(if self.editor.modal.command_palette().is_some() {
@@ -164,6 +171,10 @@ impl Render for HhApp {
             }))
             .on_action(cx.listener(|this, _: &NewBrowserTab, _, cx| {
                 this.execute_command(AppCommand::NewBrowserTab, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &NewGalleryTab, _, cx| {
+                this.execute_command(AppCommand::NewGalleryTab, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &TerminalZoomIn, _, cx| {

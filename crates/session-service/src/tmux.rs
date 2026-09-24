@@ -142,7 +142,15 @@ pub(crate) fn system_tmux_binary() -> Result<PathBuf> {
             return Ok(resolved);
         }
     }
-    bail!("trusted tmux executable was not found in a supported system location")
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+            let candidate = directory.join("tmux");
+            if is_trusted_executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    bail!("trusted tmux executable was not found")
 }
 
 pub(crate) fn tmux_local_probe_command() -> Result<Command> {

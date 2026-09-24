@@ -172,12 +172,13 @@ are live or their count is unavailable. The installer then:
 4. Replaces the app and command link, retains `.Harness Harlot.previous.app`,
    and launches a fresh desktop. Replacement failures restore the prior bundle.
 
-Local terminal layouts recover with fresh shells in their last valid directories;
-arbitrary running programs and live terminal output do not survive a service
-restart. SSH tabs remain offline until explicitly reconnected. CLI updates
-without `--restart-service` still require a quiescent incompatible service.
-Already-installed older updater binaries retain their old quiescence gate until
-they have themselves been replaced.
+Local terminals managed by HH's private tmux server resume with their processes
+and output after the service restarts. Missing or failed tmux recovery falls
+back to fresh shells in the last valid directories. SSH tabs remain offline
+until explicitly reconnected. CLI updates without `--restart-service` still
+require a quiescent incompatible service. Already-installed older updater
+binaries retain their old quiescence gate until they have themselves been
+replaced.
 
 Linux releases use the verified `.tar.gz` and `hh-update-tool install-local`
 flow instead of a DMG. The unprivileged installer stages the application at

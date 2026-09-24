@@ -23,6 +23,17 @@ pub(crate) fn assistant_composer_is_active(
     composer_pane.is_some() && composer_pane == focused_pane
 }
 
+fn assistant_approval_key(key: &str, unmodified: bool, composer_active: bool) -> Option<bool> {
+    if !unmodified || composer_active {
+        return None;
+    }
+    match key {
+        "enter" => Some(true),
+        "escape" => Some(false),
+        _ => None,
+    }
+}
+
 pub(crate) fn browser_url_editor_is_active(
     editor_pane: Option<Uuid>,
     focused_pane: Option<Uuid>,
@@ -81,6 +92,7 @@ impl HhApp {
             AppCommand::ToggleSidebar => self.toggle_sidebar(cx),
             AppCommand::NewTab => self.new_tab(cx),
             AppCommand::NewBrowserTab => self.new_browser_tab(cx),
+            AppCommand::NewGalleryTab => self.new_gallery_tab(cx),
             AppCommand::TerminalZoomIn => self.adjust_terminal_zoom(1, cx),
             AppCommand::TerminalZoomOut => self.adjust_terminal_zoom(-1, cx),
             AppCommand::SplitRight => self.split(SplitAxis::Horizontal, cx),
@@ -109,7 +121,9 @@ impl HhApp {
                     self.toggle_assistant_mic(pane_id, cx);
                 }
             }
-            AppCommand::ShowSettings => self.open_appearance_settings(cx),
+            AppCommand::ShowSettings => {
+                self.open_settings(crate::view_models::SettingsSection::Appearance, cx);
+            }
         }
     }
 
@@ -473,13 +487,24 @@ impl HhApp {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) -> BrowserKeyRoute {
-        if !assistant_composer_is_active(
+        let composer_active = assistant_composer_is_active(
             self.editor
                 .assistant_composer
                 .as_ref()
                 .map(|composer| composer.pane_id),
             self.layout.focused_pane,
-        ) {
+        );
+        let unmodified = !event.keystroke.modifiers.platform
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt;
+        if let Some(allow) =
+            assistant_approval_key(event.keystroke.key.as_str(), unmodified, composer_active)
+            && self.respond_to_assistant_approval(allow)
+        {
+            cx.notify();
+            return BrowserKeyRoute::Consumed;
+        }
+        if !composer_active {
             return BrowserKeyRoute::NotEditing;
         }
 
@@ -500,12 +525,14 @@ impl HhApp {
                     .map(str::to_owned)
                     .or_else(|| {
                         let pane_id = self.layout.focused_pane?;
-                        let session = self.voice.sessions.get(&pane_id)?;
-                        let index = session.selected_transcript?;
-                        session
-                            .transcript
+                        let pane = self.assistant.panes.get(&pane_id)?;
+                        let index = pane.selected_entry?;
+                        pane.view
+                            .as_ref()?
+                            .entries
                             .get(index)
-                            .map(|entry| entry.text.clone())
+                            .map(crate::voice::assistant_entry_text)
+                            .map(str::to_owned)
                     });
                 if let Some(selected) = selected {
                     cx.write_to_clipboard(ClipboardItem::new_string(selected));
@@ -585,6 +612,7 @@ impl HhApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn handle_key(
         &mut self,
         event: &KeyDownEvent,
@@ -690,12 +718,19 @@ impl HhApp {
                 return;
             }
             Modal::AppearanceSettings => {
-                if keystroke.key == "escape" && self.voice.settings_editor.active_field.is_none() {
+                if keystroke.key == "escape"
+                    && self.assistant.settings_editor.active_field.is_none()
+                {
                     self.editor.modal = Modal::None;
                     cx.notify();
                 } else {
                     self.handle_voice_settings_key(keystroke, cx);
                 }
+                cx.stop_propagation();
+                return;
+            }
+            Modal::AssistantModels => {
+                self.handle_assistant_models_key(keystroke, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -1044,7 +1079,10 @@ impl EntityInputHandler for HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{assistant_composer_is_active, browser_key_text, browser_url_editor_is_active};
+    use super::{
+        assistant_approval_key, assistant_composer_is_active, browser_key_text,
+        browser_url_editor_is_active,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -1075,6 +1113,17 @@ mod tests {
         ));
         assert!(!assistant_composer_is_active(Some(composer), None));
         assert!(!assistant_composer_is_active(None, Some(composer)));
+    }
+
+    #[test]
+    fn assistant_approval_keys_require_an_inactive_composer() {
+        assert_eq!(assistant_approval_key("enter", true, false), Some(true));
+        assert_eq!(assistant_approval_key("escape", true, false), Some(false));
+        assert_eq!(assistant_approval_key("y", true, false), None);
+        assert_eq!(assistant_approval_key("n", true, false), None);
+        assert_eq!(assistant_approval_key("enter", false, false), None);
+        assert_eq!(assistant_approval_key("enter", true, true), None);
+        assert_eq!(assistant_approval_key("escape", true, true), None);
     }
 
     #[test]

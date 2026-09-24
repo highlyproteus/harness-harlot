@@ -263,7 +263,7 @@ impl SessionRegistry {
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
-        let session = PtySession::spawn_local(pane_id, workspace_id, &cwd, &self.history)?;
+        let session = self.spawn_local_transport(pane_id, workspace_id, &cwd)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
@@ -349,6 +349,12 @@ impl SessionRegistry {
         let workspace_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
+        let runtime = crate::assistant::thread::AssistantRuntime::new(
+            pane_id,
+            workspace_id,
+            Arc::clone(&self.assistant_discovery),
+            Arc::clone(&self.coding_agents),
+        )?;
         let mut state = self.state.write();
         if state.snapshot.workspaces.len() >= MAX_WORKSPACES {
             bail!("workstation limit of {MAX_WORKSPACES} reached");
@@ -405,7 +411,7 @@ impl SessionRegistry {
         state.panes.insert(
             pane_id,
             RuntimePane {
-                backend: RuntimePaneBackend::Assistant,
+                backend: RuntimePaneBackend::Assistant(Arc::clone(&runtime)),
             },
         );
         let previous_revision = state.snapshot.revision;
@@ -420,6 +426,9 @@ impl SessionRegistry {
             state.snapshot.revision = previous_revision;
             return Err(error);
         }
+        drop(state);
+        runtime.bind_registry(&self.state);
+        runtime.start();
         Ok((workspace_id, pane_id))
     }
 
@@ -955,7 +964,7 @@ impl SessionRegistry {
     }
 
     pub fn delete_workspace(&self, workspace_id: Uuid) -> Result<()> {
-        let (pane_ids, sessions) = {
+        let (pane_ids, sessions, assistants, tmux_client) = {
             let state = self.state.read();
             if state.snapshot.workspaces.len() <= 1 {
                 bail!("the last workstation cannot be deleted");
@@ -977,10 +986,34 @@ impl SessionRegistry {
                         .map(|terminal| Arc::clone(&terminal.session))
                 })
                 .collect::<Vec<_>>();
-            (pane_ids, sessions)
+            let assistants = pane_ids
+                .iter()
+                .filter_map(|pane_id| state.panes.get(pane_id)?.assistant().map(Arc::clone))
+                .collect::<Vec<_>>();
+            let tmux_client = state.tmux_clients.get(&workspace_id).cloned();
+            (pane_ids, sessions, assistants, tmux_client)
         };
         for session in &sessions {
             let _ = session.terminate_and_wait();
+        }
+        let mut cleanup_errors: Vec<anyhow::Error> = Vec::new();
+        for assistant in &assistants {
+            assistant.shutdown();
+            if let Err(error) = assistant.remove_session_dir() {
+                cleanup_errors.push(error);
+            }
+        }
+        if let Some(directory) = hh_protocol::gallery_directory(workspace_id)
+            && let Err(error) = std::fs::remove_dir_all(&directory)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            cleanup_errors.push(
+                anyhow::Error::new(error)
+                    .context(format!("remove gallery directory {}", directory.display())),
+            );
+        }
+        if let Some(client) = tmux_client {
+            let _ = client.kill_session();
         }
         let mut state = self.state.write();
         if state.snapshot.workspaces.len() <= 1 {
@@ -998,12 +1031,18 @@ impl SessionRegistry {
             .into_iter()
             .filter_map(|pane_id| state.panes.remove(&pane_id))
             .collect::<Vec<_>>();
+        state.tmux_clients.remove(&workspace_id);
+        state.tmux_sinks.remove(&workspace_id);
         normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
         drop(removed);
-        self.write_snapshot(&bytes)
+        self.write_snapshot(&bytes)?;
+        if let Some(error) = cleanup_errors.into_iter().next() {
+            return Err(error).context("clean up workstation resources");
+        }
+        Ok(())
     }
 }
 
