@@ -481,7 +481,12 @@ impl HhApp {
                 .focused_pane
                 .is_some_and(|pane_id| self.pane_is_bot(pane_id))
         {
-            self.set_sidebar_mode(SidebarMode::Workstations, cx);
+            let back = if self.sidebar.sidebar_mode == SidebarMode::Notifications {
+                self.sidebar.notifications_return
+            } else {
+                SidebarMode::Workstations
+            };
+            self.set_sidebar_mode(back, cx);
             cx.stop_propagation();
             return;
         }

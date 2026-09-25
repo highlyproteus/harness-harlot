@@ -54,6 +54,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Turning Notifications off (bell or Esc) returns to the view it was opened
+  from, Workstations or Bots, instead of always Workstations.
 - Every tab and terminal — top-bar tabs, pane header tabs, sidebar tab rows,
   window ring chips, and bot thread rows — now has an always-visible × that
   closes it with the usual confirmation, and one status slot: a spinner while

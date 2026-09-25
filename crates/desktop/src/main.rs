@@ -296,6 +296,8 @@ struct SidebarUi {
     preferred_sidebar_width: f32,
     sidebar_visible: bool,
     sidebar_mode: SidebarMode,
+    /// The view Notifications was opened from, restored when it is turned off.
+    notifications_return: SidebarMode,
     /// The workstation to return to when a bot view is left.
     return_workstation: Option<Uuid>,
     sidebar_pixels: f32,
@@ -327,6 +329,7 @@ impl SidebarUi {
             preferred_sidebar_width,
             sidebar_visible: true,
             sidebar_mode: SidebarMode::Workstations,
+            notifications_return: SidebarMode::Workstations,
             return_workstation: None,
             sidebar_pixels: default_sidebar_width(),
             workstation_banner,

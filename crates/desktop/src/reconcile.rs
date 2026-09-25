@@ -257,6 +257,7 @@ mod tests {
             preferred_sidebar_width: 200.0,
             sidebar_visible: true,
             sidebar_mode: crate::view_models::SidebarMode::Workstations,
+            notifications_return: crate::view_models::SidebarMode::Workstations,
             return_workstation: None,
             sidebar_pixels: 200.0,
             workstation_banner: None,

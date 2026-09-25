@@ -144,11 +144,19 @@ impl HhApp {
         if settings_open {
             self.close_settings(cx);
         }
-        let next = next_sidebar_mode(self.sidebar.sidebar_mode, mode, settings_open);
+        let next = next_sidebar_mode(
+            self.sidebar.sidebar_mode,
+            mode,
+            settings_open,
+            self.sidebar.notifications_return,
+        );
         self.set_sidebar_mode(next, cx);
     }
 
     pub(crate) fn set_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
+        if mode == SidebarMode::Notifications && self.sidebar.sidebar_mode != mode {
+            self.sidebar.notifications_return = self.sidebar.sidebar_mode;
+        }
         self.sidebar.sidebar_mode = mode;
         match mode {
             SidebarMode::Workstations => self.leave_bot_view(cx),
@@ -424,17 +432,19 @@ impl HhApp {
 }
 
 /// The view a toolbar mode button shows. With Settings open it shows its own
-/// view; otherwise a second click returns to Workstations, the home view, so
-/// the hammer always lands there.
+/// view. Otherwise a second click turns the view off: Notifications returns to
+/// the view it was opened from, and Bots to Workstations, the home view the
+/// hammer always lands on.
 fn next_sidebar_mode(
     current: SidebarMode,
     clicked: SidebarMode,
     settings_open: bool,
+    notifications_return: SidebarMode,
 ) -> SidebarMode {
-    if !settings_open && current == clicked {
-        SidebarMode::Workstations
-    } else {
-        clicked
+    match (settings_open || current != clicked, clicked) {
+        (true, _) => clicked,
+        (false, SidebarMode::Notifications) => notifications_return,
+        (false, _) => SidebarMode::Workstations,
     }
 }
 
@@ -448,24 +458,35 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn the_hammer_always_shows_workstations_and_other_modes_toggle_back_to_it() {
+    fn the_hammer_always_shows_workstations_and_other_modes_toggle_back() {
         use SidebarMode::{Bots, Notifications, Workstations};
         for current in [Workstations, Notifications, Bots] {
             for settings_open in [false, true] {
                 assert_eq!(
-                    next_sidebar_mode(current, Workstations, settings_open),
+                    next_sidebar_mode(current, Workstations, settings_open, Bots),
                     Workstations
                 );
             }
         }
-        assert_eq!(next_sidebar_mode(Workstations, Bots, false), Bots);
-        assert_eq!(next_sidebar_mode(Bots, Bots, false), Workstations);
         assert_eq!(
-            next_sidebar_mode(Notifications, Notifications, false),
+            next_sidebar_mode(Workstations, Bots, false, Workstations),
+            Bots
+        );
+        assert_eq!(
+            next_sidebar_mode(Bots, Bots, false, Workstations),
+            Workstations
+        );
+        // Notifications goes back to the view it was opened from.
+        assert_eq!(
+            next_sidebar_mode(Notifications, Notifications, false, Bots),
+            Bots
+        );
+        assert_eq!(
+            next_sidebar_mode(Notifications, Notifications, false, Workstations),
             Workstations
         );
         // Closing Settings shows the clicked view even if it was already the mode.
-        assert_eq!(next_sidebar_mode(Bots, Bots, true), Bots);
+        assert_eq!(next_sidebar_mode(Bots, Bots, true, Workstations), Bots);
     }
 
     #[test]
