@@ -77,8 +77,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Rebuilt Settings as a surface that fills the whole main area. While it is
   open, its Appearance / Bots / Updates section list replaces the left
   sidebar, the same way the bell and robot switch it. The ⚙ button toggles
-  Settings and closing it returns to the workstation or bot shown before. The ＋
-  menu also offers New Bot.
+  Settings and closing it returns to the workstation or bot shown before.
+- The sidebar toolbar is now hammer (Workstations), robot (Bots), bell
+  (Notifications), and ⚙ (Settings); the hammer always returns to your
+  workstations and closes Settings. The Workstations view has its own header
+  with a ＋ for a new workstation, like the Bots header. The global ＋ create
+  menu is removed: ⌘N opens New Workstation, and new tabs, browsers, and
+  galleries come from their shortcuts, the command palette, or the tab strip's
+  ＋ menu.
 - Bumped the desktop/service wire protocol from 35 to 44 for bots, bot
   workspaces and threads, bot thread deletion, workers, bot home folders,
   status timestamps, coding-agent discovery, Gallery panes, browser command

@@ -112,8 +112,9 @@ Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profil
 
 ## Bots
 
-Bots are the agents you talk to. Click the robot icon next to the notifications
-bell to switch the sidebar to your bots, create one with **New bot**, and pick
+Bots are the agents you talk to. The sidebar toolbar's hammer shows your
+workstations; click the robot beside it to switch the sidebar to your bots,
+create one with the ＋ in the Bots header, and pick
 which installed agent CLI runs it: omp, Hermes, Claude Code, Codex, Gemini, or
 another supported agent. Each bot runs its agent's own interface, so the agent's
 commands, settings, and voice mode work as usual. Right-click a bot to rename

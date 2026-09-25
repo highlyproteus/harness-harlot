@@ -121,6 +121,17 @@ pub(crate) fn render_sidebar_toggle_icon(sidebar_visible: bool) -> AnyElement {
         .into_any_element()
 }
 
+/// The Workstations toolbar mark: an SVG hammer tinted by `color`, the same
+/// 14px footprint as the bell and robot.
+pub(crate) fn render_hammer_icon(color: u32) -> AnyElement {
+    svg()
+        .path("agent-icons/hammer.svg")
+        .w(px(14.0))
+        .h(px(14.0))
+        .text_color(rgb(color))
+        .into_any_element()
+}
+
 pub(crate) fn render_bell_icon(color: u32) -> AnyElement {
     div()
         .relative()

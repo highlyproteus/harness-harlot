@@ -105,7 +105,8 @@ struct WorkspaceSectionCtx {
 }
 
 impl HhApp {
-    /// The scrollable workstation list, or the empty-state hint.
+    /// The Workstations view: its header, then the scrollable workstation
+    /// list or the empty-state hint.
     pub(crate) fn render_workstation_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut workspaces = self
             .session
@@ -122,27 +123,43 @@ impl HhApp {
         workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
         let has_workspaces = !workspaces.is_empty();
         div()
-            .id("sidebar-workstation-list")
             .min_h(px(0.0))
             .flex_1()
-            .overflow_y_scroll()
-            .children(
-                workspaces
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, workspace)| self.render_workspace_section(index, workspace, cx)),
+            .flex()
+            .flex_col()
+            .child(Self::render_sidebar_view_header(
+                "Workstations",
+                "new-workstation",
+                "New workstation",
+                Self::new_workspace,
+                cx,
+            ))
+            .child(
+                div()
+                    .id("sidebar-workstation-list")
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .children(
+                        workspaces
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, workspace)| {
+                                self.render_workspace_section(index, workspace, cx)
+                            }),
+                    )
+                    .when(!has_workspaces, |element| {
+                        element.child(
+                            div()
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .font_family(".SystemUIFont")
+                                .text_xs()
+                                .text_color(rgb(THEME.dim))
+                                .child("No workstations yet. Use ＋ above to add one."),
+                        )
+                    }),
             )
-            .when(!has_workspaces, |element| {
-                element.child(
-                    div()
-                        .px(px(14.0))
-                        .pb(px(6.0))
-                        .font_family(".SystemUIFont")
-                        .text_xs()
-                        .text_color(rgb(THEME.dim))
-                        .child("No workstations yet — use Add workstation above"),
-                )
-            })
             .into_any_element()
     }
 

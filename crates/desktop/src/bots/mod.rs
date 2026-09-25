@@ -138,17 +138,13 @@ impl HhApp {
         })
     }
 
-    /// The bell and robot buttons. With Settings open they close it and show
-    /// their view; otherwise a second click returns to the workstations.
+    /// The hammer, robot, and bell toolbar buttons; see `next_sidebar_mode`.
     pub(crate) fn toggle_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
-        let next = if matches!(self.editor.modal, Modal::AppearanceSettings) {
+        let settings_open = matches!(self.editor.modal, Modal::AppearanceSettings);
+        if settings_open {
             self.close_settings(cx);
-            mode
-        } else if self.sidebar.sidebar_mode == mode {
-            SidebarMode::Workstations
-        } else {
-            mode
-        };
+        }
+        let next = next_sidebar_mode(self.sidebar.sidebar_mode, mode, settings_open);
         self.set_sidebar_mode(next, cx);
     }
 
@@ -427,13 +423,50 @@ impl HhApp {
     }
 }
 
+/// The view a toolbar mode button shows. With Settings open it shows its own
+/// view; otherwise a second click returns to Workstations, the home view, so
+/// the hammer always lands there.
+fn next_sidebar_mode(
+    current: SidebarMode,
+    clicked: SidebarMode,
+    settings_open: bool,
+) -> SidebarMode {
+    if !settings_open && current == clicked {
+        SidebarMode::Workstations
+    } else {
+        clicked
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bot_entry_pane, default_bot_agent};
+    use super::{bot_entry_pane, default_bot_agent, next_sidebar_mode};
+    use crate::view_models::SidebarMode;
     use hh_protocol::{
         BotSpec, BotThreadPane, CodingAgent, PaneLayout, SessionSnapshot, TerminalProfile,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn the_hammer_always_shows_workstations_and_other_modes_toggle_back_to_it() {
+        use SidebarMode::{Bots, Notifications, Workstations};
+        for current in [Workstations, Notifications, Bots] {
+            for settings_open in [false, true] {
+                assert_eq!(
+                    next_sidebar_mode(current, Workstations, settings_open),
+                    Workstations
+                );
+            }
+        }
+        assert_eq!(next_sidebar_mode(Workstations, Bots, false), Bots);
+        assert_eq!(next_sidebar_mode(Bots, Bots, false), Workstations);
+        assert_eq!(
+            next_sidebar_mode(Notifications, Notifications, false),
+            Workstations
+        );
+        // Closing Settings shows the clicked view even if it was already the mode.
+        assert_eq!(next_sidebar_mode(Bots, Bots, true), Bots);
+    }
 
     #[test]
     fn a_bot_opens_on_its_most_recently_activated_live_thread_else_its_first_tab() {

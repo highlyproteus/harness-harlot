@@ -3,14 +3,13 @@ use crate::appearance::workstation_banner_artwork;
 use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
     SidebarSection, banner_fit_size, click_suppression_active, composite_rgb, element_key,
-    find_pane, identity_detail, readable_text_color, render_bell_icon, render_robot_icon,
-    render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
+    find_pane, identity_detail, readable_text_color, render_bell_icon, render_hammer_icon,
+    render_robot_icon, render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
     workstation_banner_header_height,
 };
 use crate::tab_chrome::{render_pane_indicator, render_unread_dot};
 use crate::view_models::{
-    CreateMenu, CreateMenuTarget, Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView,
-    UpdateRestartConfirmation,
+    Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView, UpdateRestartConfirmation,
 };
 use crate::{
     HhApp, MACOS_TRAFFIC_LIGHT_SAFE_INSET, SIDEBAR_RESIZE_HIT_WIDTH, SIDEBAR_RESIZE_VISUAL_WIDTH,
@@ -18,8 +17,8 @@ use crate::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, ClickEvent, Context, CursorStyle, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, Point, div, img, px, rgb, rgba,
+    AnyElement, Context, CursorStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, Point, div, img, px, rgb, rgba,
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::Pane;
@@ -336,7 +335,8 @@ impl HhApp {
         cx.notify();
     }
 
-    /// The 40px create / notifications / settings toolbar under the banner.
+    /// The 40px Workstations / Bots / Notifications / Settings toolbar under
+    /// the banner.
     pub(crate) fn render_sidebar_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings_open = matches!(
             self.editor.modal,
@@ -349,44 +349,11 @@ impl HhApp {
             .flex()
             .items_center()
             .gap(px(6.0))
-            .child(
-                div()
-                    .id("new-workspace")
-                    .flex_none()
-                    .w(px(26.0))
-                    .h(px(26.0))
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .bg(rgb(THEME.surface))
-                    .border_1()
-                    .border_color(rgb(THEME.border))
-                    .font_family(".SystemUIFont")
-                    .text_sm()
-                    .text_color(rgb(THEME.foreground))
-                    .hover(|element| element.border_color(rgb(THEME.accent)))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                        this.editor.modal = Modal::CreateMenu(CreateMenu {
-                            position: event.position(),
-                            target: CreateMenuTarget::Global,
-                        });
-                        cx.notify();
-                    }))
-                    .tooltip(|_, cx| {
-                        cx.new(|_| TooltipView {
-                            text: "Create… (⌘N)".to_owned(),
-                        })
-                        .into()
-                    })
-                    .child("＋"),
-            )
             .child(self.render_sidebar_mode_button(
-                SidebarMode::Notifications,
-                "Notifications",
-                render_bell_icon,
-                self.needs_you_count(),
+                SidebarMode::Workstations,
+                "Workstations",
+                render_hammer_icon,
+                0,
                 cx,
             ))
             .child(self.render_sidebar_mode_button(
@@ -394,6 +361,13 @@ impl HhApp {
                 "Bots",
                 render_robot_icon,
                 self.bots_needing_you(),
+                cx,
+            ))
+            .child(self.render_sidebar_mode_button(
+                SidebarMode::Notifications,
+                "Notifications",
+                render_bell_icon,
+                self.needs_you_count(),
                 cx,
             ))
             .when_some(self.editor.update_available.as_ref(), |toolbar, update| {
@@ -463,7 +437,7 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// A toolbar toggle for one sidebar mode, with a red count badge.
+    /// A toolbar button for one sidebar mode, with a red count badge.
     fn render_sidebar_mode_button(
         &self,
         mode: SidebarMode,
@@ -533,6 +507,61 @@ impl HhApp {
                         .child(count_label),
                 )
             })
+            .into_any_element()
+    }
+
+    /// The title row atop the Workstations and Bots views: `title` left, a
+    /// square ＋ button right that runs `on_add`.
+    fn render_sidebar_view_header(
+        title: &'static str,
+        add_id: &'static str,
+        add_tooltip: &'static str,
+        on_add: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .h(px(34.0))
+            .pl(px(12.0))
+            .pr(px(8.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(THEME.foreground))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .id(add_id)
+                    .flex_none()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .bg(rgb(THEME.surface))
+                    .border_1()
+                    .border_color(rgb(THEME.border))
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.foreground))
+                    .hover(|element| element.border_color(rgb(THEME.accent)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: add_tooltip.to_owned(),
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| on_add(this, cx)))
+                    .child("＋"),
+            )
             .into_any_element()
     }
 

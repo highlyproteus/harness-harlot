@@ -35,51 +35,13 @@ impl HhApp {
             .flex_1()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .h(px(34.0))
-                    .pl(px(12.0))
-                    .pr(px(8.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child("Bots"),
-                    )
-                    .child(
-                        div()
-                            .id("new-bot")
-                            .flex_none()
-                            .w(px(22.0))
-                            .h(px(22.0))
-                            .rounded(px(5.0))
-                            .cursor_pointer()
-                            .bg(rgb(THEME.surface))
-                            .border_1()
-                            .border_color(rgb(THEME.border))
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .hover(|element| element.border_color(rgb(THEME.accent)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "New bot".to_owned(),
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.begin_bot_creation(cx)))
-                            .child("＋"),
-                    ),
-            )
+            .child(Self::render_sidebar_view_header(
+                "Bots",
+                "new-bot",
+                "New bot",
+                Self::begin_bot_creation,
+                cx,
+            ))
             .child(
                 div()
                     .id("sidebar-bots")

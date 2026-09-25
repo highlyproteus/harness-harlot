@@ -15,9 +15,7 @@ use crate::helpers::{
     workspace_tab_set, workspace_tab_standalone_pane,
 };
 use crate::tab_chrome::render_pane_indicator;
-use crate::view_models::{
-    CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
-};
+use crate::view_models::{CreateMenu, Modal, TabDrag, TabDropPreview, TooltipView};
 use crate::{HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
 
 impl HhApp {
@@ -328,10 +326,8 @@ impl HhApp {
                         }
                         this.editor.modal = Modal::CreateMenu(CreateMenu {
                             position: event.position(),
-                            target: CreateMenuTarget::TabStrip {
-                                workspace_id,
-                                target_tab,
-                            },
+                            workspace_id,
+                            target_tab,
                         });
                         cx.notify();
                     }))

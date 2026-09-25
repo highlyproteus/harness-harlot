@@ -27,9 +27,10 @@ pub(crate) use geometry::{
     workstation_banner_header_height,
 };
 pub(crate) use icons::{
-    IDENTITY_MARK_SIZE, identity_detail, identity_label, render_bell_icon, render_robot_icon,
-    render_sidebar_toggle_icon, render_terminal_profile_icon, render_terminal_profile_mark,
-    resolved_terminal_accent, resolved_workspace_color, workspace_is_selectable,
+    IDENTITY_MARK_SIZE, identity_detail, identity_label, render_bell_icon, render_hammer_icon,
+    render_robot_icon, render_sidebar_toggle_icon, render_terminal_profile_icon,
+    render_terminal_profile_mark, resolved_terminal_accent, resolved_workspace_color,
+    workspace_is_selectable,
 };
 pub(crate) use layout::{
     apply_layout_control_mutation, collect_terminal_tabs, find_pane, inactive_stack_contains,

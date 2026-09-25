@@ -3,8 +3,8 @@ use crate::browser::{BrowserUrlEditor, browser_command_available, browser_unavai
 use crate::commands::{AppCommand, descriptor, palette_matches};
 use crate::helpers::{element_key, find_pane};
 use crate::view_models::{
-    ColorTarget, CommandPaletteState, CreateMenu, CreateMenuTarget, GroupMenu, Modal, TabMenu,
-    TooltipView, WorkspaceConnectionInfo, WorkspaceMenu,
+    ColorTarget, CommandPaletteState, CreateMenu, GroupMenu, Modal, TabMenu, TooltipView,
+    WorkspaceConnectionInfo, WorkspaceMenu,
 };
 use crate::{COMMAND_PALETTE_LIMIT, HhApp, THEME};
 use gpui::prelude::FluentBuilder;
@@ -461,81 +461,30 @@ impl HhApp {
         menu: CreateMenu,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let left = match menu.target {
-            CreateMenuTarget::Global => menu.position.x,
-            CreateMenuTarget::TabStrip { .. } => (menu.position.x - px(232.0)).max(px(0.0)),
-        };
-        let items = match menu.target {
-            CreateMenuTarget::Global => {
-                let mut items = vec![
-                    self.create_menu_item(
-                        "create-new-workstation",
-                        "New Workstation",
-                        cx,
-                        |this, cx| {
-                            this.new_workspace(cx);
-                        },
-                    ),
-                    self.create_menu_item("create-new-bot", "New Bot", cx, |this, cx| {
-                        this.begin_bot_creation(cx);
-                    }),
-                ];
-                // Tab items target the shown workstation, never a bot.
-                if self.active_workstation().is_some() {
-                    items.push(self.create_menu_item(
-                        "create-new-tab",
-                        "New Tab",
-                        cx,
-                        |this, cx| {
-                            if let Some(workspace_id) = this.active_workstation() {
-                                this.new_workspace_tab(workspace_id, cx);
-                            } else {
-                                cx.notify();
-                            }
-                        },
-                    ));
-                    items.push(self.create_menu_item(
-                        "create-new-browser",
-                        "New Browser",
-                        cx,
-                        |this, cx| {
-                            this.new_browser_tab(cx);
-                        },
-                    ));
-                    items.push(self.create_menu_item(
-                        "create-new-gallery",
-                        "New Gallery",
-                        cx,
-                        |this, cx| {
-                            this.new_gallery_tab(cx);
-                        },
-                    ));
-                }
-                items
-            }
-            CreateMenuTarget::TabStrip {
-                workspace_id,
-                target_tab,
-            } => vec![
-                self.create_menu_item("strip-add-project", "Add Project", cx, move |this, cx| {
-                    this.begin_project_creation(workspace_id, cx);
-                }),
-                self.create_menu_item("strip-add-terminal", "Add Terminal", cx, move |this, cx| {
-                    this.add_terminal_to_context(workspace_id, target_tab, cx);
-                }),
-                self.create_menu_item("strip-add-browser", "Add Browser", cx, move |this, cx| {
-                    this.add_browser_to_context(workspace_id, target_tab, cx);
-                }),
-                self.create_menu_item("strip-add-gallery", "Add Gallery", cx, move |this, cx| {
-                    this.add_gallery_to_context(workspace_id, target_tab, cx);
-                }),
-                self.create_menu_item("strip-add-group", "Add Group", cx, move |this, cx| {
-                    this.add_group_to_context(workspace_id, target_tab, cx);
-                }),
-            ],
-        };
+        let CreateMenu {
+            position,
+            workspace_id,
+            target_tab,
+        } = menu;
+        let items = [
+            self.create_menu_item("strip-add-project", "Add Project", cx, move |this, cx| {
+                this.begin_project_creation(workspace_id, cx);
+            }),
+            self.create_menu_item("strip-add-terminal", "Add Terminal", cx, move |this, cx| {
+                this.add_terminal_to_context(workspace_id, target_tab, cx);
+            }),
+            self.create_menu_item("strip-add-browser", "Add Browser", cx, move |this, cx| {
+                this.add_browser_to_context(workspace_id, target_tab, cx);
+            }),
+            self.create_menu_item("strip-add-gallery", "Add Gallery", cx, move |this, cx| {
+                this.add_gallery_to_context(workspace_id, target_tab, cx);
+            }),
+            self.create_menu_item("strip-add-group", "Add Group", cx, move |this, cx| {
+                this.add_group_to_context(workspace_id, target_tab, cx);
+            }),
+        ];
         anchored_menu(
-            point(left, menu.position.y),
+            point((position.x - px(232.0)).max(px(0.0)), position.y),
             div()
                 .w(px(232.0))
                 .py(px(5.0))

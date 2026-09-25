@@ -175,19 +175,12 @@ pub(super) struct GroupMenu {
     pub(super) icon_picker_open: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum CreateMenuTarget {
-    Global,
-    TabStrip {
-        workspace_id: Uuid,
-        target_tab: Option<Uuid>,
-    },
-}
-
+/// The tab strip's ＋ menu: what to add to a workstation, after `target_tab`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CreateMenu {
     pub(super) position: Point<Pixels>,
-    pub(super) target: CreateMenuTarget,
+    pub(super) workspace_id: Uuid,
+    pub(super) target_tab: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug)]
