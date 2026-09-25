@@ -97,6 +97,49 @@ pub(crate) fn command_with_terminal_env(
     command
 }
 
+/// The `hh` CLI shipped next to the service executable, when present.
+pub(crate) fn hh_cli_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("hh")))
+        .filter(|path| path.is_file())
+}
+
+/// Environment exported to local terminal agents. Bot terminals also learn
+/// their bot so the Harness Harlot tools can attribute workers to it.
+pub(crate) fn agent_env(workspace_id: Uuid, bot_id: Option<Uuid>) -> Vec<(&'static str, String)> {
+    let mut env = vec![(hh_protocol::WORKSPACE_ID_ENV, workspace_id.to_string())];
+    if let Ok(path) = hh_protocol::socket_path() {
+        env.push((hh_protocol::SOCKET_ENV, path.to_string_lossy().into_owned()));
+    }
+    if let Some(path) = hh_protocol::gallery_directory(workspace_id) {
+        let _ = hh_protocol::ensure_private_directory(&path);
+        env.push((
+            hh_protocol::GALLERY_DIR_ENV,
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    if let Some(path) = hh_cli_path() {
+        env.push((hh_protocol::CLI_ENV, path.to_string_lossy().into_owned()));
+    }
+    if let Some(bot_id) = bot_id {
+        env.push((crate::bots::BOT_ID_ENV, bot_id.to_string()));
+    }
+    env
+}
+
+pub(crate) fn apply_agent_env(
+    command: &mut CommandBuilder,
+    workspace_id: Uuid,
+    bot_id: Option<Uuid>,
+) {
+    command.env_remove(hh_protocol::CLI_ENV);
+    command.env_remove(crate::bots::BOT_ID_ENV);
+    for (key, value) in agent_env(workspace_id, bot_id) {
+        command.env(key, value);
+    }
+}
+
 pub(crate) fn system_ssh_binary() -> Result<PathBuf> {
     for path in [Path::new("/usr/bin/ssh"), Path::new("/bin/ssh")] {
         if is_trusted_executable_file(path) {

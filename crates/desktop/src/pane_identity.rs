@@ -261,16 +261,24 @@ impl HhApp {
                 .text_color(rgb(fallback_color))
                 .into_any_element();
         }
-        if pane.kind.is_assistant() {
-            let active = self.voice.sessions.get(&pane.id).is_some_and(|session| {
-                !crate::voice::assistant_session_is_idle(session)
-                    && !matches!(session.engine_state, hh_voice::EngineState::Error(_))
-            });
+        if pane.kind.is_gallery() {
             return div()
-                .w(px(8.0))
-                .h(px(8.0))
-                .rounded_full()
-                .bg(rgb(if active { THEME.ansi[2] } else { THEME.dim }))
+                .relative()
+                .w(px(IDENTITY_MARK_SIZE))
+                .h(px(IDENTITY_MARK_SIZE))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(rgb(frame_color))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(3.0))
+                        .right(px(3.0))
+                        .bottom(px(4.0))
+                        .h(px(7.0))
+                        .rounded(px(2.0))
+                        .bg(rgb(fallback_color)),
+                )
                 .into_any_element();
         }
 
@@ -283,15 +291,9 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pane = self.pane_metadata(pane_id);
-        let is_assistant = pane.as_ref().is_some_and(|pane| pane.kind.is_assistant());
         let selected = pane.as_ref().and_then(|pane| pane.profile_override);
         let selected_custom = pane.and_then(|pane| pane.custom_icon);
-        let choices = std::iter::once(None).chain(
-            TerminalProfile::ALL
-                .into_iter()
-                .map(Some)
-                .filter(move |_| !is_assistant),
-        );
+        let choices = std::iter::once(None).chain(TerminalProfile::ALL.into_iter().map(Some));
         div()
             .mx(px(8.0))
             .my(px(6.0))
@@ -333,11 +335,7 @@ impl HhApp {
                     })
                     .hover(|element| element.border_color(rgb(THEME.foreground)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if is_assistant {
-                            this.set_pane_custom_icon(pane_id, None, cx);
-                        } else {
-                            this.set_pane_profile(pane_id, profile, cx);
-                        }
+                        this.set_pane_profile(pane_id, profile, cx);
                     }))
                     .tooltip(move |_, cx| {
                         cx.new(|_| TooltipView {

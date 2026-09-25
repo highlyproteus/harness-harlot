@@ -11,7 +11,7 @@ use crate::layout::{
 use crate::persistence;
 use crate::persistence::{MAX_TABS_PER_WORKSPACE, validate_title};
 use crate::process::local_spawn_dir;
-use crate::pty::PtySession;
+use crate::registry::bots::prune_bot_threads;
 use crate::registry::workspaces::remember_recent_color;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -45,7 +45,7 @@ impl SessionRegistry {
     /// every request adds a tab, which is what the workstation menu's "New Tab"
     /// means.
     pub fn create_workspace_tab(&self, workspace_id: Uuid) -> Result<Uuid> {
-        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         self.append_workspace_tab(workspace_id, None, None, None)
     }
 
@@ -56,7 +56,7 @@ impl SessionRegistry {
         workspace_id: Uuid,
         parent_tab: Option<Uuid>,
     ) -> Result<Uuid> {
-        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         let number = {
             let mut state = self.state.write();
             let number = state.next_group_number;
@@ -77,7 +77,7 @@ impl SessionRegistry {
         working_dir: &str,
         title: Option<&str>,
     ) -> Result<Uuid> {
-        self.ensure_workspace_accepts_non_assistant_tabs(workspace_id)?;
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         validate_workspace_dir(working_dir).map_err(anyhow::Error::from)?;
         let title = title.map_or_else(
             || {
@@ -171,6 +171,7 @@ impl SessionRegistry {
                 "ssh".clone_into(&mut pane.shell);
             }
             let tab = Tab {
+                owner_thread: None,
                 id: Uuid::new_v4(),
                 title: pane.title.clone(),
                 custom_title,
@@ -179,6 +180,7 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab,
                 pinned: false,
+                owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             };
             let workspace = &mut state.snapshot.workspaces[workspace_index];
@@ -237,11 +239,16 @@ impl SessionRegistry {
 
     pub fn activate_tab(&self, pane_id: Uuid) -> Result<()> {
         let mut state = self.state.write();
+        let now = crate::now_ms();
         let did_activate = state.snapshot.workspaces.iter_mut().any(|workspace| {
-            workspace
+            let activated = workspace
                 .tabs
                 .iter_mut()
-                .any(|tab| activate_tab(&mut tab.layout, pane_id))
+                .any(|tab| activate_tab(&mut tab.layout, pane_id));
+            if activated && let Some(spec) = &mut workspace.bot {
+                spec.thread_panes.entry(pane_id).or_default().activated_ms = now;
+            }
+            activated
         });
         if !did_activate {
             bail!("pane tab {pane_id} does not exist");
@@ -323,11 +330,12 @@ impl SessionRegistry {
         pane_id: Uuid,
         placement: DropPlacement,
     ) -> Result<()> {
+        self.state.read().refuse_bot_pane(pane_id)?;
         let replacement_id = Uuid::new_v4();
         let cwd = self.cwd_for_pane(pane_id)?;
         let workspace_id = self.workspace_for_pane(pane_id)?;
         let replacement_session =
-            PtySession::spawn_local(replacement_id, workspace_id, &cwd, &self.history)?;
+            self.spawn_local_transport(replacement_id, workspace_id, None, &cwd)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -444,7 +452,7 @@ impl SessionRegistry {
         let pane = pane.with_context(|| format!("source pane {source_pane} does not exist"))?;
         let mut target_layout = workspace.tabs[target_location.1].layout.clone();
         let target_pane = first_layout_pane(&target_layout);
-        if !add_tab(&mut target_layout, target_pane, pane) {
+        if !add_tab(&mut target_layout, target_pane, pane, true) {
             bail!("target group {target_tab} cannot accept pane {source_pane}");
         }
         workspace.tabs[target_location.1].layout = target_layout;
@@ -571,6 +579,7 @@ impl SessionRegistry {
         workspace.tabs.insert(
             insertion_index,
             Tab {
+                owner_thread: None,
                 id: Uuid::new_v4(),
                 title: pane.title.clone(),
                 custom_title: None,
@@ -579,6 +588,7 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: resolved_parent,
                 pinned: false,
+                owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
             },
         );
@@ -685,6 +695,7 @@ impl SessionRegistry {
             workspace.active_terminal_count = workspace
                 .active_terminal_count
                 .saturating_sub(terminal_count);
+            prune_bot_threads(workspace);
             for pane_id in pane_ids {
                 state.panes.remove(&pane_id);
             }

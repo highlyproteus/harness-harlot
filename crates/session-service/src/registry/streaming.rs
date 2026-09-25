@@ -1,5 +1,8 @@
 //! Pane streaming, notifications, and diagnostics sampling.
-use super::{PaneUpdateBatch, SessionRegistry, serialized_len, snapshot_with_runtime_transports};
+use super::{
+    PaneUpdateBatch, PaneUpdateRequest, SessionRegistry, serialized_len,
+    snapshot_with_runtime_transports,
+};
 use crate::registry::identity::refresh_runtime_metadata;
 use anyhow::{Result, bail};
 use hh_protocol::{
@@ -136,6 +139,28 @@ impl SessionRegistry {
         measure_bytes: bool,
         notifications_after: u64,
     ) -> Result<PaneUpdateBatch> {
+        self.pane_updates_for(PaneUpdateRequest {
+            snapshot_revision,
+            pane_revisions,
+            subscribed_panes,
+            browser_executor: false,
+            measure_bytes,
+            notifications_after,
+        })
+    }
+
+    pub(crate) fn pane_updates_for(
+        &self,
+        request: PaneUpdateRequest<'_>,
+    ) -> Result<PaneUpdateBatch> {
+        let PaneUpdateRequest {
+            snapshot_revision,
+            pane_revisions,
+            subscribed_panes,
+            browser_executor,
+            measure_bytes,
+            notifications_after,
+        } = request;
         if pane_revisions.len() > MAX_PANES || subscribed_panes.len() > MAX_PANES {
             bail!("pane update request exceeds the {MAX_PANES}-pane limit");
         }
@@ -162,6 +187,7 @@ impl SessionRegistry {
                     subscribed: false,
                     dirty: false,
                     exited: false,
+                    enhanced_paste: false,
                 });
                 continue;
             };
@@ -188,6 +214,7 @@ impl SessionRegistry {
                 subscribed,
                 dirty: !delivered && known_revision != Some(revision),
                 exited: runtime.exit_status.is_some(),
+                enhanced_paste: runtime.exit_status.is_none() && runtime.session.enhanced_paste(),
             });
         }
         let notifications = state
@@ -197,6 +224,11 @@ impl SessionRegistry {
             .cloned()
             .collect();
         drop(state);
+        let browser_commands = if browser_executor {
+            self.take_browser_commands()
+        } else {
+            Vec::new()
+        };
 
         pane_states.sort_unstable_by_key(|pane| pane.pane_id);
         screens.sort_unstable_by_key(|screen| screen.pane_id);
@@ -243,6 +275,7 @@ impl SessionRegistry {
             pane_states,
             notifications,
             diagnostics,
+            browser_commands,
         })
     }
     pub fn notifications(&self) -> Result<Vec<SessionNotification>> {
@@ -422,6 +455,7 @@ mod tests {
             subscribed: true,
             dirty: false,
             exited: false,
+            enhanced_paste: false,
         }];
         preserve_withheld_cursors(&mut pane_states, &withheld, &HashMap::from([(third, 4)]));
         assert_eq!(pane_states[0].revision, 4);

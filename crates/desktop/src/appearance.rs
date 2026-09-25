@@ -1,20 +1,117 @@
 //! Appearance settings, color pickers, and workstation banner art.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, Image, ImageFormat, InteractiveElement, IntoElement, PathPromptOptions,
-    div, img, px, rgb, rgba,
+    AnyElement, AppContext, Context, Image, ImageFormat, InteractiveElement, IntoElement,
+    ParentElement, PathPromptOptions, StatefulInteractiveElement, Styled, StyledImage, div, img,
+    px, rgb, rgba,
 };
-use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{AppearanceColor, ClientRequest, validate_workspace_dir};
 use std::sync::{Arc, LazyLock};
 
 use crate::elements::{HsvFieldElement, HsvFieldKind};
 use crate::helpers::{banner_fit_size, hsv_to_rgb, parse_hex_color, rgb_to_hsv};
-use crate::view_models::{ColorPickerState, ColorTarget, Modal, TooltipView};
+use crate::view_models::{ColorPickerState, ColorTarget, Modal, SettingsSection, TooltipView};
 use crate::{
     APPEARANCE_PRESETS, BUNDLED_BANNER_PIXEL_HEIGHT, BUNDLED_BANNER_PIXEL_WIDTH, HhApp,
     PANE_HEADER_HEIGHT, THEME,
 };
+
+/// Section title with its one-line explanation.
+pub(crate) fn settings_heading(title: &'static str, description: &'static str) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .font_family(".SystemUIFont")
+                .text_lg()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(THEME.foreground))
+                .child(title),
+        )
+        .child(
+            div()
+                .font_family(".SystemUIFont")
+                .text_sm()
+                .text_color(rgb(THEME.muted))
+                .child(description),
+        )
+        .into_any_element()
+}
+
+/// Label above a card inside one section panel.
+pub(crate) fn settings_section_title(title: &'static str) -> AnyElement {
+    div()
+        .font_family(".SystemUIFont")
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(THEME.muted))
+        .child(title)
+        .into_any_element()
+}
+
+pub(crate) fn settings_card(children: Vec<AnyElement>) -> AnyElement {
+    div()
+        .p(px(14.0))
+        .rounded(px(9.0))
+        .bg(rgb(THEME.surface))
+        .border_1()
+        .border_color(rgb(THEME.border))
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .children(children)
+        .into_any_element()
+}
+
+pub(crate) fn settings_row(
+    title: &'static str,
+    detail: Option<String>,
+    trailing: AnyElement,
+) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(12.0))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.foreground))
+                        .child(title),
+                )
+                .when_some(detail, |element, detail| {
+                    element.child(
+                        div()
+                            .truncate()
+                            .font_family("SF Mono")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child(detail),
+                    )
+                }),
+        )
+        .child(trailing)
+        .into_any_element()
+}
+
+pub(crate) fn radio_glyph(selected: bool) -> AnyElement {
+    div()
+        .font_family("SF Mono")
+        .text_sm()
+        .text_color(rgb(if selected { THEME.accent } else { THEME.dim }))
+        .child(if selected { "●" } else { "○" })
+        .into_any_element()
+}
 
 /// Budget the settings preview fits inside, borders excluded.
 pub(crate) const SETTINGS_BANNER_PREVIEW_MAX_WIDTH: f32 = 420.0;
@@ -227,16 +324,43 @@ impl HhApp {
         }
     }
 
-    pub(crate) fn open_appearance_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.editor.modal = Modal::AppearanceSettings;
+        // The section list lives in the sidebar, so Settings always shows it.
+        self.sidebar.sidebar_visible = true;
+        self.editor.settings_section = section;
         self.editor.color_picker = None;
-        self.editor.history_editor = None;
-        self.editor.history_clear_confirmation = None;
-        match crate::voice::VoiceSettingsEditor::load() {
-            Ok(editor) => self.voice.settings_editor = editor,
-            Err(error) => self.report(&error),
+        if section == SettingsSection::Bots && !self.coding_agents.loaded {
+            self.refresh_coding_agents(cx);
         }
-        self.refresh_history_status();
+        cx.notify();
+    }
+
+    /// The toolbar ⚙ button: opens Settings, or closes it back to the
+    /// workstation or bot shown before, which Settings never changes.
+    pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.editor.modal, Modal::AppearanceSettings) {
+            self.close_settings(cx);
+        } else {
+            self.open_settings(SettingsSection::Appearance, cx);
+        }
+    }
+
+    pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.editor.modal = Modal::None;
+        self.editor.color_picker = None;
+        cx.notify();
+    }
+
+    pub(crate) fn select_settings_section(
+        &mut self,
+        section: SettingsSection,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.settings_section = section;
+        if section == SettingsSection::Bots && !self.coding_agents.loaded {
+            self.refresh_coding_agents(cx);
+        }
         cx.notify();
     }
 
@@ -794,13 +918,73 @@ impl HhApp {
             .into_any_element()
     }
 
+    /// The app sidebar while Settings is open: its section list, the same
+    /// way the bell and robot swap the sidebar for their views.
+    pub(crate) fn render_sidebar_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let section = self.editor.settings_section;
+        let nav = SettingsSection::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let active = candidate == section;
+                div()
+                    .id(("settings-section", index))
+                    .mx(px(6.0))
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .when(active, |element| {
+                        element
+                            .bg(rgb(THEME.accent_soft))
+                            .text_color(rgb(THEME.foreground))
+                    })
+                    .when(!active, |element| {
+                        element
+                            .text_color(rgb(THEME.muted))
+                            .hover(|element| element.bg(rgb(THEME.elevated)))
+                    })
+                    .child(candidate.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_settings_section(candidate, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .min_h(px(0.0))
+            .flex_1()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(34.0))
+                    .px(px(12.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(THEME.foreground))
+                    .child("Settings"),
+            )
+            .child(div().flex().flex_col().gap(px(2.0)).children(nav))
+            .into_any_element()
+    }
+
     pub(crate) fn render_appearance_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let appearance = self
-            .session
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.appearance.clone())
-            .unwrap_or_default();
+        let section = self.editor.settings_section;
+        let panel = match section {
+            SettingsSection::Appearance => self.render_appearance_panel(cx),
+            SettingsSection::Bots => self.render_bots_settings_panel(cx),
+            SettingsSection::Updates => vec![
+                settings_heading("Updates", "Signed automatic updates."),
+                self.render_update_settings(cx),
+            ],
+        };
         div()
             .id("settings-workspace-surface")
             .size_full()
@@ -852,10 +1036,7 @@ impl HhApp {
                                     .bg(rgb(THEME.elevated))
                                     .text_color(rgb(THEME.foreground))
                             })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.editor.modal = Modal::None;
-                                cx.notify();
-                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                             .child("×"),
                     ),
             )
@@ -865,58 +1046,57 @@ impl HhApp {
                     .min_h(px(0.0))
                     .flex_1()
                     .overflow_y_scroll()
-                    .px(px(24.0))
-                    .py(px(20.0))
+                    .px(px(32.0))
+                    .py(px(24.0))
                     .child(
                         div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(14.0))
-                    .child(
-                        div()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(THEME.foreground))
-                            .child("Appearance"),
-                    )
-                    .child(
-                        div()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.muted))
-                            .child("Global defaults stay independent. Terminal accents never recolor workstations, and workstation colors never recolor terminals."),
-                    )
-                    .child(self.render_appearance_row(
-                        "Default terminal accent",
-                        "Focus rail, active tab, cursor, and terminal focus treatment",
-                        ColorTarget::DefaultTerminal,
-                        appearance.default_terminal_accent,
-                        cx,
-                    ))
-                    .child(self.render_appearance_row(
-                        "Default workstation color",
-                        "Selected workstation and workstation marker in the left rail",
-                        ColorTarget::DefaultWorkspace,
-                        appearance.default_workspace_color,
-                        cx,
-                    ))
-                    .child(self.render_workstation_banner_setting(cx))
-                    .child(
-                        div()
-                            .pt(px(2.0))
-                            .font_family("SF Mono")
-                            .text_xs()
-                            .text_color(rgb(THEME.dim))
-                            .child("Saved locally with session layout · no network or telemetry"),
-                    )
-                    .child(self.render_update_settings(cx))
-                    .child(self.render_history_settings(cx))
-                    .child(self.render_voice_settings_section(cx)),
+                            .max_w(px(640.0))
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(18.0))
+                            .children(panel),
                     ),
             )
             .into_any_element()
+    }
+
+    fn render_appearance_panel(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let appearance = self
+            .session
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.appearance.clone())
+            .unwrap_or_default();
+        vec![
+            settings_heading(
+                "Appearance",
+                "Global defaults stay independent. Terminal accents never recolor workstations, and workstation colors never recolor terminals.",
+            ),
+            settings_card(vec![
+                self.render_appearance_row(
+                    "Default terminal accent",
+                    "Focus rail, active tab, cursor, and terminal focus treatment",
+                    ColorTarget::DefaultTerminal,
+                    appearance.default_terminal_accent,
+                    cx,
+                ),
+                self.render_appearance_row(
+                    "Default workstation color",
+                    "Selected workstation and workstation marker in the left rail",
+                    ColorTarget::DefaultWorkspace,
+                    appearance.default_workspace_color,
+                    cx,
+                ),
+                self.render_workstation_banner_setting(cx),
+            ]),
+            div()
+                .font_family("SF Mono")
+                .text_xs()
+                .text_color(rgb(THEME.dim))
+                .child("Saved locally with session layout · no network or telemetry")
+                .into_any_element(),
+        ]
     }
 
     pub(crate) fn render_appearance_row(

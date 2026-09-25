@@ -220,12 +220,12 @@ ditto "$home/Applications/Harness Harlot.app" \
 "$repository_root/install.sh" --version 0.1.0+1 >/dev/null
 [ -x "$home/Applications/.Harness Harlot.previous.app/Contents/MacOS/hh" ]
 [ ! -e "$home/Applications/Harness Harlot.previous.app" ]
-mkdir -p "$home/Library/Application Support/Harness Harlot/history"
-printf 'retain\n' > "$home/Library/Application Support/Harness Harlot/history/local"
+mkdir -p "$home/Library/Application Support/Harness Harlot"
+printf 'retain\n' > "$home/Library/Application Support/Harness Harlot/sessions.json"
 "$repository_root/install.sh" --uninstall >/dev/null
 [ ! -e "$home/Applications/Harness Harlot.app" ]
 [ ! -e "$home/Applications/.Harness Harlot.previous.app" ]
 [ ! -e "$home/.local/bin/hh" ]
-[ -f "$home/Library/Application Support/Harness Harlot/history/local" ]
+[ -f "$home/Library/Application Support/Harness Harlot/sessions.json" ]
 
 echo "installer rejects unconfigured, tampered, unstapled, and invalid-manifest inputs; dual-root install and uninstall fixtures pass"

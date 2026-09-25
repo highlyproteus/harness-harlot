@@ -1,6 +1,6 @@
 //! Desired-state model: snapshots, workspaces, tabs, panes, and tmux types.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -15,11 +15,70 @@ pub struct SessionSnapshot {
     pub revision: u64,
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    #[serde(default)]
+    pub bots: BotSettings,
     /// Ephemeral transport authority projected by the local session service.
     /// Missing entries are intentionally treated as unknown and fail closed.
     #[serde(default)]
     pub terminal_transports: HashMap<Uuid, TerminalTransport>,
     pub workspaces: Vec<Workspace>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotSettings {
+    /// Agent preselected when creating a bot; None picks the first installed agent.
+    #[serde(default)]
+    pub default_agent: Option<TerminalProfile>,
+}
+
+/// Launch configuration of a bot. Each bot is its own `WorkspaceKind::Bot`
+/// workspace whose terminals run the configured agent CLI's own interface.
+/// An omp bot's tabs hold its live thread panes, one omp conversation each;
+/// the user may split and rearrange them like any workstation tab.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotSpec {
+    pub agent: TerminalProfile,
+    /// Extra standing instructions appended to the bot's coordinator prompt.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Custom home folder the bot's terminal starts in; None uses the default
+    /// `<state>/bots/<bot id>/`.
+    #[serde(default)]
+    pub home: Option<String>,
+    /// Saved thread (agent session) ids the user pinned to the top.
+    #[serde(default)]
+    pub pinned_threads: Vec<String>,
+    /// Live thread panes of this bot, keyed by pane id.
+    #[serde(default)]
+    pub thread_panes: BTreeMap<Uuid, BotThreadPane>,
+}
+
+/// What one live bot pane shows.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotThreadPane {
+    /// Agent session id the pane shows, once known.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Epoch milliseconds the pane was last activated; 0 = never.
+    #[serde(default)]
+    pub activated_ms: u64,
+}
+
+/// One thread of a bot: a saved or live agent conversation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BotThread {
+    /// Agent session id, or `pane:<pane id>` for a live pane whose session is
+    /// not known yet.
+    pub id: String,
+    pub title: Option<String>,
+    /// Epoch milliseconds of the last change.
+    pub updated_ms: u64,
+    pub pinned: bool,
+    /// The live pane showing this thread.
+    pub pane_id: Option<Uuid>,
+    /// The bot tab containing the live pane.
+    #[serde(default)]
+    pub tab_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,6 +148,7 @@ impl SessionSnapshot {
             color: None,
             identity: TerminalIdentity::default(),
             status: PaneStatus::default(),
+            status_changed_at_ms: 0,
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -102,12 +162,15 @@ impl SessionSnapshot {
             custom_icon: None,
             parent_tab: None,
             pinned: false,
+            owner_bot: None,
+            owner_thread: None,
             layout: PaneLayout::Leaf { pane },
         };
 
         Self {
             revision: 0,
             appearance: AppearanceSettings::default(),
+            bots: BotSettings::default(),
             terminal_transports: HashMap::new(),
             workspaces: vec![Workspace {
                 id: Uuid::new_v4(),
@@ -121,7 +184,9 @@ impl SessionSnapshot {
                 working_dir: None,
                 kind: WorkspaceKind::Workstation,
                 instructions: None,
+                owner_bot: None,
                 custom_icon: None,
+                bot: None,
                 tabs: vec![tab],
             }],
         }
@@ -151,14 +216,21 @@ pub struct Workspace {
     pub kind: WorkspaceKind,
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Bot whose delegated workers default to this workstation.
+    #[serde(default)]
+    pub owner_bot: Option<Uuid>,
     #[serde(default)]
     pub custom_icon: Option<String>,
+    /// Present exactly on `WorkspaceKind::Bot` workspaces.
+    #[serde(default)]
+    pub bot: Option<BotSpec>,
     pub tabs: Vec<Tab>,
 }
 
 impl Workspace {
-    pub fn is_assistant(&self) -> bool {
-        self.kind == WorkspaceKind::Assistant
+    /// Whether this workspace is a bot; bots are never workstations.
+    pub fn is_bot(&self) -> bool {
+        self.kind == WorkspaceKind::Bot
     }
 }
 
@@ -246,7 +318,8 @@ pub enum TmuxScanScope {
 pub enum WorkspaceKind {
     #[default]
     Workstation,
-    Assistant,
+    /// A bot: its tabs are the bot's live threads; never shown as a workstation.
+    Bot,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -291,6 +364,12 @@ pub struct Tab {
     pub parent_tab: Option<Uuid>,
     #[serde(default)]
     pub pinned: bool,
+    /// Bot that created this worker tab through `CreateWorker`.
+    #[serde(default)]
+    pub owner_bot: Option<Uuid>,
+    /// Bot pane (thread) that created this worker tab through `CreateWorker`.
+    #[serde(default)]
+    pub owner_thread: Option<Uuid>,
     pub layout: PaneLayout,
 }
 
@@ -327,7 +406,7 @@ pub enum PaneKind {
     Browser {
         url: String,
     },
-    Assistant,
+    Gallery,
 }
 
 impl PaneKind {
@@ -336,7 +415,7 @@ impl PaneKind {
     pub fn is_browser(&self) -> bool {
         match self {
             Self::Browser { .. } => true,
-            Self::Terminal | Self::Assistant => false,
+            Self::Terminal | Self::Gallery => false,
         }
     }
 
@@ -345,15 +424,14 @@ impl PaneKind {
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::Terminal => true,
-            Self::Browser { .. } | Self::Assistant => false,
+            Self::Browser { .. } | Self::Gallery => false,
         }
     }
 
-    /// Whether this pane renders a voice assistant view. Exhaustive by design
-    /// so a future variant fails compilation exactly here.
-    pub fn is_assistant(&self) -> bool {
+    /// Whether this pane renders an image gallery.
+    pub const fn is_gallery(&self) -> bool {
         match self {
-            Self::Assistant => true,
+            Self::Gallery => true,
             Self::Terminal | Self::Browser { .. } => false,
         }
     }
@@ -376,6 +454,9 @@ pub struct Pane {
     /// It is intentionally reset during desired-state recovery.
     #[serde(default)]
     pub status: PaneStatus,
+    /// Ephemeral epoch milliseconds of the last `status` transition; 0 = never.
+    #[serde(default)]
+    pub status_changed_at_ms: u64,
     #[serde(default)]
     pub custom_title: Option<String>,
     #[serde(default)]
@@ -416,14 +497,14 @@ mod tests {
             browser
         );
 
-        let assistant = PaneKind::Assistant;
+        let gallery = PaneKind::Gallery;
         assert_eq!(
-            serde_json::to_value(&assistant).unwrap(),
-            serde_json::json!({ "type": "assistant" })
+            serde_json::to_value(&gallery).unwrap(),
+            serde_json::json!({ "type": "gallery" })
         );
         assert_eq!(
-            serde_json::from_value::<PaneKind>(serde_json::to_value(&assistant).unwrap()).unwrap(),
-            assistant
+            serde_json::from_value::<PaneKind>(serde_json::to_value(&gallery).unwrap()).unwrap(),
+            gallery
         );
     }
 
@@ -514,5 +595,54 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
 
         assert_eq!(restored, snapshot);
+    }
+}
+
+#[cfg(test)]
+mod bot_thread_tests {
+    use super::*;
+
+    #[test]
+    fn bot_specs_and_tabs_without_thread_fields_still_load_and_new_fields_round_trip() {
+        let legacy: BotSpec = serde_json::from_value(serde_json::json!({"agent": "omp"})).unwrap();
+        assert!(legacy.pinned_threads.is_empty());
+        assert!(legacy.thread_panes.is_empty());
+
+        let pane = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let spec = BotSpec {
+            agent: TerminalProfile::Omp,
+            instructions: None,
+            home: None,
+            pinned_threads: vec!["0193-abc".to_owned()],
+            thread_panes: BTreeMap::from([(
+                pane,
+                BotThreadPane {
+                    session: Some("0193-abc".to_owned()),
+                    activated_ms: 7,
+                },
+            )]),
+        };
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            encoded["thread_panes"],
+            serde_json::json!({ pane.to_string(): {"session": "0193-abc", "activated_ms": 7} })
+        );
+        assert_eq!(serde_json::from_value::<BotSpec>(encoded).unwrap(), spec);
+
+        let mut snapshot = SessionSnapshot::seeded();
+        assert_eq!(snapshot.workspaces[0].tabs[0].owner_thread, None);
+        assert_eq!(snapshot.workspaces[0].bot, None);
+        snapshot.workspaces[0].tabs[0].owner_thread = Some(pane);
+        let mut bot = snapshot.workspaces[0].clone();
+        bot.id = Uuid::new_v4();
+        bot.kind = WorkspaceKind::Bot;
+        bot.bot = Some(spec);
+        snapshot.workspaces.push(bot);
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(encoded["workspaces"][1]["kind"], "bot");
+        assert_eq!(encoded["workspaces"][1]["bot"]["agent"], "omp");
+        let restored: SessionSnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, snapshot);
+        assert!(restored.workspaces[1].is_bot() && !restored.workspaces[0].is_bot());
     }
 }

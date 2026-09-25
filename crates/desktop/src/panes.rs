@@ -5,9 +5,8 @@ use gpui::{
     MouseUpEvent, ScrollWheelEvent, Window,
 };
 use hh_protocol::{
-    ClientRequest, DropPlacement, HistoryPageDirection, HistoryPageFlags, Pane, ServiceResponse,
-    SplitAxis, TerminalModes, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
-    TerminalSelectionKind,
+    ClientRequest, DropPlacement, Pane, ServiceResponse, SplitAxis, TerminalModes,
+    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalSelectionKind,
 };
 
 use crate::helpers::{
@@ -21,9 +20,9 @@ use crate::helpers::{
 use crate::input::browser_url_editor_is_active;
 use crate::typography::{TerminalCellMetrics, adjusted_terminal_zoom_level};
 use crate::view_models::{
-    ArchivedView, AssistantComposer, CloseConfirmation, GroupRenameEditor, LayoutControlMutation,
-    Modal, PixelRect, RenameEditor, SearchEditor, SelectionAutoscroll, SelectionDrag,
-    SidebarResizeMove, TabCloseConfirmation, WorkspaceCreationStep, route_workspace_creation_paste,
+    CloseConfirmation, GroupRenameEditor, LayoutControlMutation, Modal, PixelRect, RenameEditor,
+    SearchEditor, SelectionAutoscroll, SelectionDrag, SidebarResizeMove, TabCloseConfirmation,
+    WorkspaceCreationStep, route_workspace_creation_paste,
 };
 use crate::{
     APP_CHROME_HEIGHT, CopyTerminal, FindNextTerminal, FindTerminal, HhApp, PasteTerminal,
@@ -32,7 +31,7 @@ use uuid::Uuid;
 
 impl HhApp {
     pub(crate) fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let Some((workspace_id, assistant, scope, empty)) = self
+        let Some((workspace_id, bots, scope, empty)) = self
             .session
             .snapshot
             .as_ref()
@@ -40,7 +39,7 @@ impl HhApp {
             .map(|workspace| {
                 (
                     workspace.id,
-                    workspace.is_assistant(),
+                    workspace.is_bot(),
                     workspace_tab_set(workspace, self.sidebar.workspace_tab_scope).scope,
                     workspace.tabs.is_empty(),
                 )
@@ -48,8 +47,9 @@ impl HhApp {
         else {
             return;
         };
-        if assistant {
-            self.new_assistant_tab(workspace_id, cx);
+        // A bot's new tab is a new thread.
+        if bots {
+            self.open_bot_thread(workspace_id, None, cx);
             return;
         }
         if empty {
@@ -62,21 +62,6 @@ impl HhApp {
                 self.new_project_group(workspace_id, project_id, cx);
             }
         }
-    }
-
-    pub(crate) fn new_assistant_tab(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        self.dispatch_with(
-            ClientRequest::CreateAssistantTab { workspace_id },
-            Box::new(move |this, cx, result| match result {
-                Ok(ServiceResponse::PaneCreated { pane_id }) => {
-                    this.focus_created_pane(workspace_id, pane_id, cx);
-                }
-                Ok(response) => this.report_unexpected(&response),
-                Err(error) => this.report(&error),
-            }),
-        );
-        self.layout.last_sizes.clear();
-        cx.notify();
     }
 
     pub(crate) fn focus_created_pane(
@@ -101,10 +86,6 @@ impl HhApp {
     }
 
     pub(crate) fn open_workspace_terminal(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        if self.workspace_is_assistant(workspace_id) {
-            self.new_assistant_tab(workspace_id, cx);
-            return;
-        }
         self.dispatch_with(
             ClientRequest::CreateWorkspaceTerminal { workspace_id },
             Box::new(move |this, cx, result| match result {
@@ -120,10 +101,6 @@ impl HhApp {
     }
 
     pub(crate) fn new_workspace_tab(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        if self.workspace_is_assistant(workspace_id) {
-            self.new_assistant_tab(workspace_id, cx);
-            return;
-        }
         self.dispatch_with(
             ClientRequest::CreateWorkspaceTab { workspace_id },
             Box::new(move |this, cx, result| match result {
@@ -613,28 +590,6 @@ impl HhApp {
         let Some(pane_id) = self.layout.focused_pane else {
             return;
         };
-        if let Some(text) = self
-            .voice
-            .sessions
-            .get(&pane_id)
-            .and_then(|session| session.selected_transcript)
-            .and_then(|index| {
-                self.voice
-                    .sessions
-                    .get(&pane_id)
-                    .and_then(|session| session.transcript.get(index))
-            })
-            .map(|entry| entry.text.clone())
-        {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            return;
-        }
-        if self
-            .pane_metadata(pane_id)
-            .is_some_and(|pane| pane.kind.is_assistant())
-        {
-            return;
-        }
         self.dispatch_with(
             ClientRequest::CopySelection { pane_id },
             Box::new(|this, cx, result| {
@@ -680,7 +635,7 @@ impl HhApp {
                 self.layout.focused_pane,
             )
         {
-            self.paste_image_to_terminal(pane_id, image, cx);
+            self.paste_image_to_terminal(pane_id, image, item.text(), cx);
             return;
         }
         let Some(text) = item.text() else {
@@ -690,35 +645,7 @@ impl HhApp {
             cx.notify();
             return;
         }
-        if self.paste_voice_setting(&text, cx) {
-            return;
-        }
         if self.append_browser_url_text(&text) {
-            cx.notify();
-            return;
-        }
-        if let Some(pane_id) = self.layout.focused_pane.filter(|pane_id| {
-            self.pane_metadata(*pane_id)
-                .is_some_and(|pane| pane.kind.is_assistant())
-        }) {
-            let composer =
-                self.editor
-                    .assistant_composer
-                    .get_or_insert_with(|| AssistantComposer {
-                        pane_id,
-                        text: String::new(),
-                        selection: None,
-                        attachment: None,
-                    });
-            if composer.pane_id != pane_id {
-                *composer = AssistantComposer {
-                    pane_id,
-                    text: String::new(),
-                    selection: None,
-                    attachment: None,
-                };
-            }
-            composer.insert(&text);
             cx.notify();
             return;
         }
@@ -778,73 +705,14 @@ impl HhApp {
         self.dispatch_with(
             ClientRequest::SearchPane {
                 pane_id,
-                query: query.clone(),
+                query,
                 forward,
             },
             Box::new(move |this, cx, result| {
                 match result {
-                    Ok(ServiceResponse::SearchResult { found: false }) => {
-                        this.search_archived_history(pane_id, query);
-                        this.session.connection_error = None;
-                    }
-                    Ok(ServiceResponse::SearchResult { found: true }) => {
+                    Ok(ServiceResponse::SearchResult { found }) => {
                         if let Some(editor) = this.editor.modal.search_mut() {
-                            editor.no_match = false;
-                            this.editor.archived_views.remove(&pane_id);
-                        }
-                        this.session.connection_error = None;
-                    }
-                    Ok(response) => {
-                        this.report_unexpected(&response);
-                    }
-                    Err(error) => {
-                        this.report(&error);
-                        this.search_archived_history(pane_id, query);
-                    }
-                }
-                cx.notify();
-            }),
-        );
-    }
-
-    fn search_archived_history(&mut self, pane_id: Uuid, query: String) {
-        let before = self
-            .editor
-            .archived_views
-            .get(&pane_id)
-            .map(|view| view.page.cursor);
-        self.dispatch_stream_with(
-            ClientRequest::SearchArchivedHistory {
-                pane_id,
-                query: query.clone(),
-                before,
-            },
-            Box::new(move |this, cx, result| {
-                match result {
-                    Ok(ServiceResponse::HistorySearchResult { page: Some(page) }) => {
-                        let rows = this
-                            .session
-                            .screens
-                            .get(&pane_id)
-                            .map_or(30, |screen| usize::from(screen.rows));
-                        let first_line = page
-                            .lines
-                            .iter()
-                            .position(|line| line.contains(&query))
-                            .unwrap_or(0)
-                            .min(page.lines.len().saturating_sub(rows));
-                        this.editor.archived_views.clear();
-                        this.editor
-                            .archived_views
-                            .insert(pane_id, ArchivedView { page, first_line });
-                        if let Some(editor) = this.editor.modal.search_mut() {
-                            editor.no_match = false;
-                        }
-                        this.session.connection_error = None;
-                    }
-                    Ok(ServiceResponse::HistorySearchResult { page: None }) => {
-                        if let Some(editor) = this.editor.modal.search_mut() {
-                            editor.no_match = true;
+                            editor.no_match = !found;
                         }
                         this.session.connection_error = None;
                     }
@@ -874,19 +742,6 @@ impl HhApp {
             Self::sync_picker_hsv(picker);
             picker.replace_on_type = false;
             picker.invalid = false;
-            cx.notify();
-            return;
-        }
-        if let Some(editor) = self.editor.history_editor.as_mut() {
-            if editor.replace_on_type {
-                editor.text.clear();
-            }
-            let remaining = 4_usize.saturating_sub(editor.text.len());
-            editor
-                .text
-                .extend(text.chars().filter(char::is_ascii_digit).take(remaining));
-            editor.replace_on_type = false;
-            editor.invalid = false;
             cx.notify();
             return;
         }
@@ -1319,20 +1174,12 @@ impl HhApp {
             cx.stop_propagation();
             return;
         }
-        if self.editor.archived_views.contains_key(&pane_id) {
-            self.scroll_archived_view(pane_id, lines, cx);
-            cx.stop_propagation();
-            return;
-        }
         let mouse_reporting = self
             .session
             .screens
             .get(&pane_id)
             .is_some_and(|screen| screen.modes.contains(TerminalModes::MOUSE_REPORTING));
-        let at_live_top = self.session.screens.get(&pane_id).is_some_and(|screen| {
-            screen.display_offset >= screen.history_size && screen.history_size > 0
-        });
-        match live_scroll_target(mouse_reporting, event.modifiers.shift, at_live_top) {
+        match live_scroll_target(mouse_reporting, event.modifiers.shift) {
             LiveScrollTarget::TerminalMouseReporting => {
                 for _ in 0..lines.unsigned_abs().min(8) {
                     self.dispatch_control(ClientRequest::MouseInput {
@@ -1354,95 +1201,6 @@ impl HhApp {
         }
         cx.stop_propagation();
         cx.notify();
-    }
-
-    pub(crate) fn load_archived_page(
-        &mut self,
-        pane_id: Uuid,
-        cursor: Option<hh_protocol::HistoryCursor>,
-        direction: HistoryPageDirection,
-        _cx: &mut Context<Self>,
-    ) {
-        self.dispatch_with(
-            ClientRequest::LoadHistoryPage {
-                pane_id,
-                cursor,
-                direction,
-            },
-            Box::new(move |this, cx, result| {
-                match result {
-                    Ok(ServiceResponse::HistoryPage { page: Some(page) }) => {
-                        let rows = this
-                            .session
-                            .screens
-                            .get(&pane_id)
-                            .map_or(30, |screen| usize::from(screen.rows));
-                        let first_line = match direction {
-                            HistoryPageDirection::Older => page.lines.len().saturating_sub(rows),
-                            HistoryPageDirection::Newer => 0,
-                        };
-                        this.editor.archived_views.clear();
-                        this.editor
-                            .archived_views
-                            .insert(pane_id, ArchivedView { page, first_line });
-                        this.session.connection_error = None;
-                    }
-                    Ok(ServiceResponse::HistoryPage { page: None }) => {
-                        if direction == HistoryPageDirection::Newer {
-                            this.editor.archived_views.remove(&pane_id);
-                        }
-                    }
-                    Ok(response) => {
-                        this.report_unexpected(&response);
-                    }
-                    Err(error) => this.report(&error),
-                }
-                cx.notify();
-            }),
-        );
-    }
-
-    pub(crate) fn scroll_archived_view(
-        &mut self,
-        pane_id: Uuid,
-        lines: i32,
-        cx: &mut Context<Self>,
-    ) {
-        let rows = self
-            .session
-            .screens
-            .get(&pane_id)
-            .map_or(30, |screen| usize::from(screen.rows));
-        let Some(view) = self.editor.archived_views.get_mut(&pane_id) else {
-            return;
-        };
-        if lines > 0 {
-            let amount = usize::try_from(lines).unwrap_or(usize::MAX);
-            if view.first_line > 0 {
-                view.first_line = view.first_line.saturating_sub(amount);
-                cx.notify();
-                return;
-            }
-            if view.page.flags.contains(HistoryPageFlags::HAS_OLDER) {
-                let cursor = view.page.cursor;
-                self.load_archived_page(pane_id, Some(cursor), HistoryPageDirection::Older, cx);
-            }
-            return;
-        }
-        let amount = usize::try_from(lines.unsigned_abs()).unwrap_or(usize::MAX);
-        let maximum = view.page.lines.len().saturating_sub(rows);
-        if view.first_line < maximum {
-            view.first_line = view.first_line.saturating_add(amount).min(maximum);
-            cx.notify();
-            return;
-        }
-        if view.page.flags.contains(HistoryPageFlags::HAS_NEWER) {
-            let cursor = view.page.cursor;
-            self.load_archived_page(pane_id, Some(cursor), HistoryPageDirection::Newer, cx);
-        } else {
-            self.editor.archived_views.remove(&pane_id);
-            cx.notify();
-        }
     }
 
     pub(crate) fn handle_resize(

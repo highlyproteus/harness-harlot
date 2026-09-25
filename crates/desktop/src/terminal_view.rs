@@ -1,33 +1,27 @@
-//! Terminal pane rendering: headers, lines, search, and drops.
+//! Terminal pane rendering: headers, search, and drops.
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Context, CursorStyle, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, Point, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, px,
-    relative, rgb, rgba,
+    MouseDownEvent, Point, div, px, relative, rgb, rgba,
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled};
-use hh_protocol::{
-    ClientRequest, DropPlacement, HistoryPageFlags, Pane, PaneLayout, PaneStatus, SplitAxis,
-    TerminalAttributes, TerminalColor, TerminalLine, TerminalRun, WorkspaceConnection,
-};
+use hh_protocol::{ClientRequest, DropPlacement, Pane, PaneLayout, SplitAxis, WorkspaceConnection};
 
 use crate::browser::browser_command_available;
 use crate::commands::AppCommand;
 use crate::elements::{TerminalGridElement, TerminalPointerElement};
 use crate::helpers::{
     IDENTITY_MARK_SIZE, effective_split_ratio, element_key, find_pane, identity_detail,
-    identity_label, plain_history_line, render_headphones_icon, render_microphone_icon,
-    selection_span, split_child_dimensions, split_control_id, split_element_key,
-    split_placement_at, split_target_for_drag, split_target_for_drag_ids,
-    terminal_run_display_text, terminal_tab_secondary_label, workspace_layout_for_focused_pane,
-    workspace_tab_standalone_pane, zoom_projection,
+    split_child_dimensions, split_control_id, split_element_key, split_placement_at,
+    split_target_for_drag, split_target_for_drag_ids, terminal_tab_secondary_label,
+    workspace_layout_for_focused_pane, workspace_tab_standalone_pane, zoom_projection,
 };
-use crate::typography::TerminalCellMetrics;
+use crate::tab_chrome::render_pane_indicator;
 use crate::view_models::{
     DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag, SearchEditor, SplitControlId,
-    TabDrag, TerminalLineRender, TooltipView, WorkspaceDrag,
+    TabDrag, TooltipView, WorkspaceDrag,
 };
-use crate::{HhApp, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, THEME, pane_status_color};
+use crate::{HhApp, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD, THEME};
 use uuid::Uuid;
 
 impl HhApp {
@@ -39,10 +33,13 @@ impl HhApp {
     ) -> AnyElement {
         let merge_preview = self.layout.drag_hover.merges_into(active);
         let active_accent = self.terminal_accent(active).as_rgb();
-        let terminal_controls = panes
-            .iter()
-            .find(|pane| pane.id == active)
-            .is_some_and(|pane| pane.kind.is_terminal());
+        // Bot threads open only through the bot: no new panes or splits here.
+        let bot = self.pane_is_bot(active);
+        let terminal_controls = !bot
+            && panes
+                .iter()
+                .find(|pane| pane.id == active)
+                .is_some_and(|pane| pane.kind.is_terminal());
         div()
             .id(("pane-tab-strip", element_key(active)))
             .h(px(PANE_HEADER_HEIGHT))
@@ -93,7 +90,7 @@ impl HhApp {
                     .flex()
                     .children(self.render_pane_header_controls(panes, active, cx)),
             )
-            .when(browser_command_available(), |element| {
+            .when(!bot && browser_command_available(), |element| {
                 element.child(self.pane_control(
                     active,
                     "new-browser-tab",
@@ -137,27 +134,6 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// Wraps the assistant surface with the shared pane-header tab strip.
-    pub(crate) fn render_assistant_pane(
-        &self,
-        pane: &Pane,
-        panes: &[Pane],
-        show_pane_header: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .size_full()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            .when(show_pane_header, |element| {
-                element.child(self.render_pane_header(panes, pane.id, cx))
-            })
-            .child(self.render_assistant_workspace(pane, cx))
-            .into_any_element()
-    }
-
     fn render_pane_header_controls(
         &self,
         panes: &[Pane],
@@ -168,12 +144,11 @@ impl HhApp {
             .iter()
             .map(|pane| {
                 let pane_id = pane.id;
-                let label = identity_label(pane);
+                let label = self.pane_label(pane);
                 let input = cx.entity();
                 let secondary_label = terminal_tab_secondary_label(pane).map(str::to_owned);
                 let selected = pane_id == active;
-                let status = pane.status;
-                let status_color = pane_status_color(status);
+                let indicator = self.pane_indicator(pane);
                 let pane_accent = pane
                     .color
                     .unwrap_or_else(|| self.terminal_accent(pane_id))
@@ -181,7 +156,7 @@ impl HhApp {
                 let close_tooltip = format!("Close {label}…");
                 let drag = PaneDrag {
                     pane_id,
-                    title: label.to_owned(),
+                    title: label.clone(),
                     position: Point::default(),
                 };
                 div()
@@ -267,7 +242,7 @@ impl HhApp {
                             } else {
                                 rgb(THEME.muted)
                             })
-                            .child(label.to_owned()),
+                            .child(label),
                     )
                     .when_some(secondary_label, |element, label| {
                         element.child(
@@ -282,141 +257,14 @@ impl HhApp {
                                 .child(label),
                         )
                     })
-                    .when(status != PaneStatus::Idle, |element| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .w(px(7.0))
-                                .h(px(7.0))
-                                .rounded_full()
-                                .bg(rgb(status_color.expect("non-idle status has a color"))),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(("close-tab", element_key(pane_id)))
-                            .ml(px(1.0))
-                            .flex_none()
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .line_height(px(14.0))
-                            .text_color(rgb(THEME.dim))
-                            .hover(|element| {
-                                element
-                                    .bg(rgb(THEME.elevated))
-                                    .text_color(rgb(THEME.foreground))
-                            })
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: close_tooltip.clone(),
-                                })
-                                .into()
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.begin_close(pane_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child("×"),
-                    )
-                    .when(pane.kind.is_assistant(), |element| {
-                        let (mic_muted, speaker_muted) = self
-                            .voice
-                            .sessions
-                            .get(&pane_id)
-                            .map_or((false, false), |session| {
-                                (session.mic_muted, session.speaker_muted)
-                            });
-                        element
-                            .child(
-                                div()
-                                    .id(("assistant-mic-header", element_key(pane_id)))
-                                    .ml(px(1.0))
-                                    .flex_none()
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .font_family("SF Mono")
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(if mic_muted {
-                                        THEME.danger
-                                    } else {
-                                        THEME.accent
-                                    }))
-                                    .tooltip(move |_, cx| {
-                                        cx.new(|_| TooltipView {
-                                            text: if mic_muted {
-                                                "Unmute microphone".to_owned()
-                                            } else {
-                                                "Mute microphone".to_owned()
-                                            },
-                                        })
-                                        .into()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_assistant_mic(pane_id, cx);
-                                        cx.stop_propagation();
-                                    }))
-                                    .child(render_microphone_icon(if mic_muted {
-                                        THEME.danger
-                                    } else {
-                                        THEME.accent
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id(("assistant-speaker-header", element_key(pane_id)))
-                                    .ml(px(1.0))
-                                    .flex_none()
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .font_family("SF Mono")
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(if speaker_muted {
-                                        THEME.danger
-                                    } else {
-                                        THEME.accent
-                                    }))
-                                    .tooltip(move |_, cx| {
-                                        cx.new(|_| TooltipView {
-                                            text: if speaker_muted {
-                                                "Unmute headphones".to_owned()
-                                            } else {
-                                                "Mute headphones".to_owned()
-                                            },
-                                        })
-                                        .into()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_assistant_speaker(pane_id, cx);
-                                        cx.stop_propagation();
-                                    }))
-                                    .child(render_headphones_icon(if speaker_muted {
-                                        THEME.danger
-                                    } else {
-                                        THEME.accent
-                                    })),
-                            )
-                    })
+                    .child(render_pane_indicator(indicator))
+                    .child(self.render_close_button(
+                        ("close-tab", element_key(pane_id)),
+                        THEME.foreground,
+                        close_tooltip,
+                        move |this, cx| this.begin_close(pane_id, cx),
+                        cx,
+                    ))
                     .into_any_element()
             })
             .collect()
@@ -530,7 +378,6 @@ impl HhApp {
         let terminal_accent = self.terminal_accent(active).as_rgb();
         let metrics = self.terminal_metrics(active);
         let screen = self.session.screens.get(&active);
-        let archived = self.editor.archived_views.get(&active);
         let exited = self
             .session
             .pane_states
@@ -542,63 +389,34 @@ impl HhApp {
             .and_then(|source| split_target_for_drag(source, panes, active));
         let pane_ids = panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
         let tab_pane_ids = pane_ids.clone();
-        let rendered_lines = if let (Some(view), Some(screen)) = (archived, screen) {
-            view.page
-                .lines
-                .iter()
-                .skip(view.first_line)
-                .take(usize::from(screen.rows))
-                .map(|line| plain_history_line(line))
-                .enumerate()
-                .map(|(row, line)| {
-                    self.render_terminal_line(
-                        &line,
-                        TerminalLineRender {
-                            row,
-                            cursor: None,
-                            focused,
-                            pane_accent: terminal_accent,
-                            columns: screen.columns,
-                            selection: None,
-                        },
-                        metrics,
-                    )
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
         // Live screens use cached glyphs and one pointer surface per pane.
-        let terminal_grid = match (archived, screen) {
-            (None, Some(screen)) => Some(
-                div()
-                    .size_full()
-                    .child(TerminalGridElement {
-                        input: cx.entity(),
-                        pane_id: active,
-                        metrics,
-                        focused,
-                        pane_accent: terminal_accent,
-                    })
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(0.0))
-                            .top(px(0.0))
-                            .size_full()
-                            .child(TerminalPointerElement {
-                                input: cx.entity(),
-                                pane_id: active,
-                                rows: screen.rows,
-                                columns: screen.columns,
-                                cell_width: metrics.cell_width,
-                                line_height: metrics.line_height,
-                            }),
-                    )
-                    .into_any_element(),
-            ),
-            _ => None,
-        };
+        let terminal_grid = screen.map(|screen| {
+            div()
+                .size_full()
+                .child(TerminalGridElement {
+                    input: cx.entity(),
+                    pane_id: active,
+                    metrics,
+                    focused,
+                    pane_accent: terminal_accent,
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .size_full()
+                        .child(TerminalPointerElement {
+                            input: cx.entity(),
+                            pane_id: active,
+                            rows: screen.rows,
+                            columns: screen.columns,
+                            cell_width: metrics.cell_width,
+                            line_height: metrics.line_height,
+                        }),
+                )
+                .into_any_element()
+        });
         div()
             .id(("terminal", element_key(active)))
             .size_full()
@@ -684,51 +502,7 @@ impl HhApp {
                     .text_size(px(metrics.font_size))
                     .line_height(px(metrics.line_height))
                     .text_color(rgb(THEME.foreground))
-                    .when_some(screen.filter(|_| archived.is_some()), |element, screen| {
-                        element.child(
-                            div().relative().size_full().children(rendered_lines).child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.0))
-                                    .top(px(0.0))
-                                    .size_full()
-                                    .child(TerminalPointerElement {
-                                        input: cx.entity(),
-                                        pane_id: active,
-                                        rows: screen.rows,
-                                        columns: screen.columns,
-                                        cell_width: metrics.cell_width,
-                                        line_height: metrics.line_height,
-                                    }),
-                            ),
-                        )
-                    })
                     .when_some(terminal_grid, |element, grid| element.child(grid))
-                    .when_some(archived, |element, view| {
-                        let notice = if view.page.flags.contains(HistoryPageFlags::CORRUPT) {
-                            "LOCAL HISTORY · CORRUPT CHUNK · gap preserved"
-                        } else if view.page.flags.contains(HistoryPageFlags::GAP_BEFORE)
-                            || view.page.flags.contains(HistoryPageFlags::GAP_AFTER)
-                        {
-                            "LOCAL HISTORY · archive gap · live terminal unaffected"
-                        } else {
-                            "LOCAL HISTORY · disk-backed page · scroll down for live"
-                        };
-                        element.child(
-                            div()
-                                .absolute()
-                                .top(px(3.0))
-                                .right(px(8.0))
-                                .px(px(6.0))
-                                .py(px(2.0))
-                                .rounded(px(4.0))
-                                .bg(rgb(THEME.elevated))
-                                .font_family("SF Mono")
-                                .text_xs()
-                                .text_color(rgb(THEME.muted))
-                                .child(notice),
-                        )
-                    })
                     .when(
                         focused
                             && self.editor.modal.search().is_none()
@@ -758,9 +532,7 @@ impl HhApp {
                         |element, editor| element.child(self.render_search_bar(editor)),
                     )
                     .when_some(
-                        screen
-                            .filter(|_| archived.is_none())
-                            .filter(|screen| screen.display_offset > 0),
+                        screen.filter(|screen| screen.display_offset > 0),
                         |element, screen| {
                             let jump = -i32::try_from(screen.display_offset).unwrap_or(i32::MAX);
                             element.child(
@@ -851,77 +623,6 @@ impl HhApp {
             .into_any_element()
     }
 
-    pub(crate) fn render_terminal_line(
-        &self,
-        line: &TerminalLine,
-        render: TerminalLineRender,
-        metrics: TerminalCellMetrics,
-    ) -> AnyElement {
-        let TerminalLineRender {
-            row,
-            cursor,
-            focused,
-            pane_accent,
-            columns,
-            selection,
-        } = render;
-        let mut start_column = 0_u16;
-        let styled_runs = line
-            .runs
-            .iter()
-            .map(|style| {
-                let columns = style.columns;
-                let element = self.render_terminal_run(style, metrics, start_column, columns);
-                start_column = start_column.saturating_add(columns);
-                element
-            })
-            .collect::<Vec<_>>();
-        let cursor_column = cursor
-            .filter(|cursor| usize::from(cursor.row) == row)
-            .map(|cursor| cursor.column);
-        div()
-            .relative()
-            .h(px(metrics.line_height))
-            .flex_none()
-            .overflow_hidden()
-            .when_some(
-                selection.and_then(|selection| selection_span(selection, row, columns)),
-                |element, (start, width)| {
-                    let span = metrics.span(start, width);
-                    element.child(
-                        div()
-                            .absolute()
-                            .left(px(span.x))
-                            .top(px(0.0))
-                            .w(px(span.width))
-                            .h(px(span.height))
-                            .bg(rgb(THEME.selection)),
-                    )
-                },
-            )
-            .children(styled_runs)
-            .when_some(cursor_column, |element, column| {
-                let cursor = metrics.span(column, 1);
-                element.child(
-                    div()
-                        .absolute()
-                        .left(px(cursor.x))
-                        .top(px(0.0))
-                        .w(px(cursor.width))
-                        .h(px(cursor.height))
-                        .rounded(px(1.0))
-                        .border_1()
-                        .border_color(if focused {
-                            rgb(pane_accent)
-                        } else {
-                            rgb(THEME.muted)
-                        })
-                        .when(focused, |cursor| cursor.bg(rgba((pane_accent << 8) | 0x30))),
-                )
-            })
-            .into_any_element()
-    }
-
     pub(crate) fn render_search_bar(&self, editor: &SearchEditor) -> AnyElement {
         div()
             .absolute()
@@ -964,70 +665,6 @@ impl HhApp {
             } else {
                 "↵ next"
             })
-            .into_any_element()
-    }
-
-    pub(crate) fn render_terminal_run(
-        &self,
-        style: &TerminalRun,
-        metrics: TerminalCellMetrics,
-        start_column: u16,
-        columns: u16,
-    ) -> AnyElement {
-        let bold = style.attributes.contains(TerminalAttributes::BOLD);
-        let dim = style.attributes.contains(TerminalAttributes::DIM);
-        let italic = style.attributes.contains(TerminalAttributes::ITALIC);
-        let underline = style.attributes.contains(TerminalAttributes::UNDERLINE);
-        let strikethrough = style.attributes.contains(TerminalAttributes::STRIKETHROUGH);
-        let foreground = THEME.terminal_color(style.foreground, bold, dim);
-        let background = THEME.terminal_color(style.background, false, false);
-        let span = metrics.span(start_column, columns);
-        let glyph_top = (metrics.baseline - metrics.ascent).max(0.0);
-        let glyph_height = metrics.ascent + metrics.descent;
-        let text = if style.text.contains('\t') {
-            terminal_run_display_text(style, start_column)
-        } else {
-            style.text.clone()
-        };
-        let text_len = text.len();
-        div()
-            .absolute()
-            .left(px(span.x))
-            .top(px(0.0))
-            .w(px(span.width))
-            .h(px(span.height))
-            .overflow_hidden()
-            .when(
-                style.background != TerminalColor::DefaultBackground,
-                |element| element.bg(rgb(background)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .top(px(glyph_top))
-                    .w_full()
-                    .h(px(glyph_height))
-                    .whitespace_nowrap()
-                    .font(self.terminal_font.font(bold, italic))
-                    .text_size(px(metrics.font_size))
-                    .line_height(px(glyph_height))
-                    .child(StyledText::new(text).with_runs(vec![TextRun {
-                        len: text_len,
-                        font: self.terminal_font.font(bold, italic),
-                        color: rgb(foreground).into(),
-                        background_color: None,
-                        underline: underline.then_some(UnderlineStyle {
-                            thickness: px(1.0),
-                            color: Some(rgb(foreground).into()),
-                            wavy: false,
-                        }),
-                        strikethrough: strikethrough.then_some(StrikethroughStyle {
-                            thickness: px(1.0),
-                            color: Some(rgb(foreground).into()),
-                        }),
-                    }])),
-            )
             .into_any_element()
     }
 
@@ -1150,13 +787,8 @@ impl HhApp {
                         show_pane_header,
                         cx,
                     )
-                } else if pane.kind.is_assistant() {
-                    self.render_assistant_pane(
-                        pane,
-                        std::slice::from_ref(pane),
-                        show_pane_header,
-                        cx,
-                    )
+                } else if pane.kind.is_gallery() {
+                    self.render_gallery_pane(pane, std::slice::from_ref(pane), show_pane_header, cx)
                 } else {
                     let active = pane.id;
                     self.render_terminal(std::slice::from_ref(pane), active, show_pane_header, cx)
@@ -1179,9 +811,9 @@ impl HhApp {
                 } else if let Some(pane) = panes
                     .iter()
                     .find(|pane| pane.id == *active)
-                    .filter(|pane| pane.kind.is_assistant())
+                    .filter(|pane| pane.kind.is_gallery())
                 {
-                    self.render_assistant_pane(pane, panes.as_slice(), show_pane_header, cx)
+                    self.render_gallery_pane(pane, panes.as_slice(), show_pane_header, cx)
                 } else {
                     self.render_terminal(panes.as_slice(), *active, show_pane_header, cx)
                 }
@@ -1261,7 +893,18 @@ impl HhApp {
                     .w(px(4.0))
                     .cursor(CursorStyle::ResizeLeftRight)
             })
-            .bg(rgb(THEME.border))
+            .bg(rgb(
+                if self
+                    .layout
+                    .resizing
+                    .is_some_and(|drag| drag.split_id == split_id)
+                {
+                    THEME.accent
+                } else {
+                    THEME.border
+                },
+            ))
+            .hover(|element| element.bg(rgb(THEME.accent)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -1298,10 +941,23 @@ impl HhApp {
                 .child("session service unavailable")
                 .into_any_element();
         };
+        if matches!(self.editor.modal, Modal::AppearanceSettings) {
+            // Settings replaces the whole main area: no tab strip or pane
+            // stays visible behind it.
+            return div()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .h_full()
+                .flex_1()
+                .bg(rgb(THEME.terminal))
+                .child(self.render_appearance_settings(cx))
+                .into_any_element();
+        }
         let Some(workspace) = self.active_workspace_in(snapshot) else {
             return div().size_full().bg(rgb(THEME.terminal)).into_any_element();
         };
         let workspace_id = workspace.id;
+        let bot = workspace.is_bot();
         let empty_workspace_uses_ssh =
             matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. });
         let open_terminal_binding = self.binding_label(AppCommand::NewTab);
@@ -1366,7 +1022,7 @@ impl HhApp {
                                 .font_family(".SystemUIFont")
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(rgb(THEME.foreground))
-                                .child("No terminals open"),
+                                .child(if bot { "No open threads" } else { "No terminals open" }),
                         )
                         .child(
                             div()
@@ -1374,7 +1030,9 @@ impl HhApp {
                                 .text_sm()
                                 .text_color(rgb(THEME.muted))
                                 .text_center()
-                                .child(if empty_workspace_uses_ssh {
+                                .child(if bot {
+                                    "Start a new thread with this bot, or resume a saved one from the sidebar."
+                                } else if empty_workspace_uses_ssh {
                                     "Open a fresh remote terminal with this workstation's saved system OpenSSH destination."
                                 } else {
                                     "This workstation is saved and ready when you want another local shell."
@@ -1394,25 +1052,27 @@ impl HhApp {
                                 .text_color(rgb(0xffffff))
                                 .hover(|element| element.bg(rgb(THEME.ansi[4])))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_workspace_terminal(workspace_id, cx)
+                                    if bot {
+                                        this.open_bot_thread(workspace_id, None, cx);
+                                    } else {
+                                        this.open_workspace_terminal(workspace_id, cx);
+                                    }
                                 }))
-                                .child("Open Terminal"),
+                                .child(if bot { "New Thread" } else { "Open Terminal" }),
                         )
                         .child(
                             div()
                                 .font_family("SF Mono")
                                 .text_xs()
                                 .text_color(rgb(THEME.dim))
-                                .child(format!(
-                                    "Press {open_terminal_binding} to open a terminal"
-                                )),
+                                .child(if bot {
+                                    format!("Press {open_terminal_binding} to start a thread")
+                                } else {
+                                    format!("Press {open_terminal_binding} to open a terminal")
+                                }),
                         ),
                 )
                 .into_any_element()
-        };
-        let workspace_content = match self.editor.modal {
-            Modal::AppearanceSettings => self.render_appearance_settings(cx),
-            _ => workspace_content,
         };
         div()
             .min_w(px(0.0))

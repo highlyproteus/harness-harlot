@@ -92,7 +92,7 @@ pub(super) fn stop_managed_service(service: &Path, restart: ServiceRestart) -> R
     }
     ensure!(
         restart == ServiceRestart::Forced,
-        "session service still owns live terminals; re-run with --restart-service to restart it (running shells become fresh shells) or close every terminal first"
+        "session service still owns live terminals; re-run with --restart-service to restart it (tmux-managed local shells resume; fallback shells restart) or close every terminal first"
     );
 
     let managed_service = fs::canonicalize(service)

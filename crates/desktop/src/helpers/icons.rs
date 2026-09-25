@@ -17,8 +17,8 @@ pub(crate) fn identity_detail(pane: &Pane) -> String {
     if pane.kind.is_browser() {
         return "Chromium browser tab".to_owned();
     }
-    if pane.kind.is_assistant() {
-        return "Voice assistant".to_owned();
+    if pane.kind.is_gallery() {
+        return "Workstation image gallery".to_owned();
     }
     let detection_detail = match pane.identity.source {
         hh_protocol::TerminalIdentitySource::UserRename => "Custom terminal name",
@@ -121,6 +121,17 @@ pub(crate) fn render_sidebar_toggle_icon(sidebar_visible: bool) -> AnyElement {
         .into_any_element()
 }
 
+/// The Workstations toolbar mark: an SVG hammer tinted by `color`, the same
+/// 14px footprint as the bell and robot.
+pub(crate) fn render_hammer_icon(color: u32) -> AnyElement {
+    svg()
+        .path("agent-icons/hammer.svg")
+        .w(px(14.0))
+        .h(px(14.0))
+        .text_color(rgb(color))
+        .into_any_element()
+}
+
 pub(crate) fn render_bell_icon(color: u32) -> AnyElement {
     div()
         .relative()
@@ -159,7 +170,9 @@ pub(crate) fn render_bell_icon(color: u32) -> AnyElement {
         )
         .into_any_element()
 }
-pub(crate) fn render_microphone_icon(color: u32) -> AnyElement {
+/// A robot head with an antenna, drawn like the bell so both toolbar marks
+/// share one visual weight.
+pub(crate) fn render_robot_icon(color: u32) -> AnyElement {
     div()
         .relative()
         .w(px(14.0))
@@ -167,83 +180,51 @@ pub(crate) fn render_microphone_icon(color: u32) -> AnyElement {
         .child(
             div()
                 .absolute()
-                .left(px(4.0))
+                .left(px(6.0))
                 .top(px(0.0))
-                .w(px(6.0))
-                .h(px(9.0))
+                .w(px(2.0))
+                .h(px(2.0))
                 .rounded_full()
-                .border_1()
-                .border_color(rgb(color)),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(2.0))
-                .top(px(5.0))
-                .w(px(10.0))
-                .h(px(6.0))
-                .rounded(px(5.0))
-                .border_1()
-                .border_color(rgb(color)),
+                .bg(rgb(color)),
         )
         .child(
             div()
                 .absolute()
                 .left(px(6.5))
-                .top(px(10.0))
+                .top(px(2.0))
                 .w(px(1.0))
-                .h(px(3.0))
+                .h(px(2.0))
                 .bg(rgb(color)),
         )
         .child(
             div()
                 .absolute()
-                .left(px(4.0))
-                .top(px(13.0))
-                .w(px(6.0))
-                .h(px(1.0))
-                .bg(rgb(color)),
-        )
-        .into_any_element()
-}
-
-pub(crate) fn render_headphones_icon(color: u32) -> AnyElement {
-    div()
-        .relative()
-        .w(px(14.0))
-        .h(px(14.0))
-        .child(
-            div()
-                .absolute()
-                .left(px(2.0))
-                .top(px(1.0))
-                .w(px(10.0))
-                .h(px(10.0))
-                .rounded_tl(px(5.0))
-                .rounded_tr(px(5.0))
-                .border_t_1()
-                .border_l_1()
-                .border_r_1()
+                .left(px(1.0))
+                .top(px(4.0))
+                .w(px(12.0))
+                .h(px(9.0))
+                .rounded(px(3.0))
+                .border_1()
                 .border_color(rgb(color)),
         )
         .child(
             div()
                 .absolute()
-                .left(px(0.0))
+                .left(px(4.0))
                 .top(px(7.0))
-                .w(px(4.0))
-                .h(px(6.0))
-                .rounded(px(2.0))
+                .w(px(2.0))
+                .h(px(2.0))
+                .rounded_full()
                 .bg(rgb(color)),
         )
         .child(
             div()
                 .absolute()
-                .left(px(10.0))
+                .left(px(8.0))
                 .top(px(7.0))
-                .w(px(4.0))
-                .h(px(6.0))
-                .rounded(px(2.0))
+                .w(px(2.0))
+                .h(px(2.0))
+                .rounded_full()
                 .bg(rgb(color)),
         )
         .into_any_element()
@@ -383,6 +364,8 @@ mod tests {
     #[test]
     fn renamed_tab_hides_shell_metadata_that_would_displace_its_name() {
         let mut pane = Pane {
+            status_changed_at_ms: 0,
+
             id: Uuid::new_v4(),
             kind: hh_protocol::PaneKind::Terminal,
             title: "Release terminal".to_owned(),

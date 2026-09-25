@@ -14,9 +14,8 @@ use gpui::{
     actions, point, px, size,
 };
 use hh_protocol::{
-    AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, HistoryArchiveStatus, HistoryClearScope,
-    PaneStatus, PaneStreamState, ServiceResponse, SessionNotification, SessionSnapshot,
-    StreamDiagnostics, TerminalScreen,
+    AppearanceColor, ClientRequest, DEVELOPMENT_BUILD_ENV, PaneStreamState, ServiceResponse,
+    SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalScreen,
 };
 use hh_session_client::SessionClient;
 use parking_lot::Mutex;
@@ -35,13 +34,15 @@ use uuid::Uuid;
 
 mod agent_icons;
 mod appearance;
+mod bots;
 mod browser;
 mod cli;
 mod commands;
 mod dialogs;
 mod elements;
+mod gallery;
 mod helpers;
-mod history_settings;
+mod image_paste;
 mod image_transfer;
 mod input;
 mod menus;
@@ -53,9 +54,9 @@ mod reconcile;
 mod render;
 mod session;
 mod sidebar;
+mod tab_chrome;
 mod terminal_view;
 mod theme;
-mod voice;
 mod workspace_tab_strip;
 mod workspaces;
 
@@ -75,6 +76,7 @@ use browser::configure_linux_browser_backend;
 use browser::native_nsview;
 use browser::{BrowserUrlEditor, prepare_cef_process};
 use commands::{AppConfig, ROOT_KEY_CONTEXT, ResolvedKeymap};
+use gallery::GalleryUi;
 use helpers::{
     WorkspaceTabScope, default_sidebar_width, gpui_binding, migrated_sidebar_width,
     next_terminal_poll_delay_ms, product_name,
@@ -85,9 +87,9 @@ use typography::TerminalFontProfile;
 use ui_state::UiStateStore;
 use updates::{UpdateCheckState, automatic_update_check_interval, automatic_update_checks_enabled};
 use view_models::{
-    ArchivedView, AssistantComposer, ColorPickerState, DragHoverState, HistoryEditor, Modal,
-    PaneDrag, ResizeDrag, SelectionAutoscroll, SelectionDrag, SidebarResizeLifecycle,
-    SplitControlId, TabDropPreview, WorkspaceDropPreview,
+    ColorPickerState, DragHoverState, Modal, PaneDrag, ResizeDrag, SelectionAutoscroll,
+    SelectionDrag, SettingsSection, SidebarMode, SidebarResizeLifecycle, SplitControlId,
+    TabDropPreview, WorkspaceDropPreview,
 };
 
 actions!(
@@ -97,6 +99,7 @@ actions!(
         ToggleSidebar,
         NewTab,
         NewBrowserTab,
+        NewGalleryTab,
         TerminalZoomIn,
         TerminalZoomOut,
         SplitRight,
@@ -111,7 +114,7 @@ actions!(
         EqualizePanes,
         ReattachPane,
         RetryTerminalInput,
-        ToggleVoiceMic,
+        ShowBots,
         ShowSettings,
         ConsumeChordPrefix,
         CopyTerminal,
@@ -165,34 +168,6 @@ const STABLE_PRODUCT_NAME: &str = "Harness Harlot";
 const DEVELOPMENT_PRODUCT_NAME: &str = "Harness Harlot Dev";
 const THEME: AppTheme = BuiltInTheme::HarborNight.theme();
 
-const fn pane_status_severity(status: PaneStatus) -> u8 {
-    match status {
-        PaneStatus::Idle => 0,
-        PaneStatus::Done => 1,
-        PaneStatus::Working => 2,
-        PaneStatus::Attention => 3,
-        PaneStatus::NeedsInput => 4,
-        PaneStatus::NeedsApproval => 5,
-    }
-}
-
-fn max_pane_status(statuses: impl IntoIterator<Item = PaneStatus>) -> PaneStatus {
-    statuses
-        .into_iter()
-        .max_by_key(|status| pane_status_severity(*status))
-        .unwrap_or_default()
-}
-
-const fn pane_status_color(status: PaneStatus) -> Option<u32> {
-    match status {
-        PaneStatus::Idle => None,
-        PaneStatus::Working => Some(THEME.dim),
-        PaneStatus::NeedsApproval => Some(THEME.danger),
-        PaneStatus::NeedsInput => Some(THEME.accent),
-        PaneStatus::Attention => Some(THEME.accent_soft),
-        PaneStatus::Done => Some(THEME.ansi[2]),
-    }
-}
 const APPEARANCE_PRESETS: [AppearanceColor; 8] = [
     AppearanceColor::new(0x62, 0xad, 0xff),
     AppearanceColor::new(0x67, 0xc8, 0xc6),
@@ -230,8 +205,8 @@ impl AvailableUpdateBanner {
     }
 }
 struct SessionState {
-    /// Screen traffic only: pane updates, targeted pane snapshots, history
-    /// status. Kept separate so a keystroke never waits behind a screen payload.
+    /// Screen traffic only: pane updates and targeted pane snapshots. Kept
+    /// separate so a keystroke never waits behind a screen payload.
     stream_client: SharedSessionClient,
     /// Everything else except terminal input and selection updates.
     control_client: SharedSessionClient,
@@ -249,15 +224,20 @@ struct SessionState {
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
     pane_states: HashMap<Uuid, PaneStreamState>,
+    /// Service `Message` notifications only; pane activity is read live
+    /// from `Pane.status`.
     notifications: Vec<SessionNotification>,
     notifications_latest_id: u64,
+    /// Last Needs-you count sent to the Dock, so polling never re-sends it.
+    dock_badge: Option<usize>,
+    /// When the user last viewed each pane, for the Notifications unread dot.
+    pane_views: notifications::PaneViews,
     /// When each pane's screen was last applied, used to pace on-screen panes
     /// other than the focused one.
     last_delivery: HashMap<Uuid, Instant>,
     window_active: bool,
     stream_diagnostics: StreamDiagnostics,
     connection_error: Option<String>,
-    history_status: Option<HistoryArchiveStatus>,
 }
 
 struct SessionChannels {
@@ -289,11 +269,12 @@ impl SessionState {
             pane_states: HashMap::new(),
             notifications: Vec::new(),
             notifications_latest_id: 0,
+            dock_badge: None,
+            pane_views: notifications::PaneViews::new(bots::now_ms()),
             last_delivery: HashMap::new(),
             window_active,
             stream_diagnostics: StreamDiagnostics::default(),
             connection_error,
-            history_status: None,
         }
     }
 }
@@ -315,7 +296,11 @@ struct SidebarUi {
     sidebar_resize: SidebarResizeLifecycle,
     preferred_sidebar_width: f32,
     sidebar_visible: bool,
-    sidebar_activity: bool,
+    sidebar_mode: SidebarMode,
+    /// The view Notifications was opened from, restored when it is turned off.
+    notifications_return: SidebarMode,
+    /// The workstation to return to when a bot view is left.
+    return_workstation: Option<Uuid>,
     sidebar_pixels: f32,
     workstation_banner: Option<BannerArtwork>,
     workstation_banner_hidden: bool,
@@ -344,7 +329,9 @@ impl SidebarUi {
             sidebar_resize: SidebarResizeLifecycle::default(),
             preferred_sidebar_width,
             sidebar_visible: true,
-            sidebar_activity: false,
+            sidebar_mode: SidebarMode::Workstations,
+            notifications_return: SidebarMode::Workstations,
+            return_workstation: None,
             sidebar_pixels: default_sidebar_width(),
             workstation_banner,
             workstation_banner_hidden,
@@ -390,17 +377,14 @@ impl LayoutUi {
 
 struct EditorUi {
     modal: Modal,
-    history_editor: Option<HistoryEditor>,
-    history_clear_confirmation: Option<HistoryClearScope>,
+    settings_section: SettingsSection,
     color_picker: Option<ColorPickerState>,
     browser_url_editor: Option<BrowserUrlEditor>,
-    assistant_composer: Option<AssistantComposer>,
+    agent_skill_status: Option<String>,
     ime_preedit: String,
     workspace_input_focus: [FocusHandle; 4],
     workspace_input_layouts: [Option<ShapedLine>; 4],
     workspace_input_bounds: [Option<Bounds<Pixels>>; 4],
-    /// Archived-history views per pane; belongs with editing UI state.
-    archived_views: HashMap<Uuid, ArchivedView>,
     update_available: Option<AvailableUpdateBanner>,
     update_check: UpdateCheckState,
 }
@@ -409,16 +393,14 @@ impl EditorUi {
     fn new(workspace_input_focus: [FocusHandle; 4]) -> Self {
         Self {
             modal: Modal::None,
-            history_editor: None,
-            history_clear_confirmation: None,
+            settings_section: SettingsSection::default(),
             color_picker: None,
             browser_url_editor: None,
-            assistant_composer: None,
+            agent_skill_status: None,
             ime_preedit: String::new(),
             workspace_input_focus,
             workspace_input_layouts: [None, None, None, None],
             workspace_input_bounds: [None, None, None, None],
-            archived_views: HashMap::new(),
             update_available: None,
             update_check: UpdateCheckState::default(),
         }
@@ -434,6 +416,7 @@ struct BrowserUi {
     browser_runtime_error: Option<String>,
     cef_shutdown_subscription: Option<gpui::Subscription>,
     reassert_focus: bool,
+    deferred_commands: Vec<(hh_protocol::BrowserCommandRequest, Instant)>,
 }
 
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
@@ -447,6 +430,7 @@ impl BrowserUi {
             browser_runtime_error: None,
             cef_shutdown_subscription: None,
             reassert_focus: false,
+            deferred_commands: Vec::new(),
         }
     }
 
@@ -458,6 +442,7 @@ impl BrowserUi {
             browser_runtime_error: None,
             cef_shutdown_subscription: None,
             reassert_focus: false,
+            deferred_commands: Vec::new(),
         }
     }
 }
@@ -476,7 +461,9 @@ struct HhApp {
     sidebar: SidebarUi,
     layout: LayoutUi,
     editor: EditorUi,
-    voice: voice::VoiceUi,
+    gallery: GalleryUi,
+    coding_agents: bots::CodingAgentsState,
+    bot_threads: bots::BotThreadsState,
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     browser: BrowserUi,
 }
@@ -591,7 +578,9 @@ impl HhApp {
             ),
             layout: LayoutUi::new(),
             editor: EditorUi::new(workspace_input_focus),
-            voice: voice::VoiceUi::new(),
+            gallery: GalleryUi::new(),
+            coding_agents: bots::CodingAgentsState::default(),
+            bot_threads: bots::BotThreadsState::default(),
             #[cfg(all(target_os = "macos", feature = "browser"))]
             browser: BrowserUi::new(browser_parent_view),
             #[cfg(all(target_os = "linux", feature = "browser"))]
@@ -617,10 +606,6 @@ impl HhApp {
                 }
             }));
         }
-        app.voice.quit_subscription = Some(cx.on_app_quit(|this, _| {
-            this.shutdown_voice();
-            async {}
-        }));
 
         cx.observe_window_bounds(window, |this, window, cx| {
             if this.update_window_geometry(window) {
@@ -633,15 +618,11 @@ impl HhApp {
         cx.observe_window_activation(window, |this, window, cx| {
             this.session.window_active = window.is_window_active();
             if this.session.window_active {
+                this.mark_focused_pane_viewed();
+                cx.notify();
                 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
                 {
                     this.browser.reassert_focus = true;
-                    cx.notify();
-                }
-                if let Some(pane_id) = this.layout.focused_pane
-                    && this.auto_read_pane_notifications(pane_id, cx)
-                {
-                    cx.notify();
                 }
             } else {
                 this.cancel_sidebar_resize(window, cx);
@@ -670,18 +651,9 @@ impl HhApp {
         .detach();
         cx.spawn(async move |this, cx| {
             loop {
-                gpui::Timer::after(Duration::from_secs(5)).await;
-                let Ok(client) = this.update(cx, |this, _| Arc::clone(&this.session.stream_client))
-                else {
-                    break;
-                };
-                let response = cx
-                    .background_spawn(async move {
-                        session_call(&client, &ClientRequest::GetHistoryStatus)
-                    })
-                    .await;
+                gpui::Timer::after(tab_chrome::SPINNER_STEP).await;
                 let Ok(()) = this.update(cx, |this, cx| {
-                    if this.apply_history_status_result(response) {
+                    if this.any_pane_running() {
                         cx.notify();
                     }
                 }) else {
@@ -710,8 +682,7 @@ impl HhApp {
         }
         app
     }
-    /// Screen traffic: pane updates, targeted pane snapshots, history
-    /// status. Kept only for the synchronous startup fetch; everything
+    /// Screen traffic: pane updates and targeted pane snapshots. Kept only for the synchronous startup fetch; everything
     /// else flows through the async pipelines.
     fn stream_call(&self, request: &ClientRequest) -> anyhow::Result<ServiceResponse> {
         session_call(&self.session.stream_client, request)
@@ -748,8 +719,8 @@ impl HhApp {
 /// reachable. The service is deliberately detached from the desktop lifetime:
 /// closing or replacing the app UI never asks it to stop, preserving active
 /// terminal sessions. Protocol-changing updates stop it with
-/// `hh-update-tool install --restart-service` after user confirmation and rely
-/// on desired-state recovery to reopen fresh shells in their last directories.
+/// `hh-update-tool install --restart-service` after user confirmation; local
+/// terminals reattach through HH's private tmux server when available.
 fn ensure_bundled_session_service() {
     if std::env::var_os("HH_DISABLE_BUNDLED_SERVICE").is_some()
         || SessionClient::connect()
@@ -826,22 +797,6 @@ fn install_macos_dock_icon(development_build: bool) {
 
 #[cfg(not(target_os = "macos"))]
 fn install_macos_dock_icon(_: bool) {}
-
-#[cfg(target_os = "macos")]
-fn exclude_history_from_backup() {
-    let Some(history) = hh_protocol::state_directory().map(|directory| directory.join("history"))
-    else {
-        return;
-    };
-    if history.is_dir()
-        && let Err(error) = hh_macos_icon::exclude_directory_from_backup(&history)
-    {
-        eprintln!("Harness Harlot could not exclude local history from backups: {error}");
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn exclude_history_from_backup() {}
 
 /// Installs a panic hook that appends a timestamped, symbolized entry to
 /// `<state_dir>/panic.log`, or an owner-only temporary fallback, truncates it
@@ -925,7 +880,6 @@ fn main() {
     let development_build = development_build();
     let product_name = product_name(development_build);
     ensure_bundled_session_service();
-    exclude_history_from_backup();
     Application::new()
         .with_assets(AgentIconAssets)
         .run(move |cx: &mut App| {
@@ -978,10 +932,9 @@ fn main() {
 mod tests {
     use super::{
         AvailableUpdateBanner, BUNDLED_BANNER_PIXEL_HEIGHT, BUNDLED_BANNER_PIXEL_WIDTH,
-        max_pane_status, pane_status_color, workstation_banner_path,
+        workstation_banner_path,
     };
     use crate::sidebar::{UpdateInstallPlan, update_install_plan};
-    use hh_protocol::PaneStatus;
 
     #[test]
     fn update_banner_reflects_install_capability() {
@@ -1019,31 +972,6 @@ mod tests {
             UpdateInstallPlan::Install
         );
         assert_eq!(update_install_plan(false, None), UpdateInstallPlan::Install);
-    }
-
-    #[test]
-    fn pane_status_badges_use_declared_severity_and_colors() {
-        assert_eq!(
-            max_pane_status([
-                PaneStatus::Done,
-                PaneStatus::Working,
-                PaneStatus::Attention,
-                PaneStatus::NeedsInput,
-                PaneStatus::NeedsApproval,
-            ]),
-            PaneStatus::NeedsApproval
-        );
-        assert_eq!(max_pane_status([]), PaneStatus::Idle);
-        assert_eq!(pane_status_color(PaneStatus::Idle), None);
-        for status in [
-            PaneStatus::Done,
-            PaneStatus::Working,
-            PaneStatus::Attention,
-            PaneStatus::NeedsInput,
-            PaneStatus::NeedsApproval,
-        ] {
-            assert!(pane_status_color(status).is_some(), "status: {status:?}");
-        }
     }
 
     #[test]

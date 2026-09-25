@@ -2,9 +2,9 @@ use crate::commands::{AppCommand, ROOT_KEY_CONTEXT, ResolvedBinding};
 use crate::view_models::SplitControlId;
 use crate::{
     DEVELOPMENT_PRODUCT_NAME, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp,
-    NewBrowserTab, NewTab, NewWorkspace, ReattachPane, RetryTerminalInput, STABLE_PRODUCT_NAME,
-    ShowCommandPalette, ShowNotifications, ShowSettings, SplitDown, SplitRight, TerminalZoomIn,
-    TerminalZoomOut, TogglePaneZoom, ToggleSidebar, ToggleVoiceMic,
+    NewBrowserTab, NewGalleryTab, NewTab, NewWorkspace, ReattachPane, RetryTerminalInput,
+    STABLE_PRODUCT_NAME, ShowBots, ShowCommandPalette, ShowNotifications, ShowSettings, SplitDown,
+    SplitRight, TerminalZoomIn, TerminalZoomOut, TogglePaneZoom, ToggleSidebar,
 };
 use gpui::KeyBinding;
 use uuid::Uuid;
@@ -53,6 +53,9 @@ pub(crate) fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
         AppCommand::NewBrowserTab => {
             KeyBinding::new(&binding.sequence, NewBrowserTab, Some(ROOT_KEY_CONTEXT))
         }
+        AppCommand::NewGalleryTab => {
+            KeyBinding::new(&binding.sequence, NewGalleryTab, Some(ROOT_KEY_CONTEXT))
+        }
         AppCommand::TerminalZoomIn => {
             KeyBinding::new(&binding.sequence, TerminalZoomIn, Some(ROOT_KEY_CONTEXT))
         }
@@ -97,8 +100,8 @@ pub(crate) fn gpui_binding(binding: &ResolvedBinding) -> KeyBinding {
         AppCommand::ShowNotifications => {
             KeyBinding::new(&binding.sequence, ShowNotifications, Some(ROOT_KEY_CONTEXT))
         }
-        AppCommand::ToggleVoiceMic => {
-            KeyBinding::new(&binding.sequence, ToggleVoiceMic, Some(ROOT_KEY_CONTEXT))
+        AppCommand::ShowBots => {
+            KeyBinding::new(&binding.sequence, ShowBots, Some(ROOT_KEY_CONTEXT))
         }
         AppCommand::ShowSettings => {
             KeyBinding::new(&binding.sequence, ShowSettings, Some(ROOT_KEY_CONTEXT))

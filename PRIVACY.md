@@ -1,107 +1,80 @@
-# Voice Mode privacy and data handling
+# Bots privacy and data handling
 
-Effective: August 28, 2026
+Effective: September 24, 2026
 
-This document describes the data behavior of Voice Mode in Harness Harlot. It
-covers the application as distributed by this project; OpenAI, an optional
-Honcho server, the operating system, and terminal programs have their own terms
-and data practices.
+This document describes the data behavior of Bots in Harness Harlot. The agent
+CLIs you choose for bots and workers (for example omp, Hermes, Claude Code, or
+Codex), their model providers, the operating system, terminal programs, and
+browsers have their own terms and data practices.
 
-## Voice Mode is optional
+## Harness Harlot sends nothing to model providers
 
-Voice Mode is inactive until you use an Assistant pane. Typing a message,
-attaching an image, or reopening a saved thread may connect the Assistant to
-OpenAI, but those actions do not grant microphone access. Microphone capture
-hardware is not enumerated, configured, or opened until you use the visible
-start-voice control. Muting, suspending, or stopping the Assistant disables
-capture, and a later text-only start revokes any earlier microphone consent.
+Harness Harlot has no built-in model, voice, or speech integration and makes no
+model-provider or speech-provider requests of its own. A bot is the agent CLI
+you selected, running its own interface in a local terminal. That agent uses its
+own configuration, credentials, provider, and optional voice mode. Harness
+Harlot does not read, copy, or store agent or provider credentials.
 
-## Data sent to OpenAI
+## What a bot's agent can access
 
-When an Assistant is connected, Harness Harlot uses the OpenAI Realtime API.
-Depending on what you choose to do, it may send:
+When Harness Harlot launches a bot, it gives the agent:
 
-- typed messages and attached images;
-- microphone audio captured after explicit voice start;
-- a non-path conversation label, configured Assistant instructions, and a
-  bounded prior-conversation summary; and
-- optional Honcho memory context when you separately enable Honcho.
+- an `AGENTS.md` in the bot's home folder with the coordinator prompt, the
+  bot's name, its project folder, and any instructions you entered;
+- the Harness Harlot tools: the bundled omp plugin for omp, or the local `hh mcp`
+  server for agents whose launch command accepts an MCP configuration; and
+- the `HH_*` environment variables that identify the bot's terminal.
 
-Harness Harlot does not send terminal output, terminal notifications, OSC
-payloads, pane contents, filesystem paths, directory listings, Git state, or
-workspace control data to the Voice provider. It advertises no provider tools
-or tool-choice capability. Historical or unsolicited provider function calls
-fail locally and cannot invoke an RPC, approval, terminal action, filesystem
-operation, or memory query.
+With these tools the agent can list workstations and terminal tabs, open worker
+tabs that run commands, read worker terminal screens, send input to them, wait
+for their status, rename, focus, and close them, and drive embedded browser and
+Gallery panes. Anything a tool returns, including terminal screen text, browser
+page content, and screenshots, can become context that the agent sends to its
+model provider. Worker programs are separate local processes with their normal
+operating-system permissions.
 
-OpenAI returns generated text, audio, and transcripts. OpenAI's handling and
-retention of sent data are governed by the terms and settings of the OpenAI
-account associated with `HH_OPENAI_API_KEY`.
-
-Voice is conversation-only. The model cannot inspect or control terminals,
-panes, workstations, tabs, projects, threads, directories, filesystems, Git,
-agents, or local memory. Voice has no approval UI, and model output, speech,
-terminal content, restored context, or prior summaries cannot authorize an
-action.
-
-## Optional Honcho memory
-
-Honcho memory is disabled by default. If you configure it, Harness Harlot sends
-accepted user and assistant text turns to the Honcho server you selected. At
-session start, the application may request a bounded memory preamble and place
-that text in the conversational provider context. The model cannot issue its
-own Honcho recall or deletion requests.
-
-Remote Honcho endpoints must use HTTPS. Plain HTTP is accepted only for a
-parsed loopback destination such as `localhost`, `127.0.0.1`, or `::1`.
-Redirects are disabled for Honcho requests so credentials and conversation data
-are never forwarded to another origin.
-
-Honcho data retention and deletion are controlled by that Honcho deployment.
-Deleting or clearing local Harness Harlot threads does not delete a remote
-Honcho server's copy. Use that server's administrative controls to inspect or
-delete remote data.
+The omp plugin reports worker status changes (needs input, needs approval,
+done) with a short excerpt of that worker's screen into the bot conversation
+(thread) that opened the worker, so the bot can tell you about them. It also
+tells Harness Harlot the omp session id each bot thread tab shows, so the Bots
+sidebar can list the bot's threads.
 
 ## Local storage
 
-Harness Harlot stores non-secret Voice settings in its owner-only application
-state directory. OpenAI API keys and Honcho bearer tokens are deliberately not
-serialized to the settings file. Supply them to future launches through:
+The session snapshot records each bot's name, agent, project folder, custom
+home folder, and instructions, its open thread tabs and their layout, which
+worker tabs a bot and which of its threads created, the omp session ids of the
+bot's open threads, and the threads you pinned. It stores no terminal output, credentials, or conversation content. Bot terminals keep their output
+in the private HH tmux server like other local terminals; Harness Harlot keeps
+no disk archive of terminal output.
 
-```text
-HH_OPENAI_API_KEY
-HH_HONCHO_BEARER
-```
+Each bot's default home folder is an owner-only folder in the application state
+directory. It holds the generated `AGENTS.md` and whatever notes the agent
+writes there; Harness Harlot stores no terminal output in it. Deleting a bot
+deletes its default home folder. A custom home folder you choose is never
+deleted, and an `AGENTS.md` you wrote there yourself is never overwritten.
 
-Saved Assistant threads contain bounded text turns, titles, conversation and
-workspace identifiers, conversation labels, and session summaries. They do not
-contain microphone audio, attached image bytes, terminal output, filesystem
-paths, provider credentials, tool calls, or approval records. Thread files are
-owner-only regular files, opened without following symbolic links, and bounded
-to 8 MiB and 10,000 records per thread.
+omp bots keep their thread transcripts (omp's own session files, including
+titles and the full conversation) in a `threads` folder inside the bot's
+owner-only default home folder, even when the bot uses a custom home folder.
+omp writes them; Harness Harlot reads only the first few kilobytes of each to
+list thread titles. Deleting the bot deletes its threads.
 
-Default local thread retention keeps at most 200 threads, 90 days of activity,
-and 64 MiB in total, deleting the oldest or expired files when a limit is
-exceeded. The Assistant history UI labels its controls as local-only. Delete,
-clear-all, and retention revoke active writers before removing files and sync
-the containing directory before reporting success. Session summaries live in
-those same retained thread files, so local controls cover summaries as well as
-visible turns.
+Harness Harlot also writes the bundled omp plugin and each bot's MCP launch
+configuration (containing only the `hh` executable path) to its owner-only
+application state directory. Agents keep their own conversation history
+according to their own settings.
 
-This disclosure is included in macOS and Linux packages and is linked from the
-Voice settings panel.
+Earlier releases stored Assistant conversation files and Voice settings under
+the application state directory. This release no longer reads them and does not
+delete them automatically; remove the `assistant` directory in the application
+state directory if you no longer need it.
 
-Attached images are read only after you select them. Harness Harlot rejects
-symbolic links, non-regular or foreign-owned files, oversized input, mismatched
-file signatures, and invalid image decodes before sending accepted PNG, JPEG,
-or WebP data to OpenAI.
+## Terminal and browser boundary
 
-## Terminal and filesystem boundary
-
-Voice has no terminal or filesystem capability. Terminal output and OSC
-notifications remain local and do not become model context. Ordinary terminal,
-workspace, browser, and file-transfer features remain human-operated desktop
-features outside the Voice provider boundary.
+Harness Harlot tool requests cross the versioned, owner-only local Unix socket
+and are validated by the session service. Agents never receive the service's
+process handles, tmux control connection, or SSH credentials.
 
 ## Security and questions
 
@@ -109,5 +82,5 @@ Do not include secrets in public issues. Contact the maintainers privately for
 sensitive vulnerability reports. For non-sensitive questions, use the project's
 [GitLab issue tracker](https://gitlab.com/highlyproteus/harness-harlot/-/issues).
 
-Material changes to Voice data handling are documented here and in the project
+Material changes to Bots data handling are documented here and in the project
 changelog as part of release preparation.

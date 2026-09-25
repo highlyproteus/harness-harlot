@@ -16,7 +16,7 @@ Proceed provisionally with GPUI 0.2.2 for the macOS/Linux MVP client. Keep the U
 ## Current limits and fallback gates
 
 - The current renderer projects cell-counted styled runs from Alacritty's grid and maps ANSI 16-color, indexed, and truecolor foreground/background plus bold, dim, italic, underline, strike, cursor, selection, clipboard, bounded scrollback/search, mouse reporting, and foundational IME behavior. Grapheme shaping, remaining wide-cell edge cases, richer search, and accessibility are not complete.
-- Live state survives a desktop restart. Restricted desired-state metadata is journaled atomically to an owner-only file, so a service restart recreates fresh local shells and retains saved SSH layouts offline; it does not preserve arbitrary live processes or terminal output.
+- Live state survives a desktop restart. With tmux 3.2+, HH-managed local processes and output also survive a session-service restart through the private HH tmux server; the restricted desired-state journal preserves opaque attachment IDs and safe layout metadata. Missing or failed tmux recovery falls back to fresh local shells, while saved SSH layouts remain offline.
 - System-SSH workspaces are implemented through an explicit reviewed action that launches the installed OpenSSH client. Host discovery, remote lifecycle soak, and optional durable remote reattachment remain later work.
 - GPUI's pre-1.0 API and large native dependency graph increase upgrade and packaging cost.
 - Linux must still pass Wayland and X11 runtime tests on real GPU drivers, and macOS must pass Spaces/display-switching soak tests.

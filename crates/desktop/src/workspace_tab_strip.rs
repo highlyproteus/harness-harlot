@@ -6,20 +6,17 @@ use gpui::{
     MouseDownEvent, ParentElement, Point, StatefulInteractiveElement, Styled, StyledImage, div,
     img, px, rgb,
 };
-use hh_protocol::{AppearanceColor, PaneStatus, Workspace};
+use hh_protocol::{AppearanceColor, Workspace};
 use std::time::Instant;
 
 use crate::helpers::{
     IDENTITY_MARK_SIZE, WorkspaceTabScope, click_suppression_active, collect_terminal_tabs,
-    composite_rgb, element_key, identity_label, workspace_strip_active_tab,
-    workspace_tab_focus_target, workspace_tab_set, workspace_tab_standalone_pane,
+    composite_rgb, element_key, workspace_strip_active_tab, workspace_tab_focus_target,
+    workspace_tab_set, workspace_tab_standalone_pane,
 };
-use crate::view_models::{
-    CreateMenu, CreateMenuTarget, Modal, TabDrag, TabDropPreview, TooltipView,
-};
-use crate::{
-    HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT, max_pane_status, pane_status_color,
-};
+use crate::tab_chrome::render_pane_indicator;
+use crate::view_models::{CreateMenu, Modal, TabDrag, TabDropPreview, TooltipView};
+use crate::{HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
 
 impl HhApp {
     #[allow(clippy::too_many_lines)]
@@ -35,8 +32,8 @@ impl HhApp {
             WorkspaceTabScope::Workstation => None,
             WorkspaceTabScope::Project(project_id) => Some(project_id),
         };
-        let assistant = workspace.is_assistant();
         let active_tab = workspace_strip_active_tab(workspace, scope, self.layout.focused_pane);
+        let bot = workspace.is_bot();
         let tabs = tab_set
             .tabs
             .into_iter()
@@ -46,14 +43,7 @@ impl HhApp {
                 let active = active_tab == Some(tab.id);
                 let standalone_pane = workspace_tab_standalone_pane(tab);
                 let is_standalone = standalone_pane.is_some();
-                let label = standalone_pane.map_or_else(
-                    || {
-                        tab.custom_title
-                            .clone()
-                            .unwrap_or_else(|| tab.title.clone())
-                    },
-                    |pane| identity_label(pane).to_owned(),
-                );
+                let label = self.tab_label(tab);
                 let icon = if let Some(pane) = standalone_pane {
                     let accent = pane
                         .color
@@ -97,13 +87,16 @@ impl HhApp {
                         .bg(rgb(tab.color.map_or(THEME.dim, AppearanceColor::as_rgb)))
                         .into_any_element()
                 };
-                let (pane_count, status) = {
+                let (pane_count, indicator) = {
                     let mut panes = Vec::new();
                     collect_terminal_tabs(&tab.layout, &mut panes);
-                    let status = max_pane_status(panes.iter().map(|pane| pane.status));
-                    (panes.len(), status)
+                    let indicator = panes
+                        .iter()
+                        .map(|pane| self.pane_indicator(pane))
+                        .max()
+                        .unwrap_or_default();
+                    (panes.len(), indicator)
                 };
-                let status_color = pane_status_color(status);
                 let tab_id = tab.id;
                 let close_tooltip = if is_standalone {
                     format!("Close {label}…")
@@ -265,46 +258,14 @@ impl HhApp {
                                 .child(pane_count.to_string()),
                         )
                     })
-                    .when(status != PaneStatus::Idle, |element| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .w(px(7.0))
-                                .h(px(7.0))
-                                .rounded_full()
-                                .bg(rgb(status_color.expect("non-idle status has a color"))),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(("close-workspace-strip-tab", element_key(tab_id)))
-                            .flex_none()
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .rounded(px(3.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font_family(".SystemUIFont")
-                            .text_xs()
-                            .text_color(rgb(THEME.dim))
-                            .hover(|element| {
-                                element
-                                    .bg(rgb(THEME.accent_soft))
-                                    .text_color(rgb(THEME.foreground))
-                            })
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: close_tooltip.clone(),
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.dismiss_workspace_tab(tab_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child("×"),
-                    )
+                    .child(render_pane_indicator(indicator))
+                    .child(self.render_close_button(
+                        ("close-workspace-strip-tab", element_key(tab_id)),
+                        THEME.foreground,
+                        close_tooltip,
+                        move |this, cx| this.dismiss_workspace_tab(tab_id, cx),
+                        cx,
+                    ))
                     .into_any_element()
             });
         div()
@@ -347,27 +308,28 @@ impl HhApp {
                             .bg(rgb(THEME.elevated))
                             .text_color(rgb(THEME.foreground))
                     })
-                    .tooltip({
-                        let text = if assistant {
-                            "New thread".to_owned()
-                        } else {
-                            "Add project, terminal, browser, or group".to_owned()
-                        };
-                        move |_, cx| cx.new(|_| TooltipView { text: text.clone() }).into()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: if bot {
+                                "New thread".to_owned()
+                            } else {
+                                "Add project, terminal, browser, or group".to_owned()
+                            },
+                        })
+                        .into()
                     })
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        if assistant {
-                            this.new_assistant_tab(workspace_id, cx);
-                        } else {
-                            this.editor.modal = Modal::CreateMenu(CreateMenu {
-                                position: event.position(),
-                                target: CreateMenuTarget::TabStrip {
-                                    workspace_id,
-                                    target_tab,
-                                },
-                            });
-                            cx.notify();
+                        // A bot's tabs are its threads; ＋ starts one.
+                        if bot {
+                            this.open_bot_thread(workspace_id, None, cx);
+                            return;
                         }
+                        this.editor.modal = Modal::CreateMenu(CreateMenu {
+                            position: event.position(),
+                            workspace_id,
+                            target_tab,
+                        });
+                        cx.notify();
                     }))
                     .child("+"),
             )

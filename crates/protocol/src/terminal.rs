@@ -4,6 +4,49 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::profile::TerminalProfile;
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CodingAgent {
+    pub profile: TerminalProfile,
+    /// Command name as found on the login PATH, e.g. "claude".
+    pub command: String,
+    /// Canonical absolute executable path, for display only.
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrowserAction {
+    Navigate {
+        url: String,
+    },
+    Back,
+    Forward,
+    Reload,
+    /// Raw Chrome `DevTools` Protocol call executed against the pane's browser.
+    DevTools {
+        method: String,
+        params: serde_json::Value,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BrowserCommandRequest {
+    pub request_id: u64,
+    pub pane_id: Uuid,
+    pub action: BrowserAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrowserCommandOutcome {
+    /// `result` is the CDP `result` object for `DevTools`, `null` for the other actions.
+    Ok {
+        result: serde_json::Value,
+    },
+    Error {
+        message: String,
+    },
+}
 
 /// Ephemeral activity state projected by the local session service.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,6 +89,8 @@ pub struct PaneRevisionCursor {
 }
 
 /// Content-free delivery state for one daemon-owned pane.
+// Independent wire flags, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PaneStreamState {
     pub pane_id: Uuid,
@@ -56,6 +101,10 @@ pub struct PaneStreamState {
     /// nowhere. Runtime-only panes (tmux attach, SSH) can be reattached.
     #[serde(default)]
     pub exited: bool,
+    /// The pane's application enabled kitty paste events (`CSI ? 5522 h`),
+    /// so an image paste can go through `ClientRequest::PasteImage`.
+    #[serde(default)]
+    pub enhanced_paste: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

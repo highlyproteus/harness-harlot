@@ -53,53 +53,105 @@ impl EventListener for TermEventListener {
     }
 }
 
+/// A request the application wrote to the terminal that needs a reply on
+/// the pane's input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalRequest {
+    /// DECRQM `CSI ? 5522 $ p`, with the mode state when it was asked.
+    ReportEnhancedPasteMode { enabled: bool },
+    /// The body of one `OSC 5522 ; … ST` clipboard packet, after `5522;`.
+    ClipboardPacket(String),
+}
+
+/// Private DEC mode for kitty's clipboard paste events.
+const ENHANCED_PASTE_MODE: &[u8] = b"5522";
+const MAX_CSI_PARAMETER_BYTES: usize = 64;
+
+/// Everything the scanner extracts from one stream of pane output.
 #[derive(Debug, Default)]
-struct OscNotificationScanner {
-    state: OscScanState,
+struct ScanOutput {
+    messages: Vec<String>,
+    requests: Vec<TerminalRequest>,
+    enhanced_paste: bool,
+}
+
+/// Watches pane output for the few sequences Harness Harlot itself acts on
+/// (notifications, enhanced paste mode, and clipboard requests), carrying
+/// partial sequences across reads.
+#[derive(Debug, Default)]
+struct OutputScanner {
+    state: ScanState,
 }
 
 #[derive(Debug, Default)]
-enum OscScanState {
+enum ScanState {
     #[default]
     Ground,
     Escape,
+    Csi {
+        parameters: Vec<u8>,
+    },
     Osc {
         bytes: Vec<u8>,
         escape_pending: bool,
     },
 }
 
-impl OscNotificationScanner {
-    fn scan(&mut self, input: &[u8], messages: &mut Vec<String>) {
+impl OutputScanner {
+    fn scan(&mut self, input: &[u8], output: &mut ScanOutput) {
         for &byte in input {
             let state = std::mem::take(&mut self.state);
             self.state = match state {
-                OscScanState::Ground | OscScanState::Escape if byte == b'\x1b' => {
-                    OscScanState::Escape
+                ScanState::Ground | ScanState::Escape | ScanState::Csi { .. }
+                    if byte == b'\x1b' =>
+                {
+                    ScanState::Escape
                 }
-                OscScanState::Escape if byte == b']' => OscScanState::Osc {
+                ScanState::Escape if byte == b']' => ScanState::Osc {
                     bytes: Vec::new(),
                     escape_pending: false,
                 },
-                OscScanState::Ground | OscScanState::Escape => OscScanState::Ground,
-                OscScanState::Osc {
+                ScanState::Escape if byte == b'[' => ScanState::Csi {
+                    parameters: Vec::new(),
+                },
+                ScanState::Escape if byte == b'c' => {
+                    // RIS resets every mode, including enhanced paste.
+                    output.enhanced_paste = false;
+                    ScanState::Ground
+                }
+                ScanState::Csi { parameters } if (0x40..=0x7e).contains(&byte) => {
+                    Self::finish_csi(&parameters, byte, output);
+                    ScanState::Ground
+                }
+                ScanState::Csi { mut parameters } if (0x20..=0x3f).contains(&byte) => {
+                    if parameters.len() >= MAX_CSI_PARAMETER_BYTES {
+                        ScanState::Ground
+                    } else {
+                        parameters.push(byte);
+                        ScanState::Csi { parameters }
+                    }
+                }
+                // C0 controls inside a CSI execute without ending it.
+                ScanState::Csi { parameters } if byte < 0x20 => ScanState::Csi { parameters },
+                ScanState::Ground | ScanState::Escape | ScanState::Csi { .. } => ScanState::Ground,
+                ScanState::Osc {
                     bytes,
                     escape_pending: true,
                 } if byte == b'\\' => {
-                    Self::finish(&bytes, messages);
-                    OscScanState::Ground
+                    Self::finish_osc(&bytes, output);
+                    ScanState::Ground
                 }
-                OscScanState::Osc {
+                ScanState::Osc {
                     mut bytes,
                     escape_pending,
                 } if byte == b'\x07' => {
                     if escape_pending && bytes.len() < MAX_OSC_SEQUENCE_BYTES {
                         bytes.push(b'\x1b');
                     }
-                    Self::finish(&bytes, messages);
-                    OscScanState::Ground
+                    Self::finish_osc(&bytes, output);
+                    ScanState::Ground
                 }
-                OscScanState::Osc {
+                ScanState::Osc {
                     mut bytes,
                     escape_pending,
                 } => {
@@ -110,15 +162,15 @@ impl OscNotificationScanner {
                         bytes.push(b'\x1b');
                     }
                     if byte == b'\x1b' {
-                        OscScanState::Osc {
+                        ScanState::Osc {
                             bytes,
                             escape_pending: true,
                         }
                     } else if bytes.len() >= MAX_OSC_SEQUENCE_BYTES {
-                        OscScanState::Ground
+                        ScanState::Ground
                     } else {
                         bytes.push(byte);
-                        OscScanState::Osc {
+                        ScanState::Osc {
                             bytes,
                             escape_pending: false,
                         }
@@ -128,7 +180,43 @@ impl OscNotificationScanner {
         }
     }
 
-    fn finish(sequence: &[u8], messages: &mut Vec<String>) {
+    fn finish_csi(parameters: &[u8], final_byte: u8, output: &mut ScanOutput) {
+        let Some(private) = parameters.strip_prefix(b"?") else {
+            return;
+        };
+        match final_byte {
+            b'h' | b'l' => {
+                if private
+                    .split(|byte| *byte == b';')
+                    .any(|mode| mode == ENHANCED_PASTE_MODE)
+                {
+                    output.enhanced_paste = final_byte == b'h';
+                }
+            }
+            b'p' if private.strip_suffix(b"$") == Some(ENHANCED_PASTE_MODE) => {
+                output
+                    .requests
+                    .push(TerminalRequest::ReportEnhancedPasteMode {
+                        enabled: output.enhanced_paste,
+                    });
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_osc(sequence: &[u8], output: &mut ScanOutput) {
+        if let Some(body) = sequence.strip_prefix(b"5522;") {
+            if let Ok(body) = std::str::from_utf8(body) {
+                output
+                    .requests
+                    .push(TerminalRequest::ClipboardPacket(body.to_owned()));
+            }
+            return;
+        }
+        Self::finish_notification(sequence, &mut output.messages);
+    }
+
+    fn finish_notification(sequence: &[u8], messages: &mut Vec<String>) {
         let raw = if let Some(message) = sequence.strip_prefix(b"9;") {
             message.to_vec()
         } else if let Some(payload) = sequence.strip_prefix(b"777;notify;") {
@@ -187,8 +275,8 @@ pub struct TerminalModel {
     terminal: Term<TermEventListener>,
     title: Arc<Mutex<Option<String>>>,
     bells: Arc<AtomicU64>,
-    scanner: OscNotificationScanner,
-    pending_messages: Vec<String>,
+    scanner: OutputScanner,
+    scanned: ScanOutput,
     last_search: Option<(String, Point, Point)>,
 }
 
@@ -232,14 +320,14 @@ impl TerminalModel {
             ),
             title,
             bells,
-            scanner: OscNotificationScanner::default(),
-            pending_messages: Vec::new(),
+            scanner: OutputScanner::default(),
+            scanned: ScanOutput::default(),
             last_search: None,
         }
     }
 
     pub fn process_output(&mut self, bytes: &[u8]) {
-        self.scanner.scan(bytes, &mut self.pending_messages);
+        self.scanner.scan(bytes, &mut self.scanned);
         self.parser.advance(&mut self.terminal, bytes);
     }
 
@@ -248,7 +336,18 @@ impl TerminalModel {
     }
 
     pub fn take_notification_messages(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.pending_messages)
+        std::mem::take(&mut self.scanned.messages)
+    }
+
+    /// Whether the application enabled kitty's paste-event mode
+    /// (`CSI ? 5522 h`) and has not reset it since.
+    pub fn enhanced_paste(&self) -> bool {
+        self.scanned.enhanced_paste
+    }
+
+    /// Drains DECRQM and OSC 5522 requests in the order the pane wrote them.
+    pub fn take_terminal_requests(&mut self) -> Vec<TerminalRequest> {
+        std::mem::take(&mut self.scanned.requests)
     }
 
     /// Resizes the terminal's visible grid while preserving its parser state.
@@ -733,6 +832,58 @@ mod tests {
             model.take_notification_messages(),
             vec!["Claude: needs approval".to_owned()]
         );
+    }
+
+    #[test]
+    fn tracks_enhanced_paste_mode_across_split_reads_and_parameter_lists() {
+        let mut model = TerminalModel::new(20, 3);
+        assert!(!model.enhanced_paste());
+        model.process_output(b"text\x1b[?55");
+        assert!(!model.enhanced_paste());
+        model.process_output(b"22h more");
+        assert!(model.enhanced_paste());
+
+        model.process_output(b"\x1b[?2004;5522l");
+        assert!(!model.enhanced_paste());
+        model.process_output(b"\x1b[?1;5522;2004h");
+        assert!(model.enhanced_paste());
+        // Other modes and non-private sequences leave it alone.
+        model.process_output(b"\x1b[?2004l\x1b[5522l\x1b[?55220l");
+        assert!(model.enhanced_paste());
+        model.process_output(b"\x1bc");
+        assert!(!model.enhanced_paste());
+        assert_eq!(model.dimensions(), (20, 3));
+    }
+
+    #[test]
+    fn reports_decrqm_queries_with_the_mode_state_at_query_time() {
+        let mut model = TerminalModel::new(20, 3);
+        model.process_output(b"\x1b[?5522$p\x1b[?5522h\x1b[?55");
+        model.process_output(b"22$p\x1b[?2004$p");
+        assert_eq!(
+            model.take_terminal_requests(),
+            vec![
+                TerminalRequest::ReportEnhancedPasteMode { enabled: false },
+                TerminalRequest::ReportEnhancedPasteMode { enabled: true },
+            ]
+        );
+        assert!(model.take_terminal_requests().is_empty());
+    }
+
+    #[test]
+    fn captures_split_osc_5522_packets_with_either_terminator() {
+        let mut model = TerminalModel::new(20, 3);
+        model.process_output(b"\x1b]5522;type=read:pw=YWJj");
+        model.process_output(b":mime=aW1hZ2UvcG5n\x07\x1b]5522;type=read;LgA=\x1b");
+        model.process_output(b"\\");
+        assert_eq!(
+            model.take_terminal_requests(),
+            vec![
+                TerminalRequest::ClipboardPacket("type=read:pw=YWJj:mime=aW1hZ2UvcG5n".to_owned()),
+                TerminalRequest::ClipboardPacket("type=read;LgA=".to_owned()),
+            ]
+        );
+        assert!(model.take_notification_messages().is_empty());
     }
 
     #[test]

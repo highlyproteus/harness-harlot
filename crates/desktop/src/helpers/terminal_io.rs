@@ -6,8 +6,8 @@ use crate::{
 };
 use gpui::{Bounds, MouseButton, Pixels, Point};
 use hh_protocol::{
-    TerminalAttributes, TerminalColor, TerminalLine, TerminalModifiers, TerminalMouseButton,
-    TerminalPoint, TerminalRun, TerminalSelection, TerminalSelectionKind,
+    TerminalLine, TerminalModifiers, TerminalMouseButton, TerminalPoint, TerminalRun,
+    TerminalSelection, TerminalSelectionKind,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -169,31 +169,6 @@ pub(crate) fn prepare_paste(text: &str, bracketed: bool) -> Result<Vec<u8>, &'st
         Ok(bytes)
     } else {
         Ok(sanitized.into_bytes())
-    }
-}
-
-pub(crate) fn plain_history_line(text: &str) -> TerminalLine {
-    TerminalLine {
-        runs: if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![TerminalRun {
-                text: text.to_owned(),
-                columns: text.chars().fold(0_u16, |columns, character| {
-                    columns.saturating_add(
-                        u16::try_from(if character == '\t' {
-                            1
-                        } else {
-                            character.width().unwrap_or(0)
-                        })
-                        .unwrap_or(u16::MAX),
-                    )
-                }),
-                foreground: TerminalColor::DefaultForeground,
-                background: TerminalColor::DefaultBackground,
-                attributes: TerminalAttributes::default(),
-            }]
-        },
     }
 }
 
@@ -387,13 +362,15 @@ pub(crate) fn terminal_grid_for_pane(
 
 #[cfg(test)]
 mod tests {
+    use hh_protocol::{TerminalAttributes, TerminalColor};
+
     use super::{
         Bounds, MAX_PASTE_BYTES, PANE_HEADER_HEIGHT, TERMINAL_BOTTOM_GUARD,
-        TERMINAL_VERTICAL_PADDING, TerminalAttributes, TerminalColor, TerminalLine, TerminalPoint,
-        TerminalPointerAction, TerminalRun, TerminalSelection, TerminalUrlOpenTarget,
-        prepare_paste, selection_span, terminal_grid_for_pane, terminal_input_bytes,
-        terminal_point_clamped, terminal_pointer_action, terminal_run_display_text,
-        terminal_url_open_target, typography, url_at_column,
+        TERMINAL_VERTICAL_PADDING, TerminalLine, TerminalPoint, TerminalPointerAction, TerminalRun,
+        TerminalSelection, TerminalUrlOpenTarget, prepare_paste, selection_span,
+        terminal_grid_for_pane, terminal_input_bytes, terminal_point_clamped,
+        terminal_pointer_action, terminal_run_display_text, terminal_url_open_target, typography,
+        url_at_column,
     };
     use gpui::{Modifiers, MouseButton, point, px, size};
     use hh_protocol::TerminalSelectionKind;

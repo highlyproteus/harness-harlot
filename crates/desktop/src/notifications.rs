@@ -1,11 +1,15 @@
-//! Session notification refresh, dock badge, and read state.
-use gpui::Context;
-use hh_protocol::{ClientRequest, ServiceResponse};
-use std::collections::HashSet;
+//! Live pane activity (Needs you, Running, Done), the Dock badge, and the
+//! service's message notifications.
+use hh_protocol::{
+    ClientRequest, NotificationKind, Pane, PaneLayout, PaneStatus, PaneStreamState,
+    ServiceResponse, SessionSnapshot, Tab, Workspace,
+};
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::HhApp;
-use crate::view_models::Modal;
+use crate::helpers::collect_terminal_tabs;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn set_macos_dock_badge(label: Option<&str>) {
@@ -14,6 +18,168 @@ pub(crate) fn set_macos_dock_badge(label: Option<&str>) {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn set_macos_dock_badge(_: Option<&str>) {}
+
+/// Notifications groups, in display order.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ActivitySection {
+    NeedsYou,
+    Running,
+    Done,
+}
+
+impl ActivitySection {
+    pub(crate) const ALL: [Self; 3] = [Self::NeedsYou, Self::Running, Self::Done];
+
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "Needs you",
+            Self::Running => "Running",
+            Self::Done => "Done",
+        }
+    }
+}
+
+/// A pane whose process exited is done whatever its last status said.
+pub(crate) const fn activity_section(status: PaneStatus, exited: bool) -> Option<ActivitySection> {
+    if exited {
+        return Some(ActivitySection::Done);
+    }
+    match status {
+        PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention => {
+            Some(ActivitySection::NeedsYou)
+        }
+        PaneStatus::Working => Some(ActivitySection::Running),
+        PaneStatus::Done => Some(ActivitySection::Done),
+        PaneStatus::Idle => None,
+    }
+}
+
+pub(crate) const fn activity_badge(status: PaneStatus, exited: bool) -> &'static str {
+    if exited {
+        return "Exited";
+    }
+    match status {
+        PaneStatus::NeedsApproval => "Needs approval",
+        PaneStatus::NeedsInput => "Needs input",
+        PaneStatus::Attention => "Attention",
+        PaneStatus::Working => "Running",
+        PaneStatus::Done => "Done",
+        PaneStatus::Idle => "Idle",
+    }
+}
+
+/// One pane shown in Notifications.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ActivityEntry<'a> {
+    pub(crate) section: ActivitySection,
+    pub(crate) workspace: &'a Workspace,
+    pub(crate) tab: &'a Tab,
+    pub(crate) pane: &'a Pane,
+    pub(crate) exited: bool,
+}
+
+/// Every pane with activity across workstation tabs and bots, grouped by
+/// section and newest status change first within each section.
+pub(crate) fn activity_entries<'a>(
+    snapshot: &'a SessionSnapshot,
+    pane_states: &HashMap<Uuid, PaneStreamState>,
+) -> Vec<ActivityEntry<'a>> {
+    let mut entries = Vec::new();
+    for workspace in &snapshot.workspaces {
+        for tab in &workspace.tabs {
+            let mut panes = Vec::new();
+            collect_terminal_tabs(&tab.layout, &mut panes);
+            for pane in panes {
+                let exited = pane_states.get(&pane.id).is_some_and(|state| state.exited);
+                if let Some(section) = activity_section(pane.status, exited) {
+                    entries.push(ActivityEntry {
+                        section,
+                        workspace,
+                        tab,
+                        pane,
+                        exited,
+                    });
+                }
+            }
+        }
+    }
+    entries.sort_by_key(|entry| (entry.section, Reverse(entry.pane.status_changed_at_ms)));
+    entries
+}
+
+fn needs_you_in(layout: &PaneLayout, pane_states: &HashMap<Uuid, PaneStreamState>) -> usize {
+    let needs_you = |pane: &Pane| {
+        let exited = pane_states.get(&pane.id).is_some_and(|state| state.exited);
+        usize::from(activity_section(pane.status, exited) == Some(ActivitySection::NeedsYou))
+    };
+    match layout {
+        PaneLayout::Leaf { pane } => needs_you(pane),
+        PaneLayout::Stack { panes, .. } => panes.iter().map(needs_you).sum(),
+        PaneLayout::Split { first, second, .. } => {
+            needs_you_in(first, pane_states) + needs_you_in(second, pane_states)
+        }
+    }
+}
+
+/// Bot workspaces with at least one pane waiting on the user.
+pub(crate) fn bots_needing_you(
+    snapshot: &SessionSnapshot,
+    pane_states: &HashMap<Uuid, PaneStreamState>,
+) -> usize {
+    snapshot
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.is_bot())
+        .filter(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .any(|tab| needs_you_in(&tab.layout, pane_states) > 0)
+        })
+        .count()
+}
+
+/// Whether a pane's latest status change is unread: newer than the last time
+/// the user viewed the pane.
+pub(crate) const fn is_unread(status_changed_at_ms: u64, last_viewed_ms: u64) -> bool {
+    status_changed_at_ms > last_viewed_ms
+}
+
+/// When the user last viewed each pane (focused it, clicked its
+/// Notifications row, or opened its bot thread), in epoch ms. Desktop-local
+/// and not persisted: a pane not viewed since launch counts as viewed at
+/// launch, so a restart does not mark every finished pane unread.
+#[derive(Debug, Default)]
+pub(crate) struct PaneViews {
+    launched_ms: u64,
+    viewed_ms: HashMap<Uuid, u64>,
+}
+
+impl PaneViews {
+    pub(crate) fn new(launched_ms: u64) -> Self {
+        Self {
+            launched_ms,
+            viewed_ms: HashMap::new(),
+        }
+    }
+
+    /// Records a view of `pane_id` at `at_ms`; a later view is never undone.
+    pub(crate) fn mark(&mut self, pane_id: Uuid, at_ms: u64) {
+        let viewed = self.viewed_ms.entry(pane_id).or_insert(at_ms);
+        *viewed = (*viewed).max(at_ms);
+    }
+
+    pub(crate) fn last_viewed_ms(&self, pane_id: Uuid) -> u64 {
+        self.viewed_ms
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(self.launched_ms)
+    }
+
+    pub(crate) fn is_unread(&self, pane: &Pane) -> bool {
+        is_unread(pane.status_changed_at_ms, self.last_viewed_ms(pane.id))
+    }
+}
 
 impl HhApp {
     pub(crate) fn refresh_notifications(&mut self) {
@@ -28,9 +194,11 @@ impl HhApp {
                             .map(|notification| notification.id)
                             .max()
                             .unwrap_or(0);
-                        this.session.notifications = items;
+                        this.session.notifications = items
+                            .into_iter()
+                            .filter(|notification| notification.kind == NotificationKind::Message)
+                            .collect();
                         this.session.connection_error = None;
-                        this.sync_dock_badge();
                     }
                     Ok(response) => this.report_unexpected(&response),
                     Err(error) => this.report(&error),
@@ -42,83 +210,68 @@ impl HhApp {
         );
     }
 
-    pub(crate) fn unread_notification_count(&self) -> usize {
-        self.session
-            .notifications
-            .iter()
-            .filter(|notification| !notification.read)
-            .count()
+    /// Panes waiting on the user; drives the bell and Dock badges.
+    pub(crate) fn needs_you_count(&self) -> usize {
+        self.session.snapshot.as_ref().map_or(0, |snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .map(|tab| needs_you_in(&tab.layout, &self.session.pane_states))
+                .sum()
+        })
     }
 
-    pub(crate) fn sync_dock_badge(&self) {
-        let unread = self.unread_notification_count();
-        if unread == 0 {
+    /// Records that the user viewed pane `pane_id` now. Its latest status
+    /// change counts as seen even if the service clock runs ahead.
+    pub(crate) fn mark_pane_viewed(&mut self, pane_id: Uuid) {
+        let changed_ms = self
+            .session
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.tabs)
+                    .find_map(|tab| crate::helpers::find_pane(&tab.layout, pane_id))
+            })
+            .map_or(0, |pane| pane.status_changed_at_ms);
+        self.session
+            .pane_views
+            .mark(pane_id, crate::bots::now_ms().max(changed_ms));
+    }
+
+    /// The focused pane of an active window is being looked at, so its
+    /// status changes are seen as they arrive.
+    pub(crate) fn mark_focused_pane_viewed(&mut self) {
+        if self.session.window_active
+            && let Some(pane_id) = self.layout.focused_pane
+        {
+            self.mark_pane_viewed(pane_id);
+        }
+    }
+
+    pub(crate) fn sync_dock_badge(&mut self) {
+        let count = self.needs_you_count();
+        if self.session.dock_badge == Some(count) {
+            return;
+        }
+        self.session.dock_badge = Some(count);
+        if count == 0 {
             set_macos_dock_badge(None);
         } else {
-            let label = unread.to_string();
-            set_macos_dock_badge(Some(&label));
+            set_macos_dock_badge(Some(&count.to_string()));
         }
     }
 
-    /// Marks the given notifications read locally (the visible state must
-    /// change immediately) and persists the read state asynchronously.
-    pub(crate) fn mark_notification_ids_read(&mut self, ids: &[u64]) -> bool {
-        if ids.is_empty() {
-            return false;
-        }
-        let id_set = ids.iter().copied().collect::<HashSet<_>>();
-        let mut marked = false;
-        for notification in &mut self.session.notifications {
-            if id_set.contains(&notification.id) && !notification.read {
-                notification.read = true;
-                marked = true;
-            }
-        }
-        if !marked {
-            return false;
-        }
-        self.sync_dock_badge();
-        self.dispatch_control(ClientRequest::MarkNotificationsRead { ids: ids.to_vec() });
-        true
-    }
-
-    pub(crate) fn auto_read_pane_notifications(
-        &mut self,
-        pane_id: Uuid,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let ids = self
-            .session
-            .notifications
-            .iter()
-            .filter(|notification| notification.pane_id == pane_id && !notification.read)
-            .map(|notification| notification.id)
-            .collect::<Vec<_>>();
-        let _ = cx;
-        self.mark_notification_ids_read(&ids)
-    }
-
-    pub(crate) fn mark_all_notifications_read(&mut self, cx: &mut Context<Self>) {
-        let ids = self
-            .session
-            .notifications
-            .iter()
-            .filter(|notification| !notification.read)
-            .map(|notification| notification.id)
-            .collect::<Vec<_>>();
-        if self.mark_notification_ids_read(&ids) {
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn clear_notifications(&mut self, _cx: &mut Context<Self>) {
+    pub(crate) fn clear_notifications(&mut self) {
         self.dispatch_with(
             ClientRequest::ClearNotifications,
             Box::new(|this, cx, result| match result {
                 Ok(ServiceResponse::Ack) => {
                     this.session.notifications.clear();
                     this.session.connection_error = None;
-                    this.sync_dock_badge();
                     cx.notify();
                 }
                 Ok(response) => this.report_unexpected(&response),
@@ -126,17 +279,146 @@ impl HhApp {
             }),
         );
     }
+}
 
-    pub(crate) fn open_notification(
-        &mut self,
-        notification_id: u64,
-        pane_id: Uuid,
-        workspace_id: Uuid,
-        cx: &mut Context<Self>,
-    ) {
-        self.mark_notification_ids_read(&[notification_id]);
-        self.editor.modal = Modal::None;
-        self.sidebar.active_workspace = Some(workspace_id);
-        self.focus_pane_with_snapshot(pane_id, cx);
+#[cfg(test)]
+mod tests {
+    use super::{ActivitySection, PaneViews, activity_entries, bots_needing_you, is_unread};
+    use hh_protocol::{
+        PaneLayout, PaneStatus, PaneStreamState, SessionSnapshot, Tab, Workspace, WorkspaceKind,
+    };
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn tab_with(template: &Tab, status: PaneStatus) -> (Tab, Uuid) {
+        let mut tab = template.clone();
+        tab.id = Uuid::new_v4();
+        let PaneLayout::Leaf { pane } = &mut tab.layout else {
+            unreachable!("seeded tabs are single panes");
+        };
+        pane.id = Uuid::new_v4();
+        pane.status = status;
+        let pane_id = pane.id;
+        (tab, pane_id)
+    }
+
+    fn bot(template: &Workspace, tabs: Vec<Tab>) -> Workspace {
+        let mut bot = template.clone();
+        bot.id = Uuid::new_v4();
+        bot.kind = WorkspaceKind::Bot;
+        bot.tabs = tabs;
+        bot
+    }
+
+    #[test]
+    fn a_status_change_is_unread_until_the_pane_is_viewed_after_it() {
+        assert!(is_unread(20, 10));
+        assert!(
+            !is_unread(10, 10),
+            "a change at the viewing instant is seen"
+        );
+        assert!(!is_unread(5, 10));
+
+        let pane = Uuid::new_v4();
+        let mut views = PaneViews::new(100);
+        assert_eq!(
+            views.last_viewed_ms(pane),
+            100,
+            "unviewed panes date from launch"
+        );
+        views.mark(pane, 300);
+        views.mark(pane, 200);
+        assert_eq!(views.last_viewed_ms(pane), 300, "an older view never wins");
+        assert_eq!(views.last_viewed_ms(Uuid::new_v4()), 100);
+    }
+
+    #[test]
+    fn bots_needing_you_counts_bots_not_panes_and_ignores_workstations_and_exited_panes() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let workstation = snapshot.workspaces[0].clone();
+        let template = workstation.tabs[0].clone();
+        let (waiting, _) = tab_with(&template, PaneStatus::NeedsApproval);
+        let (also_waiting, _) = tab_with(&template, PaneStatus::NeedsInput);
+        let (working, _) = tab_with(&template, PaneStatus::Working);
+        let (exited_tab, exited) = tab_with(&template, PaneStatus::NeedsInput);
+        snapshot.workspaces[0].tabs = vec![tab_with(&template, PaneStatus::NeedsInput).0];
+        snapshot.workspaces.extend([
+            bot(&workstation, vec![waiting, also_waiting]),
+            bot(&workstation, vec![working]),
+            bot(&workstation, vec![exited_tab]),
+        ]);
+        let pane_states = HashMap::from([(
+            exited,
+            PaneStreamState {
+                pane_id: exited,
+                revision: 1,
+                subscribed: false,
+                dirty: false,
+                exited: true,
+                enhanced_paste: false,
+            },
+        )]);
+        assert_eq!(bots_needing_you(&snapshot, &pane_states), 1);
+    }
+
+    #[test]
+    fn activity_groups_needs_you_running_done_newest_first_and_treats_exited_as_done() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let template = snapshot.workspaces[0].tabs[0].clone();
+        let statuses = [
+            (PaneStatus::Working, 10),
+            (PaneStatus::NeedsInput, 20),
+            (PaneStatus::Done, 30),
+            (PaneStatus::NeedsApproval, 40),
+            (PaneStatus::Idle, 50),
+            (PaneStatus::Attention, 5),
+            (PaneStatus::NeedsInput, 60),
+        ];
+        let mut ids = Vec::new();
+        snapshot.workspaces[0].tabs = statuses
+            .iter()
+            .map(|(status, changed_at)| {
+                let mut tab = template.clone();
+                tab.id = uuid::Uuid::new_v4();
+                let PaneLayout::Leaf { pane } = &mut tab.layout else {
+                    unreachable!("seeded tabs are single panes");
+                };
+                pane.id = uuid::Uuid::new_v4();
+                pane.status = *status;
+                pane.status_changed_at_ms = *changed_at;
+                ids.push(pane.id);
+                tab
+            })
+            .collect();
+        let exited = ids[6];
+        let pane_states = HashMap::from([(
+            exited,
+            PaneStreamState {
+                pane_id: exited,
+                revision: 1,
+                subscribed: false,
+                dirty: false,
+                exited: true,
+                enhanced_paste: false,
+            },
+        )]);
+
+        let entries = activity_entries(&snapshot, &pane_states);
+        let order = entries
+            .iter()
+            .map(|entry| (entry.section, entry.pane.id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            order,
+            vec![
+                (ActivitySection::NeedsYou, ids[3]),
+                (ActivitySection::NeedsYou, ids[1]),
+                (ActivitySection::NeedsYou, ids[5]),
+                (ActivitySection::Running, ids[0]),
+                (ActivitySection::Done, exited),
+                (ActivitySection::Done, ids[2]),
+            ]
+        );
     }
 }

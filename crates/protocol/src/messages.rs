@@ -3,19 +3,16 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::history::{
-    HistoryArchiveStatus, HistoryClearScope, HistoryCursor, HistoryPageDirection, HistorySettings,
-    TerminalHistoryPage,
-};
 use crate::model::{
-    AppearanceColor, PaneKind, SessionSnapshot, SplitAxis, TerminalTransport, TmuxScanScope,
-    TmuxSession, TmuxSessionAttachIssue, TmuxSessionId, WorkspacePinMove,
+    AppearanceColor, BotSettings, BotThread, PaneKind, SessionSnapshot, SplitAxis,
+    TerminalTransport, TmuxScanScope, TmuxSession, TmuxSessionAttachIssue, TmuxSessionId,
+    WorkspacePinMove,
 };
 use crate::profile::TerminalProfile;
 use crate::terminal::{
-    DropPlacement, PaneRevisionCursor, PaneStreamState, SessionNotification, StreamDiagnostics,
-    TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen,
-    TerminalSelectionKind,
+    BrowserAction, BrowserCommandOutcome, BrowserCommandRequest, CodingAgent, DropPlacement,
+    PaneRevisionCursor, PaneStreamState, SessionNotification, StreamDiagnostics, TerminalModifiers,
+    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
 };
 
 /// Exact pane identity and transport approved by a trusted caller. The service
@@ -43,7 +40,79 @@ pub enum ClientRequest {
         pane_revisions: Vec<PaneRevisionCursor>,
         subscribed_panes: Vec<Uuid>,
         notifications_after: u64,
+        #[serde(default)]
+        browser_executor: bool,
     },
+    SetBotSettings {
+        settings: BotSettings,
+    },
+    /// Creates a bot workspace with one thread tab and launches the agent's
+    /// own interface in its terminal.
+    CreateBot {
+        name: Option<String>,
+        agent: TerminalProfile,
+        /// The bot's project folder, where its threads open by default.
+        working_dir: Option<String>,
+        instructions: Option<String>,
+    },
+    /// Replaces the bot's agent and relaunches its terminal. `bot_id` is the
+    /// bot workspace id, like every bot request below.
+    SetBotAgent {
+        bot_id: Uuid,
+        agent: TerminalProfile,
+    },
+    /// Terminates the bot's active thread and launches its agent again.
+    RestartBot {
+        bot_id: Uuid,
+    },
+    /// Sets the bot's home folder (None restores the default) and relaunches
+    /// its terminal there.
+    SetBotHome {
+        bot_id: Uuid,
+        home: Option<String>,
+    },
+    /// Lists the bot's threads: saved agent sessions plus live panes, pinned
+    /// first, then most recently updated.
+    ListBotThreads {
+        bot_id: Uuid,
+    },
+    /// Shows a thread of the bot: focuses the live pane showing it or resumes
+    /// it in a new thread tab. `None` starts a new thread tab.
+    OpenBotThread {
+        bot_id: Uuid,
+        thread_id: Option<String>,
+    },
+    SetBotThreadPinned {
+        bot_id: Uuid,
+        thread_id: String,
+        pinned: bool,
+    },
+    /// Deletes a thread of the bot: closes every live pane showing it and
+    /// removes its saved conversation and its pin.
+    DeleteBotThread {
+        bot_id: Uuid,
+        thread_id: String,
+    },
+    /// Sent by a bot's agent when its pane switches to another session.
+    ReportBotSession {
+        pane_id: Uuid,
+        session_id: String,
+    },
+    /// Opens a worker terminal tab in a workstation and optionally types
+    /// `command` into its shell once the shell is spawned. When
+    /// `requester_pane` is a bot pane, the tab records that bot as
+    /// `owner_bot` and the pane as `owner_thread`, and `workspace_id: None`
+    /// targets the bot's own
+    /// workstation (created on demand, titled after the bot). Without a bot
+    /// requester, `workspace_id` is required.
+    CreateWorker {
+        workspace_id: Option<Uuid>,
+        working_dir: Option<String>,
+        title: Option<String>,
+        command: Option<String>,
+        requester_pane: Option<Uuid>,
+    },
+    GetCodingAgents,
     GetNotifications,
     MarkNotificationsRead {
         ids: Vec<u64>,
@@ -76,11 +145,24 @@ pub enum ClientRequest {
         target_pane: Uuid,
         url: Option<String>,
     },
-    CreateAssistantTab {
+    CreateGalleryTab {
         workspace_id: Uuid,
     },
-    CreateGroupAssistant {
+    CreateGroupGallery {
         target_pane: Uuid,
+    },
+    AddGalleryImage {
+        workspace_id: Uuid,
+        origin_pane: Option<Uuid>,
+        source: String,
+    },
+    BrowserCommand {
+        pane_id: Uuid,
+        action: BrowserAction,
+    },
+    BrowserCommandResult {
+        request_id: u64,
+        outcome: BrowserCommandOutcome,
     },
     CreateWorkspaceGroup {
         workspace_id: Uuid,
@@ -245,11 +327,6 @@ pub enum ClientRequest {
         working_dir: String,
         authorized_root: String,
     },
-    CreateAssistantWorkspace {
-        title: Option<String>,
-        working_dir: Option<String>,
-        instructions: Option<String>,
-    },
     CreateSshWorkspace {
         title: Option<String>,
         destination: String,
@@ -288,6 +365,17 @@ pub enum ClientRequest {
         authority: PaneAuthority,
         bytes: Vec<u8>,
     },
+    /// Offers a PNG the desktop wrote to the private paste directory to the
+    /// pane's application as a kitty OSC 5522 paste event. The service
+    /// validates, reads, and deletes the file. Fails without touching the
+    /// file when the pane has not enabled enhanced paste.
+    PasteImage {
+        pane_id: Uuid,
+        image_path: String,
+        /// Plain text from the same clipboard item, offered as `text/plain`.
+        #[serde(default)]
+        text: Option<String>,
+    },
     BeginSelection {
         pane_id: Uuid,
         point: TerminalPoint,
@@ -324,23 +412,6 @@ pub enum ClientRequest {
         columns: u16,
         rows: u16,
     },
-    GetHistoryStatus,
-    SetHistorySettings {
-        settings: HistorySettings,
-    },
-    ClearHistory {
-        scope: HistoryClearScope,
-    },
-    LoadHistoryPage {
-        pane_id: Uuid,
-        cursor: Option<HistoryCursor>,
-        direction: HistoryPageDirection,
-    },
-    SearchArchivedHistory {
-        pane_id: Uuid,
-        query: String,
-        before: Option<HistoryCursor>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -366,6 +437,8 @@ pub enum ServiceResponse {
         pane_states: Vec<PaneStreamState>,
         notifications: Vec<SessionNotification>,
         diagnostics: StreamDiagnostics,
+        #[serde(default)]
+        browser_commands: Vec<BrowserCommandRequest>,
     },
     Notifications {
         items: Vec<SessionNotification>,
@@ -374,8 +447,36 @@ pub enum ServiceResponse {
         screen: TerminalScreen,
         diagnostics: StreamDiagnostics,
     },
+    BotCreated {
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        pane_id: Uuid,
+    },
+    BotThreads {
+        threads: Vec<BotThread>,
+    },
+    /// The pane (and its tab) showing the thread `OpenBotThread` opened.
+    BotThreadOpened {
+        tab_id: Uuid,
+        pane_id: Uuid,
+    },
+    WorkerCreated {
+        workspace_id: Uuid,
+        tab_id: Uuid,
+        pane_id: Uuid,
+    },
+    CodingAgents {
+        agents: Vec<CodingAgent>,
+    },
     PaneCreated {
         pane_id: Uuid,
+    },
+    GalleryImageAdded {
+        path: String,
+        pane_id: Uuid,
+    },
+    BrowserCommandResult {
+        outcome: BrowserCommandOutcome,
     },
     WorkspaceCreated {
         workspace_id: Uuid,
@@ -403,15 +504,6 @@ pub enum ServiceResponse {
     },
     SearchResult {
         found: bool,
-    },
-    HistoryStatus {
-        status: HistoryArchiveStatus,
-    },
-    HistoryPage {
-        page: Option<TerminalHistoryPage>,
-    },
-    HistorySearchResult {
-        page: Option<TerminalHistoryPage>,
     },
     Error {
         message: String,
@@ -457,32 +549,120 @@ mod tests {
                 }),
             ),
             (
-                ClientRequest::CreateAssistantTab { workspace_id },
+                ClientRequest::CreateGroupBrowser {
+                    target_pane: pane_id,
+                    url: Some("https://example.com/group".to_owned()),
+                },
                 serde_json::json!({
-                    "type": "create_assistant_tab",
+                    "type": "create_group_browser",
+                    "target_pane": pane_id,
+                    "url": "https://example.com/group",
+                }),
+            ),
+            (
+                ClientRequest::CreateGalleryTab { workspace_id },
+                serde_json::json!({
+                    "type": "create_gallery_tab",
                     "workspace_id": workspace_id,
                 }),
             ),
             (
-                ClientRequest::CreateAssistantWorkspace {
-                    title: Some("Research".to_owned()),
-                    working_dir: Some("/srv/projects".to_owned()),
-                    instructions: Some("Answer tersely".to_owned()),
-                },
-                serde_json::json!({
-                    "type": "create_assistant_workspace",
-                    "title": "Research",
-                    "working_dir": "/srv/projects",
-                    "instructions": "Answer tersely",
-                }),
-            ),
-            (
-                ClientRequest::CreateGroupAssistant {
+                ClientRequest::CreateGroupGallery {
                     target_pane: pane_id,
                 },
                 serde_json::json!({
-                    "type": "create_group_assistant",
+                    "type": "create_group_gallery",
                     "target_pane": pane_id,
+                }),
+            ),
+            (
+                ClientRequest::AddGalleryImage {
+                    workspace_id,
+                    origin_pane: Some(pane_id),
+                    source: "/tmp/image.png".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "add_gallery_image",
+                    "workspace_id": workspace_id,
+                    "origin_pane": pane_id,
+                    "source": "/tmp/image.png",
+                }),
+            ),
+            (
+                ClientRequest::BrowserCommand {
+                    pane_id,
+                    action: BrowserAction::DevTools {
+                        method: "Runtime.evaluate".to_owned(),
+                        params: serde_json::json!({"expression": "1+1"}),
+                    },
+                },
+                serde_json::json!({
+                    "type": "browser_command",
+                    "pane_id": pane_id,
+                    "action": {
+                        "type": "dev_tools",
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": "1+1"},
+                    },
+                }),
+            ),
+            (
+                ClientRequest::BrowserCommandResult {
+                    request_id: 7,
+                    outcome: BrowserCommandOutcome::Ok {
+                        result: serde_json::json!({"value": 2}),
+                    },
+                },
+                serde_json::json!({
+                    "type": "browser_command_result",
+                    "request_id": 7,
+                    "outcome": {
+                        "type": "ok",
+                        "result": {"value": 2},
+                    },
+                }),
+            ),
+            (
+                ClientRequest::CreateBot {
+                    name: Some("Hive3".to_owned()),
+                    agent: TerminalProfile::Omp,
+                    working_dir: Some("/srv/projects".to_owned()),
+                    instructions: None,
+                },
+                serde_json::json!({
+                    "type": "create_bot",
+                    "name": "Hive3",
+                    "agent": "omp",
+                    "working_dir": "/srv/projects",
+                    "instructions": null,
+                }),
+            ),
+            (
+                ClientRequest::SetBotHome {
+                    bot_id: tab_id,
+                    home: Some("/srv/bots/hive3".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "set_bot_home",
+                    "bot_id": tab_id,
+                    "home": "/srv/bots/hive3",
+                }),
+            ),
+            (
+                ClientRequest::CreateWorker {
+                    workspace_id: None,
+                    working_dir: Some("/srv/projects/api".to_owned()),
+                    title: Some("api-fix".to_owned()),
+                    command: Some("omp 'fix the api'".to_owned()),
+                    requester_pane: Some(pane_id),
+                },
+                serde_json::json!({
+                    "type": "create_worker",
+                    "workspace_id": null,
+                    "working_dir": "/srv/projects/api",
+                    "title": "api-fix",
+                    "command": "omp 'fix the api'",
+                    "requester_pane": pane_id,
                 }),
             ),
             (
@@ -551,6 +731,12 @@ mod tests {
                 serde_json::json!({
                     "type": "close_tab",
                     "tab_id": tab_id,
+                }),
+            ),
+            (
+                ClientRequest::GetCodingAgents,
+                serde_json::json!({
+                    "type": "get_coding_agents",
                 }),
             ),
         ];
@@ -645,6 +831,121 @@ mod tests {
         ];
 
         assert_request_json_round_trips(cases);
+    }
+    #[test]
+    fn bot_thread_messages_use_stable_snake_case_tags_and_round_trip() {
+        let bot_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let tab_id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
+        let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        assert_request_json_round_trips([
+            (
+                ClientRequest::ListBotThreads { bot_id },
+                serde_json::json!({"type": "list_bot_threads", "bot_id": bot_id}),
+            ),
+            (
+                ClientRequest::OpenBotThread {
+                    bot_id,
+                    thread_id: Some("0193-abc".to_owned()),
+                },
+                serde_json::json!({
+                    "type": "open_bot_thread",
+                    "bot_id": bot_id,
+                    "thread_id": "0193-abc",
+                }),
+            ),
+            (
+                ClientRequest::OpenBotThread {
+                    bot_id,
+                    thread_id: None,
+                },
+                serde_json::json!({"type": "open_bot_thread", "bot_id": bot_id, "thread_id": null}),
+            ),
+            (
+                ClientRequest::SetBotThreadPinned {
+                    bot_id,
+                    thread_id: "0193-abc".to_owned(),
+                    pinned: true,
+                },
+                serde_json::json!({
+                    "type": "set_bot_thread_pinned",
+                    "bot_id": bot_id,
+                    "thread_id": "0193-abc",
+                    "pinned": true,
+                }),
+            ),
+            (
+                ClientRequest::DeleteBotThread {
+                    bot_id,
+                    thread_id: "0193-abc".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "delete_bot_thread",
+                    "bot_id": bot_id,
+                    "thread_id": "0193-abc",
+                }),
+            ),
+            (
+                ClientRequest::SetBotAgent {
+                    bot_id,
+                    agent: TerminalProfile::Omp,
+                },
+                serde_json::json!({"type": "set_bot_agent", "bot_id": bot_id, "agent": "omp"}),
+            ),
+            (
+                ClientRequest::RestartBot { bot_id },
+                serde_json::json!({"type": "restart_bot", "bot_id": bot_id}),
+            ),
+            (
+                ClientRequest::ReportBotSession {
+                    pane_id,
+                    session_id: "0193-abc".to_owned(),
+                },
+                serde_json::json!({
+                    "type": "report_bot_session",
+                    "pane_id": pane_id,
+                    "session_id": "0193-abc",
+                }),
+            ),
+        ]);
+        let response = ServiceResponse::BotThreads {
+            threads: vec![BotThread {
+                id: "0193-abc".to_owned(),
+                title: Some("Fix login".to_owned()),
+                updated_ms: 1_700_000_000_000,
+                pinned: true,
+                pane_id: Some(pane_id),
+                tab_id: Some(tab_id),
+            }],
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "type": "bot_threads",
+                "threads": [{
+                    "id": "0193-abc",
+                    "title": "Fix login",
+                    "updated_ms": 1_700_000_000_000_u64,
+                    "pinned": true,
+                    "pane_id": pane_id,
+                    "tab_id": tab_id,
+                }],
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceResponse>(encoded).unwrap(),
+            response
+        );
+        let opened = ServiceResponse::BotThreadOpened { tab_id, pane_id };
+        let encoded = serde_json::to_value(&opened).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type": "bot_thread_opened", "tab_id": tab_id, "pane_id": pane_id})
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceResponse>(encoded).unwrap(),
+            opened
+        );
     }
 
     #[test]

@@ -6,14 +6,27 @@
 //! plus the desired-state snapshot; [`serve_connection`] frames one
 //! authenticated client connection over a Unix-domain socket.
 
-mod history;
+mod bots;
+mod gallery;
 mod layout;
+mod paste_events;
 mod persistence;
 mod process;
 mod pty;
 mod registry;
 mod rpc;
 mod tmux;
+mod tmux_control;
 
 pub use registry::{PaneUpdateBatch, SessionRegistry, TmuxAttachmentResult, TmuxScanResult};
 pub use rpc::serve_connection;
+pub use tmux_control::managed_tmux_socket_name;
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}

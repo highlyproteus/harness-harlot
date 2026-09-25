@@ -91,7 +91,7 @@ if [ "$uninstall" = 1 ]; then
     rm -rf "$legacy_backup"
     if [ -L "$link" ]; then rm -f "$link"; fi
   fi
-  echo "local history remains under ~/Library/Application Support/Harness Harlot"
+  echo "local app state remains under ~/Library/Application Support/Harness Harlot"
   exit 0
 fi
 

@@ -1,7 +1,7 @@
 //! Clipboard-image materialization and local/managed-SSH file transfer.
 
 use anyhow::{Context as _, Result, bail, ensure};
-use gpui::{AppContext as _, Context, Image, ImageFormat};
+use gpui::{AppContext as _, Context, Image};
 use hh_protocol::{
     ClientRequest, PaneKind, ServiceResponse, SessionSnapshot, TerminalModes, TerminalTransport,
     ensure_private_directory, validate_ssh_host,
@@ -11,15 +11,16 @@ use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 use crate::HhApp;
 use crate::helpers::{find_pane, prepare_paste};
+use crate::image_paste::{image_file_png, is_image_path, offer_png_paste, png_bytes};
 use crate::session::session_call;
 
-const MAX_CLIPBOARD_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 16;
 const MAX_TRANSFER_FILE_BYTES: u64 = 100 * 1024 * 1024;
 const SCP_TIMEOUT: Duration = Duration::from_secs(45);
@@ -64,18 +65,6 @@ enum FilePasteSource {
     Paths(Vec<PathBuf>),
 }
 
-fn image_extension(format: ImageFormat) -> &'static str {
-    match format {
-        ImageFormat::Png => "png",
-        ImageFormat::Jpeg => "jpg",
-        ImageFormat::Webp => "webp",
-        ImageFormat::Gif => "gif",
-        ImageFormat::Svg => "svg",
-        ImageFormat::Bmp => "bmp",
-        ImageFormat::Tiff => "tiff",
-    }
-}
-
 fn paste_directory() -> Result<PathBuf> {
     let directory = std::env::temp_dir().join("harness-harlot-paste");
     ensure_private_directory(&directory).context("secure Harness Harlot paste directory")?;
@@ -97,9 +86,15 @@ fn cleanup_stale_clipboard_images(directory: &Path, now: SystemTime) -> Result<(
         if !name.starts_with("clipboard-") && !name.starts_with("upload-") {
             continue;
         }
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("inspect clipboard image {}", entry.path().display()))?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect clipboard image {}", entry.path().display())
+                });
+            }
+        };
         if !metadata.is_file() {
             continue;
         }
@@ -107,31 +102,29 @@ fn cleanup_stale_clipboard_images(directory: &Path, now: SystemTime) -> Result<(
             .modified()
             .with_context(|| format!("read clipboard image age {}", entry.path().display()))?;
         if now.duration_since(modified).unwrap_or_default() >= CLIPBOARD_IMAGE_RETENTION {
-            fs::remove_file(entry.path())
-                .with_context(|| format!("remove stale clipboard image {name}"))?;
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("remove stale clipboard image {name}"));
+                }
+            }
         }
     }
     Ok(())
 }
 
-pub(crate) fn materialize_clipboard_image(image: &Image) -> Result<PathBuf> {
-    ensure!(!image.bytes.is_empty(), "clipboard image is empty");
-    ensure!(
-        image.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES,
-        "clipboard image exceeds the 25 MiB limit"
-    );
-    let path = paste_directory()?.join(format!(
-        "clipboard-{}.{}",
-        Uuid::new_v4(),
-        image_extension(image.format)
-    ));
+/// Writes PNG bytes to a new private `clipboard-<uuid>.png` file.
+pub(crate) fn write_paste_png(png: &[u8]) -> Result<PathBuf> {
+    let path = paste_directory()?.join(format!("clipboard-{}.png", Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("create clipboard image {}", path.display()))?;
-    std::io::Write::write_all(&mut file, &image.bytes)
+    std::io::Write::write_all(&mut file, png)
         .with_context(|| format!("write clipboard image {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("sync clipboard image {}", path.display()))?;
@@ -224,15 +217,28 @@ fn stage_remote_sources(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(staged)
 }
 
-fn shell_quote_path(path: &Path) -> String {
+/// Types a path the way macOS Terminal does for dragged files: unchanged
+/// when every character is `[A-Za-z0-9/._-]`, otherwise with each other
+/// ASCII character backslash-escaped. Non-ASCII characters stay literal.
+fn shell_escape_path(path: &Path) -> String {
     let value = path.to_string_lossy();
-    format!("'{}'", value.replace('\'', "'\\''"))
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii()
+            && !character.is_ascii_alphanumeric()
+            && !matches!(character, '/' | '.' | '_' | '-')
+        {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 pub(crate) fn shell_join_paths(paths: &[PathBuf]) -> String {
     paths
         .iter()
-        .map(|path| shell_quote_path(path))
+        .map(|path| shell_escape_path(path))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -769,9 +775,10 @@ impl HhApp {
         &mut self,
         pane_id: Uuid,
         image: Image,
+        text: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.start_file_paste(pane_id, FilePasteSource::Image(image), cx);
+        self.start_file_paste(pane_id, FilePasteSource::Image(image), text, cx);
     }
 
     pub(crate) fn paste_paths_to_terminal(
@@ -780,10 +787,20 @@ impl HhApp {
         paths: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        self.start_file_paste(pane_id, FilePasteSource::Paths(paths), cx);
+        self.start_file_paste(pane_id, FilePasteSource::Paths(paths), None, cx);
     }
 
-    fn start_file_paste(&mut self, pane_id: Uuid, source: FilePasteSource, cx: &mut Context<Self>) {
+    /// Pastes an image or files into a terminal pane. An application that
+    /// enabled kitty paste events (OSC 5522) receives an image as a PNG paste
+    /// event, in-band over any transport; otherwise the image is saved as a
+    /// PNG and its path typed (after an scp upload for SSH panes).
+    fn start_file_paste(
+        &mut self,
+        pane_id: Uuid,
+        source: FilePasteSource,
+        text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(screen) = self.session.screens.get(&pane_id) else {
             return;
         };
@@ -794,18 +811,44 @@ impl HhApp {
             return;
         };
         let bracketed = screen.modes.contains(TerminalModes::BRACKETED_PASTE);
+        let enhanced_paste = self
+            .session
+            .pane_states
+            .get(&pane_id)
+            .is_some_and(|state| state.enhanced_paste && !state.exited);
         let control_client = self.control_client_handle();
+        let event_client = Arc::clone(&control_client);
 
         cx.spawn(async move |this, cx| {
             let transfer_target = authority.target.clone();
             let result = cx
                 .background_spawn(async move {
+                    let offer = |png: &[u8]| {
+                        offer_png_paste(&event_client, pane_id, png, text)
+                            .inspect_err(|error| {
+                                eprintln!("image paste event failed, typing a path instead: {error:#}");
+                            })
+                            .is_ok()
+                    };
                     let (paths, owned_clipboard_image) = match source {
                         FilePasteSource::Image(image) => {
-                            let path = materialize_clipboard_image(&image)?;
+                            let png = png_bytes(&image.bytes)?;
+                            if enhanced_paste && offer(&png) {
+                                return Ok(None);
+                            }
+                            let path = write_paste_png(&png)?;
                             (vec![path.clone()], Some(path))
                         }
-                        FilePasteSource::Paths(paths) => (paths, None),
+                        FilePasteSource::Paths(paths) => {
+                            if enhanced_paste
+                                && let [path] = paths.as_slice()
+                                && is_image_path(path)
+                                && image_file_png(path).is_ok_and(|png| offer(&png))
+                            {
+                                return Ok(None);
+                            }
+                            (paths, None)
+                        }
                     };
                     let remote_destination = match &transfer_target {
                         FileTransferTarget::SystemSsh(destination) => Some(destination.clone()),
@@ -824,13 +867,17 @@ impl HhApp {
                             cleanup,
                             rollback_remote_paths,
                         )
-                        .map(|paths| (paths, None));
+                        .map(|paths| Some((paths, None)));
                     }
-                    result.map(|paths| (paths, owned_clipboard_image))
+                    result.map(|paths| Some((paths, owned_clipboard_image)))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                match result.and_then(|(paths, owned_local_path)| {
+                match result.and_then(|transferred| {
+                    // `None`: the application already received a paste event.
+                    let Some((paths, owned_local_path)) = transferred else {
+                        return Ok(());
+                    };
                     complete_transferred_paste(
                         &authority,
                         &paths,
@@ -881,12 +928,12 @@ impl HhApp {
 mod tests {
     use super::{
         CLIPBOARD_IMAGE_RETENTION, FileTransferTarget, cleanup_stale_clipboard_images,
-        complete_transferred_paste, materialize_clipboard_image, read_bounded_stderr,
-        receive_stderr_with_timeout, reconcile_remote_source_cleanup, remote_paste_path,
-        revalidate_transfer_authority, scp_upload_command_with, shell_join_paths,
-        ssh_cleanup_command_with, ssh_private_directory_command_with,
-        ssh_private_files_command_with, stage_remote_source, transfer_authority_for_pane,
-        transfer_target_for_pane, validate_transfer_paths,
+        complete_transferred_paste, png_bytes, read_bounded_stderr, receive_stderr_with_timeout,
+        reconcile_remote_source_cleanup, remote_paste_path, revalidate_transfer_authority,
+        scp_upload_command_with, shell_join_paths, ssh_cleanup_command_with,
+        ssh_private_directory_command_with, ssh_private_files_command_with, stage_remote_source,
+        transfer_authority_for_pane, transfer_target_for_pane, validate_transfer_paths,
+        write_paste_png,
     };
     use gpui::{Image, ImageFormat};
     use hh_protocol::{
@@ -1107,15 +1154,23 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_images_are_materialized_as_private_encoded_files() {
-        let image = Image::from_bytes(ImageFormat::Png, b"fixture-png".to_vec());
-        let path = materialize_clipboard_image(&image).unwrap();
+    fn clipboard_images_are_materialized_as_private_png_files() {
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 4)
+            .write_to(&mut tiff, image::ImageFormat::Tiff)
+            .unwrap();
+        let image = Image::from_bytes(ImageFormat::Tiff, tiff.into_inner());
+        let path = write_paste_png(&png_bytes(&image.bytes).unwrap()).unwrap();
 
         assert_eq!(
             path.extension().and_then(|value| value.to_str()),
             Some("png")
         );
-        assert_eq!(std::fs::read(&path).unwrap(), b"fixture-png");
+        assert!(
+            std::fs::read(&path)
+                .unwrap()
+                .starts_with(b"\x89PNG\r\n\x1a\n")
+        );
         #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1245,13 +1300,20 @@ mod tests {
     }
 
     #[test]
-    fn pasted_paths_are_shell_escaped_without_losing_spaces_or_quotes() {
+    fn pasted_paths_are_typed_bare_when_safe_and_backslash_escaped_otherwise() {
         assert_eq!(
             shell_join_paths(&[
-                PathBuf::from("/tmp/Screen Shot.png"),
-                PathBuf::from("/tmp/designer's note.jpg"),
+                PathBuf::from("/private/var/folders/x_y/T/harness-harlot-paste/clipboard-1.png"),
+                PathBuf::from("/tmp/Screen Shot (2).png"),
+                PathBuf::from("/tmp/designer's $HOME note&*.jpg"),
+                PathBuf::from("/tmp/café.png"),
             ]),
-            "'/tmp/Screen Shot.png' '/tmp/designer'\\''s note.jpg'"
+            concat!(
+                "/private/var/folders/x_y/T/harness-harlot-paste/clipboard-1.png ",
+                "/tmp/Screen\\ Shot\\ \\(2\\).png ",
+                "/tmp/designer\\'s\\ \\$HOME\\ note\\&\\*.jpg ",
+                "/tmp/café.png"
+            )
         );
     }
 

@@ -6,6 +6,131 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-09-24
+
+### Added
+
+- Added Bots: a robot button beside the notifications bell switches the sidebar
+  to your bots. Each bot runs an installed agent CLI's own interface (omp,
+  Hermes, Claude Code, Codex, Gemini, and others), can be renamed, restarted, or
+  switched to another agent from its context menu, and survives restarts. Bots
+  act as coordinators: they open named worker tabs in a workstation, watch them,
+  and relay your answers when a worker needs input or approval.
+- Each bot runs in its own home folder with a generated `AGENTS.md` holding its
+  coordinator instructions, name, project folder, standing instructions, and an
+  `hh` CLI reference, so every agent CLI, including ones without launch flags
+  such as Hermes, knows it is a bot. The New bot dialog's optional **Project
+  folder** is where its workers open by default, and **Set home folder…** in a
+  bot's context menu moves the bot elsewhere without overwriting your own
+  `AGENTS.md`. The per-agent prompt launch flags are gone.
+- Each bot is its own space with thread tabs you can split and rearrange like a
+  workstation: the Bots sidebar shows it as a workstation card whose tabs are
+  its open threads, with ＋ for a new thread tab. omp bots list their saved
+  conversations below the open tabs, pinned first and newest next. Up to five
+  threads stay open and older ones reopen with `omp --resume`; `/new` and
+  `/resume` typed in omp become that tab's thread, and worker updates go only
+  to the thread that opened the worker.
+  Threads are stored in the bot's folder and deleted with the bot. Added
+  `hh bot report-session` and `hh bot info` for the omp plugin.
+- The × on every bot thread row, open or saved, deletes the thread after one
+  confirmation: its open panes close and its saved conversation is removed, so
+  it no longer returns to the saved list. Threads closed automatically past the
+  five-open limit still move to the saved list.
+- Added a bundled omp plugin for bots with native Harness Harlot tools and worker
+  status reports, and attach the `hh mcp` server automatically to Claude Code and
+  Codex bots.
+- Added `hh terminal` commands and matching MCP tools to list, create, send to,
+  read, wait for, focus, rename, and close worker terminals, plus
+  `hh workstation new`. `hh skill install` now also installs the skill for omp.
+- Added an HH-owned private tmux substrate for local terminals. Managed shells,
+  processes, and terminal output now survive desktop and session-service
+  restarts when tmux 3.2 or newer is available.
+- Added automatic coding-agent discovery. The session service resolves installed
+  agent CLIs on the login `PATH` for the bot agent picker and Settings.
+- Added workstation Galleries with drag-and-drop and picker imports, selected-image
+  previews, one-click Finder reveal, and private per-workstation image storage.
+- Added local browser automation for terminal agents through the `hh` CLI, a
+  stdio MCP server, and an installable Harness Harlot skill. Browser commands use
+  the active desktop's embedded browser and can navigate, read, evaluate,
+  interact, capture screenshots, and call raw CDP.
+- Added image paste through kitty's clipboard paste events (OSC 5522): when the
+  terminal's application enables them (`CSI ? 5522 h`, as omp does), ⌘V or
+  dropping an image file delivers the image to it as a PNG in-band, including
+  over SSH, without typing a file path. The session service only serves bytes
+  the desktop handed over, once, to the reader holding the paste's one-time
+  password, and never reads the system clipboard.
+
+### Changed
+
+- Turning Notifications off (bell or Esc) returns to the view it was opened
+  from, Workstations or Bots, instead of always Workstations.
+- Every tab and terminal — top-bar tabs, pane header tabs, sidebar tab rows,
+  window ring chips, and bot thread rows — now has an always-visible × that
+  closes it with the usual confirmation, and one status slot: a spinner while
+  running, an orange dot when it needs you, and empty space otherwise.
+- Bot thread rows use the normal row colors instead of a dimmed style; only the
+  current thread is highlighted. The Bots header's New bot button is now a
+  small ＋ icon, and menu buttons show a vertical ⋮.
+- Show each split window in the workstation sidebar as a ring of terminal chips,
+  with no header row or collapse menu, instead of a nested row per terminal:
+  the map keeps the window's proportions and each split's real size, so
+  side-by-side terminals are tall and narrow, grids and full-width rows appear
+  as laid out, and stacked ones stack. Each chip shows
+  the terminal's icon, name, and live status; click it to focus that terminal,
+  drag it out to its own tab, or right-click it for the tab menu. Drag the ring
+  to reorder the window and right-click it for the window menu.
+- Rebuilt Notifications around live status: tabs and bots are grouped as Needs
+  you, Running, and Done, newest first, using the real tab rows. Each row shows
+  a status symbol (a spinner while running, an orange dot when it needs you, a
+  green dot when done or exited) and a blue dot until you view that pane after
+  its latest change. The bell and Dock badges count items that need you.
+- Rebuilt Settings as a surface that fills the whole main area. While it is
+  open, its Appearance / Bots / Updates section list replaces the left
+  sidebar, the same way the bell and robot switch it. The ⚙ button toggles
+  Settings and closing it returns to the workstation or bot shown before.
+- The sidebar toolbar is now hammer (Workstations), robot (Bots), bell
+  (Notifications), and ⚙ (Settings); the hammer always returns to your
+  workstations and closes Settings. The Workstations view has its own header
+  with a ＋ for a new workstation, like the Bots header. The global ＋ create
+  menu is removed: ⌘N opens New Workstation, and new tabs, browsers, and
+  galleries come from their shortcuts, the command palette, or the tab strip's
+  ＋ menu.
+- Bumped the desktop/service wire protocol from 35 to 45 for bots, bot
+  workspaces and threads, bot thread deletion, workers, bot home folders,
+  status timestamps, coding-agent discovery, Gallery panes, browser command
+  execution, image paste events, and the removed history archive requests; desktop and service
+  must be upgraded together. Session snapshots move to schema 15; existing
+  snapshots load with former Assistant workspaces and panes removed, and the
+  shared Bots workspace becomes one space per bot with each of its threads in
+  its own tab.
+
+### Removed
+
+- Removed Voice Mode and its OpenAI Realtime integration, microphone controls,
+  and `HH_OPENAI_API_KEY` setting. Use your agent's own voice mode in a bot.
+- Removed Assistant panes and workspaces. Bots replace them.
+- Removed the optional local terminal history archive, its Settings section, and
+  archived search. Agent CLIs keep their own session history; live scrollback
+  and search are unchanged. Any saved archive is deleted on first start.
+
+### Fixed
+
+- Pasted images are no longer typed as quoted TIFF paths: clipboard images are
+  saved as PNG, and pasted or dropped paths are typed bare when they contain
+  only safe characters, otherwise backslash-escaped like macOS Terminal.
+- Keep split dividers following the pointer while dragging across terminals
+  that use the mouse (agent interfaces), and highlight a divider on hover.
+- Running the test suite or a service with a custom state directory no longer
+  shares, or disrupts, the app's private tmux server.
+- Keep the private tmux server alive when creating a second workstation after
+  resizing a terminal. Preserve captured terminal lines beginning with tmux
+  control keywords and extra panes in referenced windows during recovery.
+- Fall back to plain PTYs with a notification when managed tmux discovery fails,
+  including an invalid `HH_TMUX_BINARY`; track both service-bundled assets.
+- Keep managed terminals attached when a program's output splits a multi-byte
+  character across tmux notifications; previously the pane was reported as
+  exited while its program kept running.
+
 ## [0.1.21] - 2026-09-18
 
 ### Fixed

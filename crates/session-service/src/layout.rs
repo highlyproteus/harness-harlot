@@ -126,11 +126,11 @@ pub(crate) fn split_layout(
     }
 }
 
-pub(crate) fn add_tab(layout: &mut PaneLayout, target: Uuid, pane: Pane) -> bool {
+pub(crate) fn add_tab(layout: &mut PaneLayout, target: Uuid, pane: Pane, activate: bool) -> bool {
     match layout {
         PaneLayout::Leaf { pane: existing } if existing.id == target => {
             let existing = existing.clone();
-            let active = pane.id;
+            let active = if activate { pane.id } else { existing.id };
             *layout = PaneLayout::Stack {
                 panes: vec![existing, pane],
                 active,
@@ -138,13 +138,16 @@ pub(crate) fn add_tab(layout: &mut PaneLayout, target: Uuid, pane: Pane) -> bool
             true
         }
         PaneLayout::Stack { panes, active } if panes.iter().any(|pane| pane.id == target) => {
-            *active = pane.id;
+            if activate {
+                *active = pane.id;
+            }
             panes.push(pane);
             true
         }
         PaneLayout::Leaf { .. } | PaneLayout::Stack { .. } => false,
         PaneLayout::Split { first, second, .. } => {
-            add_tab(first, target, pane.clone()) || add_tab(second, target, pane)
+            add_tab(first, target, pane.clone(), activate)
+                || add_tab(second, target, pane, activate)
         }
     }
 }
@@ -312,7 +315,7 @@ pub(crate) fn move_workspace_pane_to_tab(
         return false;
     };
     let mut target_layout = workspace.tabs[target_tab].layout.clone();
-    if !add_tab(&mut target_layout, target, pane) {
+    if !add_tab(&mut target_layout, target, pane, true) {
         return false;
     }
     workspace.tabs[target_tab].layout = target_layout;
@@ -358,7 +361,7 @@ pub(crate) fn move_existing_pane_to_tab(
     let (Some(pane), Some(mut remaining)) = (pane, remaining) else {
         return false;
     };
-    if !add_tab(&mut remaining, target, pane) {
+    if !add_tab(&mut remaining, target, pane, true) {
         return false;
     }
     *layout = remaining;
@@ -552,6 +555,7 @@ pub(crate) fn pane_fixture(id: Uuid) -> Pane {
         color: None,
         identity: TerminalIdentity::default(),
         status: hh_protocol::PaneStatus::default(),
+        status_changed_at_ms: 0,
         custom_title: None,
         profile_override: None,
         custom_icon: None,

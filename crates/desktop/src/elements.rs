@@ -17,18 +17,31 @@ use std::rc::Rc;
 use crate::helpers::{
     hsv_to_rgb, selection_span, terminal_point_clamped, terminal_run_display_text,
 };
+use crate::tab_chrome::PaneIndicator;
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{DialogTextEditor, WorkspaceCreationField, WorkspaceCreationStep};
 use crate::{HhApp, THEME};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SidebarPaneRowContext {
     pub(crate) workspace_id: Uuid,
     pub(crate) tab_id: Option<Uuid>,
     pub(crate) tab_color: Option<AppearanceColor>,
     pub(crate) from_group: bool,
     pub(crate) indent: f32,
+    /// Set on Notifications rows, which never drag-reorder.
+    pub(crate) activity: Option<ActivityRow>,
+}
+
+/// The status symbol, unread dot, and location line of one Notifications row.
+#[derive(Clone, Debug)]
+pub(crate) struct ActivityRow {
+    /// Replaces the row's tab indicator; see `notification_indicator`.
+    pub(crate) indicator: PaneIndicator,
+    pub(crate) unread: bool,
+    pub(crate) location: String,
+    pub(crate) bot: bool,
 }
 
 pub(crate) struct WorkspaceTextInputElement {
@@ -319,15 +332,16 @@ impl Element for TerminalInputElement {
     }
 }
 
-/// Registers window-level listeners while the sidebar divider owns an active
-/// pointer gesture. GPUI's normal element listeners are hover-scoped, while a
-/// resize capture must continue to receive drag and release events outside the
-/// divider (and even outside the window bounds when the platform delivers them).
-pub(crate) struct SidebarResizeCaptureElement {
+/// Registers window-level listeners while the sidebar divider or a split
+/// divider owns an active pointer gesture. GPUI's normal element listeners are
+/// hover-scoped, and a terminal under the pointer that consumes mouse events
+/// (agent TUIs enable mouse reporting) would stall a bubbling resize, so the
+/// drag must keep receiving move and release events wherever the pointer goes.
+pub(crate) struct ResizeCaptureElement {
     pub(crate) input: Entity<HhApp>,
 }
 
-impl IntoElement for SidebarResizeCaptureElement {
+impl IntoElement for ResizeCaptureElement {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -335,7 +349,7 @@ impl IntoElement for SidebarResizeCaptureElement {
     }
 }
 
-impl Element for SidebarResizeCaptureElement {
+impl Element for ResizeCaptureElement {
     type RequestLayoutState = ();
     type PrepaintState = ();
 

@@ -101,10 +101,11 @@ The equivalent command-line entry point is:
 ```
 
 Add `--restart-service` (also supported by `hh update`) to authorize stopping
-live terminals for a protocol change; otherwise the CLI requires quiescence.
-Local tabs reopen as fresh shells in their last directories and running programs
-stop. SSH tabs remain offline until explicitly reconnected. Existing older
-updater binaries still use their old gate until replaced.
+the service for a protocol change; otherwise the CLI requires quiescence. Local
+terminals managed by HH's private tmux server resume with their processes and
+output. Missing or failed tmux recovery falls back to fresh shells in the last
+valid directories. SSH tabs remain offline until explicitly reconnected.
+Existing older updater binaries still use their old gate until replaced.
 
 The release manifest and archive are signed with the same offline Ed25519 update key used by the macOS channel. Linux package trust does not depend on Apple credentials. Repository/package signing can be added later for `.deb`, `.rpm`, or AppImage distribution without changing this signed update-feed contract.
 

@@ -1,6 +1,6 @@
 use hh_protocol::{
-    AppearanceColor, ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, PaneKind, PaneLayout,
-    ServiceResponse, WireError,
+    ClientRequest, MAX_FRAME_SIZE, PROTOCOL_VERSION, PaneKind, PaneLayout, ServiceResponse,
+    WireError,
 };
 use hh_session_service::{SessionRegistry, serve_connection};
 use serde::Serialize;
@@ -53,6 +53,7 @@ async fn client_can_handshake_and_fetch_snapshot() {
                     pane_revisions: Vec::new(),
                     subscribed_panes: vec![target_pane],
                     notifications_after: 0,
+                    browser_executor: false,
                 },
             )
             .await
@@ -92,14 +93,18 @@ async fn client_can_handshake_and_fetch_snapshot() {
 }
 
 #[tokio::test]
-async fn assistant_identity_requests_round_trip_over_the_service_socket() {
+async fn create_worker_opens_a_titled_tab_and_types_its_command() {
     let (mut client, server) = UnixStream::pair().unwrap();
     let registry = SessionRegistry::new().expect("start seeded configured-shell PTY");
-    let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+    let snapshot = registry.snapshot().unwrap();
+    let workspace_id = snapshot.workspaces[0].id;
+    let PaneLayout::Leaf { pane } = &snapshot.workspaces[0].tabs[0].layout else {
+        panic!("seeded workstation holds one terminal");
+    };
+    let requester_pane = pane.id;
     let server_task = tokio::spawn(async move {
         serve_connection(server, &registry).await.unwrap();
     });
-
     write_message(
         &mut client,
         &ClientRequest::Hello {
@@ -108,52 +113,33 @@ async fn assistant_identity_requests_round_trip_over_the_service_socket() {
     )
     .await
     .unwrap();
+    read_message::<ServiceResponse>(&mut client).await.unwrap();
+
+    let worker = |workspace_id| ClientRequest::CreateWorker {
+        workspace_id,
+        working_dir: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        title: Some("api-fix".to_owned()),
+        command: Some("echo HH_WORKER_$((6 * 7))".to_owned()),
+        requester_pane: Some(requester_pane),
+    };
+    write_message(&mut client, &worker(None)).await.unwrap();
     assert!(matches!(
         read_message::<ServiceResponse>(&mut client).await.unwrap(),
-        ServiceResponse::Hello {
-            protocol_version: PROTOCOL_VERSION
-        }
+        ServiceResponse::Error { message } if message.contains("workspace_id")
     ));
 
-    write_message(
-        &mut client,
-        &ClientRequest::CreateAssistantTab { workspace_id },
-    )
-    .await
-    .unwrap();
-    let ServiceResponse::PaneCreated { pane_id } =
-        read_message::<ServiceResponse>(&mut client).await.unwrap()
+    write_message(&mut client, &worker(Some(workspace_id)))
+        .await
+        .unwrap();
+    let ServiceResponse::WorkerCreated {
+        workspace_id: created_in,
+        tab_id,
+        pane_id,
+    } = read_message::<ServiceResponse>(&mut client).await.unwrap()
     else {
-        panic!("assistant creation did not return its pane id");
+        panic!("worker creation did not report its tab");
     };
-
-    let color = AppearanceColor::new(0x12, 0x34, 0x56);
-    let requests = [
-        ClientRequest::RenamePane {
-            pane_id,
-            title: "Helper".to_owned(),
-        },
-        ClientRequest::SetPaneColor {
-            pane_id,
-            color: Some(color),
-        },
-        ClientRequest::SetPaneCustomIcon {
-            pane_id,
-            icon: None,
-        },
-        ClientRequest::SetPaneProfile {
-            pane_id,
-            profile: None,
-        },
-        ClientRequest::ResetPaneIdentity { pane_id },
-    ];
-    for request in requests {
-        write_message(&mut client, &request).await.unwrap();
-        assert!(matches!(
-            read_message::<ServiceResponse>(&mut client).await.unwrap(),
-            ServiceResponse::Ack
-        ));
-    }
+    assert_eq!(created_in, workspace_id);
 
     write_message(&mut client, &ClientRequest::GetSnapshot)
         .await
@@ -163,19 +149,45 @@ async fn assistant_identity_requests_round_trip_over_the_service_socket() {
     else {
         panic!("snapshot request returned an unexpected response");
     };
-    let pane = snapshot.workspaces[0]
+    let tab = snapshot.workspaces[0]
         .tabs
         .iter()
-        .find_map(|tab| match &tab.layout {
-            PaneLayout::Leaf { pane } if pane.id == pane_id => Some(pane),
-            _ => None,
-        })
-        .expect("assistant pane in service snapshot");
-    assert_eq!(pane.kind, PaneKind::Assistant);
-    assert_eq!(pane.title, "Helper");
-    assert_eq!(pane.color, Some(color));
-    assert_eq!(pane.custom_title, None);
-    assert_eq!(pane.custom_icon, None);
+        .find(|tab| tab.id == tab_id)
+        .expect("worker tab in its workstation");
+    assert_eq!(tab.custom_title.as_deref(), Some("api-fix"));
+    assert_eq!(tab.owner_bot, None);
+    let PaneLayout::Leaf { pane } = &tab.layout else {
+        panic!("worker tab holds one terminal");
+    };
+    assert_eq!(pane.id, pane_id);
+    assert_eq!(pane.kind, PaneKind::Terminal);
+    assert_eq!(pane.title, "api-fix");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        write_message(&mut client, &ClientRequest::GetPaneSnapshot { pane_id })
+            .await
+            .unwrap();
+        let ServiceResponse::PaneSnapshot { screen, .. } =
+            read_message::<ServiceResponse>(&mut client).await.unwrap()
+        else {
+            panic!("pane snapshot request returned an unexpected response");
+        };
+        let text = screen
+            .lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        if text.contains("HH_WORKER_42") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker command never ran; screen: {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     drop(client);
     server_task.await.unwrap();

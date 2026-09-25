@@ -1,52 +1,27 @@
 //! The root Render implementation.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent,
-    ParentElement, Render, Styled, Window, div, px, rgb,
+    AnyElement, Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseMoveEvent, ParentElement, Pixels, Render, Styled, Window, div, px, rgb,
 };
 
 use crate::HhApp;
 use crate::commands::{AppCommand, ROOT_KEY_CONTEXT};
 use crate::elements::{
-    SidebarResizeCaptureElement, TerminalInputElement, TerminalSelectionCaptureElement,
+    ResizeCaptureElement, TerminalInputElement, TerminalSelectionCaptureElement,
 };
 use crate::input::browser_url_editor_is_active;
 use crate::view_models::{ColorTarget, DialogAction, Modal};
 use crate::{
     ConsumeChordPrefix, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp, NewBrowserTab,
-    NewTab, NewWorkspace, PaneDrag, ReattachPane, RetryTerminalInput, ShowCommandPalette,
-    ShowNotifications, ShowSettings, SplitDown, SplitRight, THEME, TerminalZoomIn, TerminalZoomOut,
-    TogglePaneZoom, ToggleSidebar, ToggleVoiceMic,
+    NewGalleryTab, NewTab, NewWorkspace, PaneDrag, ReattachPane, RetryTerminalInput, ShowBots,
+    ShowCommandPalette, ShowNotifications, ShowSettings, SplitDown, SplitRight, THEME,
+    TerminalZoomIn, TerminalZoomOut, TogglePaneZoom, ToggleSidebar,
 };
 
-impl Render for HhApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.update_window_geometry(window);
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
-        self.schedule_browser_presentation(window, cx);
-
-        // The workspace dialog has its own focus targets. A pointer click on
-        // the sidebar button must not leave native text input attached to the
-        // terminal behind the dialog.
-        if let Some(dialog) = self.editor.modal.workspace_creation() {
-            self.editor.workspace_input_focus[dialog.field.index()].focus(window);
-        } else if browser_url_editor_is_active(
-            self.editor
-                .browser_url_editor
-                .as_ref()
-                .map(|editor| editor.pane_id),
-            self.layout.focused_pane,
-        ) || self.editor.modal.pane_rename().is_some()
-            || self.editor.modal.workspace_rename().is_some()
-            || self.editor.modal.group_rename().is_some()
-            || self.editor.modal.dir_editor().is_some()
-        {
-            // Keep custom text editors on the root input route so native child
-            // views cannot consume replacement typing.
-            self.focus_handle.focus(window);
-        }
-        let menu_max_height = window.viewport_size().height - px(16.0);
-        let modal_element = match &self.editor.modal {
+impl HhApp {
+    fn render_modal(&self, menu_max_height: Pixels, cx: &mut Context<Self>) -> Option<AnyElement> {
+        match &self.editor.modal {
             Modal::None | Modal::AppearanceSettings | Modal::Search(_) => None,
             Modal::CommandPalette(palette) => Some(self.render_command_palette(palette, cx)),
             Modal::WorkspaceCreation(dialog) => {
@@ -55,7 +30,11 @@ impl Render for HhApp {
             Modal::WorkspaceRename(editor) => Some(self.render_rename_dialog(
                 Some(("workspace-rename-input", editor.replace_on_type)),
                 format!("{}{}", editor.value, self.editor.ime_preedit),
-                "Rename workstation",
+                if editor.bot {
+                    "Rename bot"
+                } else {
+                    "Rename workstation"
+                },
                 "save-workspace-rename",
                 DialogAction::RenameWorkspace,
                 cx,
@@ -95,10 +74,46 @@ impl Render for HhApp {
             }
             Modal::CreateMenu(menu) => Some(self.render_create_menu(*menu, cx)),
             Modal::GroupMenu(menu) => Some(self.render_group_menu(*menu, menu_max_height, cx)),
+            Modal::BotMenu(menu) => Some(self.render_bot_menu(*menu, menu_max_height, cx)),
+            Modal::BotThreadMenu(menu) => Some(self.render_bot_thread_menu(menu, cx)),
+            Modal::BotThreadDelete(confirmation) => {
+                Some(self.render_bot_thread_delete_dialog(confirmation, cx))
+            }
             Modal::WorkspaceConnectionInfo(info) => {
                 Some(self.render_workspace_connection_info(info, cx))
             }
-        };
+        }
+    }
+}
+
+impl Render for HhApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.update_window_geometry(window);
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
+        self.schedule_browser_presentation(window, cx);
+
+        // The workspace dialog has its own focus targets. A pointer click on
+        // the sidebar button must not leave native text input attached to the
+        // terminal behind the dialog.
+        if let Some(dialog) = self.editor.modal.workspace_creation() {
+            self.editor.workspace_input_focus[dialog.field.index()].focus(window);
+        } else if browser_url_editor_is_active(
+            self.editor
+                .browser_url_editor
+                .as_ref()
+                .map(|editor| editor.pane_id),
+            self.layout.focused_pane,
+        ) || self.editor.modal.pane_rename().is_some()
+            || self.editor.modal.workspace_rename().is_some()
+            || self.editor.modal.group_rename().is_some()
+            || self.editor.modal.dir_editor().is_some()
+        {
+            // Keep custom text editors on the root input route so native child
+            // views cannot consume replacement typing.
+            self.focus_handle.focus(window);
+        }
+        let menu_max_height = window.viewport_size().height - px(16.0);
+        let modal_element = self.render_modal(menu_max_height, cx);
 
         div()
             .key_context(if self.editor.modal.command_palette().is_some() {
@@ -143,6 +158,8 @@ impl Render for HhApp {
                             | Modal::WorkspaceMenu(_)
                             | Modal::CreateMenu(_)
                             | Modal::GroupMenu(_)
+                            | Modal::BotMenu(_)
+                            | Modal::BotThreadMenu(_)
                             | Modal::WorkspaceConnectionInfo(_)
                     ) {
                         this.editor.modal = Modal::None;
@@ -164,6 +181,10 @@ impl Render for HhApp {
             }))
             .on_action(cx.listener(|this, _: &NewBrowserTab, _, cx| {
                 this.execute_command(AppCommand::NewBrowserTab, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &NewGalleryTab, _, cx| {
+                this.execute_command(AppCommand::NewGalleryTab, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &TerminalZoomIn, _, cx| {
@@ -222,8 +243,8 @@ impl Render for HhApp {
                 this.execute_command(AppCommand::ShowNotifications, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &ToggleVoiceMic, _, cx| {
-                this.execute_command(AppCommand::ToggleVoiceMic, cx);
+            .on_action(cx.listener(|this, _: &ShowBots, _, cx| {
+                this.execute_command(AppCommand::ShowBots, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &ShowSettings, _, cx| {
@@ -244,15 +265,18 @@ impl Render for HhApp {
                     .h(px(1.0))
                     .child(TerminalInputElement { input: cx.entity() }),
             )
-            .when(self.sidebar.sidebar_resize.is_active(), |element| {
-                element.child(
-                    div()
-                        .absolute()
-                        .w(px(1.0))
-                        .h(px(1.0))
-                        .child(SidebarResizeCaptureElement { input: cx.entity() }),
-                )
-            })
+            .when(
+                self.sidebar.sidebar_resize.is_active() || self.layout.resizing.is_some(),
+                |element| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .w(px(1.0))
+                            .h(px(1.0))
+                            .child(ResizeCaptureElement { input: cx.entity() }),
+                    )
+                },
+            )
             .when(self.layout.selection_drag.is_some(), |element| {
                 element.child(
                     div()

@@ -187,8 +187,9 @@ impl SessionRegistry {
 
     /// Performs an explicit bounded metadata-only scan of the default tmux
     /// server for one workstation. It never starts tmux, reconnects a saved
-    /// SSH workstation, or writes scan output to terminal history.
+    /// SSH workstation, or writes scan output into a terminal.
     pub fn scan_tmux_sessions(&self, workspace_id: Uuid) -> Result<TmuxScanResult> {
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         let _scan_permit = self.begin_tmux_scan(workspace_id)?;
         let connection = self.workspace_connection(workspace_id)?;
         let (scope, probe) = tmux_probe_for_connection(&connection)?;
@@ -227,6 +228,7 @@ impl SessionRegistry {
         workspace_id: Uuid,
         session_ids: &[TmuxSessionId],
     ) -> Result<TmuxAttachmentResult> {
+        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
         let connection = {
             let state = self.state.read();
             state
@@ -296,24 +298,13 @@ impl SessionRegistry {
         let pane_id = Uuid::new_v4();
         let (session, kind) = match connection {
             WorkspaceConnection::Local => (
-                PtySession::spawn_tmux_local(
-                    pane_id,
-                    workspace_id,
-                    &tmux_session.id,
-                    &self.history,
-                )?,
+                PtySession::spawn_tmux_local(pane_id, &tmux_session.id)?,
                 RuntimePaneKind::TmuxLocal {
                     session_id: tmux_session.id.clone(),
                 },
             ),
             WorkspaceConnection::SystemSsh { destination, .. } => (
-                PtySession::spawn_tmux_ssh(
-                    pane_id,
-                    workspace_id,
-                    destination,
-                    &tmux_session.id,
-                    &self.history,
-                )?,
+                PtySession::spawn_tmux_ssh(pane_id, destination, &tmux_session.id)?,
                 RuntimePaneKind::TmuxSystemSsh {
                     host: destination.clone(),
                     session_id: tmux_session.id.clone(),
@@ -375,6 +366,7 @@ impl SessionRegistry {
                 _ => bail!("tmux transport no longer matches its workstation"),
             }
             workspace.tabs.push(Tab {
+                owner_thread: None,
                 id: Uuid::new_v4(),
                 title: tmux_session.name.clone(),
                 custom_title: None,
@@ -383,6 +375,7 @@ impl SessionRegistry {
                 custom_icon: None,
                 parent_tab: None,
                 pinned: false,
+                owner_bot: None,
                 layout: PaneLayout::Leaf {
                     pane: Pane {
                         id: pane_id,
@@ -395,6 +388,7 @@ impl SessionRegistry {
                             source: TerminalIdentitySource::Command,
                         },
                         status: hh_protocol::PaneStatus::default(),
+                        status_changed_at_ms: 0,
                         custom_title: None,
                         profile_override: None,
                         custom_icon: None,
@@ -473,14 +467,12 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from("printf fixture; sleep 1"),
             ]),
             "live remote tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let tmux_session = tmux_session("$12", "remote-editor");
@@ -514,14 +506,12 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from("printf fixture; sleep 1"),
             ]),
             "live tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let tmux_session = tmux_session("$9", "editor");
@@ -559,14 +549,12 @@ mod tests {
         let tmux_pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             tmux_pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from("printf fixture; sleep 1"),
             ]),
             "live tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let tmux_session = tmux_session("$11", "persisted-group");
@@ -619,10 +607,8 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![OsString::from("/usr/bin/false")]),
             "failed tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -711,14 +697,12 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
-            workspace_id,
             CommandBuilder::from_argv(vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from("printf fixture; sleep 5"),
             ]),
             "live tmux fixture",
-            &registry.history,
         )
         .unwrap();
         let tmux_session = tmux_session("$9", "editor");

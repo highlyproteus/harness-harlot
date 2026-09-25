@@ -146,7 +146,7 @@ impl HhApp {
 
     /// Enqueues a control-lane request with a typed continuation applied
     /// with the response on the UI thread, followed by one poll cycle.
-    pub(crate) fn dispatch_with(&mut self, request: ClientRequest, apply: ApplyFn) {
+    pub(crate) fn dispatch_with(&mut self, request: ClientRequest, apply: ApplyFn) -> bool {
         let one_way = PipelineJob::is_one_way(&request);
         if self
             .session
@@ -161,6 +161,9 @@ impl HhApp {
         {
             self.session.connection_error =
                 Some("control pipeline overloaded; newest request was not queued".to_owned());
+            false
+        } else {
+            true
         }
     }
 
@@ -185,6 +188,7 @@ impl HhApp {
 
     pub(crate) fn pane_update_request(&self) -> ClientRequest {
         let now = Instant::now();
+        let on_screen = self.on_screen_panes();
         let pane_revisions = self
             .session
             .screens
@@ -196,7 +200,7 @@ impl HhApp {
             .collect();
         let subscribed_panes = paced_subscriptions(
             now,
-            &self.on_screen_panes(),
+            &on_screen,
             self.layout.focused_pane,
             &self.session.last_delivery,
             SECONDARY_PANE_INTERVAL,
@@ -210,6 +214,10 @@ impl HhApp {
             pane_revisions,
             subscribed_panes,
             notifications_after: self.session.notifications_latest_id,
+            browser_executor: cfg!(all(
+                any(target_os = "macos", target_os = "linux"),
+                feature = "browser"
+            )),
         }
     }
     pub(crate) fn apply_update_result(
@@ -225,6 +233,7 @@ impl HhApp {
                 pane_states,
                 notifications: notification_deltas,
                 diagnostics,
+                browser_commands,
             }) => {
                 let apply_started = Instant::now();
                 let outcome = reconcile_updates(
@@ -241,6 +250,7 @@ impl HhApp {
                     },
                     Instant::now(),
                 );
+                self.run_browser_commands(browser_commands, cx);
                 self.terminal_shape_cache
                     .borrow_mut()
                     .retain(|id, _| self.session.screens.contains_key(id));
@@ -256,16 +266,10 @@ impl HhApp {
                 if outcome.notifications_need_refresh {
                     self.refresh_notifications();
                 }
-                if outcome.auto_read_or_badge {
-                    if self.session.window_active
-                        && let Some(pane_id) = self.layout.focused_pane
-                    {
-                        self.auto_read_pane_notifications(pane_id, cx);
-                    } else {
-                        self.sync_dock_badge();
-                    }
-                }
+                self.sync_dock_badge();
                 let mut state_changed = outcome.state_changed;
+                self.refresh_changed_bot_threads();
+                self.mark_focused_pane_viewed();
                 if let Some(pane_id) = outcome.focus_resync {
                     state_changed |= self.focus_pane_with_snapshot(pane_id, cx);
                 }
@@ -285,22 +289,6 @@ impl HhApp {
                 self.session.connection_error != previous
             }
         };
-        let mut live_assistants = std::collections::HashSet::new();
-        if let Some(snapshot) = self.session.snapshot.as_ref() {
-            for workspace in &snapshot.workspaces {
-                for tab in &workspace.tabs {
-                    let mut panes = Vec::new();
-                    crate::helpers::collect_terminal_tabs(&tab.layout, &mut panes);
-                    live_assistants.extend(
-                        panes
-                            .into_iter()
-                            .filter(|pane| pane.kind.is_assistant())
-                            .map(|pane| pane.id),
-                    );
-                }
-            }
-        }
-        self.prune_assistant_sessions(&live_assistants, cx);
         if self
             .editor
             .browser_url_editor
@@ -350,7 +338,8 @@ impl HhApp {
         if needs_activation {
             self.dispatch(ClientRequest::ActivateTab { pane_id });
         }
-        let notifications_changed = self.auto_read_pane_notifications(pane_id, cx);
+        self.note_bot_pane_focus(pane_id);
+        self.mark_pane_viewed(pane_id);
         if self
             .pane_metadata(pane_id)
             .is_some_and(|pane| !pane.kind.is_terminal())
@@ -359,11 +348,11 @@ impl HhApp {
             self.layout.focused_pane = Some(pane_id);
             self.session.connection_error = None;
             self.ensure_visible_browser_views(cx);
-            return changed || notifications_changed;
+            return changed;
         }
         let focus_changed = self.layout.focused_pane != Some(pane_id);
         if !focus_changed {
-            return notifications_changed;
+            return false;
         }
         self.layout.focused_pane = Some(pane_id);
         self.dispatch_stream_with(
@@ -380,6 +369,11 @@ impl HhApp {
                             .screens
                             .get(&pane_id)
                             .is_none_or(|current| current.revision != screen.revision);
+                        // A focus snapshot says nothing about liveness or paste
+                        // modes; keep whatever the last update round reported.
+                        let previous = this.session.pane_states.get(&pane_id);
+                        let exited = previous.is_some_and(|state| state.exited);
+                        let enhanced_paste = previous.is_some_and(|state| state.enhanced_paste);
                         this.session.pane_states.insert(
                             pane_id,
                             PaneStreamState {
@@ -387,20 +381,15 @@ impl HhApp {
                                 revision: screen.revision,
                                 subscribed: true,
                                 dirty: false,
-                                // A focus snapshot says nothing about liveness; keep
-                                // whatever the last update round reported.
-                                exited: this
-                                    .session
-                                    .pane_states
-                                    .get(&pane_id)
-                                    .is_some_and(|state| state.exited),
+                                exited,
+                                enhanced_paste,
                             },
                         );
                         this.session.screens.insert(pane_id, screen);
                         this.session.last_delivery.insert(pane_id, delivered_at);
                         this.session.stream_diagnostics = diagnostics;
                         this.session.connection_error = None;
-                        if changed || notifications_changed {
+                        if changed {
                             cx.notify();
                         }
                     }
@@ -409,7 +398,7 @@ impl HhApp {
                 }
             }),
         );
-        focus_changed || notifications_changed
+        focus_changed
     }
     pub(crate) fn active_workspace_in<'a>(
         &self,
@@ -449,35 +438,6 @@ impl HhApp {
             .zoomed_pane
             .and_then(|pane_id| zoom_projection(layout, pane_id));
         visible_panes(projected.as_ref().unwrap_or(layout))
-    }
-
-    pub(crate) fn refresh_history_status(&mut self) {
-        self.dispatch_stream_with(
-            ClientRequest::GetHistoryStatus,
-            Box::new(|this, cx, result| {
-                if this.apply_history_status_result(result) {
-                    cx.notify();
-                }
-            }),
-        );
-    }
-
-    pub(crate) fn apply_history_status_result(
-        &mut self,
-        response: anyhow::Result<ServiceResponse>,
-    ) -> bool {
-        let previous = self.session.history_status.clone();
-        match response {
-            Ok(ServiceResponse::HistoryStatus { status }) => {
-                self.session.history_status = Some(status);
-                self.session.connection_error = None;
-            }
-            Ok(response) => {
-                self.report_unexpected(&response);
-            }
-            Err(error) => self.report(&error),
-        }
-        self.session.history_status != previous
     }
 
     pub(crate) fn update_window_geometry(&mut self, window: &Window) -> bool {

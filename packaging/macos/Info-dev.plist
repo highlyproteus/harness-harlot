@@ -32,7 +32,7 @@
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Harness Harlot uses the microphone for Voice Mode.</string>
+  <string>Programs you run in Harness Harlot terminals, such as an agent's voice mode, and web pages in browser tabs may use the microphone when you ask them to.</string>
   <key>NSDesktopFolderUsageDescription</key>
   <string>Terminal commands may access files in your Desktop folder when you request it.</string>
   <key>NSDocumentsFolderUsageDescription</key>

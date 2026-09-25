@@ -60,10 +60,12 @@ hh update --check
 rollback, and relaunches Harness Harlot after a successful replacement on Linux
 and packaged community macOS builds. The sidebar Update button keeps the app
 open while downloading and asks once before restarting an incompatible terminal
-service. Running local terminals then reopen as fresh shells in their last
-directories; their programs stop, and SSH tabs stay offline until reconnected.
-For the CLI, use `hh update --restart-service` to authorize that restart, or end
-active terminal sessions first. Compatible service updates preserve live shells.
+service. Local terminals managed by the private HH tmux server resume with
+their running programs and output; unsupported or failed tmux recovery falls
+back to fresh shells in the last valid directories. SSH tabs stay offline until
+reconnected. For the CLI, use `hh update --restart-service` to authorize that
+restart, or end active terminal sessions first. Compatible service updates
+preserve live shells without restarting the service.
 Contributors can opt into the independently published main-branch feed with
 `hh update --channel edge`.
 
@@ -74,7 +76,7 @@ present by default on supported Ubuntu installations or available from the
 standard package repositories.
 
 The desktop package uses the matching distribution runtime libraries. Browser tabs
-need GTK, NSS, and GBM; Voice Mode needs ALSA:
+need GTK, NSS, ALSA, and GBM:
 
 ```text
 Ubuntu 22.04:  libgtk-3-0 libnss3 libasound2 libgbm1
@@ -96,10 +98,10 @@ A workstation is a machine — your local computer or an SSH host.
 ## Terminals
 
 - Fast native terminals with tabs, split panes, drag-to-rearrange layouts, selection/copy/paste, scrollback, and search.
+- Paste or drop images into terminals: apps that support kitty paste events (OSC 5522), such as omp, receive the image directly; others get the PNG's path.
 - Rename any terminal tab, pick its color, or give it its own icon.
 - Known agent CLIs — Codex, Claude Code, Cursor, Aider, Gemini, and more — are recognized and labeled with their official icons automatically.
 - Your terminals keep running if the app closes, crashes, or updates. They live in a small local session service, so reopening the app puts you right back where you were. Ending a session is always explicit: close its tab or exit the shell.
-- Optional terminal history archive: beyond live scrollback, an opt-in owner-only disk archive lets explicit searches reach older output, with quotas and retention you control.
 
 ## Groups
 
@@ -109,26 +111,92 @@ A group displays several terminals together in one view — and can include a br
 
 Full embedded Chromium tabs on macOS and Linux, isolated to the app's own profile directory.
 
-## Voice Mode
+## Bots
 
-Assistant panes support typed messages, image attachments, and optional spoken
-conversation through the OpenAI Realtime API. Text and image actions can start
-an Assistant connection, but the microphone remains off until you use the
-visible start-voice control. Voice is conversation-only: it receives no provider
-tools or approval path and cannot inspect or control terminals, panes,
-workstations, files, Git, agents, or memory retrieval.
+Bots are the agents you talk to. The sidebar toolbar's hammer shows your
+workstations; click the robot beside it to switch the sidebar to your bots,
+create one with the ＋ in the Bots header, and pick
+which installed agent CLI runs it: omp, Hermes, Claude Code, Codex, Gemini, or
+another supported agent. Each bot runs its agent's own interface, so the agent's
+commands, settings, and voice mode work as usual. Right-click a bot to rename
+it, change its agent, restart it, set its home folder, or delete it. Bots
+survive app and service restarts like any other local terminal.
 
-OpenAI and optional Honcho credentials are not saved to the settings file. Set
-`HH_OPENAI_API_KEY` and, when needed, `HH_HONCHO_BEARER` in the launch
-environment. See [Voice Mode privacy and data handling](PRIVACY.md) for the data
-sent to providers, local retention limits, deletion controls, and workspace
-authorization boundaries.
+Each bot runs in its own home folder, by default a private folder in the app's
+state directory. On every launch Harness Harlot writes an `AGENTS.md` there with
+the coordinator instructions, the bot's name, its project folder, and your
+instructions, so every agent that reads `AGENTS.md` (omp, Claude Code, Codex,
+Hermes, and others) knows it is a bot and how to drive Harness Harlot with the
+`hh` CLI. The optional **Project folder** chosen when you create a bot is where
+its workers open by default; the home folder is only for the bot's notes. A
+custom home folder never gets an `AGENTS.md` over one that you wrote yourself.
+
+A bot is a coordinator. Ask it to "spin up three worktrees and have omp
+implement the plan" and it opens named worker tabs in a workstation (by default
+one titled after the bot), each running a coding agent on its task. Open the
+workstation to watch the workers or take over any of them yourself.
+When a worker needs input or approval, the bot tells you what it is asking;
+answer the bot and it relays your decision to the worker.
+
+Each bot is its own space with thread tabs you can split and rearrange like a
+workstation: its card in the Bots sidebar looks like a workstation card, and
+each open conversation (thread) is a tab. Click ＋ on the bot's card for a new
+thread tab. omp bots list their saved threads below the open ones, pinned
+first and newest next; click one to reopen it with its full history, or
+right-click it to pin it. Up to five threads stay open; older idle ones close
+and stay saved. Starting `/new` or `/resume` inside omp shows up as that tab's
+thread, and each thread hears only about the workers it opened.
+
+omp bots load the bundled Harness Harlot plugin automatically, which also
+reports worker status changes into the bot's conversation. Claude Code and
+Codex bots get the `hh mcp` server attached at launch. Other agents need a
+one-time MCP setup for the tools; **Settings → Bots** shows the exact command.
+Claude Code and Codex may ask once to trust the bot's folder. See
+[Bots privacy and data handling](PRIVACY.md).
+
+## Notifications
+
+The bell switches the sidebar to Notifications, which lists terminal tabs and
+bots by live status: **Needs you** (waiting for input or approval), then
+**Running**, then **Done**, newest first within each group. Click a row to jump
+to it. The bell and Dock badges count what needs you.
+
+## Browser automation and Galleries
+
+Harness Harlot terminals receive `HH_WORKSPACE_ID`, `HH_PANE_ID`,
+`HH_GALLERY_DIR`, and `HH_CLI`. The bundled `hh` command uses that context to
+control browser panes and publish images without exposing a remote network
+endpoint:
+
+```bash
+hh browser open https://example.com --json
+hh browser read body --pane BROWSER_PANE_ID --json
+hh browser screenshot --pane BROWSER_PANE_ID --json
+hh gallery add /absolute/path/to/image.png --json
+hh gallery list --json
+```
+
+`hh terminal` controls worker terminals the same way (`list`, `new`, `send`,
+`read`, `wait`, `focus`, `close`, `rename`). `hh mcp` exposes all of these as a
+stdio MCP server. `hh skill install` installs the bundled agent instructions for
+omp, Claude Code, Codex, and pi. **Settings → Bots** shows the MCP
+configuration and skill installer.
+
+Gallery images are copied into private per-workstation application storage.
+Opening or importing from a terminal creates or reuses a Gallery without taking
+focus from the terminal. The desktop Gallery supports file drops, previews, and
+revealing the selected image in Finder or the platform file manager.
 
 ## tmux
 
-- Scan the local or remote tmux server from the workstation menu and open selected sessions as tabs.
-- Sessions attach exactly like a hand-run `tmux attach-session`: tmux stays in charge of its own windows and panes, and detaching leaves the session running on the server.
-- Nothing is scanned in the background — only when you ask.
+- Local terminal panes use an HH-owned private tmux server when tmux 3.2 or
+  newer is installed, preserving processes and output across service restarts.
+- The managed server uses a private `hh` (`hh-dev` in development) socket and
+  does not alter the user's default tmux server. A custom `HH_STATE_DIR` gets
+  its own private server (`hh-<hash of the state directory>`).
+- The workstation menu can still scan an explicitly requested local or remote
+  tmux server and attach selected sessions as tabs. Nothing is scanned in the
+  background.
 
 ## Run locally
 
@@ -191,5 +259,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 ## License
 
 Harness Harlot is available under the [MIT License](LICENSE). See also
-[Voice Mode privacy and data handling](PRIVACY.md),
+[Bots privacy and data handling](PRIVACY.md),
 [security reporting](SECURITY.md), and [third-party notices](THIRD_PARTY_NOTICES.md).

@@ -9,11 +9,14 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::history::{HistoryArchive, HistorySink};
+use crate::paste_events::PasteEvents;
 #[cfg(any(test, debug_assertions))]
 use crate::process::local_spawn_dir;
-use crate::process::{configured_shell, local_shell_command, system_ssh_command};
+use crate::process::{
+    agent_env, apply_agent_env, configured_shell, local_shell_command, system_ssh_command,
+};
 use crate::tmux::{tmux_local_attach_command, tmux_ssh_attach_command};
+use crate::tmux_control::{PaneSink, TmuxControlClient};
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     DeliveryDisposition, MAX_TERMINAL_CELLS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS,
@@ -26,8 +29,6 @@ use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use uuid::Uuid;
 
-use crate::history;
-
 pub(crate) const INITIAL_COLUMNS: u16 = 100;
 
 pub(crate) const INITIAL_ROWS: u16 = 30;
@@ -35,6 +36,14 @@ pub(crate) const INITIAL_ROWS: u16 = 30;
 pub(crate) const MAX_INPUT_FRAME: usize = 64 * 1024;
 
 const PTY_INPUT_COMPLETION_BOUND: Duration = Duration::from_secs(5);
+
+/// Paste-event replies can carry a multi-megabyte image the application
+/// reads at its own pace.
+const PTY_REPLY_COMPLETION_BOUND: Duration = Duration::from_mins(1);
+
+/// Replies up to this size go through `send-keys`; larger ones through a
+/// tmux paste buffer.
+const TMUX_SEND_KEYS_REPLY_LIMIT: usize = 1024;
 
 #[derive(Debug)]
 pub(crate) struct InputDeliveryError {
@@ -225,18 +234,31 @@ fn await_input_completion(
 
 pub(crate) struct PtySession {
     pane_id: Uuid,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    input_tx: Mutex<Option<std::sync::mpsc::SyncSender<PtyInput>>>,
-    writer: Mutex<Option<thread::JoinHandle<()>>>,
-    writer_exit: Mutex<std::sync::mpsc::Receiver<()>>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
-    reader: Mutex<Option<thread::JoinHandle<()>>>,
-    reader_exit: Mutex<std::sync::mpsc::Receiver<()>>,
+    transport: Transport,
     terminal: Arc<Mutex<TerminalModel>>,
     revision: Arc<AtomicU64>,
     content_revision: Arc<AtomicU64>,
     events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
-    _history: Arc<HistorySink>,
+    paste_events: Arc<PasteEvents>,
+}
+
+enum Transport {
+    Pty {
+        master: Mutex<Box<dyn MasterPty + Send>>,
+        input_tx: Mutex<Option<std::sync::mpsc::SyncSender<PtyInput>>>,
+        writer: Mutex<Option<thread::JoinHandle<()>>>,
+        writer_exit: Mutex<std::sync::mpsc::Receiver<()>>,
+        child: Mutex<Box<dyn Child + Send + Sync>>,
+        reader: Mutex<Option<thread::JoinHandle<()>>>,
+        reader_exit: Mutex<std::sync::mpsc::Receiver<()>>,
+    },
+    Tmux {
+        client: Arc<TmuxControlClient>,
+        window_id: String,
+        tmux_pane_id: String,
+        pane_pid: u32,
+        exited: Arc<Mutex<Option<String>>>,
+    },
 }
 
 /// Bound for joining PTY worker threads at teardown. A grandchild that kept
@@ -306,13 +328,22 @@ impl std::fmt::Debug for PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        if let Err(error) = terminate_child_bounded(self.child.get_mut().as_mut()) {
-            eprintln!(
-                "failed to terminate PTY child for pane {}: {error:#}",
-                self.pane_id
-            );
+        match &mut self.transport {
+            Transport::Pty { child, .. } => {
+                if let Err(error) = terminate_child_bounded(child.get_mut().as_mut()) {
+                    eprintln!(
+                        "failed to terminate PTY child for pane {}: {error:#}",
+                        self.pane_id
+                    );
+                }
+                self.shutdown_threads_bounded();
+            }
+            Transport::Tmux {
+                client,
+                tmux_pane_id,
+                ..
+            } => client.unregister_sink(tmux_pane_id),
         }
-        self.shutdown_threads_bounded();
     }
 }
 
@@ -334,95 +365,177 @@ impl PtySession {
     pub(crate) fn spawn_local(
         pane_id: Uuid,
         workspace_id: Uuid,
+        bot_id: Option<Uuid>,
         cwd: &Path,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         let shell = configured_shell();
-        Self::spawn_command(
-            pane_id,
-            workspace_id,
-            local_shell_command(pane_id, cwd),
-            &format!("configured shell {shell}"),
-            archive,
-        )
+        let mut command = local_shell_command(pane_id, cwd);
+        apply_agent_env(&mut command, workspace_id, bot_id);
+        Self::spawn_command(pane_id, command, &format!("configured shell {shell}"))
     }
 
+    // The workspace only feeds the local SSH test seam's agent environment.
+    #[cfg_attr(not(any(test, debug_assertions)), allow(unused_variables))]
     pub(crate) fn spawn_ssh(
         pane_id: Uuid,
         workspace_id: Uuid,
         host: &str,
         remote_dir: Option<&str>,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         #[cfg(test)]
         if TEST_LOCAL_SSH_SEAM_ENABLED.load(Ordering::Relaxed) {
-            return Self::spawn_local(
-                pane_id,
-                workspace_id,
-                &local_spawn_dir(remote_dir)?,
-                archive,
-            );
+            return Self::spawn_local(pane_id, workspace_id, None, &local_spawn_dir(remote_dir)?);
         }
         #[cfg(debug_assertions)]
         if std::env::var_os(LOCAL_SSH_TEST_SEAM_ENV).is_some() {
-            return Self::spawn_local(
-                pane_id,
-                workspace_id,
-                &local_spawn_dir(remote_dir)?,
-                archive,
-            );
+            return Self::spawn_local(pane_id, workspace_id, None, &local_spawn_dir(remote_dir)?);
         }
         Self::spawn_command(
             pane_id,
-            workspace_id,
             system_ssh_command(pane_id, host, remote_dir)?,
             "system OpenSSH",
-            archive,
         )
     }
 
-    pub(crate) fn spawn_tmux_local(
-        pane_id: Uuid,
-        workspace_id: Uuid,
-        session_id: &TmuxSessionId,
-        archive: &HistoryArchive,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn spawn_tmux_local(pane_id: Uuid, session_id: &TmuxSessionId) -> Result<Arc<Self>> {
         Self::spawn_command(
             pane_id,
-            workspace_id,
             tmux_local_attach_command(pane_id, session_id)?,
             "tmux session attach",
-            archive,
         )
     }
 
     pub(crate) fn spawn_tmux_ssh(
         pane_id: Uuid,
-        workspace_id: Uuid,
         host: &str,
         session_id: &TmuxSessionId,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
         Self::spawn_command(
             pane_id,
-            workspace_id,
             tmux_ssh_attach_command(pane_id, host, session_id)?,
             "system OpenSSH tmux session attach",
-            archive,
         )
+    }
+    pub(crate) fn spawn_tmux(
+        pane_id: Uuid,
+        workspace_id: Uuid,
+        bot_id: Option<Uuid>,
+        cwd: &Path,
+        client: &Arc<TmuxControlClient>,
+    ) -> Result<Arc<Self>> {
+        let pane_id_text = pane_id.to_string();
+        let agent_env = agent_env(workspace_id, bot_id);
+        let mut window_env = vec![
+            (hh_protocol::pane_id_env(), pane_id_text.as_str()),
+            ("COLORTERM", "truecolor"),
+        ];
+        window_env.extend(agent_env.iter().map(|(key, value)| (*key, value.as_str())));
+        let (window_id, tmux_pane_id, shell_pid) = client.new_window("shell", cwd, &window_env)?;
+        let session = Self::new_tmux_transport(
+            pane_id,
+            Arc::clone(client),
+            window_id.clone(),
+            tmux_pane_id.clone(),
+            shell_pid,
+            None,
+        );
+        if let Err(error) = &session {
+            let _ = client.kill_window(&window_id);
+            client.unregister_sink(&tmux_pane_id);
+            return Err(anyhow::anyhow!("{error:#}"));
+        }
+        if let Err(error) = client.resize_window(&window_id, INITIAL_COLUMNS, INITIAL_ROWS) {
+            client.unregister_sink(&tmux_pane_id);
+            let _ = client.kill_window(&window_id);
+            return Err(error).context("set initial tmux window size");
+        }
+        session
+    }
+
+    pub(crate) fn attach_tmux(
+        pane_id: Uuid,
+        client: Arc<TmuxControlClient>,
+        window_id: String,
+        tmux_pane_id: String,
+        shell_pid: u32,
+    ) -> Result<Arc<Self>> {
+        let captured = client.capture_pane(&tmux_pane_id)?;
+        Self::new_tmux_transport(
+            pane_id,
+            client,
+            window_id,
+            tmux_pane_id,
+            shell_pid,
+            Some(captured),
+        )
+    }
+
+    fn new_tmux_transport(
+        pane_id: Uuid,
+        client: Arc<TmuxControlClient>,
+        window_id: String,
+        tmux_pane_id: String,
+        shell_pid: u32,
+        captured: Option<Vec<u8>>,
+    ) -> Result<Arc<Self>> {
+        let terminal = Arc::new(Mutex::new(TerminalModel::new(
+            usize::from(INITIAL_COLUMNS),
+            usize::from(INITIAL_ROWS),
+        )));
+        let revision = Arc::new(AtomicU64::new(0));
+        let content_revision = Arc::new(AtomicU64::new(0));
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let exited = Arc::new(Mutex::new(None));
+        let paste_events = Arc::new(PasteEvents::default());
+        let mut bell_count = 0;
+        if let Some(captured) = captured {
+            ingest_output(
+                &terminal,
+                &events,
+                &paste_events,
+                &revision,
+                &content_revision,
+                &mut bell_count,
+                &captured,
+            );
+        }
+        client.register_sink(
+            &tmux_pane_id,
+            PaneSink {
+                terminal: Arc::clone(&terminal),
+                revision: Arc::clone(&revision),
+                content_revision: Arc::clone(&content_revision),
+                events: Arc::clone(&events),
+                paste_events: Arc::clone(&paste_events),
+                exited: Arc::clone(&exited),
+                bell_count,
+                window_id: window_id.clone(),
+            },
+        )?;
+        let session = Arc::new(Self {
+            pane_id,
+            transport: Transport::Tmux {
+                client,
+                window_id,
+                tmux_pane_id,
+                pane_pid: shell_pid,
+                exited,
+            },
+            terminal,
+            revision,
+            content_revision,
+            events,
+            paste_events,
+        });
+        session.paste_events.bind(&session);
+        Ok(session)
     }
 
     pub(crate) fn spawn_command(
         pane_id: Uuid,
-        workspace_id: Uuid,
         command: CommandBuilder,
         description: &str,
-        archive: &HistoryArchive,
     ) -> Result<Arc<Self>> {
-        // Session registration may wait behind prior disk work, so do it
-        // before a child exists. Once the PTY is live, its reader only uses
-        // the archive's bounded non-blocking append path.
-        let history = Arc::new(archive.start_session(pane_id, workspace_id));
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: INITIAL_ROWS,
@@ -451,7 +564,8 @@ impl PtySession {
         let reader_revision = Arc::clone(&revision);
         let reader_content_revision = Arc::clone(&content_revision);
         let reader_events = Arc::clone(&events);
-        let reader_history = Arc::clone(&history);
+        let paste_events = Arc::new(PasteEvents::default());
+        let reader_paste_events = Arc::clone(&paste_events);
         let (reader_exit_tx, reader_exit) = std::sync::mpsc::channel::<()>();
         let reader = thread::Builder::new()
             .name(format!("rmux-pty-{pane_id}"))
@@ -464,19 +578,15 @@ impl PtySession {
                 loop {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
-                        Ok(read) => {
-                            let mut terminal = reader_terminal.lock();
-                            terminal.process_output(&buffer[..read]);
-                            try_enqueue_terminal_notifications(
-                                &mut terminal,
-                                &reader_events,
-                                &mut previous_bell_count,
-                            );
-                            reader_content_revision.fetch_add(1, Ordering::Release);
-                            reader_revision.fetch_add(1, Ordering::Release);
-                            drop(terminal);
-                            reader_history.record(&buffer[..read]);
-                        }
+                        Ok(read) => ingest_output(
+                            &reader_terminal,
+                            &reader_events,
+                            &reader_paste_events,
+                            &reader_revision,
+                            &reader_content_revision,
+                            &mut previous_bell_count,
+                            &buffer[..read],
+                        ),
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => break,
                     }
@@ -497,21 +607,25 @@ impl PtySession {
             })
             .context("spawn PTY writer thread")?;
 
-        Ok(Arc::new(Self {
+        let session = Arc::new(Self {
             pane_id,
-            master: Mutex::new(pair.master),
-            input_tx: Mutex::new(Some(input_tx)),
-            writer: Mutex::new(Some(writer_thread)),
-            writer_exit: Mutex::new(writer_exit),
-            child: Mutex::new(child),
-            reader: Mutex::new(Some(reader)),
-            reader_exit: Mutex::new(reader_exit),
+            transport: Transport::Pty {
+                master: Mutex::new(pair.master),
+                input_tx: Mutex::new(Some(input_tx)),
+                writer: Mutex::new(Some(writer_thread)),
+                writer_exit: Mutex::new(writer_exit),
+                child: Mutex::new(child),
+                reader: Mutex::new(Some(reader)),
+                reader_exit: Mutex::new(reader_exit),
+            },
             terminal,
             revision,
             content_revision,
             events,
-            _history: history,
-        }))
+            paste_events,
+        });
+        session.paste_events.bind(&session);
+        Ok(session)
     }
 
     pub(crate) fn write_input(&self, bytes: &[u8]) -> std::result::Result<(), InputDeliveryError> {
@@ -520,7 +634,89 @@ impl PtySession {
                 "terminal input exceeds {MAX_INPUT_FRAME}-byte frame limit"
             )));
         }
-        match self.child.lock().try_wait() {
+        {
+            let mut terminal = self.terminal.lock();
+            if terminal.display_offset() != 0 {
+                terminal.scroll_bottom();
+                self.content_revision.fetch_add(1, Ordering::Release);
+                self.revision.fetch_add(1, Ordering::Release);
+            }
+        }
+        match &self.transport {
+            Transport::Tmux {
+                client,
+                tmux_pane_id,
+                exited,
+                ..
+            } => {
+                if exited.lock().is_some() {
+                    return Err(InputDeliveryError::definitely_unsent(
+                        "terminal process has exited",
+                    ));
+                }
+                client.send_keys_hex(tmux_pane_id, bytes).map_err(|error| {
+                    let message = format!("write terminal input through tmux: {error:#}");
+                    if error.to_string().starts_with("tmux did not answer") {
+                        InputDeliveryError::indeterminate(message)
+                    } else if !client.is_alive() {
+                        InputDeliveryError::definitely_unsent(message)
+                    } else {
+                        InputDeliveryError::indeterminate(message)
+                    }
+                })
+            }
+            Transport::Pty { .. } => self.write_pty(bytes.to_vec(), PTY_INPUT_COMPLETION_BOUND),
+        }
+    }
+
+    /// Writes a terminal reply (DECRQM report or OSC 5522 packets) to the
+    /// pane's input as one uninterrupted unit. Unlike typed input it has no
+    /// frame limit and leaves the viewport where it is.
+    pub(crate) fn write_reply(
+        &self,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), InputDeliveryError> {
+        match &self.transport {
+            Transport::Tmux {
+                client,
+                tmux_pane_id,
+                exited,
+                ..
+            } => {
+                if exited.lock().is_some() {
+                    return Err(InputDeliveryError::definitely_unsent(
+                        "terminal process has exited",
+                    ));
+                }
+                let result = if bytes.len() <= TMUX_SEND_KEYS_REPLY_LIMIT {
+                    client.send_keys_hex(tmux_pane_id, &bytes)
+                } else {
+                    client.paste_bytes(tmux_pane_id, &bytes)
+                };
+                result.map_err(|error| {
+                    InputDeliveryError::indeterminate(format!(
+                        "write terminal reply through tmux: {error:#}"
+                    ))
+                })
+            }
+            Transport::Pty { .. } => self.write_pty(bytes, PTY_REPLY_COMPLETION_BOUND),
+        }
+    }
+
+    fn write_pty(
+        &self,
+        bytes: Vec<u8>,
+        bound: Duration,
+    ) -> std::result::Result<(), InputDeliveryError> {
+        let Transport::Pty {
+            child, input_tx, ..
+        } = &self.transport
+        else {
+            return Err(InputDeliveryError::definitely_unsent(
+                "terminal is not a PTY",
+            ));
+        };
+        match child.lock().try_wait() {
             Ok(Some(_)) => {
                 return Err(InputDeliveryError::definitely_unsent(
                     "terminal process has exited",
@@ -533,30 +729,13 @@ impl PtySession {
                 )));
             }
         }
-        // Typing snaps the viewport back to the live bottom (stock terminal
-        // behavior). While `display_offset` is nonzero, `Grid::scroll_up`
-        // anchors streaming output to old content and the typed line recedes
-        // below the fold. The revision bump makes the next poll deliver the
-        // re-anchored screen.
-        {
-            let mut terminal = self.terminal.lock();
-            if terminal.display_offset() != 0 {
-                terminal.scroll_bottom();
-                self.content_revision.fetch_add(1, Ordering::Release);
-                self.revision.fetch_add(1, Ordering::Release);
-            }
-        }
-        let Some(input_tx) = self.input_tx.lock().as_ref().cloned() else {
+        let Some(input_tx) = input_tx.lock().as_ref().cloned() else {
             return Err(InputDeliveryError::definitely_unsent(
                 "terminal is not accepting input",
             ));
         };
-        // A single bounded channel preserves keystroke/paste ordering while
-        // turning a wedged writer (stopped child, full PTY buffer) into an
-        // error instead of a frozen handler thread. Clone the sender so the
-        // lifecycle lock itself never sits inside the completion bound.
-        let deadline = Instant::now() + PTY_INPUT_COMPLETION_BOUND;
-        let (input, result) = PtyInput::new(bytes.to_vec());
+        let deadline = Instant::now() + bound;
+        let (input, result) = PtyInput::new(bytes);
         let mut queued = input.clone();
         loop {
             match input_tx.try_send(queued) {
@@ -581,15 +760,20 @@ impl PtySession {
 
     pub(crate) fn resize(&self, columns: u16, rows: u16) -> Result<()> {
         validate_terminal_dimensions(columns, rows)?;
-        self.master
-            .lock()
-            .resize(PtySize {
-                rows,
-                cols: columns,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("resize PTY")?;
+        match &self.transport {
+            Transport::Pty { master, .. } => master
+                .lock()
+                .resize(PtySize {
+                    rows,
+                    cols: columns,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("resize PTY")?,
+            Transport::Tmux {
+                client, window_id, ..
+            } => client.resize_window(window_id, columns, rows)?,
+        }
         let mut terminal = self.terminal.lock();
         terminal.resize(usize::from(columns), usize::from(rows));
         self.content_revision.fetch_add(1, Ordering::Release);
@@ -691,9 +875,28 @@ impl PtySession {
     }
 
     pub(crate) fn terminate_and_wait(&self) -> Result<()> {
-        let result = terminate_child_bounded(self.child.lock().as_mut());
-        self.shutdown_threads_bounded();
-        result
+        match &self.transport {
+            Transport::Pty { child, .. } => {
+                let result = terminate_child_bounded(child.lock().as_mut());
+                self.shutdown_threads_bounded();
+                result
+            }
+            Transport::Tmux {
+                client,
+                window_id,
+                tmux_pane_id,
+                exited,
+                ..
+            } => {
+                client.unregister_sink(tmux_pane_id);
+                if exited.lock().is_some() {
+                    return Ok(());
+                }
+                client.kill_window(window_id)?;
+                *exited.lock() = Some("exited".to_owned());
+                Ok(())
+            }
+        }
     }
 
     /// Stops and joins the PTY worker threads with a patience bound. Dropping
@@ -702,36 +905,56 @@ impl PtySession {
     /// bound (an orphan still holds the slave side) is detached instead of
     /// blocking teardown.
     fn shutdown_threads_bounded(&self) {
-        self.input_tx.lock().take();
+        let Transport::Pty {
+            input_tx,
+            writer,
+            writer_exit,
+            reader,
+            reader_exit,
+            ..
+        } = &self.transport
+        else {
+            return;
+        };
+        input_tx.lock().take();
         join_thread_bounded(
-            &self.writer,
-            &self.writer_exit,
+            writer,
+            writer_exit,
             &format!("pty writer for pane {}", self.pane_id),
         );
         join_thread_bounded(
-            &self.reader,
-            &self.reader_exit,
+            reader,
+            reader_exit,
             &format!("pty reader for pane {}", self.pane_id),
         );
     }
 
     pub(crate) fn exit_status(&self) -> Result<Option<String>> {
-        self.child
-            .lock()
-            .try_wait()
-            .map(|status| status.map(|status| status.to_string()))
-            .context("observe PTY child exit")
+        match &self.transport {
+            Transport::Pty { child, .. } => child
+                .lock()
+                .try_wait()
+                .map(|status| status.map(|status| status.to_string()))
+                .context("observe PTY child exit"),
+            Transport::Tmux { exited, .. } => Ok(exited.lock().clone()),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn terminate_child_for_test(&self) -> Result<()> {
-        terminate_child_bounded(self.child.lock().as_mut())
+        match &self.transport {
+            Transport::Pty { child, .. } => terminate_child_bounded(child.lock().as_mut()),
+            Transport::Tmux { .. } => bail!("test termination is only available for PTY panes"),
+        }
     }
 
     /// A successful `spawn` only means the executable started. tmux reports a
     /// missing/dead target by exiting immediately, so do not register a tab
     /// until it survived a short bounded startup window.
     pub(crate) fn confirm_live_for_tmux_attach(&self) -> Result<()> {
+        if matches!(self.transport, Transport::Tmux { .. }) {
+            bail!("HH-managed tmux windows do not use the attach startup check");
+        }
         let deadline = Instant::now() + TMUX_ATTACH_STARTUP_GRACE;
         loop {
             if let Some(status) = self.exit_status()? {
@@ -745,7 +968,45 @@ impl PtySession {
     }
 
     pub(crate) fn process_id(&self) -> Option<u32> {
-        self.child.lock().process_id()
+        match &self.transport {
+            Transport::Pty { child, .. } => child.lock().process_id(),
+            Transport::Tmux { pane_pid, .. } => Some(*pane_pid),
+        }
+    }
+
+    pub(crate) fn tmux_ids(&self) -> Option<(&str, &str)> {
+        match &self.transport {
+            Transport::Tmux {
+                window_id,
+                tmux_pane_id,
+                ..
+            } => Some((window_id, tmux_pane_id)),
+            Transport::Pty { .. } => None,
+        }
+    }
+
+    pub(crate) fn rename_tmux_window(&self, title: &str) -> Result<()> {
+        if let Transport::Tmux {
+            client, window_id, ..
+        } = &self.transport
+        {
+            client.rename_window(window_id, title)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the pane's application currently accepts kitty paste events.
+    pub(crate) fn enhanced_paste(&self) -> bool {
+        self.terminal.lock().enhanced_paste()
+    }
+
+    /// Offers a PNG (and optional text) as a paste event. Fails when the
+    /// application has not enabled enhanced paste or the pane has exited.
+    pub(crate) fn paste_image(&self, png: Vec<u8>, text: Option<String>) -> Result<()> {
+        if !self.enhanced_paste() || self.exit_status()?.is_some() {
+            bail!("the pane's application has not enabled enhanced paste");
+        }
+        self.paste_events.offer(self, png, text)
     }
 
     pub(crate) fn terminal_title(&self) -> Option<String> {
@@ -763,10 +1024,13 @@ impl PtySession {
 
     /// Whether the output reader thread has finished draining the PTY.
     pub(crate) fn reader_is_finished(&self) -> bool {
-        self.reader
-            .lock()
-            .as_ref()
-            .is_some_and(thread::JoinHandle::is_finished)
+        match &self.transport {
+            Transport::Pty { reader, .. } => reader
+                .lock()
+                .as_ref()
+                .is_some_and(thread::JoinHandle::is_finished),
+            Transport::Tmux { exited, .. } => exited.lock().is_some(),
+        }
     }
 
     /// Drains all queued raw events without blocking on a concurrent writer.
@@ -780,6 +1044,28 @@ impl PtySession {
     pub(crate) fn current_revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
+}
+
+pub(crate) fn ingest_output(
+    terminal: &Mutex<TerminalModel>,
+    events: &Mutex<VecDeque<RawPaneEvent>>,
+    paste_events: &Arc<PasteEvents>,
+    revision: &AtomicU64,
+    content_revision: &AtomicU64,
+    bell_count: &mut u64,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut terminal = terminal.lock();
+    terminal.process_output(bytes);
+    try_enqueue_terminal_notifications(&mut terminal, events, bell_count);
+    let requests = terminal.take_terminal_requests();
+    content_revision.fetch_add(1, Ordering::Release);
+    revision.fetch_add(1, Ordering::Release);
+    drop(terminal);
+    paste_events.enqueue(requests);
 }
 
 fn try_enqueue_terminal_notifications(
@@ -797,7 +1083,7 @@ fn try_enqueue_terminal_notifications(
             RawPaneEvent {
                 kind: NotificationKind::Attention,
                 message: None,
-                at_ms: history::now_ms(),
+                at_ms: crate::now_ms(),
             },
         );
     }
@@ -807,7 +1093,7 @@ fn try_enqueue_terminal_notifications(
             RawPaneEvent {
                 kind: NotificationKind::Message,
                 message: Some(message),
-                at_ms: history::now_ms(),
+                at_ms: crate::now_ms(),
             },
         );
     }
@@ -830,27 +1116,24 @@ mod tests {
 
     #[test]
     fn selection_revision_preserves_content_revision() {
-        let root = std::env::temp_dir().join(format!("hh-selection-revision-{}", Uuid::new_v4()));
-        let archive = HistoryArchive::open(root.clone()).unwrap();
         let pane_id = Uuid::new_v4();
         let mut command = CommandBuilder::new("/usr/bin/seq");
         command.args(["1", "200"]);
-        let session = PtySession::spawn_command(
-            pane_id,
-            Uuid::new_v4(),
-            command,
-            "selection revision test",
-            &archive,
-        )
-        .unwrap();
+        let session =
+            PtySession::spawn_command(pane_id, command, "selection revision test").unwrap();
+        let Transport::Pty {
+            reader_exit,
+            reader,
+            ..
+        } = &session.transport
+        else {
+            unreachable!();
+        };
         assert_eq!(
-            session
-                .reader_exit
-                .lock()
-                .recv_timeout(Duration::from_secs(5)),
+            reader_exit.lock().recv_timeout(Duration::from_secs(5)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
         );
-        session.reader.lock().take().unwrap().join().unwrap();
+        reader.lock().take().unwrap().join().unwrap();
         for lines in [0, -1] {
             let before = session.screen(pane_id).unwrap();
             session.scroll(lines);
@@ -885,9 +1168,6 @@ mod tests {
         let unchanged = session.screen(pane_id).unwrap();
         assert_eq!(unchanged.content_revision, oldest.content_revision);
         assert_eq!(unchanged.revision, oldest.revision);
-        drop(session);
-        drop(archive);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[derive(Clone)]
@@ -1039,6 +1319,127 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         assert!(registry.pane_process_id(pane_id).unwrap().is_some());
+    }
+    #[test]
+    fn managed_tmux_transport_streams_and_reattaches_when_available() {
+        use std::collections::HashMap;
+
+        use crate::tmux::system_tmux_binary;
+        use crate::tmux_control::{PaneSinks, PrivateTmuxServerGuard, TmuxServer};
+
+        let Ok(binary) = system_tmux_binary() else {
+            return;
+        };
+        let fixture = std::env::temp_dir().join(format!("hh-tmux-transport-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let config_path = fixture.join("hh.conf");
+        std::fs::write(
+            &config_path,
+            concat!(
+                include_str!("../bundled/hh.tmux.conf"),
+                "set -g default-shell '/bin/sh'\n"
+            ),
+        )
+        .unwrap();
+        let token = Uuid::new_v4().simple().to_string();
+        let socket_name = format!("hh-test-{}", &token[..12]);
+        let _server_guard = PrivateTmuxServerGuard {
+            binary: binary.clone(),
+            socket_name: socket_name.clone(),
+        };
+        let server = TmuxServer {
+            binary,
+            socket_name,
+            config_path,
+        };
+        let sinks: PaneSinks = Arc::new(Mutex::new(HashMap::new()));
+        let client =
+            TmuxControlClient::spawn(&server, &format!("hh-{}", &token[..12]), sinks).unwrap();
+        let pane_id = Uuid::new_v4();
+        let session = PtySession::spawn_tmux(
+            pane_id,
+            Uuid::new_v4(),
+            None,
+            Path::new("/tmp"),
+            &Arc::clone(&client),
+        )
+        .unwrap();
+        session.resize(90, 25).unwrap();
+        let second_client = TmuxControlClient::spawn(
+            &server,
+            &format!("hh-second-{}", &token[..12]),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .unwrap();
+        let second_session = PtySession::spawn_tmux(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            None,
+            Path::new("/tmp"),
+            &second_client,
+        )
+        .unwrap();
+        second_session.resize(80, 24).unwrap();
+        second_session.terminate_and_wait().unwrap();
+        second_client.kill_session().unwrap();
+        drop(second_session);
+        drop(second_client);
+        session
+            .write_input(b"printf 'HH_TMUX_TRANSPORT\\n'\r")
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let screen = session.screen(pane_id).unwrap();
+            if screen
+                .lines
+                .iter()
+                .flat_map(|line| &line.runs)
+                .any(|run| run.text.contains("HH_TMUX_TRANSPORT"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tmux transport output did not arrive"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let (window_id, tmux_pane_id) = session.tmux_ids().unwrap();
+        let window_id = window_id.to_owned();
+        let tmux_pane_id = tmux_pane_id.to_owned();
+        let shell_pid = session.process_id().unwrap();
+        drop(session);
+        assert!(
+            client
+                .list_panes()
+                .unwrap()
+                .iter()
+                .any(|(window, pane, _, _)| window == &window_id && pane == &tmux_pane_id)
+        );
+
+        let attached_id = Uuid::new_v4();
+        let attached = PtySession::attach_tmux(
+            attached_id,
+            Arc::clone(&client),
+            window_id,
+            tmux_pane_id,
+            shell_pid,
+        )
+        .unwrap();
+        let screen = attached.screen(attached_id).unwrap();
+        assert!(
+            screen
+                .lines
+                .iter()
+                .flat_map(|line| &line.runs)
+                .any(|run| run.text.contains("HH_TMUX_TRANSPORT"))
+        );
+        attached.terminate_and_wait().unwrap();
+        client.kill_session().unwrap();
+        drop(attached);
+        drop(client);
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]

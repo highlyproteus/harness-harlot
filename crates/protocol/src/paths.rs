@@ -12,6 +12,9 @@ pub const SOCKET_ENV: &str = "HH_SOCKET";
 pub const STATE_DIR_ENV: &str = "HH_STATE_DIR";
 pub const CONFIG_ENV: &str = "HH_CONFIG";
 pub const PANE_ID_ENV: &str = "HH_PANE_ID";
+pub const WORKSPACE_ID_ENV: &str = "HH_WORKSPACE_ID";
+pub const GALLERY_DIR_ENV: &str = "HH_GALLERY_DIR";
+pub const CLI_ENV: &str = "HH_CLI";
 /// Marks the separately packaged development desktop build.
 ///
 /// Explicit `HH_SOCKET`, `HH_STATE_DIR`, and `HH_CONFIG` values always
@@ -75,6 +78,10 @@ fn socket_filename(development_build: bool) -> &'static str {
 /// Returns the owner-only runtime directory used for the session socket.
 pub fn runtime_directory() -> Option<PathBuf> {
     state_directory().map(|directory| directory.join("run"))
+}
+/// Per-workstation gallery directory: `<state>/gallery/<workspace_id>`.
+pub fn gallery_directory(workspace_id: Uuid) -> Option<PathBuf> {
+    state_directory().map(|directory| directory.join("gallery").join(workspace_id.to_string()))
 }
 
 fn default_socket_path(runtime_directory: &Path, development_build: bool) -> PathBuf {
@@ -308,6 +315,9 @@ mod tests {
         assert_eq!(CONFIG_ENV, "HH_CONFIG");
         assert_eq!(DEVELOPMENT_BUILD_ENV, "HH_DEVELOPMENT_BUILD");
         assert_eq!(pane_id_env(), "HH_PANE_ID");
+        assert_eq!(WORKSPACE_ID_ENV, "HH_WORKSPACE_ID");
+        assert_eq!(GALLERY_DIR_ENV, "HH_GALLERY_DIR");
+        assert_eq!(CLI_ENV, "HH_CLI");
         assert!(default_socket_path(Path::new("/private/run"), false).ends_with("hh-session.sock"));
     }
 
