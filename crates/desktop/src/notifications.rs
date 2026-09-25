@@ -355,6 +355,7 @@ mod tests {
                 subscribed: false,
                 dirty: false,
                 exited: true,
+                enhanced_paste: false,
             },
         )]);
         assert_eq!(bots_needing_you(&snapshot, &pane_states), 1);
@@ -398,6 +399,7 @@ mod tests {
                 subscribed: false,
                 dirty: false,
                 exited: true,
+                enhanced_paste: false,
             },
         )]);
 

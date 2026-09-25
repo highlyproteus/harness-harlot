@@ -369,6 +369,11 @@ impl HhApp {
                             .screens
                             .get(&pane_id)
                             .is_none_or(|current| current.revision != screen.revision);
+                        // A focus snapshot says nothing about liveness or paste
+                        // modes; keep whatever the last update round reported.
+                        let previous = this.session.pane_states.get(&pane_id);
+                        let exited = previous.is_some_and(|state| state.exited);
+                        let enhanced_paste = previous.is_some_and(|state| state.enhanced_paste);
                         this.session.pane_states.insert(
                             pane_id,
                             PaneStreamState {
@@ -376,13 +381,8 @@ impl HhApp {
                                 revision: screen.revision,
                                 subscribed: true,
                                 dirty: false,
-                                // A focus snapshot says nothing about liveness; keep
-                                // whatever the last update round reported.
-                                exited: this
-                                    .session
-                                    .pane_states
-                                    .get(&pane_id)
-                                    .is_some_and(|state| state.exited),
+                                exited,
+                                enhanced_paste,
                             },
                         );
                         this.session.screens.insert(pane_id, screen);

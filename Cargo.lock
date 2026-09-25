@@ -2881,6 +2881,7 @@ name = "hh-session-service"
 version = "0.1.21"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "hh-protocol",
  "hh-terminal-model",
  "libc",

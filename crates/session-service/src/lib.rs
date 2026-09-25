@@ -9,6 +9,7 @@
 mod bots;
 mod gallery;
 mod layout;
+mod paste_events;
 mod persistence;
 mod process;
 mod pty;

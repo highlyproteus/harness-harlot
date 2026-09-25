@@ -98,6 +98,7 @@ A workstation is a machine — your local computer or an SSH host.
 ## Terminals
 
 - Fast native terminals with tabs, split panes, drag-to-rearrange layouts, selection/copy/paste, scrollback, and search.
+- Paste or drop images into terminals: apps that support kitty paste events (OSC 5522), such as omp, receive the image directly; others get the PNG's path.
 - Rename any terminal tab, pick its color, or give it its own icon.
 - Known agent CLIs — Codex, Claude Code, Cursor, Aider, Gemini, and more — are recognized and labeled with their official icons automatically.
 - Your terminals keep running if the app closes, crashes, or updates. They live in a small local session service, so reopening the app puts you right back where you were. Ending a session is always explicit: close its tab or exit the shell.

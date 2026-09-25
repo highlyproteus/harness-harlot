@@ -42,6 +42,7 @@ mod dialogs;
 mod elements;
 mod gallery;
 mod helpers;
+mod image_paste;
 mod image_transfer;
 mod input;
 mod menus;

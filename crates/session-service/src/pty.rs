@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::paste_events::PasteEvents;
 #[cfg(any(test, debug_assertions))]
 use crate::process::local_spawn_dir;
 use crate::process::{
@@ -35,6 +36,14 @@ pub(crate) const INITIAL_ROWS: u16 = 30;
 pub(crate) const MAX_INPUT_FRAME: usize = 64 * 1024;
 
 const PTY_INPUT_COMPLETION_BOUND: Duration = Duration::from_secs(5);
+
+/// Paste-event replies can carry a multi-megabyte image the application
+/// reads at its own pace.
+const PTY_REPLY_COMPLETION_BOUND: Duration = Duration::from_mins(1);
+
+/// Replies up to this size go through `send-keys`; larger ones through a
+/// tmux paste buffer.
+const TMUX_SEND_KEYS_REPLY_LIMIT: usize = 1024;
 
 #[derive(Debug)]
 pub(crate) struct InputDeliveryError {
@@ -230,6 +239,7 @@ pub(crate) struct PtySession {
     revision: Arc<AtomicU64>,
     content_revision: Arc<AtomicU64>,
     events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
+    paste_events: Arc<PasteEvents>,
 }
 
 enum Transport {
@@ -476,11 +486,13 @@ impl PtySession {
         let content_revision = Arc::new(AtomicU64::new(0));
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let exited = Arc::new(Mutex::new(None));
+        let paste_events = Arc::new(PasteEvents::default());
         let mut bell_count = 0;
         if let Some(captured) = captured {
             ingest_output(
                 &terminal,
                 &events,
+                &paste_events,
                 &revision,
                 &content_revision,
                 &mut bell_count,
@@ -494,12 +506,13 @@ impl PtySession {
                 revision: Arc::clone(&revision),
                 content_revision: Arc::clone(&content_revision),
                 events: Arc::clone(&events),
+                paste_events: Arc::clone(&paste_events),
                 exited: Arc::clone(&exited),
                 bell_count,
                 window_id: window_id.clone(),
             },
         )?;
-        Ok(Arc::new(Self {
+        let session = Arc::new(Self {
             pane_id,
             transport: Transport::Tmux {
                 client,
@@ -512,7 +525,10 @@ impl PtySession {
             revision,
             content_revision,
             events,
-        }))
+            paste_events,
+        });
+        session.paste_events.bind(&session);
+        Ok(session)
     }
 
     pub(crate) fn spawn_command(
@@ -548,6 +564,8 @@ impl PtySession {
         let reader_revision = Arc::clone(&revision);
         let reader_content_revision = Arc::clone(&content_revision);
         let reader_events = Arc::clone(&events);
+        let paste_events = Arc::new(PasteEvents::default());
+        let reader_paste_events = Arc::clone(&paste_events);
         let (reader_exit_tx, reader_exit) = std::sync::mpsc::channel::<()>();
         let reader = thread::Builder::new()
             .name(format!("rmux-pty-{pane_id}"))
@@ -563,6 +581,7 @@ impl PtySession {
                         Ok(read) => ingest_output(
                             &reader_terminal,
                             &reader_events,
+                            &reader_paste_events,
                             &reader_revision,
                             &reader_content_revision,
                             &mut previous_bell_count,
@@ -588,7 +607,7 @@ impl PtySession {
             })
             .context("spawn PTY writer thread")?;
 
-        Ok(Arc::new(Self {
+        let session = Arc::new(Self {
             pane_id,
             transport: Transport::Pty {
                 master: Mutex::new(pair.master),
@@ -603,7 +622,10 @@ impl PtySession {
             revision,
             content_revision,
             events,
-        }))
+            paste_events,
+        });
+        session.paste_events.bind(&session);
+        Ok(session)
     }
 
     pub(crate) fn write_input(&self, bytes: &[u8]) -> std::result::Result<(), InputDeliveryError> {
@@ -643,51 +665,97 @@ impl PtySession {
                     }
                 })
             }
-            Transport::Pty {
-                child, input_tx, ..
+            Transport::Pty { .. } => self.write_pty(bytes.to_vec(), PTY_INPUT_COMPLETION_BOUND),
+        }
+    }
+
+    /// Writes a terminal reply (DECRQM report or OSC 5522 packets) to the
+    /// pane's input as one uninterrupted unit. Unlike typed input it has no
+    /// frame limit and leaves the viewport where it is.
+    pub(crate) fn write_reply(
+        &self,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), InputDeliveryError> {
+        match &self.transport {
+            Transport::Tmux {
+                client,
+                tmux_pane_id,
+                exited,
+                ..
             } => {
-                match child.lock().try_wait() {
-                    Ok(Some(_)) => {
-                        return Err(InputDeliveryError::definitely_unsent(
-                            "terminal process has exited",
-                        ));
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        return Err(InputDeliveryError::indeterminate(format!(
-                            "observe terminal process before input delivery: {error}"
-                        )));
-                    }
+                if exited.lock().is_some() {
+                    return Err(InputDeliveryError::definitely_unsent(
+                        "terminal process has exited",
+                    ));
                 }
-                let Some(input_tx) = input_tx.lock().as_ref().cloned() else {
+                let result = if bytes.len() <= TMUX_SEND_KEYS_REPLY_LIMIT {
+                    client.send_keys_hex(tmux_pane_id, &bytes)
+                } else {
+                    client.paste_bytes(tmux_pane_id, &bytes)
+                };
+                result.map_err(|error| {
+                    InputDeliveryError::indeterminate(format!(
+                        "write terminal reply through tmux: {error:#}"
+                    ))
+                })
+            }
+            Transport::Pty { .. } => self.write_pty(bytes, PTY_REPLY_COMPLETION_BOUND),
+        }
+    }
+
+    fn write_pty(
+        &self,
+        bytes: Vec<u8>,
+        bound: Duration,
+    ) -> std::result::Result<(), InputDeliveryError> {
+        let Transport::Pty {
+            child, input_tx, ..
+        } = &self.transport
+        else {
+            return Err(InputDeliveryError::definitely_unsent(
+                "terminal is not a PTY",
+            ));
+        };
+        match child.lock().try_wait() {
+            Ok(Some(_)) => {
+                return Err(InputDeliveryError::definitely_unsent(
+                    "terminal process has exited",
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(InputDeliveryError::indeterminate(format!(
+                    "observe terminal process before input delivery: {error}"
+                )));
+            }
+        }
+        let Some(input_tx) = input_tx.lock().as_ref().cloned() else {
+            return Err(InputDeliveryError::definitely_unsent(
+                "terminal is not accepting input",
+            ));
+        };
+        let deadline = Instant::now() + bound;
+        let (input, result) = PtyInput::new(bytes);
+        let mut queued = input.clone();
+        loop {
+            match input_tx.try_send(queued) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(input)) => queued = input,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                     return Err(InputDeliveryError::definitely_unsent(
                         "terminal is not accepting input",
                     ));
-                };
-                let deadline = Instant::now() + PTY_INPUT_COMPLETION_BOUND;
-                let (input, result) = PtyInput::new(bytes.to_vec());
-                let mut queued = input.clone();
-                loop {
-                    match input_tx.try_send(queued) {
-                        Ok(()) => break,
-                        Err(std::sync::mpsc::TrySendError::Full(input)) => queued = input,
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                            return Err(InputDeliveryError::definitely_unsent(
-                                "terminal is not accepting input",
-                            ));
-                        }
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(InputDeliveryError::definitely_unsent(
-                            "terminal is not accepting input",
-                        ));
-                    }
-                    thread::sleep(Duration::from_millis(5));
                 }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                await_input_completion(&input, &result, remaining)
             }
+            if Instant::now() >= deadline {
+                return Err(InputDeliveryError::definitely_unsent(
+                    "terminal is not accepting input",
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        await_input_completion(&input, &result, remaining)
     }
 
     pub(crate) fn resize(&self, columns: u16, rows: u16) -> Result<()> {
@@ -927,6 +995,20 @@ impl PtySession {
         Ok(())
     }
 
+    /// Whether the pane's application currently accepts kitty paste events.
+    pub(crate) fn enhanced_paste(&self) -> bool {
+        self.terminal.lock().enhanced_paste()
+    }
+
+    /// Offers a PNG (and optional text) as a paste event. Fails when the
+    /// application has not enabled enhanced paste or the pane has exited.
+    pub(crate) fn paste_image(&self, png: Vec<u8>, text: Option<String>) -> Result<()> {
+        if !self.enhanced_paste() || self.exit_status()?.is_some() {
+            bail!("the pane's application has not enabled enhanced paste");
+        }
+        self.paste_events.offer(self, png, text)
+    }
+
     pub(crate) fn terminal_title(&self) -> Option<String> {
         self.terminal.lock().terminal_title()
     }
@@ -967,6 +1049,7 @@ impl PtySession {
 pub(crate) fn ingest_output(
     terminal: &Mutex<TerminalModel>,
     events: &Mutex<VecDeque<RawPaneEvent>>,
+    paste_events: &Arc<PasteEvents>,
     revision: &AtomicU64,
     content_revision: &AtomicU64,
     bell_count: &mut u64,
@@ -978,8 +1061,11 @@ pub(crate) fn ingest_output(
     let mut terminal = terminal.lock();
     terminal.process_output(bytes);
     try_enqueue_terminal_notifications(&mut terminal, events, bell_count);
+    let requests = terminal.take_terminal_requests();
     content_revision.fetch_add(1, Ordering::Release);
     revision.fetch_add(1, Ordering::Release);
+    drop(terminal);
+    paste_events.enqueue(requests);
 }
 
 fn try_enqueue_terminal_notifications(

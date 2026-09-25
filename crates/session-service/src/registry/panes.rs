@@ -980,6 +980,28 @@ impl SessionRegistry {
         }
     }
 
+    /// Offers a desktop-materialized PNG to the pane's application as a
+    /// kitty paste event. The pane must have enhanced paste enabled; the
+    /// image file is left untouched otherwise, so the desktop can fall back
+    /// to typing its path.
+    pub fn paste_image(&self, pane_id: Uuid, image_path: &str, text: Option<String>) -> Result<()> {
+        let pane = self.pane(pane_id)?;
+        if !pane.enhanced_paste() {
+            bail!("pane {pane_id} has not enabled enhanced paste");
+        }
+        if text
+            .as_ref()
+            .is_some_and(|text| text.len() > crate::paste_events::MAX_PASTE_TEXT_BYTES)
+        {
+            bail!("pasted text exceeds the 1 MiB limit");
+        }
+        let png = crate::paste_events::take_paste_image(
+            Path::new(image_path),
+            &crate::paste_events::paste_directory(),
+        )?;
+        pane.paste_image(png, text)
+    }
+
     pub fn write_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<()> {
         self.write_input_with_delivery(pane_id, bytes)
             .map_err(anyhow::Error::new)

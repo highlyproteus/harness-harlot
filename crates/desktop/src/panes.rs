@@ -635,7 +635,7 @@ impl HhApp {
                 self.layout.focused_pane,
             )
         {
-            self.paste_image_to_terminal(pane_id, image, cx);
+            self.paste_image_to_terminal(pane_id, image, item.text(), cx);
             return;
         }
         let Some(text) = item.text() else {

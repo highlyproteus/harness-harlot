@@ -193,6 +193,7 @@ pub(crate) fn handle_request(
         | ClientRequest::ScrollPane { .. }
         | ClientRequest::SearchPane { .. }
         | ClientRequest::MouseInput { .. }
+        | ClientRequest::PasteImage { .. }
         | ClientRequest::ResizePane { .. } => handle_terminal_request(sessions, request),
         ClientRequest::ScanTmuxSessions { .. }
         | ClientRequest::ListRemoteDirectory { .. }
@@ -632,6 +633,14 @@ fn handle_terminal_request(
         }
         ClientRequest::ClearSelection { pane_id } => {
             sessions.clear_selection(pane_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::PasteImage {
+            pane_id,
+            image_path,
+            text,
+        } => {
+            sessions.paste_image(pane_id, &image_path, text)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::CopySelection { pane_id } => Ok(ServiceResponse::SelectionText {

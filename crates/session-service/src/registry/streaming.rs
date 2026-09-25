@@ -187,6 +187,7 @@ impl SessionRegistry {
                     subscribed: false,
                     dirty: false,
                     exited: false,
+                    enhanced_paste: false,
                 });
                 continue;
             };
@@ -213,6 +214,7 @@ impl SessionRegistry {
                 subscribed,
                 dirty: !delivered && known_revision != Some(revision),
                 exited: runtime.exit_status.is_some(),
+                enhanced_paste: runtime.exit_status.is_none() && runtime.session.enhanced_paste(),
             });
         }
         let notifications = state
@@ -453,6 +455,7 @@ mod tests {
             subscribed: true,
             dirty: false,
             exited: false,
+            enhanced_paste: false,
         }];
         preserve_withheld_cursors(&mut pane_states, &withheld, &HashMap::from([(third, 4)]));
         assert_eq!(pane_states[0].revision, 4);

@@ -89,6 +89,8 @@ pub struct PaneRevisionCursor {
 }
 
 /// Content-free delivery state for one daemon-owned pane.
+// Independent wire flags, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PaneStreamState {
     pub pane_id: Uuid,
@@ -99,6 +101,10 @@ pub struct PaneStreamState {
     /// nowhere. Runtime-only panes (tmux attach, SSH) can be reattached.
     #[serde(default)]
     pub exited: bool,
+    /// The pane's application enabled kitty paste events (`CSI ? 5522 h`),
+    /// so an image paste can go through `ClientRequest::PasteImage`.
+    #[serde(default)]
+    pub enhanced_paste: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

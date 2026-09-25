@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
 use std::time::Duration;
 
+use crate::paste_events::PasteEvents;
 use crate::persistence::validate_title;
 use crate::process::{configured_shell, is_trusted_executable_file, run_bounded_command};
 use crate::pty::{RawPaneEvent, ingest_output};
@@ -31,6 +33,7 @@ pub(crate) struct PaneSink {
     pub revision: Arc<AtomicU64>,
     pub content_revision: Arc<AtomicU64>,
     pub events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
+    pub paste_events: Arc<PasteEvents>,
     pub exited: Arc<Mutex<Option<String>>>,
     pub bell_count: u64,
     pub window_id: String,
@@ -370,6 +373,47 @@ impl TmuxControlClient {
         Ok(())
     }
 
+    /// Writes `bytes` to the pane's input in one step through a private
+    /// temporary file and a uniquely named tmux paste buffer. Without `-p`
+    /// there is no bracketing, and `-r` keeps every byte as written.
+    pub(crate) fn paste_bytes(&self, pane_id: &str, bytes: &[u8]) -> Result<()> {
+        validate_target_id(pane_id, '%', "pane")?;
+        let directory = std::env::temp_dir().join("harness-harlot-tmux-input");
+        hh_protocol::ensure_private_directory(&directory)
+            .with_context(|| format!("prepare tmux input directory {}", directory.display()))?;
+        let buffer = format!("hh-input-{}", uuid::Uuid::new_v4().simple());
+        let path = directory.join(&buffer);
+        let load = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("create tmux input file {}", path.display()))?;
+            file.write_all(bytes).context("write tmux input file")?;
+            let path_text = path.to_str().context("tmux input path is not UTF-8")?;
+            ensure_control_atom(path_text, "tmux input path")?;
+            self.run(
+                &format!("load-buffer -b {buffer} {}", shellquote(path_text)),
+                DEFAULT_COMMAND_TIMEOUT,
+            )?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        load?;
+        if let Err(error) = self.run(
+            &format!("paste-buffer -b {buffer} -d -r -t {pane_id}"),
+            DEFAULT_COMMAND_TIMEOUT,
+        ) {
+            let _ = self.run(
+                &format!("delete-buffer -b {buffer}"),
+                DEFAULT_COMMAND_TIMEOUT,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn kill_window(&self, window_id: &str) -> Result<()> {
         validate_target_id(window_id, '@', "window")?;
         self.run(
@@ -512,6 +556,7 @@ fn read_control_output(
                 ingest_output(
                     &sink.terminal,
                     &sink.events,
+                    &sink.paste_events,
                     &sink.revision,
                     &sink.content_revision,
                     &mut sink.bell_count,
@@ -760,6 +805,7 @@ mod tests {
             revision: Arc::default(),
             content_revision: Arc::default(),
             events: Arc::default(),
+            paste_events: Arc::default(),
             exited: Arc::clone(&exited),
             bell_count: 0,
             window_id: "@1".to_owned(),

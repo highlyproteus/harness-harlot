@@ -365,6 +365,17 @@ pub enum ClientRequest {
         authority: PaneAuthority,
         bytes: Vec<u8>,
     },
+    /// Offers a PNG the desktop wrote to the private paste directory to the
+    /// pane's application as a kitty OSC 5522 paste event. The service
+    /// validates, reads, and deletes the file. Fails without touching the
+    /// file when the pane has not enabled enhanced paste.
+    PasteImage {
+        pane_id: Uuid,
+        image_path: String,
+        /// Plain text from the same clipboard item, offered as `text/plain`.
+        #[serde(default)]
+        text: Option<String>,
+    },
     BeginSelection {
         pane_id: Uuid,
         point: TerminalPoint,

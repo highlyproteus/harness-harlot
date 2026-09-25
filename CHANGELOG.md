@@ -51,6 +51,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stdio MCP server, and an installable Harness Harlot skill. Browser commands use
   the active desktop's embedded browser and can navigate, read, evaluate,
   interact, capture screenshots, and call raw CDP.
+- Added image paste through kitty's clipboard paste events (OSC 5522): when the
+  terminal's application enables them (`CSI ? 5522 h`, as omp does), ⌘V or
+  dropping an image file delivers the image to it as a PNG in-band, including
+  over SSH, without typing a file path. The session service only serves bytes
+  the desktop handed over, once, to the reader holding the paste's one-time
+  password, and never reads the system clipboard.
 
 ### Changed
 
@@ -87,10 +93,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   menu is removed: ⌘N opens New Workstation, and new tabs, browsers, and
   galleries come from their shortcuts, the command palette, or the tab strip's
   ＋ menu.
-- Bumped the desktop/service wire protocol from 35 to 44 for bots, bot
+- Bumped the desktop/service wire protocol from 35 to 45 for bots, bot
   workspaces and threads, bot thread deletion, workers, bot home folders,
   status timestamps, coding-agent discovery, Gallery panes, browser command
-  execution, and the removed history archive requests; desktop and service
+  execution, image paste events, and the removed history archive requests; desktop and service
   must be upgraded together. Session snapshots move to schema 15; existing
   snapshots load with former Assistant workspaces and panes removed, and the
   shared Bots workspace becomes one space per bot with each of its threads in
@@ -107,6 +113,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Pasted images are no longer typed as quoted TIFF paths: clipboard images are
+  saved as PNG, and pasted or dropped paths are typed bare when they contain
+  only safe characters, otherwise backslash-escaped like macOS Terminal.
 - Keep split dividers following the pointer while dragging across terminals
   that use the mouse (agent interfaces), and highlight a divider on hover.
 - Running the test suite or a service with a custom state directory no longer
