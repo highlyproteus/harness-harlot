@@ -3,7 +3,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
-#[cfg(all(target_os = "macos", feature = "community-macos"))]
+#[cfg(feature = "community-macos")]
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
