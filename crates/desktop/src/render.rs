@@ -76,6 +76,7 @@ impl HhApp {
             Modal::GroupMenu(menu) => Some(self.render_group_menu(*menu, menu_max_height, cx)),
             Modal::BotMenu(menu) => Some(self.render_bot_menu(*menu, menu_max_height, cx)),
             Modal::BotThreadMenu(menu) => Some(self.render_bot_thread_menu(menu, cx)),
+            Modal::TerminalImageMenu(menu) => Some(self.render_terminal_image_menu(menu, cx)),
             Modal::BotThreadDelete(confirmation) => {
                 Some(self.render_bot_thread_delete_dialog(confirmation, cx))
             }
@@ -160,6 +161,7 @@ impl Render for HhApp {
                             | Modal::GroupMenu(_)
                             | Modal::BotMenu(_)
                             | Modal::BotThreadMenu(_)
+                            | Modal::TerminalImageMenu(_)
                             | Modal::WorkspaceConnectionInfo(_)
                     ) {
                         this.editor.modal = Modal::None;

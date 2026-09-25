@@ -55,6 +55,7 @@ mod render;
 mod session;
 mod sidebar;
 mod tab_chrome;
+mod terminal_image_menu;
 mod terminal_images;
 mod terminal_view;
 mod theme;

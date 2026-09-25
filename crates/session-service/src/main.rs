@@ -71,10 +71,13 @@ fn reject_excess_client(stream: &UnixStream) {
 /// Shares the persist-then-exit path between all shutdown signals.
 async fn persist_before_exit(sessions: &SessionRegistry) -> Result<()> {
     let sessions = sessions.clone();
-    tokio::task::spawn_blocking(move || sessions.persist())
-        .await
-        .context("join shutdown persistence task")?
-        .context("persist sessions before service shutdown")
+    tokio::task::spawn_blocking(move || {
+        sessions.save_terminal_input_modes();
+        sessions.persist()
+    })
+    .await
+    .context("join shutdown persistence task")?
+    .context("persist sessions before service shutdown")
 }
 
 fn connect_running_service(
@@ -290,6 +293,7 @@ async fn main() -> Result<()> {
             _ = persistence_tick.tick() => {
                 let sessions = sessions.clone();
                 tokio::task::spawn_blocking(move || {
+                    sessions.save_terminal_input_modes();
                     if let Err(error) = sessions.persist() {
                         eprintln!("failed to persist session recovery state: {error:#}");
                     }

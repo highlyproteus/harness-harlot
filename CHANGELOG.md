@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-09-25
+
+### Added
+
+- Right-click an inline terminal image for **Copy Image** (puts the PNG on the
+  clipboard, ready to paste into Preview, Slack, or a browser), **Save Image…**
+  (a save dialog defaulting to Downloads as `terminal-image-<id>.png`), and
+  **Open in Default App**. The menu opens even when the application has mouse
+  reporting on, since the image is drawn by Harness Harlot; right-clicks
+  elsewhere in the terminal behave as before.
+
+### Fixed
+
+- Terminals keep their applications' input modes across a session-service
+  restart, such as the one an update performs. Pasting an image into omp (or any
+  app using kitty paste events) delivers the image again instead of typing its
+  path, and bracketed paste and mouse reporting keep working. The service stores
+  each tmux pane's modes in a pane option and restores them when it reattaches.
+  Modes are saved from this release on, so apps started before updating to it
+  need one restart.
+
 ## [0.1.23] - 2026-09-25
 
 ### Added
