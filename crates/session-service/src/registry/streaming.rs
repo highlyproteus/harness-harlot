@@ -430,6 +430,7 @@ mod tests {
             selection: None,
             display_offset: 0,
             history_size: 0,
+            images: Vec::new(),
             modes: hh_protocol::TerminalModes::new(0),
         }
     }

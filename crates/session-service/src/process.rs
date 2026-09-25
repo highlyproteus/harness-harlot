@@ -125,6 +125,11 @@ pub(crate) fn agent_env(workspace_id: Uuid, bot_id: Option<Uuid>) -> Vec<(&'stat
     if let Some(bot_id) = bot_id {
         env.push((crate::bots::BOT_ID_ENV, bot_id.to_string()));
     }
+    // The terminal draws kitty graphics through Unicode placeholders, the only
+    // image mode that survives the tmux substrate. omp cannot detect this
+    // through tmux, so tell it.
+    env.push(("PI_FORCE_IMAGE_PROTOCOL", "kitty".to_owned()));
+    env.push(("PI_KITTY_PLACEHOLDERS", "1".to_owned()));
     env
 }
 

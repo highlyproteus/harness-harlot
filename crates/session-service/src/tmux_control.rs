@@ -16,6 +16,7 @@ use crate::paste_events::PasteEvents;
 use crate::persistence::validate_title;
 use crate::process::{configured_shell, is_trusted_executable_file, run_bounded_command};
 use crate::pty::{RawPaneEvent, ingest_output};
+use crate::terminal_images::TerminalImageStore;
 use crate::tmux::{TMUX_PROBE_TIMEOUT, system_tmux_binary};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hh_terminal_model::TerminalModel;
@@ -34,6 +35,7 @@ pub(crate) struct PaneSink {
     pub content_revision: Arc<AtomicU64>,
     pub events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
     pub paste_events: Arc<PasteEvents>,
+    pub images: Arc<TerminalImageStore>,
     pub exited: Arc<Mutex<Option<String>>>,
     pub bell_count: u64,
     pub window_id: String,
@@ -557,6 +559,7 @@ fn read_control_output(
                     &sink.terminal,
                     &sink.events,
                     &sink.paste_events,
+                    &sink.images,
                     &sink.revision,
                     &sink.content_revision,
                     &mut sink.bell_count,
@@ -806,6 +809,7 @@ mod tests {
             content_revision: Arc::default(),
             events: Arc::default(),
             paste_events: Arc::default(),
+            images: Arc::new(TerminalImageStore::in_directory(std::env::temp_dir())),
             exited: Arc::clone(&exited),
             bell_count: 0,
             window_id: "@1".to_owned(),

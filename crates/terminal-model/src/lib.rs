@@ -10,10 +10,18 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Osc52, TermMode, point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::{self, Color, NamedColor};
+mod kitty_graphics;
+
+use kitty_graphics::KittyGraphics;
+pub use kitty_graphics::{
+    KittyImageEvent, MAX_KITTY_IMAGE_BYTES, MAX_KITTY_IMAGES, MAX_KITTY_TOTAL_BYTES,
+    PlacedKittyImage,
+};
+
 use hh_protocol::{
-    TerminalAttributes, TerminalColor, TerminalCursor, TerminalLine, TerminalModifiers,
-    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalRun, TerminalSelection,
-    TerminalSelectionKind,
+    KITTY_PLACEHOLDER, TerminalAttributes, TerminalColor, TerminalCursor, TerminalLine,
+    TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalRun,
+    TerminalSelection, TerminalSelectionKind,
 };
 
 pub const SCROLLBACK_HISTORY_LIMIT: usize = 2_000;
@@ -22,6 +30,9 @@ const MAX_STYLE_RUNS_PER_LINE: usize = 128;
 const MAX_TOTAL_STYLE_RUNS: usize = 3_000;
 const MAX_OSC_NOTIFICATION_BYTES: usize = 512;
 const MAX_OSC_SEQUENCE_BYTES: usize = 4 * 1024;
+/// Largest APC or DCS string scanned. Kitty graphics chunks are at most 4 KiB
+/// of base64; tmux passthrough doubles each escape inside one.
+const MAX_STRING_SEQUENCE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 struct TermEventListener {
@@ -73,11 +84,13 @@ struct ScanOutput {
     messages: Vec<String>,
     requests: Vec<TerminalRequest>,
     enhanced_paste: bool,
+    graphics: KittyGraphics,
 }
 
 /// Watches pane output for the few sequences Harness Harlot itself acts on
-/// (notifications, enhanced paste mode, and clipboard requests), carrying
-/// partial sequences across reads.
+/// (notifications, enhanced paste mode, clipboard requests, and kitty
+/// graphics, plain or wrapped in tmux passthrough), carrying partial
+/// sequences across reads.
 #[derive(Debug, Default)]
 struct OutputScanner {
     state: ScanState,
@@ -95,12 +108,36 @@ enum ScanState {
         bytes: Vec<u8>,
         escape_pending: bool,
     },
+    /// `ESC _ … ESC \`: application program command (kitty graphics).
+    Apc {
+        bytes: Vec<u8>,
+        escape_pending: bool,
+    },
+    /// `ESC P … ESC \`: device control string. Inside tmux passthrough
+    /// (`ESC P tmux; …`), each escape of the wrapped sequence is doubled.
+    Dcs {
+        bytes: Vec<u8>,
+        escape_pending: bool,
+    },
 }
 
 impl OutputScanner {
     fn scan(&mut self, input: &[u8], output: &mut ScanOutput) {
         for &byte in input {
-            let state = std::mem::take(&mut self.state);
+            let state = match std::mem::take(&mut self.state) {
+                // An escape inside an APC/DCS that does not terminate it (or,
+                // in tmux passthrough, double it) ends the string and starts
+                // the next sequence, as in the terminal's own parser.
+                ScanState::Apc {
+                    escape_pending: true,
+                    ..
+                } if byte != b'\\' => ScanState::Escape,
+                ScanState::Dcs {
+                    escape_pending: true,
+                    ..
+                } if byte != b'\\' && byte != b'\x1b' => ScanState::Escape,
+                state => state,
+            };
             self.state = match state {
                 ScanState::Ground | ScanState::Escape | ScanState::Csi { .. }
                     if byte == b'\x1b' =>
@@ -114,6 +151,22 @@ impl OutputScanner {
                 ScanState::Escape if byte == b'[' => ScanState::Csi {
                     parameters: Vec::new(),
                 },
+                ScanState::Escape if byte == b'_' => ScanState::Apc {
+                    bytes: Vec::new(),
+                    escape_pending: false,
+                },
+                ScanState::Escape if byte == b'P' => ScanState::Dcs {
+                    bytes: Vec::new(),
+                    escape_pending: false,
+                },
+                ScanState::Apc {
+                    bytes,
+                    escape_pending,
+                } => Self::scan_apc(bytes, escape_pending, byte, output),
+                ScanState::Dcs {
+                    bytes,
+                    escape_pending,
+                } => Self::scan_dcs(bytes, escape_pending, byte, output),
                 ScanState::Escape if byte == b'c' => {
                     // RIS resets every mode, including enhanced paste.
                     output.enhanced_paste = false;
@@ -177,6 +230,77 @@ impl OutputScanner {
                     }
                 }
             };
+        }
+    }
+
+    fn scan_apc(
+        mut bytes: Vec<u8>,
+        escape_pending: bool,
+        byte: u8,
+        output: &mut ScanOutput,
+    ) -> ScanState {
+        if escape_pending {
+            if byte == b'\\'
+                && let Some(command) = bytes.strip_prefix(b"G")
+            {
+                output.graphics.handle_command(command);
+            }
+            return ScanState::Ground;
+        }
+        if byte == b'\x1b' {
+            return ScanState::Apc {
+                bytes,
+                escape_pending: true,
+            };
+        }
+        if bytes.len() >= MAX_STRING_SEQUENCE_BYTES {
+            return ScanState::Ground;
+        }
+        bytes.push(byte);
+        ScanState::Apc {
+            bytes,
+            escape_pending: false,
+        }
+    }
+
+    fn scan_dcs(
+        mut bytes: Vec<u8>,
+        escape_pending: bool,
+        byte: u8,
+        output: &mut ScanOutput,
+    ) -> ScanState {
+        if escape_pending {
+            match byte {
+                b'\\' => {
+                    if let Some(wrapped) = bytes.strip_prefix(b"tmux;") {
+                        OutputScanner::default().scan(wrapped, output);
+                    }
+                    return ScanState::Ground;
+                }
+                // tmux passthrough doubles every escape it wraps.
+                b'\x1b' if bytes.len() < MAX_STRING_SEQUENCE_BYTES => {
+                    bytes.push(b'\x1b');
+                    return ScanState::Dcs {
+                        bytes,
+                        escape_pending: false,
+                    };
+                }
+                _ => return ScanState::Ground,
+            }
+        }
+        if byte == b'\x1b' {
+            return ScanState::Dcs {
+                bytes,
+                escape_pending: true,
+            };
+        }
+        if bytes.len() >= MAX_STRING_SEQUENCE_BYTES {
+            return ScanState::Ground;
+        }
+        bytes.push(byte);
+        ScanState::Dcs {
+            bytes,
+            escape_pending: false,
         }
     }
 
@@ -345,6 +469,16 @@ impl TerminalModel {
         self.scanned.enhanced_paste
     }
 
+    /// Drains kitty-graphics image data changes since the last call.
+    pub fn take_image_events(&mut self) -> Vec<KittyImageEvent> {
+        self.scanned.graphics.take_events()
+    }
+
+    /// Transmitted images with a Unicode placeholder placement.
+    pub fn placed_images(&self) -> Vec<PlacedKittyImage> {
+        self.scanned.graphics.placed_images()
+    }
+
     /// Drains DECRQM and OSC 5522 requests in the order the pane wrote them.
     pub fn take_terminal_requests(&mut self) -> Vec<TerminalRequest> {
         std::mem::take(&mut self.scanned.requests)
@@ -440,7 +574,10 @@ impl TerminalModel {
                             && previous.background == background
                             && previous.attributes == attributes
                     });
+                    // A placeholder's foreground color is its image id, so it
+                    // never borrows a neighboring run's style.
                     let coarsen_style = !runs.is_empty()
+                        && cell.c != KITTY_PLACEHOLDER
                         && (runs.len() >= MAX_STYLE_RUNS_PER_LINE || styled_runs_remaining == 0);
                     if extends_previous || coarsen_style {
                         if let Some(previous) = runs.last_mut() {
@@ -831,6 +968,146 @@ mod tests {
         assert_eq!(
             model.take_notification_messages(),
             vec!["Claude: needs approval".to_owned()]
+        );
+    }
+
+    const TEST_PNG: &[u8] = b"\x89PNG\r\n\x1a\nkitty-test";
+
+    /// omp's tmux passthrough envelope: every escape doubled, then ESC \.
+    fn tmux_wrapped(sequence: &str) -> String {
+        format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
+    }
+
+    /// The bytes omp writes inside tmux for one placeholder image: a chunked
+    /// `a=t` transmit, then rows of placeholders whose first row carries the
+    /// `a=p,U=1` virtual placement.
+    fn omp_placeholder_image(id: u32, columns: u16, rows: u16) -> String {
+        use base64::Engine as _;
+        let data = base64::engine::general_purpose::STANDARD.encode(TEST_PNG);
+        let (first, rest) = data.split_at(8);
+        let mut out = tmux_wrapped(&format!("\x1b_Ga=t,f=100,q=2,i={id},m=1;{first}\x1b\\"));
+        out += &tmux_wrapped(&format!("\x1b_Gq=2,m=0;{rest}\x1b\\"));
+        let color = format!(
+            "\x1b[38;2;{};{};{}m",
+            (id >> 16) & 0xff,
+            (id >> 8) & 0xff,
+            id & 0xff
+        );
+        for row in 0..rows {
+            if row == 0 {
+                out += &tmux_wrapped(&format!(
+                    "\x1b_Ga=p,U=1,q=2,i={id},p={id},c={columns},r={rows}\x1b\\"
+                ));
+            }
+            out += &color;
+            for column in 0..columns {
+                out.push(KITTY_PLACEHOLDER);
+                out.push(hh_protocol::placeholder_diacritic(row).unwrap());
+                out.push(hh_protocol::placeholder_diacritic(column).unwrap());
+            }
+            out += "\x1b[39m\r\n";
+        }
+        out
+    }
+
+    #[test]
+    fn tmux_wrapped_kitty_image_is_stored_placed_and_leaves_only_placeholders() {
+        let mut model = TerminalModel::new(20, 6);
+        let output = omp_placeholder_image(0x01_02_03, 4, 2);
+        // Split mid-sequence to cover state carried across reads.
+        let (first, second) = output.as_bytes().split_at(17);
+        model.process_output(first);
+        model.process_output(second);
+        model.process_output(b"after");
+
+        assert_eq!(
+            model.take_image_events(),
+            vec![KittyImageEvent::Stored {
+                id: 0x01_02_03,
+                generation: 1,
+                png: TEST_PNG.to_vec()
+            }]
+        );
+        assert_eq!(
+            model.placed_images(),
+            vec![PlacedKittyImage {
+                id: 0x01_02_03,
+                generation: 1,
+                columns: 4,
+                rows: 2
+            }]
+        );
+        let lines = model.styled_lines();
+        for row in 0..2_u16 {
+            let runs = &lines[usize::from(row)].runs;
+            assert_eq!(runs.len(), 1, "row {row}: {runs:?}");
+            assert_eq!(runs[0].columns, 4);
+            assert_eq!(
+                runs[0].foreground,
+                TerminalColor::Rgb {
+                    red: 1,
+                    green: 2,
+                    blue: 3
+                }
+            );
+            let cells = hh_protocol::placeholder_cells(&runs[0].text);
+            assert_eq!(
+                cells,
+                (0..4)
+                    .map(|column| hh_protocol::PlaceholderCell::Image { row, column })
+                    .collect::<Vec<_>>()
+            );
+        }
+        let third: String = lines[2].runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(third, "after", "protocol bytes leaked as text");
+    }
+
+    #[test]
+    fn an_unterminated_apc_does_not_swallow_the_image_sequence_after_it() {
+        let mut model = TerminalModel::new(20, 6);
+        // A stray `ESC _ G` (no terminator) right before a real transmission.
+        let mut output = String::from("label=\x1b_G more text\n");
+        output += &omp_placeholder_image(4242, 2, 1);
+        model.process_output(output.as_bytes());
+        assert_eq!(model.take_image_events().len(), 1);
+        assert_eq!(model.placed_images().len(), 1);
+    }
+
+    #[test]
+    fn plain_kitty_graphics_apc_is_handled_without_tmux() {
+        use base64::Engine as _;
+        let mut model = TerminalModel::new(20, 4);
+        let data = base64::engine::general_purpose::STANDARD.encode(TEST_PNG);
+        model.process_output(format!("\x1b_Ga=t,f=100,q=2,i=9;{data}\x1b\\ok").as_bytes());
+        assert_eq!(model.take_image_events().len(), 1);
+        let text: String = model.styled_lines()[0]
+            .runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect();
+        assert_eq!(text, "ok");
+    }
+
+    #[test]
+    fn placeholders_keep_their_image_color_past_the_style_run_budget() {
+        let mut model = TerminalModel::new(400, 2);
+        let mut output = String::new();
+        for index in 0..MAX_STYLE_RUNS_PER_LINE {
+            let _ = write!(output, "\x1b[38;5;{}mx", index % 200);
+        }
+        output += "\x1b[38;2;0;0;7m";
+        output.push(KITTY_PLACEHOLDER);
+        model.process_output(output.as_bytes());
+        let runs = &model.styled_lines()[0].runs;
+        let last = runs.last().unwrap();
+        assert!(last.text.starts_with(KITTY_PLACEHOLDER), "{last:?}");
+        assert_eq!(
+            last.foreground,
+            TerminalColor::Rgb {
+                red: 0,
+                green: 0,
+                blue: 7
+            }
         );
     }
 

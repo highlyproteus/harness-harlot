@@ -76,6 +76,24 @@ pub struct TerminalScreen {
     pub display_offset: u32,
     pub history_size: u32,
     pub modes: TerminalModes,
+    /// Kitty-graphics images this pane can currently display through Unicode
+    /// placeholder cells in `lines`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<TerminalImage>,
+}
+
+/// One transmitted kitty-graphics image with a virtual (placeholder) placement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalImage {
+    /// Image id; placeholder cells carry it as their 24-bit foreground color.
+    pub id: u32,
+    /// Changes whenever the id is re-transmitted, so renderers can reload.
+    pub generation: u64,
+    /// Cell box the image is fit into, preserving its aspect ratio.
+    pub columns: u16,
+    pub rows: u16,
+    /// Owner-only PNG file written by the local session service.
+    pub path: String,
 }
 
 /// The last terminal revision a receiver has applied for one pane.

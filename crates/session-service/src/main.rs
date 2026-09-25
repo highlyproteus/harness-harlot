@@ -10,7 +10,7 @@ use hh_protocol::{
     ClientRequest, PROTOCOL_VERSION, ServiceResponse, legacy_socket_path, read_message,
     socket_path, write_message,
 };
-use hh_session_service::{SessionRegistry, serve_connection};
+use hh_session_service::{SessionRegistry, clear_stale_terminal_images, serve_connection};
 use rustix::fs::Mode;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
@@ -231,6 +231,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("restrict session socket {}", path.display()))?;
     rustix::process::umask(inherited_umask);
     let _guard = SocketGuard(path.clone());
+    // Owning the socket makes this the only service for this state directory.
+    clear_stale_terminal_images();
     let sessions = SessionRegistry::load_default()?;
     let clients = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
     let mut persistence_tick = tokio::time::interval(std::time::Duration::from_secs(2));

@@ -79,6 +79,12 @@ fn socket_filename(development_build: bool) -> &'static str {
 pub fn runtime_directory() -> Option<PathBuf> {
     state_directory().map(|directory| directory.join("run"))
 }
+/// Owner-only directory for images terminal applications transmitted with the
+/// kitty graphics protocol: `<state>/run/terminal-images`.
+pub fn terminal_images_directory() -> Option<PathBuf> {
+    runtime_directory().map(|directory| directory.join("terminal-images"))
+}
+
 /// Per-workstation gallery directory: `<state>/gallery/<workspace_id>`.
 pub fn gallery_directory(workspace_id: Uuid) -> Option<PathBuf> {
     state_directory().map(|directory| directory.join("gallery").join(workspace_id.to_string()))

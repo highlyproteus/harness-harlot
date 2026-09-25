@@ -6,6 +6,7 @@
 //! - `model`: desired-state snapshot, workspace, tab, and pane types.
 //! - `profile`: stable terminal profiles and bounded detection.
 //! - `terminal`: screen state, streaming cursors, and notifications.
+//! - `kitty`: kitty graphics Unicode placeholder cells.
 //! - `messages`: request and response enums.
 //! - `wire`: bounded length-prefixed JSON framing.
 //! - `paths`: owner-only runtime paths and private-file access.
@@ -18,7 +19,7 @@
 /// bump. Because the
 /// handshake is strict equality, a bump orphans every live service until
 /// the desktop relaunches them.
-pub const PROTOCOL_VERSION: u16 = 45;
+pub const PROTOCOL_VERSION: u16 = 46;
 
 pub const MAX_SSH_HOST_LEN: usize = 253;
 pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;
@@ -38,6 +39,7 @@ pub const MAX_TERMINAL_ROWS: u16 = 1_000;
 pub const MAX_TERMINAL_CELLS: u32 = 600_000;
 pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
 
+mod kitty;
 mod messages;
 mod model;
 mod paths;
@@ -46,6 +48,7 @@ mod terminal;
 mod validation;
 mod wire;
 
+pub use kitty::*;
 pub use messages::*;
 pub use model::*;
 pub use paths::*;

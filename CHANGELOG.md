@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-09-25
+
+### Added
+
+- Terminals now show images inline. Harness Harlot implements the kitty
+  graphics protocol's Unicode placeholder mode: an application transmits a
+  PNG once and then writes ordinary placeholder cells, which the terminal
+  paints with the matching part of the image. The cells are text, so images
+  scroll with the output and pass through the tmux substrate. Local terminals
+  export `PI_FORCE_IMAGE_PROTOCOL=kitty` and `PI_KITTY_PLACEHOLDERS=1`, so omp
+  shows generated images, screenshots, and review images inline. Transmitted
+  images are kept per pane (up to 32 images and 128 MB, oldest evicted first)
+  in owner-only files under the state directory's `run/terminal-images`,
+  removed when the pane closes and when the session service starts. PNG
+  images sent in-band are supported; cursor-positioned placements, file
+  transmission, and raw pixel formats are not.
+
 ## [0.1.22] - 2026-09-24
 
 ### Added
