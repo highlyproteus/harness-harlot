@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Right-click an inline terminal image for **Copy Image** (puts the PNG on the
+  clipboard, ready to paste into Preview, Slack, or a browser), **Save Image…**
+  (a save dialog defaulting to Downloads as `terminal-image-<id>.png`), and
+  **Open in Default App**. The menu opens even when the application has mouse
+  reporting on, since the image is drawn by Harness Harlot; right-clicks
+  elsewhere in the terminal behave as before.
+
 ## [0.1.23] - 2026-09-25
 
 ### Added

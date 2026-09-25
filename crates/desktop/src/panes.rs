@@ -801,6 +801,16 @@ impl HhApp {
         self.layout.scroll_residual.remove(&pane_id);
         self.focus_pane_with_snapshot(pane_id, cx);
         self.focus_handle.focus(window);
+        if matches!(self.editor.modal, Modal::TerminalImageMenu(_)) {
+            self.editor.modal = Modal::None;
+        }
+        if event.button == MouseButton::Right
+            && self.open_terminal_image_menu(pane_id, point, event.position)
+        {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let mouse_reporting = self
             .session
             .screens
@@ -896,6 +906,11 @@ impl HhApp {
             }
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        if event.pressed_button == Some(MouseButton::Right)
+            && self.terminal_image_menu_open(pane_id)
+        {
             return;
         }
         let mouse_motion = self
@@ -1094,6 +1109,10 @@ impl HhApp {
         event: &MouseUpEvent,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Right && self.terminal_image_menu_open(pane_id) {
+            cx.stop_propagation();
+            return;
+        }
         self.layout.selection_autoscroll = None;
         self.layout.autoscroll_generation = self.layout.autoscroll_generation.wrapping_add(1);
         if let Some(selection) = self

@@ -1,8 +1,8 @@
 use gpui::{IntoElement, ParentElement, Pixels, Point, Render, Styled, Window, div, px, rgb};
 use hh_protocol::{
     ClientRequest, DropPlacement, MAX_SSH_INPUT_LEN, MAX_WORKSPACE_DIR_BYTES, Pane, SplitAxis,
-    TerminalPoint, TerminalProfile, TerminalSelectionKind, TmuxScanScope, TmuxSession,
-    TmuxSessionId, normalize_ssh_input, validate_ssh_host,
+    TerminalImage, TerminalPoint, TerminalProfile, TerminalSelectionKind, TmuxScanScope,
+    TmuxSession, TmuxSessionId, normalize_ssh_input, validate_ssh_host,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -125,6 +125,14 @@ pub(super) struct TabMenu {
     pub(super) pane_id: Uuid,
     pub(super) position: Point<Pixels>,
     pub(super) identity_picker_open: bool,
+}
+
+/// Right-click menu for one inline terminal image.
+#[derive(Clone, Debug)]
+pub(super) struct TerminalImageMenu {
+    pub(super) pane_id: Uuid,
+    pub(super) position: Point<Pixels>,
+    pub(super) image: TerminalImage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1010,6 +1018,7 @@ pub(super) enum Modal {
     GroupMenu(GroupMenu),
     BotMenu(BotMenu),
     BotThreadMenu(BotThreadMenu),
+    TerminalImageMenu(TerminalImageMenu),
     BotThreadDelete(BotThreadDeleteConfirmation),
     WorkspaceConnectionInfo(WorkspaceConnectionInfo),
     AppearanceSettings,

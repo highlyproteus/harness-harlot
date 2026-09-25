@@ -122,6 +122,26 @@ pub(crate) fn segment_draw_bounds(
     Some((image, clip))
 }
 
+/// The placed image painted under one screen cell. Uses the same row segments,
+/// placement lookup, and decode state as the painter, so a cell maps to an
+/// image exactly when that image is drawn there.
+pub(crate) fn painted_image_at<'a>(
+    lines: &[TerminalLine],
+    images: &'a [TerminalImage],
+    cache: &TerminalImageCache,
+    row: u16,
+    column: u16,
+) -> Option<&'a TerminalImage> {
+    let line = lines.get(usize::from(row))?;
+    let segment = placeholder_segments(row, line)
+        .into_iter()
+        .find(|segment| {
+            column >= segment.start_column && column - segment.start_column < segment.cells
+        })?;
+    let placement = images.iter().find(|image| image.id == segment.image_id)?;
+    matches!(cache.get(&placement.path), Some(ImageLoad::Ready(_))).then_some(placement)
+}
+
 pub(crate) enum ImageLoad {
     Loading,
     Ready(Arc<RenderImage>),
@@ -306,5 +326,91 @@ mod tests {
         .unwrap();
         assert_eq!(image.size, size(px(100.0), px(25.0)));
         assert_eq!(image.origin, point(px(100.0), px(97.5)));
+    }
+
+    fn placed(id: u32, path: &str) -> TerminalImage {
+        TerminalImage {
+            id,
+            generation: 1,
+            columns: 4,
+            rows: 2,
+            path: path.to_owned(),
+        }
+    }
+
+    fn ready(cache: &mut TerminalImageCache, path: &str) {
+        let frame = Frame::new(image::RgbaImage::new(1, 1));
+        cache.finish_load(
+            path.to_owned(),
+            Some(Arc::new(RenderImage::new(vec![frame]))),
+        );
+    }
+
+    const IMAGE_9: TerminalColor = TerminalColor::Rgb {
+        red: 0,
+        green: 0,
+        blue: 9,
+    };
+
+    /// Row 0: `ab`, image 7 in columns 2..5, a space, image 9 in columns 6..8.
+    fn two_images() -> (Vec<TerminalLine>, Vec<TerminalImage>) {
+        let lines = vec![
+            TerminalLine {
+                runs: vec![
+                    run("ab".to_owned(), 2, TerminalColor::DefaultForeground),
+                    run(placeholders(0, 0..3), 3, IMAGE_7),
+                    run(" ".to_owned(), 1, TerminalColor::DefaultForeground),
+                    run(placeholders(0, 0..2), 2, IMAGE_9),
+                ],
+            },
+            TerminalLine {
+                runs: vec![run(placeholders(1, 0..3), 3, IMAGE_7)],
+            },
+        ];
+        (lines, vec![placed(7, "/seven.png"), placed(9, "/nine.png")])
+    }
+
+    #[test]
+    fn a_cell_inside_a_painted_segment_maps_to_its_image() {
+        let (lines, images) = two_images();
+        let mut cache = TerminalImageCache::default();
+        ready(&mut cache, "/seven.png");
+        ready(&mut cache, "/nine.png");
+        let at = |row, column| painted_image_at(&lines, &images, &cache, row, column);
+        assert_eq!(at(0, 2).map(|image| image.id), Some(7));
+        assert_eq!(at(0, 4).map(|image| image.id), Some(7));
+        assert_eq!(at(1, 0).map(|image| image.id), Some(7));
+        assert_eq!(at(0, 6).map(|image| image.id), Some(9));
+        assert_eq!(at(0, 7).map(|image| image.id), Some(9));
+    }
+
+    #[test]
+    fn cells_outside_every_segment_map_to_no_image() {
+        let (lines, images) = two_images();
+        let mut cache = TerminalImageCache::default();
+        ready(&mut cache, "/seven.png");
+        ready(&mut cache, "/nine.png");
+        let at = |row, column| painted_image_at(&lines, &images, &cache, row, column);
+        // Text before, the gap between, past the last segment, and past the grid.
+        assert!(at(0, 1).is_none());
+        assert!(at(0, 5).is_none());
+        assert!(at(0, 8).is_none());
+        assert!(at(1, 3).is_none());
+        assert!(at(2, 0).is_none());
+    }
+
+    #[test]
+    fn only_decoded_placed_images_are_hit() {
+        let (lines, images) = two_images();
+        let mut cache = TerminalImageCache::default();
+        assert!(cache.begin_load("/seven.png"));
+        cache.finish_load("/nine.png".to_owned(), None);
+        // Still decoding, or failed to decode: nothing is painted there.
+        assert!(painted_image_at(&lines, &images, &cache, 0, 2).is_none());
+        assert!(painted_image_at(&lines, &images, &cache, 0, 6).is_none());
+        ready(&mut cache, "/seven.png");
+        assert!(painted_image_at(&lines, &images, &cache, 0, 2).is_some());
+        // Placeholder cells for an id the screen no longer lists.
+        assert!(painted_image_at(&lines, &images[1..], &cache, 0, 2).is_none());
     }
 }

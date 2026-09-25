@@ -676,6 +676,7 @@ impl HhApp {
             | Modal::GroupMenu(_)
             | Modal::BotMenu(_)
             | Modal::BotThreadMenu(_)
+            | Modal::TerminalImageMenu(_)
             | Modal::WorkspaceConnectionInfo(_) => {
                 if keystroke.key == "escape" {
                     self.editor.modal = Modal::None;
