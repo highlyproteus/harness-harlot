@@ -2902,6 +2902,7 @@ name = "hh-terminal-model"
 version = "0.1.22"
 dependencies = [
  "alacritty_terminal",
+ "base64 0.22.1",
  "hh-protocol",
 ]
 

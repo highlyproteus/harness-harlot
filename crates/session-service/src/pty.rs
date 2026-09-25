@@ -15,6 +15,7 @@ use crate::process::local_spawn_dir;
 use crate::process::{
     agent_env, apply_agent_env, configured_shell, local_shell_command, system_ssh_command,
 };
+use crate::terminal_images::TerminalImageStore;
 use crate::tmux::{tmux_local_attach_command, tmux_ssh_attach_command};
 use crate::tmux_control::{PaneSink, TmuxControlClient};
 use anyhow::{Context, Result, bail};
@@ -240,6 +241,7 @@ pub(crate) struct PtySession {
     content_revision: Arc<AtomicU64>,
     events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
     paste_events: Arc<PasteEvents>,
+    images: Arc<TerminalImageStore>,
 }
 
 enum Transport {
@@ -344,6 +346,7 @@ impl Drop for PtySession {
                 ..
             } => client.unregister_sink(tmux_pane_id),
         }
+        self.images.remove_all();
     }
 }
 
@@ -487,12 +490,14 @@ impl PtySession {
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let exited = Arc::new(Mutex::new(None));
         let paste_events = Arc::new(PasteEvents::default());
+        let images = Arc::new(TerminalImageStore::for_pane(pane_id));
         let mut bell_count = 0;
         if let Some(captured) = captured {
             ingest_output(
                 &terminal,
                 &events,
                 &paste_events,
+                &images,
                 &revision,
                 &content_revision,
                 &mut bell_count,
@@ -507,6 +512,7 @@ impl PtySession {
                 content_revision: Arc::clone(&content_revision),
                 events: Arc::clone(&events),
                 paste_events: Arc::clone(&paste_events),
+                images: Arc::clone(&images),
                 exited: Arc::clone(&exited),
                 bell_count,
                 window_id: window_id.clone(),
@@ -526,6 +532,7 @@ impl PtySession {
             content_revision,
             events,
             paste_events,
+            images,
         });
         session.paste_events.bind(&session);
         Ok(session)
@@ -566,6 +573,8 @@ impl PtySession {
         let reader_events = Arc::clone(&events);
         let paste_events = Arc::new(PasteEvents::default());
         let reader_paste_events = Arc::clone(&paste_events);
+        let images = Arc::new(TerminalImageStore::for_pane(pane_id));
+        let reader_images = Arc::clone(&images);
         let (reader_exit_tx, reader_exit) = std::sync::mpsc::channel::<()>();
         let reader = thread::Builder::new()
             .name(format!("rmux-pty-{pane_id}"))
@@ -582,6 +591,7 @@ impl PtySession {
                             &reader_terminal,
                             &reader_events,
                             &reader_paste_events,
+                            &reader_images,
                             &reader_revision,
                             &reader_content_revision,
                             &mut previous_bell_count,
@@ -623,6 +633,7 @@ impl PtySession {
             content_revision,
             events,
             paste_events,
+            images,
         });
         session.paste_events.bind(&session);
         Ok(session)
@@ -809,6 +820,7 @@ impl PtySession {
             history_size: u32::try_from(terminal.history_size())
                 .context("terminal history exceeds protocol range")?,
             modes: TerminalModes::new(mode_bits),
+            images: self.images.screen_images(terminal.placed_images()),
         })
     }
 
@@ -1046,10 +1058,13 @@ impl PtySession {
     }
 }
 
+// Each argument is one of the pane's independently shared handles.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ingest_output(
     terminal: &Mutex<TerminalModel>,
     events: &Mutex<VecDeque<RawPaneEvent>>,
     paste_events: &Arc<PasteEvents>,
+    images: &TerminalImageStore,
     revision: &AtomicU64,
     content_revision: &AtomicU64,
     bell_count: &mut u64,
@@ -1060,6 +1075,11 @@ pub(crate) fn ingest_output(
     }
     let mut terminal = terminal.lock();
     terminal.process_output(bytes);
+    // Written before the revision advances so no screen names a missing file.
+    let image_events = terminal.take_image_events();
+    if !image_events.is_empty() {
+        images.apply(image_events);
+    }
     try_enqueue_terminal_notifications(&mut terminal, events, bell_count);
     let requests = terminal.take_terminal_requests();
     content_revision.fetch_add(1, Ordering::Release);

@@ -55,6 +55,7 @@ mod render;
 mod session;
 mod sidebar;
 mod tab_chrome;
+mod terminal_images;
 mod terminal_view;
 mod theme;
 mod workspace_tab_strip;
@@ -453,6 +454,7 @@ struct HhApp {
     terminal_font: TerminalFontProfile,
     terminal_zoom_levels: HashMap<Uuid, i8>,
     terminal_shape_cache: RefCell<HashMap<Uuid, elements::PaneShapeCache>>,
+    terminal_images: RefCell<terminal_images::TerminalImageCache>,
     terminal_grid_bounds:
         RefCell<HashMap<Uuid, (gpui::Bounds<gpui::Pixels>, typography::TerminalCellMetrics)>>,
     custom_icons: Vec<CustomIcon>,
@@ -555,6 +557,7 @@ impl HhApp {
             terminal_font,
             terminal_zoom_levels: HashMap::new(),
             terminal_shape_cache: RefCell::new(HashMap::new()),
+            terminal_images: RefCell::default(),
             terminal_grid_bounds: RefCell::new(HashMap::new()),
             custom_icons: load_custom_icons(),
             ui_state_store,

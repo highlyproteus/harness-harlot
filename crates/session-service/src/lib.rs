@@ -15,11 +15,13 @@ mod process;
 mod pty;
 mod registry;
 mod rpc;
+mod terminal_images;
 mod tmux;
 mod tmux_control;
 
 pub use registry::{PaneUpdateBatch, SessionRegistry, TmuxAttachmentResult, TmuxScanResult};
 pub use rpc::serve_connection;
+pub use terminal_images::clear_stale_terminal_images;
 pub use tmux_control::managed_tmux_socket_name;
 
 pub(crate) fn now_ms() -> u64 {

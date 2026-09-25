@@ -173,6 +173,11 @@ pub(crate) fn prepare_paste(text: &str, bracketed: bool) -> Result<Vec<u8>, &'st
 }
 
 pub(crate) fn terminal_run_display_text(run: &TerminalRun, _start_column: u16) -> String {
+    // Kitty image placeholders are painted as images on the live grid only;
+    // elsewhere (archived history) they are blank cells, not missing glyphs.
+    if run.text.contains(hh_protocol::KITTY_PLACEHOLDER) {
+        return " ".repeat(usize::from(run.columns));
+    }
     // The terminal model already represents every occupied grid cell,
     // including the cells skipped by a tab. Render its tab cell as one
     // blank cell instead of asking GPUI to apply proportional tab stops.

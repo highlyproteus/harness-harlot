@@ -1,23 +1,29 @@
 //! Custom gpui elements for terminals, input, and resize capture.
 
 use gpui::{
-    App, BorderStyle, Bounds, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
-    Entity, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, ScrollWheelEvent,
-    ShapedLine, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill,
-    linear_color_stop, linear_gradient, point, px, quad, relative, rgb, rgba, size,
-    transparent_black,
+    App, AppContext as _, BorderStyle, Bounds, ContentMask, Corners, CursorStyle, DispatchPhase,
+    Element, ElementId, ElementInputHandler, Entity, GlobalElementId, Hitbox, HitboxBehavior,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, RenderImage, ScrollWheelEvent, ShapedLine, StrikethroughStyle,
+    Style, TextRun, UnderlineStyle, Window, fill, linear_color_stop, linear_gradient, point, px,
+    quad, relative, rgb, rgba, size, transparent_black,
 };
 use hh_protocol::{
-    AppearanceColor, TerminalAttributes, TerminalColor, TerminalCursor, TerminalRun,
+    AppearanceColor, TerminalAttributes, TerminalColor, TerminalCursor, TerminalImage, TerminalRun,
     TerminalScreen, TerminalSelection,
 };
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::helpers::{
     hsv_to_rgb, selection_span, terminal_point_clamped, terminal_run_display_text,
 };
 use crate::tab_chrome::PaneIndicator;
+use crate::terminal_images::{
+    ImageLoad, ImageSegment, decode_terminal_image, is_placeholder_run, placeholder_segments,
+    segment_draw_bounds,
+};
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{DialogTextEditor, WorkspaceCreationField, WorkspaceCreationStep};
 use crate::{HhApp, THEME};
@@ -886,6 +892,8 @@ pub(crate) struct PaneShapeCache {
     pub(crate) font_size: f32,
     pub(crate) cell_width: f32,
     pub(crate) rows: Rc<Vec<Vec<CachedRun>>>,
+    /// Kitty image placeholder stretches; their runs are not shaped as text.
+    pub(crate) images: Rc<Vec<ImageSegment>>,
 }
 
 pub(crate) struct TerminalGridElement {
@@ -898,6 +906,8 @@ pub(crate) struct TerminalGridElement {
 
 pub(crate) struct TerminalGridPrepaintState {
     rows: Rc<Vec<Vec<CachedRun>>>,
+    /// Image stretches whose image has decoded, with their placement.
+    images: Vec<(ImageSegment, TerminalImage, Arc<RenderImage>)>,
     selection: Option<TerminalSelection>,
     cursor: Option<TerminalCursor>,
     columns: u16,
@@ -922,6 +932,10 @@ fn build_pane_shape_cache(
                 .iter()
                 .filter_map(|run| {
                     let columns = run.columns;
+                    if is_placeholder_run(&run.text) {
+                        start_column = start_column.saturating_add(columns);
+                        return None;
+                    }
                     let cached = cache_terminal_run(app, run, metrics, start_column, window);
                     start_column = start_column.saturating_add(columns);
                     cached
@@ -929,12 +943,19 @@ fn build_pane_shape_cache(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let images = screen
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| placeholder_segments(u16::try_from(row).unwrap_or(u16::MAX), line))
+        .collect::<Vec<_>>();
     PaneShapeCache {
         content_revision: screen.content_revision,
         columns: screen.columns,
         font_size: metrics.font_size,
         cell_width: metrics.cell_width,
         rows: Rc::new(rows),
+        images: Rc::new(images),
     }
 }
 
@@ -1051,13 +1072,68 @@ impl Element for TerminalGridElement {
                 build_pane_shape_cache(app, screen, self.metrics, window),
             );
         }
-        let rows = cache.get(&self.pane_id)?.rows.clone();
-        Some(TerminalGridPrepaintState {
+        let entry = cache.get(&self.pane_id)?;
+        let rows = entry.rows.clone();
+        let segments = entry.images.clone();
+        drop(cache);
+        let mut images = Vec::new();
+        let mut to_load = Vec::new();
+        if !segments.is_empty() {
+            let mut loaded = app.terminal_images.borrow_mut();
+            for segment in segments.iter() {
+                let Some(placement) = screen
+                    .images
+                    .iter()
+                    .find(|image| image.id == segment.image_id)
+                else {
+                    continue;
+                };
+                match loaded.get(&placement.path) {
+                    Some(ImageLoad::Ready(image)) => {
+                        images.push((*segment, placement.clone(), Arc::clone(image)));
+                    }
+                    Some(ImageLoad::Loading | ImageLoad::Failed) => {}
+                    None => {
+                        if loaded.begin_load(&placement.path) {
+                            to_load.push(placement.path.clone());
+                        }
+                    }
+                }
+            }
+            loaded.prune(
+                app.session
+                    .screens
+                    .values()
+                    .flat_map(|screen| screen.images.iter().map(|image| image.path.as_str())),
+            );
+        }
+        let prepaint = TerminalGridPrepaintState {
             rows,
+            images,
             selection: screen.selection,
             cursor: screen.cursor,
             columns: screen.columns,
-        })
+        };
+        for path in to_load {
+            let entity = self.input.clone();
+            cx.spawn(async move |cx| {
+                let decode_path = path.clone();
+                let image = cx
+                    .background_spawn(async move { decode_terminal_image(Path::new(&decode_path)) })
+                    .await;
+                let _ = entity.update(cx, |app, cx| {
+                    if let Err(error) = &image {
+                        eprintln!("terminal image unavailable: {error:#}");
+                    }
+                    app.terminal_images
+                        .borrow_mut()
+                        .finish_load(path, image.ok());
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        Some(prepaint)
     }
 
     fn paint(
@@ -1114,6 +1190,25 @@ impl Element for TerminalGridElement {
                     cx,
                 );
             }
+        }
+        for (segment, placement, image) in &state.images {
+            let pixels = image.size(0);
+            #[allow(clippy::cast_precision_loss)]
+            let image_size = size(pixels.width.0 as f32, pixels.height.0 as f32);
+            let Some((image_bounds, clip)) =
+                segment_draw_bounds(*segment, placement, image_size, metrics, bounds.origin)
+            else {
+                continue;
+            };
+            window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                let _ = window.paint_image(
+                    image_bounds,
+                    Corners::default(),
+                    Arc::clone(image),
+                    0,
+                    false,
+                );
+            });
         }
         if let Some(cursor) = state.cursor {
             let span = metrics.span(cursor.column, 1);
