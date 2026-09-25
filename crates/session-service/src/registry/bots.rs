@@ -559,10 +559,7 @@ impl SessionRegistry {
                 bail!("pane limit of {MAX_PANES} reached");
             }
             let previous = state.snapshot.clone();
-            let mut pane = state.new_pane(pane_id, Some(cwd.as_path()));
-            if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
-                "ssh".clone_into(&mut pane.shell);
-            }
+            let mut pane = state.new_runtime_pane(pane_id, &cwd, &kind);
             if let Some(title) = title {
                 title.clone_into(&mut pane.title);
                 pane.custom_title = Some(title.to_owned());

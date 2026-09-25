@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Tab status: a working agent shows a slowly pulsing blue dot instead of the
+  spinner, and a finished one a solid blue dot that stays until you view the
+  tab. Orange means only that the agent needs you (input or an approval).
+
+### Fixed
+
+- omp's end-of-turn notification no longer turns its tab orange and then
+  blank. Inside HH omp announces a finished turn with a plain bell, which is now
+  read as Done unless omp is waiting on an ask or approval. A finished turn also
+  stays Done in Notifications until the next turn starts, instead of dropping to
+  idle when the title tracker re-reads omp's prompt.
+- Remote (SSH) workstation tabs get the same status tracking as local ones:
+  omp's `π` terminal title identifies it over SSH, so remote tabs show the
+  working and done dots and appear in Notifications.
+- New tabs on an SSH workstation are named for its host (`SSH devbox`) rather
+  than this machine's home folder, which made remote tabs look local.
+
 ## [0.1.24] - 2026-09-25
 
 ### Added

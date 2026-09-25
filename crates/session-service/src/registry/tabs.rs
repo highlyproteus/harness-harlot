@@ -166,10 +166,7 @@ impl SessionRegistry {
             if state.snapshot.workspaces[workspace_index].tabs.len() >= MAX_TABS_PER_WORKSPACE {
                 bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
             }
-            let mut pane = state.new_pane(pane_id, Some(cwd.as_path()));
-            if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
-                "ssh".clone_into(&mut pane.shell);
-            }
+            let pane = state.new_runtime_pane(pane_id, &cwd, &kind);
             let tab = Tab {
                 owner_thread: None,
                 id: Uuid::new_v4(),

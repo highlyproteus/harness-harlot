@@ -1,5 +1,5 @@
 //! Runtime identity discovery: process profiles, titles, and workspace activity.
-use super::{RegistryState, RuntimePane};
+use super::{PaneLocation, RegistryState, RuntimePane, ssh_pane_title};
 use crate::layout::{find_pane_in_snapshot, find_pane_mut_in_snapshot, pane_ids_for_workspace};
 use crate::process::valid_local_cwd;
 use crate::registry::status::omp_title_status;
@@ -10,7 +10,6 @@ use hh_protocol::{
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -155,35 +154,36 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
     }
+    // Local and SSH terminals: an agent's title reaches HH through ssh as
+    // well, so remote tabs get the same identity and status tracking.
     let identity_inputs = state
         .panes
         .iter()
         .filter_map(|(pane_id, runtime)| {
             let terminal = runtime.terminal()?;
-            terminal.kind.is_local().then(|| {
+            (terminal.kind.is_local() || terminal.kind.is_remote()).then(|| {
                 (
                     *pane_id,
                     terminal.session.terminal_title(),
                     terminal.detected_command_profile,
-                    terminal.last_valid_cwd.clone(),
+                    terminal.location(),
                 )
             })
         })
         .collect::<Vec<_>>();
     let mut identity_changed = false;
-    for (pane_id, title_signal, command_profile, cwd) in identity_inputs {
-        let resolved_profile =
-            if let Some(pane) = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id) {
-                identity_changed |= resolve_pane_identity(
-                    pane,
-                    title_signal.as_deref(),
-                    command_profile,
-                    Some(cwd.as_path()),
-                );
-                Some(pane.identity.profile)
-            } else {
-                None
-            };
+    for (pane_id, title_signal, command_profile, location) in identity_inputs {
+        let resolved = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id).map(|pane| {
+            identity_changed |= resolve_pane_identity(
+                pane,
+                title_signal.as_deref(),
+                command_profile,
+                Some(&location),
+            );
+            (pane.identity.profile, pane.status)
+        });
+        let resolved_profile = resolved.map(|(profile, _)| profile);
+        let current_status = resolved.map(|(_, status)| status);
         let status_update = state
             .panes
             .get_mut(&pane_id)
@@ -209,7 +209,11 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
                     },
                 )
             });
-        if let Some(status) = status_update {
+        // A finished turn stays Done until the next one starts: the idle
+        // prompt after it, or a re-read once the tracker resets, is not news.
+        if let Some(status) = status_update
+            && !(status == PaneStatus::Idle && current_status == Some(PaneStatus::Done))
+        {
             state.set_pane_status(pane_id, status);
         }
     }
@@ -327,11 +331,18 @@ pub(crate) fn discover_descendant_profile(
     None
 }
 
+/// The agent a terminal title names: a known program title, or omp's live
+/// `π <state> label` title, the only omp signal an SSH pane carries.
+fn title_profile(title: &str) -> Option<TerminalProfile> {
+    terminal_profile_for_title(title)
+        .or_else(|| omp_title_status(title).map(|_| TerminalProfile::Omp))
+}
+
 pub(crate) fn resolve_pane_identity(
     pane: &mut Pane,
     terminal_title: Option<&str>,
     command_profile: Option<TerminalProfile>,
-    cwd: Option<&Path>,
+    location: Option<&PaneLocation>,
 ) -> bool {
     let (profile, mut source, generated_title) = if let Some(profile) = pane.profile_override {
         (
@@ -339,7 +350,7 @@ pub(crate) fn resolve_pane_identity(
             TerminalIdentitySource::UserProfile,
             profile.display_name().to_owned(),
         )
-    } else if let Some(profile) = terminal_title.and_then(terminal_profile_for_title) {
+    } else if let Some(profile) = terminal_title.and_then(title_profile) {
         (
             profile,
             TerminalIdentitySource::TerminalTitle,
@@ -352,8 +363,14 @@ pub(crate) fn resolve_pane_identity(
             profile.display_name().to_owned(),
         )
     } else {
-        let title = if let Some(name) = cwd.and_then(Path::file_name) {
+        let local_name = match location {
+            Some(PaneLocation::Local(cwd)) => cwd.file_name(),
+            Some(PaneLocation::Remote(_)) | None => None,
+        };
+        let title = if let Some(name) = local_name {
             name.to_string_lossy().into_owned()
+        } else if let Some(PaneLocation::Remote(host)) = location {
+            ssh_pane_title(host)
         } else if pane.identity.source == TerminalIdentitySource::Fallback
             && pane.title.starts_with("Terminal")
         {
@@ -451,29 +468,29 @@ mod tests {
     }
 
     #[test]
-    fn fallback_title_uses_cwd_folder_name_and_custom_title_wins() {
+    fn fallback_title_uses_local_folder_or_ssh_host_and_custom_title_wins() {
         let mut snapshot = SessionSnapshot::seeded();
         let pane_id = first_pane_id(&snapshot).unwrap();
         let pane = find_pane_mut_in_snapshot(&mut snapshot, pane_id).unwrap();
         pane.custom_title = None;
         pane.profile_override = None;
+        let local = PaneLocation::Local("/Users/x/Projects/hh-ui-web".into());
 
-        resolve_pane_identity(
-            pane,
-            Some("editor"),
-            None,
-            Some(Path::new("/Users/x/Projects/hh-ui-web")),
-        );
+        resolve_pane_identity(pane, Some("editor"), None, Some(&local));
         assert_eq!(pane.title, "hh-ui-web");
         assert_eq!(pane.identity.source, TerminalIdentitySource::Fallback);
 
+        // A remote shell is named for its host, never this machine's folder,
+        // and loses an agent's name once the agent's title is gone.
+        let remote = PaneLocation::Remote("devbox".to_owned());
+        resolve_pane_identity(pane, Some("π ⠋ fixing tests"), None, Some(&remote));
+        assert_eq!(pane.identity.profile, TerminalProfile::Omp);
+        resolve_pane_identity(pane, Some("user@devbox: ~"), None, Some(&remote));
+        assert_eq!(pane.title, "SSH devbox");
+        assert_eq!(pane.identity.source, TerminalIdentitySource::Fallback);
+
         pane.custom_title = Some("My work".to_owned());
-        resolve_pane_identity(
-            pane,
-            Some("editor"),
-            None,
-            Some(Path::new("/Users/x/Projects/hh-ui-web")),
-        );
+        resolve_pane_identity(pane, Some("editor"), None, Some(&local));
         assert_eq!(pane.title, "My work");
         assert_eq!(pane.identity.source, TerminalIdentitySource::UserRename);
     }

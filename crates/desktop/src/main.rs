@@ -655,7 +655,7 @@ impl HhApp {
         .detach();
         cx.spawn(async move |this, cx| {
             loop {
-                gpui::Timer::after(tab_chrome::SPINNER_STEP).await;
+                gpui::Timer::after(tab_chrome::PULSE_STEP).await;
                 let Ok(()) = this.update(cx, |this, cx| {
                     if this.any_pane_running() {
                         cx.notify();
