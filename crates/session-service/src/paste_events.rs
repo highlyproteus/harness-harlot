@@ -31,6 +31,10 @@ pub(crate) const MAX_PASTE_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 pub(crate) const MAX_PASTE_TEXT_BYTES: usize = 1024 * 1024;
 /// Largest raw (pre-base64) payload of one `status=DATA` packet.
 pub(crate) const MAX_DATA_CHUNK_BYTES: usize = 4096;
+/// `S_IRWXG | S_IRWXO` as a literal: `mode_t` is 16 bits on macOS and 32 on
+/// Linux, so the libc constants would need a platform-specific conversion.
+const GROUP_OTHER_PERMISSIONS: u32 = 0o077;
+
 const PENDING_PASTE_TTL: Duration = Duration::from_mins(2);
 const MAX_QUEUED_REQUESTS: usize = 64;
 const MAX_REPLY_ID_CHARS: usize = 64;
@@ -62,7 +66,7 @@ pub(crate) fn take_paste_image(path: &Path, directory: &Path) -> Result<Vec<u8>>
     ensure!(
         directory_metadata.is_dir()
             && directory_metadata.uid() == uid
-            && directory_metadata.mode() & u32::from(libc::S_IRWXG | libc::S_IRWXO) == 0,
+            && directory_metadata.mode() & GROUP_OTHER_PERMISSIONS == 0,
         "paste directory is not a private directory owned by this user"
     );
     let mut file = std::fs::OpenOptions::new()
