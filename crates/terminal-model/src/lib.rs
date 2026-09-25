@@ -240,10 +240,10 @@ impl OutputScanner {
         output: &mut ScanOutput,
     ) -> ScanState {
         if escape_pending {
-            if byte == b'\\' {
-                if let Some(command) = bytes.strip_prefix(b"G") {
-                    output.graphics.handle_command(command);
-                }
+            if byte == b'\\'
+                && let Some(command) = bytes.strip_prefix(b"G")
+            {
+                output.graphics.handle_command(command);
             }
             return ScanState::Ground;
         }
