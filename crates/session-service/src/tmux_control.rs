@@ -416,6 +416,43 @@ impl TmuxControlClient {
         Ok(())
     }
 
+    /// Reads pane user option `name` (e.g. `@hh-input-modes`); `None` when unset.
+    pub(crate) fn pane_user_option(&self, pane_id: &str, name: &str) -> Result<Option<String>> {
+        validate_target_id(pane_id, '%', "pane")?;
+        validate_user_option_name(name)?;
+        let lines = self.run(
+            &format!("show-options -p -q -v -t {pane_id} {name}"),
+            DEFAULT_COMMAND_TIMEOUT,
+        )?;
+        Ok(lines.into_iter().next().filter(|value| !value.is_empty()))
+    }
+
+    /// Stores `value` (digits and commas only) in pane user option `name`,
+    /// or unsets it when `value` is empty. The tmux server keeps it across
+    /// session-service restarts.
+    pub(crate) fn set_pane_user_option(
+        &self,
+        pane_id: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        validate_target_id(pane_id, '%', "pane")?;
+        validate_user_option_name(name)?;
+        ensure!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b','),
+            "tmux pane option value must be digits and commas"
+        );
+        let command = if value.is_empty() {
+            format!("set-option -p -u -t {pane_id} {name}")
+        } else {
+            format!("set-option -p -t {pane_id} {name} {value}")
+        };
+        self.run(&command, DEFAULT_COMMAND_TIMEOUT)?;
+        Ok(())
+    }
+
     pub(crate) fn kill_window(&self, window_id: &str) -> Result<()> {
         validate_target_id(window_id, '@', "window")?;
         self.run(
@@ -679,6 +716,18 @@ fn ensure_control_atom(value: &str, label: &str) -> Result<()> {
                 .chars()
                 .any(|character| matches!(character, '\r' | '\n' | '\0')),
         "{label} contains an invalid control character"
+    );
+    Ok(())
+}
+
+fn validate_user_option_name(name: &str) -> Result<()> {
+    ensure!(
+        name.len() > 1
+            && name.starts_with('@')
+            && name[1..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "tmux user option name is invalid"
     );
     Ok(())
 }

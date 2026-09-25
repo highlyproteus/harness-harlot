@@ -33,6 +33,19 @@ const MAX_OSC_SEQUENCE_BYTES: usize = 4 * 1024;
 /// Largest APC or DCS string scanned. Kitty graphics chunks are at most 4 KiB
 /// of base64; tmux passthrough doubles each escape inside one.
 const MAX_STRING_SEQUENCE_BYTES: usize = 1024 * 1024;
+/// DEC private modes that change how the terminal must deliver input to the
+/// application. The application keeps them on across a session-service
+/// restart, but a model rebuilt from captured screen text cannot see them.
+const RESTORABLE_INPUT_MODES: [(u16, TermMode); 6] = [
+    (1000, TermMode::MOUSE_REPORT_CLICK),
+    (1002, TermMode::MOUSE_DRAG),
+    (1003, TermMode::MOUSE_MOTION),
+    (1004, TermMode::FOCUS_IN_OUT),
+    (1006, TermMode::SGR_MOUSE),
+    (2004, TermMode::BRACKETED_PASTE),
+];
+/// Kitty paste events, tracked by the output scanner rather than Alacritty.
+const ENHANCED_PASTE_MODE_NUMBER: u16 = 5522;
 
 #[derive(Clone, Debug, Default)]
 struct TermEventListener {
@@ -467,6 +480,42 @@ impl TerminalModel {
     /// (`CSI ? 5522 h`) and has not reset it since.
     pub fn enhanced_paste(&self) -> bool {
         self.scanned.enhanced_paste
+    }
+
+    /// Enabled input modes as sorted DEC private mode numbers, e.g.
+    /// `"1000,1006,2004,5522"`; empty when none are on.
+    pub fn input_modes(&self) -> String {
+        let mode = *self.terminal.mode();
+        let mut numbers = RESTORABLE_INPUT_MODES
+            .iter()
+            .filter(|(_, flag)| mode.contains(*flag))
+            .map(|(number, _)| *number)
+            .collect::<Vec<_>>();
+        if self.scanned.enhanced_paste {
+            numbers.push(ENHANCED_PASTE_MODE_NUMBER);
+        }
+        numbers
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Re-enables input modes saved by [`Self::input_modes`], as if the
+    /// application had just set them. Unknown numbers are ignored.
+    pub fn restore_input_modes(&mut self, encoded: &str) {
+        for number in encoded
+            .split(',')
+            .filter_map(|part| part.trim().parse::<u16>().ok())
+        {
+            let restorable = number == ENHANCED_PASTE_MODE_NUMBER
+                || RESTORABLE_INPUT_MODES
+                    .iter()
+                    .any(|(known, _)| *known == number);
+            if restorable {
+                self.process_output(format!("\x1b[?{number}h").as_bytes());
+            }
+        }
     }
 
     /// Drains kitty-graphics image data changes since the last call.
@@ -1071,6 +1120,31 @@ mod tests {
         model.process_output(output.as_bytes());
         assert_eq!(model.take_image_events().len(), 1);
         assert_eq!(model.placed_images().len(), 1);
+    }
+
+    #[test]
+    fn input_modes_survive_a_rebuilt_model() {
+        let mut original = TerminalModel::new(20, 4);
+        original.process_output(b"\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?5522h\x1b[?1049h");
+        let saved = original.input_modes();
+        assert_eq!(saved, "1000,1006,2004,5522");
+
+        let mut rebuilt = TerminalModel::new(20, 4);
+        assert_eq!(rebuilt.input_modes(), "");
+        rebuilt.restore_input_modes(&saved);
+        assert!(rebuilt.bracketed_paste());
+        assert!(rebuilt.mouse_reporting());
+        assert!(rebuilt.sgr_mouse());
+        assert!(rebuilt.enhanced_paste());
+        assert_eq!(rebuilt.input_modes(), saved);
+    }
+
+    #[test]
+    fn restoring_input_modes_ignores_anything_but_known_input_modes() {
+        let mut model = TerminalModel::new(20, 4);
+        model.restore_input_modes("1049, 25,abc,,9999,2004");
+        assert_eq!(model.input_modes(), "2004");
+        assert!(!model.terminal().mode().contains(TermMode::ALT_SCREEN));
     }
 
     #[test]

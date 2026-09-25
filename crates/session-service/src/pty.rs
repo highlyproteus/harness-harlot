@@ -30,6 +30,8 @@ use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use uuid::Uuid;
 
+mod input_modes;
+
 pub(crate) const INITIAL_COLUMNS: u16 = 100;
 
 pub(crate) const INITIAL_ROWS: u16 = 30;
@@ -242,6 +244,8 @@ pub(crate) struct PtySession {
     events: Arc<Mutex<VecDeque<RawPaneEvent>>>,
     paste_events: Arc<PasteEvents>,
     images: Arc<TerminalImageStore>,
+    /// Input modes last stored in the tmux pane (see `input_modes`).
+    saved_input_modes: Mutex<String>,
 }
 
 enum Transport {
@@ -463,14 +467,16 @@ impl PtySession {
         shell_pid: u32,
     ) -> Result<Arc<Self>> {
         let captured = client.capture_pane(&tmux_pane_id)?;
-        Self::new_tmux_transport(
+        let session = Self::new_tmux_transport(
             pane_id,
             client,
             window_id,
             tmux_pane_id,
             shell_pid,
             Some(captured),
-        )
+        )?;
+        session.restore_saved_input_modes();
+        Ok(session)
     }
 
     fn new_tmux_transport(
@@ -533,6 +539,7 @@ impl PtySession {
             events,
             paste_events,
             images,
+            saved_input_modes: Mutex::new(String::new()),
         });
         session.paste_events.bind(&session);
         Ok(session)
@@ -634,6 +641,7 @@ impl PtySession {
             events,
             paste_events,
             images,
+            saved_input_modes: Mutex::new(String::new()),
         });
         session.paste_events.bind(&session);
         Ok(session)

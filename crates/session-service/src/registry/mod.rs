@@ -1121,6 +1121,27 @@ impl SessionRegistry {
         self.shutdown_requested.load(Ordering::Acquire)
     }
 
+    /// Copies each tmux-backed terminal's input modes into its tmux pane when
+    /// they changed, so a restarted service can restore them on reattach.
+    pub fn save_terminal_input_modes(&self) {
+        let sessions = self
+            .state
+            .read()
+            .panes
+            .values()
+            .filter_map(|runtime| {
+                runtime
+                    .terminal()
+                    .map(|terminal| Arc::clone(&terminal.session))
+            })
+            .collect::<Vec<_>>();
+        for session in sessions {
+            if let Err(error) = session.save_input_modes() {
+                eprintln!("failed to save terminal input modes: {error:#}");
+            }
+        }
+    }
+
     pub fn persist(&self) -> Result<()> {
         refresh_process_metadata(&self.state, true);
         let bytes = {
