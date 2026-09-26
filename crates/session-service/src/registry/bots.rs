@@ -697,9 +697,9 @@ impl SessionRegistry {
         spec: &BotSpec,
         resume: Option<&str>,
     ) -> Result<PreparedLaunch> {
-        let mut agents = self.coding_agents(false)?;
+        let mut agents = self.coding_agents(false);
         if !agents.iter().any(|agent| agent.profile == spec.agent) {
-            agents = self.coding_agents(true)?;
+            agents = self.coding_agents(true);
         }
         let bot = BotLaunch {
             bot_id,

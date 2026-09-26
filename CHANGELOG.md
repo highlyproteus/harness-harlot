@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Thirteen more coding agents are recognized in terminals and offered for
+  Bots, each with its official icon where one is published: Pi, Amp, Qwen Code,
+  Grok Build, Kimi Code CLI, Antigravity CLI, Kiro CLI, Mistral Vibe, Crush,
+  goose, Cline CLI, Auggie CLI, and Continue CLI. omp now shows its icon too.
+
+### Fixed
+
+- Bots find every installed agent. The agent list read the `PATH` of a
+  login-only shell, which skips `~/.zshrc`, where installers for omp, Claude
+  Code, OpenCode, Grok, and npm-installed agents usually add their folder, so
+  most agents were missing. It now reads an interactive login shell's `PATH`,
+  also checks the common per-user install folders, and Rescan re-reads your
+  shell configuration.
+- Agents launched through Node, Bun, or Python (Gemini CLI, Pi, Qwen Code,
+  Kimi Code, npm installs of Codex and others) and symlinked installs (Claude
+  Code, Grok Build, Cursor) are recognized in terminals. Detection used only
+  the process name, which for these is `node`, `python`, or a version number;
+  it now also checks the install location and, when needed, the command the
+  agent was started with.
+- OpenCode's icon, and the new full-color icons, render in their own colors
+  instead of as a solid shape.
+
 ## [0.1.25] - 2026-09-25
 
 ### Added

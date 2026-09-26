@@ -55,11 +55,24 @@ pub(crate) fn bot_integration(profile: TerminalProfile, hh: &Path) -> BotIntegra
             BotIntegration::SetupCommand(format!("droid mcp add harness-harlot {hh} mcp"))
         }
         TerminalProfile::Terminal
+        | TerminalProfile::Pi
         | TerminalProfile::KiloCode
         | TerminalProfile::Cursor
         | TerminalProfile::OpenCode
         | TerminalProfile::Aider
         | TerminalProfile::GitHubCopilot
+        | TerminalProfile::Amp
+        | TerminalProfile::QwenCode
+        | TerminalProfile::GrokBuild
+        | TerminalProfile::KimiCode
+        | TerminalProfile::Antigravity
+        | TerminalProfile::KiroCli
+        | TerminalProfile::MistralVibe
+        | TerminalProfile::Crush
+        | TerminalProfile::Goose
+        | TerminalProfile::Cline
+        | TerminalProfile::Auggie
+        | TerminalProfile::ContinueCli
         | TerminalProfile::Tmux => BotIntegration::ManualConfig,
     }
 }
@@ -155,7 +168,7 @@ impl HhApp {
             );
         } else if state.loaded && state.agents.is_empty() {
             rows.push(settings_row(
-                "No coding agent CLIs were found on your login PATH",
+                "No coding agent CLIs were found in your shell's PATH",
                 Some("Install omp, Claude Code, Codex, Hermes, or another supported agent and click Rescan".to_owned()),
                 div().into_any_element(),
             ));
@@ -227,7 +240,7 @@ impl HhApp {
     fn render_agent_integration_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if self.coding_agents.agents.is_empty() {
             return vec![note(
-                "Installed agents appear here once found on your login PATH.",
+                "Installed agents appear here once found in your shell's PATH.",
             )];
         }
         let hh = hh_command();

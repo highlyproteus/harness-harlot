@@ -5,8 +5,9 @@ use crate::process::valid_local_cwd;
 use crate::registry::status::omp_title_status;
 use hh_protocol::{
     NotificationKind, Pane, PaneStatus, SessionSnapshot, TerminalIdentity, TerminalIdentitySource,
-    TerminalProfile, WorkspaceConnection, WorkspaceConnectionStatus, terminal_profile_for_command,
-    terminal_profile_for_executable, terminal_profile_for_title,
+    TerminalProfile, WorkspaceConnection, WorkspaceConnectionStatus,
+    terminal_profile_for_arguments, terminal_profile_for_command, terminal_profile_for_executable,
+    terminal_profile_for_title,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
@@ -82,7 +83,7 @@ pub(crate) fn refresh_process_metadata(shared: &Arc<RwLock<RegistryState>>, forc
                 .map(|(pane_id, pid)| {
                     (
                         *pane_id,
-                        discover_descendant_profile(&system, &children, *pid),
+                        discover_descendant_profile(&mut system, &children, *pid),
                     )
                 })
                 .collect::<HashMap<_, _>>()
@@ -300,8 +301,11 @@ fn process_children(system: &System) -> HashMap<Pid, Vec<Pid>> {
     children
 }
 
+/// Breadth-first over the pane's descendants: a process is identified by its
+/// name, then its executable's install location, and only then by its command
+/// line, which is read for that one process on demand.
 pub(crate) fn discover_descendant_profile(
-    system: &System,
+    system: &mut System,
     children: &HashMap<Pid, Vec<Pid>>,
     root: Pid,
 ) -> Option<TerminalProfile> {
@@ -316,14 +320,24 @@ pub(crate) fn discover_descendant_profile(
             if inspected > MAX_DISCOVERY_DESCENDANTS_PER_PANE {
                 return None;
             }
-            if let Some(process) = system.process(*child)
-                && let Some(profile) = process
+            let profile = system.process(*child).and_then(|process| {
+                process
                     .name()
                     .to_str()
                     .and_then(terminal_profile_for_command)
                     .or_else(|| process.exe().and_then(terminal_profile_for_executable))
-            {
-                return Some(profile);
+            });
+            let profile = profile.or_else(|| {
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[*child]),
+                    ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
+                );
+                system
+                    .process(*child)
+                    .and_then(|process| terminal_profile_for_arguments(process.cmd()))
+            });
+            if profile.is_some() {
+                return profile;
             }
             queue.push_back((*child, depth + 1));
         }
