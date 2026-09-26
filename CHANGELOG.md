@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-09-25
+
 ### Added
 
 - **Settings → Permissions** (macOS) shows whether programs in your terminals,
@@ -13,7 +15,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **Allow…** buttons that show the macOS prompt or open the right System
   Settings page. The status refreshes when you come back to the app. A
   **Permissions** button appears in the sidebar when you have granted a
-  permission that the running terminals can't use yet.
+  permission that the running terminals can't use yet. Because macOS ties a
+  grant to the exact build, the first **Allow…** clears the entry an earlier
+  build left behind, which otherwise hides the prompt behind a switch that no
+  longer does anything.
 - `hh doctor` reports whether the terminal it runs in may record the screen
   and use Accessibility.
 
