@@ -98,6 +98,31 @@ impl Permission {
             Self::Accessibility => ACCESSIBILITY_SETTINGS,
         }
     }
+
+    /// The `tccutil` service name.
+    const fn tcc_service(self) -> &'static str {
+        match self {
+            Self::ScreenRecording => "ScreenCapture",
+            Self::Accessibility => "Accessibility",
+        }
+    }
+}
+
+/// Clears this app's entry for `permission`. macOS keys each entry to the
+/// exact build that was granted; unnotarized builds differ on every update,
+/// so an entry left by an earlier build keeps its switch shown in System
+/// Settings while blocking this build's prompt. Only called while this build
+/// lacks the permission, so no working grant is lost.
+fn reset_outdated_grant(permission: Permission) {
+    let Some(bundle) = hh_macos_privacy::main_bundle_identifier() else {
+        return;
+    };
+    let _ = Command::new("/usr/bin/tccutil")
+        .args(["reset", permission.tcc_service(), &bundle])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -178,7 +203,7 @@ fn current_status() -> Result<PrivacyStatus> {
     let grants = serde_json::from_slice(&output).context("decode privacy permissions")?;
     Ok(PrivacyStatus {
         grants,
-        terminals: terminal_attribution(&desktop),
+        terminals: terminal_attribution(),
     })
 }
 
@@ -187,19 +212,22 @@ fn desktop_executable() -> Result<PathBuf> {
     std::fs::canonicalize(&executable).with_context(|| format!("resolve {}", executable.display()))
 }
 
-fn terminal_attribution(desktop: &Path) -> TerminalAttribution {
+fn terminal_attribution() -> TerminalAttribution {
     if std::env::var_os("HH_DISABLE_BUNDLED_SERVICE").is_some() {
         return TerminalAttribution::Unmanaged;
     }
     let Some(service) = service_pid() else {
         return TerminalAttribution::NoService;
     };
+    // Grants follow the exact build, so the host must run this build's code,
+    // not merely the same path, which a rebuilt or updated bundle reuses.
+    let own_code = hh_macos_privacy::code_hash(std::process::id());
     let hosted = |pid| {
-        hh_macos_privacy::responsible_pid(pid)
-            .filter(|host| *host != pid)
-            .and_then(hh_macos_privacy::executable_path)
-            .and_then(|path| std::fs::canonicalize(path).ok())
-            .is_some_and(|path| path == desktop)
+        own_code.is_some()
+            && hh_macos_privacy::responsible_pid(pid)
+                .filter(|host| *host != pid)
+                .and_then(hh_macos_privacy::code_hash)
+                == own_code
     };
     if hosted(service) && tmux_server_pid().is_none_or(hosted) {
         TerminalAttribution::Current
@@ -348,6 +376,7 @@ impl HhApp {
             cx.open_url(permission.settings_url());
         } else {
             *prompted = true;
+            reset_outdated_grant(permission);
             match permission {
                 Permission::ScreenRecording => {
                     hh_macos_privacy::request_screen_recording();

@@ -49,11 +49,19 @@ across window restarts and compatible updates.
 
 A tmux server started by an older service, or by a host from a different app
 build, keeps that attribution. **Settings → Permissions** detects this by
-comparing the service's and tmux server's responsible processes (found through
-`LOCAL_PEERPID` on their sockets) with the running app binary, and offers
-**Restart Terminals**: SIGTERM the service so it persists the layout, SIGTERM
-the tmux server, then start a new host. Panes reopen through the fallback
-described above.
+comparing the code hash of the service's and tmux server's responsible
+processes (found through `LOCAL_PEERPID` on their sockets) with the running
+app's; paths are not enough because a rebuilt or updated bundle reuses them.
+It offers **Restart Terminals**: SIGTERM the service so it persists the
+layout, SIGTERM the tmux server, then start a new host. Panes reopen through
+the fallback described above.
+
+macOS keys each grant to the exact build it was given to. An unnotarized
+build differs on every update, so an older build's entry keeps its switch in
+System Settings while silently blocking the new build's prompt. The first
+**Allow…** click therefore runs `tccutil reset <service> <bundle id>` for the
+missing permission before asking, which removes only entries that no longer
+work for this build.
 
 ## Storage safety
 
