@@ -1,0 +1,14 @@
+[package]
+name = "hh-macos-privacy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "macOS privacy permission and process-responsibility bridge for Harness Harlot"
+publish = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -2818,6 +2818,7 @@ dependencies = [
  "gpui",
  "hh-cef-view",
  "hh-macos-icon",
+ "hh-macos-privacy",
  "hh-protocol",
  "hh-session-client",
  "hh-updater",
@@ -2843,6 +2844,13 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+]
+
+[[package]]
+name = "hh-macos-privacy"
+version = "0.1.24"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
