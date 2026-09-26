@@ -1030,16 +1030,28 @@ pub(super) enum SettingsSection {
     #[default]
     Appearance,
     Bots,
+    #[cfg(target_os = "macos")]
+    Permissions,
     Updates,
 }
 
 impl SettingsSection {
+    #[cfg(target_os = "macos")]
+    pub(super) const ALL: [Self; 4] = [
+        Self::Appearance,
+        Self::Bots,
+        Self::Permissions,
+        Self::Updates,
+    ];
+    #[cfg(not(target_os = "macos"))]
     pub(super) const ALL: [Self; 3] = [Self::Appearance, Self::Bots, Self::Updates];
 
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
             Self::Bots => "Bots",
+            #[cfg(target_os = "macos")]
+            Self::Permissions => "Permissions",
             Self::Updates => "Updates",
         }
     }

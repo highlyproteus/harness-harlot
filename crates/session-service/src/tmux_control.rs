@@ -111,48 +111,10 @@ impl TmuxServer {
 
         Ok(Some(Self {
             binary,
-            socket_name: managed_tmux_socket_name(state_dir),
+            socket_name: hh_protocol::managed_tmux_socket_name(state_dir),
             config_path,
         }))
     }
-}
-
-/// Names the private tmux server (`tmux -L <name>`) owned by `state_dir`.
-///
-/// The default install keeps the readable `hh` (release) or `hh-dev` (debug)
-/// socket. Any other state directory, including every `HH_STATE_DIR`
-/// override, gets `hh-<fnv1a64 of the canonical path>` so disposable test and
-/// custom-state services never share or disrupt the app's live server. The
-/// digest is fixed (not `DefaultHasher`) so a restarted or updated service
-/// finds the same server again.
-#[must_use]
-pub fn managed_tmux_socket_name(state_dir: &Path) -> String {
-    let canonical = canonical_state_dir(state_dir);
-    let is_default_install = std::env::var_os(hh_protocol::STATE_DIR_ENV).is_none()
-        && hh_protocol::state_directory()
-            .is_some_and(|default| canonical_state_dir(&default) == canonical);
-    if is_default_install {
-        let name = if cfg!(debug_assertions) {
-            "hh-dev"
-        } else {
-            "hh"
-        };
-        return name.to_owned();
-    }
-    format!(
-        "hh-{:016x}",
-        fnv1a64(canonical.as_os_str().as_encoded_bytes())
-    )
-}
-
-fn canonical_state_dir(state_dir: &Path) -> PathBuf {
-    std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf())
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
 }
 
 /// Kills a private test tmux server and removes its socket file when
@@ -178,10 +140,7 @@ impl Drop for PrivateTmuxServerGuard {
             .stderr(Stdio::null())
             .status();
         // tmux leaves the socket file behind on macOS after the server exits.
-        let base =
-            std::env::var_os("TMUX_TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        let uid = rustix::process::getuid().as_raw();
-        let _ = std::fs::remove_file(base.join(format!("tmux-{uid}")).join(&self.socket_name));
+        let _ = std::fs::remove_file(hh_protocol::tmux_socket_path(&self.socket_name));
     }
 }
 

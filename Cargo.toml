@@ -3,6 +3,7 @@ members = [
   "crates/desktop",
   "crates/cef-view",
   "crates/macos-icon",
+  "crates/macos-privacy",
   "crates/protocol",
   "crates/session-service",
   "crates/session-client",

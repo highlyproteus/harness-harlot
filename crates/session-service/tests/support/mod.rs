@@ -7,7 +7,7 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use hh_session_service::managed_tmux_socket_name;
+use hh_protocol::{managed_tmux_socket_name, tmux_socket_path};
 use uuid::Uuid;
 
 /// Owner-only temporary state directory for one test registry.
@@ -60,10 +60,7 @@ impl Drop for TestStateDir {
             .stderr(Stdio::null())
             .status();
         // tmux leaves the socket file behind on macOS after the server exits.
-        let base =
-            std::env::var_os("TMUX_TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        let uid = rustix::process::getuid().as_raw();
-        let _ = fs::remove_file(base.join(format!("tmux-{uid}")).join(&self.socket_name));
+        let _ = fs::remove_file(tmux_socket_path(&self.socket_name));
         let _ = fs::remove_dir_all(&self.path);
     }
 }

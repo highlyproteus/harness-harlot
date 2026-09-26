@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 #[cfg(test)]
 use std::path::PathBuf;
+#[cfg(not(target_os = "macos"))]
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
@@ -50,6 +51,8 @@ mod notifications;
 mod pane_identity;
 mod panes;
 mod pipeline;
+#[cfg(target_os = "macos")]
+mod privacy;
 mod reconcile;
 mod render;
 mod session;
@@ -389,6 +392,8 @@ struct EditorUi {
     workspace_input_bounds: [Option<Bounds<Pixels>>; 4],
     update_available: Option<AvailableUpdateBanner>,
     update_check: UpdateCheckState,
+    #[cfg(target_os = "macos")]
+    privacy: privacy::PrivacyUi,
 }
 
 impl EditorUi {
@@ -405,6 +410,8 @@ impl EditorUi {
             workspace_input_bounds: [None, None, None, None],
             update_available: None,
             update_check: UpdateCheckState::default(),
+            #[cfg(target_os = "macos")]
+            privacy: privacy::PrivacyUi::default(),
         }
     }
 }
@@ -623,6 +630,9 @@ impl HhApp {
             this.session.window_active = window.is_window_active();
             if this.session.window_active {
                 this.mark_focused_pane_viewed();
+                // Returning from System Settings is the usual moment a grant changes.
+                #[cfg(target_os = "macos")]
+                this.refresh_privacy_status(cx);
                 cx.notify();
                 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
                 {
@@ -684,6 +694,17 @@ impl HhApp {
             })
             .detach();
         }
+        #[cfg(target_os = "macos")]
+        cx.spawn(async move |this, cx| {
+            loop {
+                gpui::Timer::after(privacy::VISIBLE_REFRESH).await;
+                let Ok(()) = this.update(cx, |this, cx| this.refresh_privacy_status_if_due(cx))
+                else {
+                    break;
+                };
+            }
+        })
+        .detach();
         app
     }
     /// Screen traffic: pane updates and targeted pane snapshots. Kept only for the synchronous startup fetch; everything
@@ -724,7 +745,9 @@ impl HhApp {
 /// closing or replacing the app UI never asks it to stop, preserving active
 /// terminal sessions. Protocol-changing updates stop it with
 /// `hh-update-tool install --restart-service` after user confirmation; local
-/// terminals reattach through HH's private tmux server when available.
+/// terminals reattach through HH's private tmux server when available. On
+/// macOS it runs under a session host so terminals keep the app's privacy
+/// permissions after the window closes.
 fn ensure_bundled_session_service() {
     if std::env::var_os("HH_DISABLE_BUNDLED_SERVICE").is_some()
         || SessionClient::connect()
@@ -750,8 +773,15 @@ fn ensure_bundled_session_service() {
     if !service.is_file() {
         return;
     }
-    if let Err(error) = Command::new(service).spawn() {
-        eprintln!("Harness Harlot could not start its bundled session service: {error}");
+    #[cfg(target_os = "macos")]
+    let started = privacy::start_session_host();
+    #[cfg(not(target_os = "macos"))]
+    let started = Command::new(service)
+        .spawn()
+        .map(drop)
+        .map_err(anyhow::Error::from);
+    if let Err(error) = started {
+        eprintln!("Harness Harlot could not start its bundled session service: {error:#}");
         return;
     }
 

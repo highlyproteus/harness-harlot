@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::BufReader;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -154,6 +155,16 @@ impl SessionClient {
             valid: true,
         })
     }
+}
+
+/// The connected session socket, e.g. to identify the service process.
+impl AsFd for SessionClient {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+impl SessionClient {
     /// Changes the deadline used by subsequent blocking response reads.
     ///
     /// # Errors

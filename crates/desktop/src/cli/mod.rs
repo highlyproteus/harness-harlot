@@ -27,6 +27,12 @@ pub(crate) enum CliAction {
     Doctor,
     InstallCli,
     Agent(AgentCommand),
+    /// Internal: the long-lived parent of the session service (macOS).
+    #[cfg(target_os = "macos")]
+    SessionHost,
+    /// Internal: prints this process's privacy grants as JSON (macOS).
+    #[cfg(target_os = "macos")]
+    PrivacyStatus,
 }
 
 pub(crate) fn parse_cli_action<I, S>(arguments: I) -> Result<CliAction>
@@ -43,6 +49,12 @@ where
         [argument] if argument == "version" || argument == "--version" => Ok(CliAction::Version),
         [argument] if argument == "doctor" => Ok(CliAction::Doctor),
         [argument] if argument == "install-cli" => Ok(CliAction::InstallCli),
+        #[cfg(target_os = "macos")]
+        [argument] if argument == crate::privacy::SESSION_HOST_COMMAND => {
+            Ok(CliAction::SessionHost)
+        }
+        #[cfg(target_os = "macos")]
+        [argument] if argument == crate::privacy::STATUS_COMMAND => Ok(CliAction::PrivacyStatus),
         [command, arguments @ ..] if command == "update" => {
             parse_update_options(arguments).map(CliAction::Update)
         }
@@ -222,6 +234,19 @@ pub(crate) fn run_cli_or_request_desktop() -> Result<bool> {
             println!("build: {}", hh_updater::current_build());
             println!("session service: {}", service.display());
             println!("updater: {}", updater.display());
+            // Answers for this process, i.e. for the terminal running `hh doctor`.
+            #[cfg(target_os = "macos")]
+            {
+                let allowed = |allowed| if allowed { "allowed" } else { "not allowed" };
+                println!(
+                    "screen recording: {}",
+                    allowed(hh_macos_privacy::screen_recording_allowed())
+                );
+                println!(
+                    "accessibility: {}",
+                    allowed(hh_macos_privacy::accessibility_allowed())
+                );
+            }
             println!("Harness Harlot installation is healthy");
         }
         CliAction::InstallCli => {
@@ -255,6 +280,12 @@ pub(crate) fn run_cli_or_request_desktop() -> Result<bool> {
                 agent::print_result(&result, command.context.json)?;
             }
         },
+        #[cfg(target_os = "macos")]
+        CliAction::SessionHost => {
+            crate::privacy::run_session_host(&bundled_executable("hh-service")?)?;
+        }
+        #[cfg(target_os = "macos")]
+        CliAction::PrivacyStatus => crate::privacy::print_status()?,
     }
     Ok(false)
 }

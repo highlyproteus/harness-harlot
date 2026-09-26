@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Settings → Permissions** (macOS) shows whether programs in your terminals,
+  such as coding agents, may use Screen Recording and Accessibility, with
+  **Allow…** buttons that show the macOS prompt or open the right System
+  Settings page. The status refreshes when you come back to the app. A
+  **Permissions** button appears in the sidebar when you have granted a
+  permission that the running terminals can't use yet.
+- `hh doctor` reports whether the terminal it runs in may record the screen
+  and use Accessibility.
+
+### Fixed
+
+- Terminal programs keep Harness Harlot's macOS privacy permissions after the
+  window closes, relaunches, or updates. macOS credits those permissions to the
+  app process that started a program, and terminals outlive the window, so
+  they used to lose them the first time the app quit. The session service now
+  runs under `hh session-host`, a windowless copy of the app that stays alive
+  as long as any terminal does. Terminals started before this release need one
+  restart to pick this up: **Settings → Permissions → Restart Terminals**
+  closes every running terminal program and reopens the tabs as fresh shells in
+  the same folders.
+
 ## [0.1.24] - 2026-09-25
 
 ### Added
