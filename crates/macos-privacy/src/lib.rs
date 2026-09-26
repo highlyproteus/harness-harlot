@@ -19,7 +19,7 @@ use std::io::{self, Read as _};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitStatus;
 use std::ptr;
 
@@ -56,7 +56,18 @@ unsafe extern "C" {
         value_callbacks: *const c_void,
     ) -> *const c_void;
     fn CFRelease(object: *const c_void);
+    fn CFBundleGetMainBundle() -> *const c_void;
+    fn CFBundleGetIdentifier(bundle: *const c_void) -> *const c_void;
+    fn CFStringGetCString(
+        string: *const c_void,
+        buffer: *mut c_char,
+        size: isize,
+        encoding: u32,
+    ) -> u8;
 }
+
+/// `kCFStringEncodingUTF8`.
+const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 // libSystem SPI used by Chromium, LLDB, and terminal emulators to launch a
 // child that is its own responsible process.
@@ -66,6 +77,7 @@ unsafe extern "C" {
         disclaim: c_int,
     ) -> c_int;
     safe fn responsibility_get_pid_responsible_for_pid(pid: libc::pid_t) -> libc::pid_t;
+    fn csops(pid: libc::pid_t, operation: u32, buffer: *mut c_void, size: usize) -> c_int;
 }
 
 /// Whether this process's responsible app may record the screen. A process
@@ -87,6 +99,37 @@ pub fn request_screen_recording() -> bool {
 pub fn accessibility_allowed() -> bool {
     // SAFETY: a null options dictionary is documented as "no options".
     unsafe { AXIsProcessTrustedWithOptions(ptr::null()) != 0 }
+}
+
+/// The running app bundle's identifier, or `None` outside an app bundle.
+#[must_use]
+pub fn main_bundle_identifier() -> Option<String> {
+    const BUFFER_LENGTH: isize = 256;
+    let mut buffer = [0 as c_char; BUFFER_LENGTH as usize];
+    // SAFETY: both CF getters follow the Get rule (no ownership transfer);
+    // the buffer is writable for the length passed and NUL-terminated on
+    // success.
+    unsafe {
+        let bundle = CFBundleGetMainBundle();
+        if bundle.is_null() {
+            return None;
+        }
+        let identifier = CFBundleGetIdentifier(bundle);
+        if identifier.is_null()
+            || CFStringGetCString(
+                identifier,
+                buffer.as_mut_ptr(),
+                BUFFER_LENGTH,
+                CF_STRING_ENCODING_UTF8,
+            ) == 0
+        {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(buffer.as_ptr())
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    }
 }
 
 /// Shows the system Accessibility prompt when the app is not yet trusted.
@@ -268,22 +311,17 @@ pub fn processes_responsible_to(pid: u32) -> io::Result<Vec<u32>> {
         .collect())
 }
 
-/// The executable path of a live process.
+/// The code directory hash of a live process's signed code: the identity
+/// macOS privacy grants follow for ad-hoc-signed builds.
 #[must_use]
-pub fn executable_path(pid: u32) -> Option<PathBuf> {
-    let pid = c_int::try_from(pid).ok()?;
-    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+pub fn code_hash(pid: u32) -> Option<[u8; 20]> {
+    /// `<sys/codesign.h>` `CS_OPS_CDHASH`.
+    const CS_OPS_CDHASH: u32 = 5;
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let mut hash = [0_u8; 20];
     // SAFETY: the buffer is writable for the length passed.
-    let length = unsafe {
-        libc::proc_pidpath(
-            pid,
-            buffer.as_mut_ptr().cast(),
-            libc::PROC_PIDPATHINFO_MAXSIZE as u32,
-        )
-    };
-    let length = usize::try_from(length).ok().filter(|length| *length > 0)?;
-    buffer.truncate(length);
-    Some(PathBuf::from(OsStr::from_bytes(&buffer)))
+    let result = unsafe { csops(pid, CS_OPS_CDHASH, hash.as_mut_ptr().cast(), hash.len()) };
+    (result == 0).then_some(hash)
 }
 
 /// The process on the other end of a connected Unix-domain socket.
