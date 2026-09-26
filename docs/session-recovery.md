@@ -34,6 +34,35 @@ before the desktop quits, then uses `--restart-service` to request shutdown and,
 if necessary, SIGTERM the managed service so it can persist. Compatible updates
 leave the service and live shells running without a service restart.
 
+## macOS privacy attribution
+
+macOS grants Screen Recording and Accessibility to a process's *responsible
+process*, inherited from the app that launched it. When that app process
+exits, its descendants become responsible for themselves and lose the app's
+permissions. The desktop therefore starts the session service through
+`hh session-host`: the app's own `hh` binary, spawned with responsibility
+disclaimed (`responsibility_spawnattrs_setdisclaim`) in a new session. The host
+runs `hh-service` as a child and, after it exits, stays alive while any process
+it is responsible for still runs, which includes the detached private tmux
+server and every shell in it. Terminals therefore keep the app's grants
+across window restarts and compatible updates.
+
+A tmux server started by an older service, or by a host from a different app
+build, keeps that attribution. **Settings → Permissions** detects this by
+comparing the code hash of the service's and tmux server's responsible
+processes (found through `LOCAL_PEERPID` on their sockets) with the running
+app's; paths are not enough because a rebuilt or updated bundle reuses them.
+It offers **Restart Terminals**: SIGTERM the service so it persists the
+layout, SIGTERM the tmux server, then start a new host. Panes reopen through
+the fallback described above.
+
+macOS keys each grant to the exact build it was given to. An unnotarized
+build differs on every update, so an older build's entry keeps its switch in
+System Settings while silently blocking the new build's prompt. The first
+**Allow…** click therefore runs `tccutil reset <service> <bundle id>` for the
+missing permission before asking, which removes only entries that no longer
+work for this build.
+
 ## Storage safety
 
 Fresh stable installs write `sessions.json` under `~/Library/Application Support/Harness Harlot` on macOS and `$XDG_STATE_HOME/hh` (or `~/.local/state/hh`) on Linux. Development builds use the separate durable `Harness Harlot Dev` or `hh-dev` state directory by default. `HH_STATE_DIR` remains available for disposable isolated tests and packaging. The directory is mode `0700` and snapshots are mode `0600`.

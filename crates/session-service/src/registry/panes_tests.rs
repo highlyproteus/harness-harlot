@@ -4,7 +4,7 @@ use crate::layout::{
     pane_in_layout,
 };
 use crate::pty::{TEST_LOCAL_SSH_SEAM_ENABLED, validate_terminal_dimensions};
-use crate::registry::{SessionRegistry, create_owner_only_directory};
+use crate::registry::{SessionRegistry, create_owner_only_directory, refresh_runtime_metadata};
 use hh_protocol::DropPlacement;
 use std::fs;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn ssh_test_seam_honors_workspace_directory_and_keeps_direct_tabs_offline() {
     let directory = std::env::temp_dir().join(format!("hh-ssh-working-dir-{}", Uuid::new_v4()));
     create_owner_only_directory(&directory);
@@ -40,6 +41,52 @@ fn ssh_test_seam_honors_workspace_directory_and_keeps_direct_tabs_offline() {
         directory
     );
     drop(state);
+
+    // A remote tab is named for its host, not this machine's folder, and an
+    // omp there is tracked from its title alone: working, then a finished
+    // turn that stays Done when the title tracker later re-reads `π >`.
+    let pane = || {
+        find_pane_in_snapshot(&registry.snapshot().unwrap(), pane_id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(pane().title, "SSH admin@test-host");
+    registry
+        .write_input(
+            pane_id,
+            "exec sh -c \"printf '\\033]0;π ⠋ fixing\\007'; sleep 1; printf '\\033]0;π > fixing\\007'; sleep 30\"\r".as_bytes(),
+        )
+        .unwrap();
+    let observe = |title: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while registry
+            .state
+            .read()
+            .terminal_pane(pane_id)
+            .unwrap()
+            .session
+            .terminal_title()
+            .as_deref()
+            != Some(title)
+        {
+            assert!(Instant::now() < deadline, "title {title:?} never arrived");
+            thread::sleep(Duration::from_millis(10));
+        }
+        refresh_runtime_metadata(&mut registry.state.write());
+    };
+    observe("π ⠋ fixing");
+    assert_eq!(pane().identity.profile, TerminalProfile::Omp);
+    assert_eq!(pane().status, PaneStatus::Working);
+    observe("π > fixing");
+    assert_eq!(pane().status, PaneStatus::Done);
+    registry
+        .state
+        .write()
+        .terminal_pane_mut(pane_id)
+        .unwrap()
+        .omp_title_status = None;
+    refresh_runtime_metadata(&mut registry.state.write());
+    assert_eq!(pane().status, PaneStatus::Done);
     drop(registry);
 
     let recovered = SessionRegistry::persistent(snapshot_path).unwrap();

@@ -3,6 +3,7 @@ members = [
   "crates/desktop",
   "crates/cef-view",
   "crates/macos-icon",
+  "crates/macos-privacy",
   "crates/protocol",
   "crates/session-service",
   "crates/session-client",
@@ -13,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.24"
+version = "0.1.25"
 repository = "https://gitlab.com/highlyproteus/harness-harlot"
 edition = "2024"
 rust-version = "1.96"

@@ -328,12 +328,8 @@ impl HhApp {
         self.editor.modal = Modal::AppearanceSettings;
         // The section list lives in the sidebar, so Settings always shows it.
         self.sidebar.sidebar_visible = true;
-        self.editor.settings_section = section;
         self.editor.color_picker = None;
-        if section == SettingsSection::Bots && !self.coding_agents.loaded {
-            self.refresh_coding_agents(cx);
-        }
-        cx.notify();
+        self.select_settings_section(section, cx);
     }
 
     /// The toolbar ⚙ button: opens Settings, or closes it back to the
@@ -360,6 +356,10 @@ impl HhApp {
         self.editor.settings_section = section;
         if section == SettingsSection::Bots && !self.coding_agents.loaded {
             self.refresh_coding_agents(cx);
+        }
+        #[cfg(target_os = "macos")]
+        if section == SettingsSection::Permissions {
+            self.refresh_privacy_status(cx);
         }
         cx.notify();
     }
@@ -980,6 +980,8 @@ impl HhApp {
         let panel = match section {
             SettingsSection::Appearance => self.render_appearance_panel(cx),
             SettingsSection::Bots => self.render_bots_settings_panel(cx),
+            #[cfg(target_os = "macos")]
+            SettingsSection::Permissions => self.render_permissions_panel(cx),
             SettingsSection::Updates => vec![
                 settings_heading("Updates", "Signed automatic updates."),
                 self.render_update_settings(cx),

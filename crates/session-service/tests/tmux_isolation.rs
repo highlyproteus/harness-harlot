@@ -2,7 +2,8 @@ mod support;
 
 use std::process::{Command, Stdio};
 
-use hh_session_service::{SessionRegistry, managed_tmux_socket_name};
+use hh_protocol::managed_tmux_socket_name;
+use hh_session_service::SessionRegistry;
 use support::{TestStateDir, tmux_binary};
 
 #[test]

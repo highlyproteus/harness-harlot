@@ -6,7 +6,7 @@ use std::os::unix::fs::{
 use std::path::{Path, PathBuf};
 
 use crate::MAX_UNIX_SOCKET_PATH_BYTES;
-use rustix::process::geteuid;
+use rustix::process::{geteuid, getuid};
 use uuid::Uuid;
 pub const SOCKET_ENV: &str = "HH_SOCKET";
 pub const STATE_DIR_ENV: &str = "HH_STATE_DIR";
@@ -196,6 +196,53 @@ pub fn read_private_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
 
 fn development_build() -> bool {
     std::env::var(DEVELOPMENT_BUILD_ENV).as_deref() == Ok("1")
+}
+
+/// Names the private tmux server (`tmux -L <name>`) owned by `state_dir`.
+///
+/// The default install keeps the readable `hh` (release) or `hh-dev` (debug)
+/// socket. Any other state directory, including every `HH_STATE_DIR`
+/// override, gets `hh-<fnv1a64 of the canonical path>` so disposable test and
+/// custom-state services never share or disrupt the app's live server. The
+/// digest is fixed (not `DefaultHasher`) so a restarted or updated service
+/// finds the same server again.
+#[must_use]
+pub fn managed_tmux_socket_name(state_dir: &Path) -> String {
+    let canonical = canonical_state_dir(state_dir);
+    let is_default_install = std::env::var_os(STATE_DIR_ENV).is_none()
+        && state_directory().is_some_and(|default| canonical_state_dir(&default) == canonical);
+    if is_default_install {
+        let name = if cfg!(debug_assertions) {
+            "hh-dev"
+        } else {
+            "hh"
+        };
+        return name.to_owned();
+    }
+    format!(
+        "hh-{:016x}",
+        fnv1a64(canonical.as_os_str().as_encoded_bytes())
+    )
+}
+
+/// The socket file tmux creates for `tmux -L <socket_name>`:
+/// `$TMUX_TMPDIR/tmux-<uid>/<socket_name>`, with `TMUX_TMPDIR` defaulting to
+/// `/tmp`.
+#[must_use]
+pub fn tmux_socket_path(socket_name: &str) -> PathBuf {
+    let base = std::env::var_os("TMUX_TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    base.join(format!("tmux-{}", getuid().as_raw()))
+        .join(socket_name)
+}
+
+fn canonical_state_dir(state_dir: &Path) -> PathBuf {
+    fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf())
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// Child terminals receive this stable pane identifier.

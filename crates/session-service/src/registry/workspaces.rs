@@ -1,7 +1,7 @@
 //! Workstation lifecycle: creation, SSH intents, pins, order, and appearance defaults.
 use super::{
     RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry, SshWorkspaceIds,
-    TerminalRuntimePane, encode_desired_state,
+    TerminalRuntimePane, encode_desired_state, ssh_pane_title,
 };
 use crate::layout::{find_pane_mut, pane_ids_for_workspace};
 use crate::persistence::{MAX_RECENT_COLORS, MAX_WORKSPACES, validate_title};
@@ -355,7 +355,7 @@ impl SessionRegistry {
         let pane = Pane {
             id: ids.pane,
             kind: hh_protocol::PaneKind::Terminal,
-            title: format!("SSH {destination}"),
+            title: ssh_pane_title(destination),
             shell: "ssh".to_owned(),
             color: None,
             identity: TerminalIdentity::default(),
@@ -787,7 +787,7 @@ impl SessionRegistry {
             let pane = Pane {
                 id: pane_id,
                 kind: hh_protocol::PaneKind::Terminal,
-                title: format!("SSH {destination}"),
+                title: ssh_pane_title(destination),
                 shell: "ssh".to_owned(),
                 color: None,
                 identity: TerminalIdentity::default(),
@@ -817,7 +817,7 @@ impl SessionRegistry {
                     .iter_mut()
                     .find_map(|tab| find_pane_mut(&mut tab.layout, *pane_id))
                 {
-                    pane.title = format!("SSH {destination}");
+                    pane.title = ssh_pane_title(destination);
                     "ssh".clone_into(&mut pane.shell);
                 }
             }

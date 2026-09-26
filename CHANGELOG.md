@@ -6,6 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-09-25
+
+### Added
+
+- **Settings → Permissions** (macOS) shows whether programs in your terminals,
+  such as coding agents, may use Screen Recording and Accessibility, with
+  **Allow…** buttons that show the macOS prompt or open the right System
+  Settings page. The status refreshes when you come back to the app. A
+  **Permissions** button appears in the sidebar when you have granted a
+  permission that the running terminals can't use yet. Because macOS ties a
+  grant to the exact build, the first **Allow…** clears the entry an earlier
+  build left behind, which otherwise hides the prompt behind a switch that no
+  longer does anything.
+- `hh doctor` reports whether the terminal it runs in may record the screen
+  and use Accessibility.
+
+### Changed
+
+- Tab status: a working agent shows a slowly pulsing blue dot instead of the
+  spinner, and a finished one a solid blue dot that stays until you view the
+  tab. Orange means only that the agent needs you (input or an approval).
+
+### Fixed
+
+- Terminal programs keep Harness Harlot's macOS privacy permissions after the
+  window closes, relaunches, or updates. macOS credits those permissions to the
+  app process that started a program, and terminals outlive the window, so
+  they used to lose them the first time the app quit. The session service now
+  runs under `hh session-host`, a windowless copy of the app that stays alive
+  as long as any terminal does. Terminals started before this release need one
+  restart to pick this up: **Settings → Permissions → Restart Terminals**
+  closes every running terminal program and reopens the tabs as fresh shells in
+  the same folders.
+- omp's end-of-turn notification no longer turns its tab orange and then
+  blank. Inside HH omp announces a finished turn with a plain bell, which is now
+  read as Done unless omp is waiting on an ask or approval. A finished turn also
+  stays Done in Notifications until the next turn starts, instead of dropping to
+  idle when the title tracker re-reads omp's prompt.
+- Remote (SSH) workstation tabs get the same status tracking as local ones:
+  omp's `π` terminal title identifies it over SSH, so remote tabs show the
+  working and done dots and appear in Notifications.
+- New tabs on an SSH workstation are named for its host (`SSH devbox`) rather
+  than this machine's home folder, which made remote tabs look local.
+
 ## [0.1.24] - 2026-09-25
 
 ### Added

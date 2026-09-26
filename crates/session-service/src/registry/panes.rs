@@ -1,7 +1,7 @@
 //! Pane lifecycle: creation, input, identity overrides, and close/reattach.
 use super::{
     InitialTerminalSpawn, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
-    TerminalRuntimePane, encode_desired_state,
+    TerminalRuntimePane, encode_desired_state, ssh_pane_title,
 };
 use crate::gallery::import_gallery_image;
 use crate::layout::{
@@ -85,10 +85,7 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-            let mut new_pane = state.new_pane(new_id, Some(cwd.as_path()));
-            if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
-                "ssh".clone_into(&mut new_pane.shell);
-            }
+            let new_pane = state.new_runtime_pane(new_id, &cwd, &kind);
             let did_split = state.snapshot.workspaces.iter_mut().any(|workspace| {
                 workspace
                     .tabs
@@ -165,10 +162,7 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-            let mut pane = state.new_pane(new_id, Some(cwd.as_path()));
-            if matches!(kind, RuntimePaneKind::SystemSsh { .. }) {
-                "ssh".clone_into(&mut pane.shell);
-            }
+            let pane = state.new_runtime_pane(new_id, &cwd, &kind);
             let did_add = state.snapshot.workspaces.iter_mut().any(|workspace| {
                 workspace
                     .tabs
@@ -317,7 +311,7 @@ impl SessionRegistry {
                 kind: RuntimePaneKind::SystemSsh {
                     host: destination.clone(),
                 },
-                pane_title: format!("SSH {destination}"),
+                pane_title: ssh_pane_title(destination),
                 pane_shell: "ssh".to_owned(),
                 tab_title: "Remote".to_owned(),
             }),
@@ -468,7 +462,7 @@ impl SessionRegistry {
             let pane = Pane {
                 id: pane_id,
                 kind: hh_protocol::PaneKind::Terminal,
-                title: format!("SSH {host}"),
+                title: ssh_pane_title(host),
                 shell: "ssh".to_owned(),
                 color: None,
                 identity: TerminalIdentity::default(),
@@ -728,7 +722,7 @@ impl SessionRegistry {
                 (
                     terminal.session.terminal_title(),
                     terminal.detected_command_profile,
-                    terminal.last_valid_cwd.clone(),
+                    terminal.location(),
                 )
             }),
             None => bail!("pane {pane_id} does not exist"),
@@ -740,12 +734,12 @@ impl SessionRegistry {
         }
         pane.profile_override = profile;
         pane.custom_icon = None;
-        if let Some((title_signal, command_profile, cwd)) = terminal_identity {
+        if let Some((title_signal, command_profile, location)) = terminal_identity {
             resolve_pane_identity(
                 pane,
                 title_signal.as_deref(),
                 command_profile,
-                Some(cwd.as_path()),
+                Some(&location),
             );
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
@@ -782,7 +776,7 @@ impl SessionRegistry {
                 (
                     terminal.session.terminal_title(),
                     terminal.detected_command_profile,
-                    terminal.last_valid_cwd.clone(),
+                    terminal.location(),
                 )
             }),
             None => bail!("pane {pane_id} does not exist"),
@@ -792,12 +786,12 @@ impl SessionRegistry {
         pane.custom_title = None;
         pane.profile_override = None;
         pane.custom_icon = None;
-        if let Some((title_signal, command_profile, cwd)) = terminal_identity {
+        if let Some((title_signal, command_profile, location)) = terminal_identity {
             resolve_pane_identity(
                 pane,
                 title_signal.as_deref(),
                 command_profile,
-                Some(cwd.as_path()),
+                Some(&location),
             );
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);

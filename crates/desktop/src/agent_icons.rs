@@ -280,7 +280,7 @@ pub fn agent_icon_definition(profile: TerminalProfile) -> &'static AgentIconDefi
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgentIconAssets;
 
-const EMBEDDED_ASSETS: [(&str, &[u8]); 14] = [
+const EMBEDDED_ASSETS: [(&str, &[u8]); 13] = [
     (
         "agent-icons/hermes-agent.png",
         include_bytes!("../assets/agent-icons/hermes-agent.png"),
@@ -324,10 +324,6 @@ const EMBEDDED_ASSETS: [(&str, &[u8]); 14] = [
     (
         "agent-icons/browser-globe.svg",
         include_bytes!("../assets/agent-icons/browser-globe.svg"),
-    ),
-    (
-        "agent-icons/spinner.svg",
-        include_bytes!("../assets/agent-icons/spinner.svg"),
     ),
     (
         "agent-icons/hammer.svg",
