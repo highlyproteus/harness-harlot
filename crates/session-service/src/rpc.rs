@@ -793,7 +793,7 @@ fn handle_bots_request(
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::GetCodingAgents => Ok(ServiceResponse::CodingAgents {
-            agents: sessions.coding_agents(true)?,
+            agents: sessions.coding_agents(true),
         }),
         _ => unreachable!("bots request dispatched to the wrong handler"),
     }

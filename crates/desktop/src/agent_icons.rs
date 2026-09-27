@@ -14,6 +14,7 @@ use crate::ui_state::CanonicalPng;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentIconFormat {
     Svg,
+    ColorSvg,
     Png,
 }
 
@@ -141,10 +142,21 @@ fn matches_custom_icon_format(extension: &str, bytes: &[u8]) -> bool {
     }
 }
 
+/// Single-color mark drawn as a mask in the surrounding text color.
 const fn svg(path: &'static str, sha256: &'static str) -> AgentIconAsset {
     AgentIconAsset {
         path,
         format: AgentIconFormat::Svg,
+        sha256,
+    }
+}
+
+/// Artwork whose own colors (or backing tile) carry the mark, drawn as an
+/// image; as a mask it would render as a solid shape.
+const fn color_svg(path: &'static str, sha256: &'static str) -> AgentIconAsset {
+    AgentIconAsset {
+        path,
+        format: AgentIconFormat::ColorSvg,
         sha256,
     }
 }
@@ -159,7 +171,7 @@ const fn png(path: &'static str, sha256: &'static str) -> AgentIconAsset {
 
 /// Desktop-only icon registry. Assets are compiled into the executable and
 /// are never fetched or resolved from the user's environment at runtime.
-pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 13] = [
+pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 26] = [
     AgentIconDefinition {
         profile: TerminalProfile::Terminal,
         accessible_name: "Terminal",
@@ -178,8 +190,20 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 13] = [
     AgentIconDefinition {
         profile: TerminalProfile::Omp,
         accessible_name: "omp",
-        asset: None,
+        asset: Some(color_svg(
+            "agent-icons/omp.svg",
+            "9419975a0c24961341221c4cec18703db26a989fa037768f92cda74e3769fe05",
+        )),
         notice_key: "omp",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::Pi,
+        accessible_name: "Pi",
+        asset: Some(color_svg(
+            "agent-icons/pi.svg",
+            "abd66e7868b2d24f0f0895f9237ee8a6dcb22337583b0dc54aeb595acecb4d6b",
+        )),
+        notice_key: "pi",
     },
     AgentIconDefinition {
         profile: TerminalProfile::Codex,
@@ -229,7 +253,7 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 13] = [
     AgentIconDefinition {
         profile: TerminalProfile::OpenCode,
         accessible_name: "OpenCode",
-        asset: Some(svg(
+        asset: Some(color_svg(
             "agent-icons/opencode.svg",
             "e29bbe33380ad1c1ada9134b52f229d30e9776d60481512c9d81f2bb6f37def9",
         )),
@@ -260,6 +284,114 @@ pub const AGENT_ICON_REGISTRY: [AgentIconDefinition; 13] = [
         notice_key: "gemini-cli",
     },
     AgentIconDefinition {
+        profile: TerminalProfile::Amp,
+        accessible_name: "Amp",
+        asset: Some(png(
+            "agent-icons/amp.png",
+            "fbadb205d29ba1217d954a02412b3c1b7ac1ba09614b5765b596b7db690da833",
+        )),
+        notice_key: "amp",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::QwenCode,
+        accessible_name: "Qwen Code",
+        asset: Some(color_svg(
+            "agent-icons/qwen-code.svg",
+            "f7e324607c3f657953977d2742fbb8a3a0a354a13736671d27bfb906e9d1f3f2",
+        )),
+        notice_key: "qwen-code",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::GrokBuild,
+        accessible_name: "Grok Build",
+        asset: Some(svg(
+            "agent-icons/grok-build.svg",
+            "b20648e2f111d7fbc91f58b22d1e76e9885b68a163cb5a1010f7f11bf5840491",
+        )),
+        notice_key: "grok-build",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::KimiCode,
+        accessible_name: "Kimi Code CLI",
+        asset: Some(png(
+            "agent-icons/kimi-code-cli.png",
+            "dbd00e2ad61ea8832ef0b024662a4a8a5d1b66f0599d5d42e1c9688b9d4cfdf6",
+        )),
+        notice_key: "kimi-code-cli",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::Antigravity,
+        accessible_name: "Antigravity CLI",
+        asset: Some(png(
+            "agent-icons/antigravity-cli.png",
+            "8f0b95d2d21dbf930b4d100e2fdc4505673e900a731aa56ea633a4b59c312799",
+        )),
+        notice_key: "antigravity-cli",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::KiroCli,
+        accessible_name: "Kiro CLI",
+        asset: Some(png(
+            "agent-icons/kiro-cli.png",
+            "dcc333999ca9506662e97897d8b14ecd4a9f1eb15085a5b7e4f538915667e559",
+        )),
+        notice_key: "kiro-cli",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::MistralVibe,
+        accessible_name: "Mistral Vibe",
+        asset: Some(svg(
+            "agent-icons/mistral-vibe.svg",
+            "7c0e3122d2be9fc603c4e37956033f13bc8391da7d163e3ffc91ad80a59f40f9",
+        )),
+        notice_key: "mistral-vibe",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::Crush,
+        accessible_name: "Crush",
+        asset: Some(png(
+            "agent-icons/crush.png",
+            "2a92e5dafb44b8f9661421db739b4f97a58b10192638558f72effdb200e30c14",
+        )),
+        notice_key: "crush",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::Goose,
+        accessible_name: "goose",
+        asset: Some(color_svg(
+            "agent-icons/goose.svg",
+            "b4a9ab0aa1da378732f41c0e00733e7a37c9b97bab368ea6fddc25821ddbefc2",
+        )),
+        notice_key: "goose",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::Cline,
+        accessible_name: "Cline CLI",
+        asset: Some(color_svg(
+            "agent-icons/cline.svg",
+            "7ee1785df25a4b4d30609514608a29a2509f8ab33f53b63e2dabcfbff6dc7464",
+        )),
+        notice_key: "cline-cli",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::Auggie,
+        accessible_name: "Auggie CLI",
+        asset: Some(svg(
+            "agent-icons/auggie.svg",
+            "dfed39cd6e56aaa0a9d3c04e4eb6384707d677556146eae08f980cba7c1353f3",
+        )),
+        notice_key: "auggie-cli",
+    },
+    AgentIconDefinition {
+        profile: TerminalProfile::ContinueCli,
+        accessible_name: "Continue CLI",
+        asset: Some(color_svg(
+            "agent-icons/continue-cli.svg",
+            "1ed7c1c8c09f1910be3263dd4ded7b646ead52a464871d8ac6316af48af649b6",
+        )),
+        notice_key: "continue-cli",
+    },
+    AgentIconDefinition {
         profile: TerminalProfile::Tmux,
         accessible_name: "tmux",
         asset: Some(svg(
@@ -280,10 +412,18 @@ pub fn agent_icon_definition(profile: TerminalProfile) -> &'static AgentIconDefi
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AgentIconAssets;
 
-const EMBEDDED_ASSETS: [(&str, &[u8]); 13] = [
+const EMBEDDED_ASSETS: [(&str, &[u8]); 27] = [
     (
         "agent-icons/hermes-agent.png",
         include_bytes!("../assets/agent-icons/hermes-agent.png"),
+    ),
+    (
+        "agent-icons/omp.svg",
+        include_bytes!("../assets/agent-icons/omp.svg"),
+    ),
+    (
+        "agent-icons/pi.svg",
+        include_bytes!("../assets/agent-icons/pi.svg"),
     ),
     (
         "agent-icons/codex-cli.png",
@@ -316,6 +456,54 @@ const EMBEDDED_ASSETS: [(&str, &[u8]); 13] = [
     (
         "agent-icons/gemini-cli.png",
         include_bytes!("../assets/agent-icons/gemini-cli.png"),
+    ),
+    (
+        "agent-icons/amp.png",
+        include_bytes!("../assets/agent-icons/amp.png"),
+    ),
+    (
+        "agent-icons/qwen-code.svg",
+        include_bytes!("../assets/agent-icons/qwen-code.svg"),
+    ),
+    (
+        "agent-icons/grok-build.svg",
+        include_bytes!("../assets/agent-icons/grok-build.svg"),
+    ),
+    (
+        "agent-icons/kimi-code-cli.png",
+        include_bytes!("../assets/agent-icons/kimi-code-cli.png"),
+    ),
+    (
+        "agent-icons/antigravity-cli.png",
+        include_bytes!("../assets/agent-icons/antigravity-cli.png"),
+    ),
+    (
+        "agent-icons/kiro-cli.png",
+        include_bytes!("../assets/agent-icons/kiro-cli.png"),
+    ),
+    (
+        "agent-icons/mistral-vibe.svg",
+        include_bytes!("../assets/agent-icons/mistral-vibe.svg"),
+    ),
+    (
+        "agent-icons/crush.png",
+        include_bytes!("../assets/agent-icons/crush.png"),
+    ),
+    (
+        "agent-icons/goose.svg",
+        include_bytes!("../assets/agent-icons/goose.svg"),
+    ),
+    (
+        "agent-icons/cline.svg",
+        include_bytes!("../assets/agent-icons/cline.svg"),
+    ),
+    (
+        "agent-icons/auggie.svg",
+        include_bytes!("../assets/agent-icons/auggie.svg"),
+    ),
+    (
+        "agent-icons/continue-cli.svg",
+        include_bytes!("../assets/agent-icons/continue-cli.svg"),
     ),
     (
         "agent-icons/tmux.svg",

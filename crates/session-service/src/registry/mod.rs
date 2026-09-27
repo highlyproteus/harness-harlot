@@ -1156,14 +1156,14 @@ impl SessionRegistry {
         }
     }
 
-    /// Cached login-PATH scan for installed coding agent CLIs.
-    pub(crate) fn coding_agents(&self, refresh: bool) -> Result<Vec<CodingAgent>> {
+    /// Cached scan for installed coding agent CLIs; `refresh` rescans.
+    pub(crate) fn coding_agents(&self, refresh: bool) -> Vec<CodingAgent> {
         if !refresh && let Some(cached) = self.coding_agents.lock().clone() {
-            return Ok(cached);
+            return cached;
         }
-        let agents = discover_coding_agents()?;
+        let agents = discover_coding_agents();
         *self.coding_agents.lock() = Some(agents.clone());
-        Ok(agents)
+        agents
     }
 
     pub fn request_shutdown(&self) -> Result<()> {

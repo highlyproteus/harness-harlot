@@ -12,3 +12,12 @@ condition = "AND"
 regexTarget = "line"
 regexes = ['''key:\s+cef-8245a003c52c01811310b9b7d026e92dff859626-macosarm64''']
 paths = ['''^\.github/workflows/edge\.yml$''']
+
+[[rules]]
+id = "sourcegraph-access-token"
+
+[[rules.allowlists]]
+description = "Git commit and blob IDs recorded as icon provenance in the asset notices"
+regexTarget = "match"
+regexes = ['''^[0-9a-f]{40}`$''']
+paths = ['''^ASSET_NOTICES\.md$''']
