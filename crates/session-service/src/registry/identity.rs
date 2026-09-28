@@ -122,12 +122,12 @@ pub(crate) fn refresh_process_metadata(shared: &Arc<RwLock<RegistryState>>, forc
     refresh_runtime_metadata(&mut state);
 }
 
-/// Exit reason of a saved tmux window recovery could not reattach (session
-/// survival's `Transport::Unattached`, reported as `not reattached: <why>`).
-/// Its program is still running in the window.
+/// Exit reason of a saved tmux window recovery could not reattach
+/// (`Transport::Unattached`, reported as `not reattached: <why>`). Its
+/// program is still running in the window.
 pub(crate) const PANE_NOT_REATTACHED_PREFIX: &str = "not reattached:";
-/// Exit reason of a remote tmux pane whose SSH connection dropped (session
-/// survival's `REMOTE_CONNECTION_LOST`). Its program keeps running on the host.
+/// Exit reason of a remote tmux pane whose SSH connection dropped. Its
+/// program keeps running on the host.
 pub(crate) const PANE_CONNECTION_LOST: &str = "connection lost";
 /// Exit reason of a pane whose SSH workstation the user disconnected.
 pub(crate) const PANE_DISCONNECTED: &str = "disconnected";

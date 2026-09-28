@@ -243,7 +243,13 @@ revealing the selected image in Finder or the platform file manager.
 ## tmux
 
 - Local terminal panes use an HH-owned private tmux server when tmux 3.2 or
-  newer is installed, preserving processes and output across service restarts.
+  newer is installed, preserving processes and output across service restarts
+  and app updates. Only closing a tab ends its program.
+- SSH workstation terminals run in HH's tmux on the remote host, so they
+  survive dropped connections and restarts; Reconnect reattaches them with
+  full scrollback. The login must work without a prompt (known host key, key
+  in ssh-agent or the Keychain); otherwise a **Sign in to** *host* tab asks
+  once. See [session recovery](docs/session-recovery.md#ssh-workstations).
 - The managed server uses a private `hh` (`hh-dev` in development) socket and
   does not alter the user's default tmux server. A custom `HH_STATE_DIR` gets
   its own private server (`hh-<hash of the state directory>`).

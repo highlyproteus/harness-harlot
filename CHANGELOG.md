@@ -46,6 +46,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Notifications keeps a **Recent** list of the last 200 finished and attention
   notifications across restarts, with unread ones marked, and a **Mark all
   read** button. Rows are marked magenta for attention and green for finished.
+- SSH workstations keep running when the connection drops, the app quits, or
+  it updates. Their terminals are windows of Harness Harlot's own tmux on the
+  remote host (`tmux -L hh`, separate from your own tmux), and Reconnect
+  reattaches each tab with its full scrollback. Direct SSH tabs in a local
+  workstation work the same way. Workstations still stay offline after a
+  restart until you click Reconnect.
+- Hosts that need a password, passphrase, second factor, or a new host key
+  open a **Sign in to** *host* tab once. It leaves a shared SSH connection
+  that the workstation uses without prompting until the network drops. Hosts
+  without tmux 3.2 or newer keep working as plain SSH shells, and a
+  notification says so.
+- `recovery.log` in the app's data folder records how each terminal came back
+  after a restart, and when a lost tmux connection was re-established. It
+  holds ids and errors, never terminal output.
 
 ### Changed
 
@@ -82,6 +96,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The bell counts unread notifications, magenta when one needs you (including
   an agent asking for approval or input) and blue otherwise. The Dock icon
   shows the same count in macOS's standard red badge.
+- Closing a tab is the only thing that ends its terminal's program, for local
+  and SSH tabs alike. Quitting, updating, disconnecting, and a dropped
+  connection leave it running. A tab closed while its host was unreachable is
+  ended when the workstation next connects.
+- The toolbar no longer shows a Permissions warning for terminals started by
+  an earlier version. **Settings → Permissions** explains that they keep their
+  earlier permissions until they restart, and still offers Restart Terminals
+  with its warning.
 
 ### Fixed
 
@@ -103,6 +125,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   app reloads the list when the service's notification history changes.
 - omp completions and every other finish or request for attention are
   recorded as notifications, without duplicates for repeated events.
+- A restart or update never kills a running local terminal program any more.
+  If a saved terminal could not be reattached, the service used to open a
+  fresh shell over it and then close its tmux window, ending the program.
+  Recovery now finds windows by a tag as well as their saved ids, gives slow
+  scrollback reads 30 seconds instead of 5, retries on a fresh tmux
+  connection, and otherwise leaves the tab showing that its program is still
+  running, with Reattach to try again.
+- A lost connection to the local tmux server no longer marks every terminal
+  in the workstation as exited; the service reconnects and the terminals carry
+  on.
+- An SSH tab's “— Offline; reconnect required” title no longer sticks after
+  reconnecting.
+- Tests no longer write into the installed app's data folder or reach its
+  session service when run from inside a Harness Harlot terminal.
 
 ## [0.1.26] - 2026-09-26
 

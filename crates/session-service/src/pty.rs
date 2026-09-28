@@ -15,9 +15,11 @@ use crate::process::local_spawn_dir;
 use crate::process::{
     agent_env, apply_agent_env, configured_shell, local_shell_command, system_ssh_command,
 };
+use crate::registry::PANE_NOT_REATTACHED_PREFIX;
 use crate::terminal_images::TerminalImageStore;
 use crate::tmux::{tmux_local_attach_command, tmux_ssh_attach_command};
 use crate::tmux_control::{PaneSink, TmuxControlClient};
+use crate::tmux_remote::RemoteTmux;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     DeliveryDisposition, MAX_TERMINAL_CELLS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS,
@@ -26,7 +28,7 @@ use hh_protocol::{
     TmuxSessionId,
 };
 use hh_terminal_model::TerminalModel;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use uuid::Uuid;
 
@@ -259,11 +261,20 @@ enum Transport {
         reader_exit: Mutex<std::sync::mpsc::Receiver<()>>,
     },
     Tmux {
-        client: Arc<TmuxControlClient>,
+        /// Replaced in place when a lost local connection is re-established.
+        client: RwLock<Arc<TmuxControlClient>>,
         window_id: String,
         tmux_pane_id: String,
         pane_pid: u32,
         exited: Arc<Mutex<Option<String>>>,
+    },
+    /// A saved tmux window that could not be reattached. The window and its
+    /// program keep running and its ids stay saved, so the next restart or an
+    /// explicit Reattach tries again; nothing ever covers it with a new shell.
+    Unattached {
+        window_id: String,
+        tmux_pane_id: String,
+        reason: String,
     },
 }
 
@@ -348,7 +359,8 @@ impl Drop for PtySession {
                 client,
                 tmux_pane_id,
                 ..
-            } => client.unregister_sink(tmux_pane_id),
+            } => client.get_mut().unregister_sink(tmux_pane_id),
+            Transport::Unattached { .. } => {}
         }
         self.images.remove_all();
     }
@@ -423,6 +435,7 @@ impl PtySession {
             "system OpenSSH tmux session attach",
         )
     }
+    /// A new window of HH's local tmux server for `pane_id`.
     pub(crate) fn spawn_tmux(
         pane_id: Uuid,
         workspace_id: Uuid,
@@ -430,6 +443,9 @@ impl PtySession {
         cwd: &Path,
         client: &Arc<TmuxControlClient>,
     ) -> Result<Arc<Self>> {
+        let cwd = cwd
+            .to_str()
+            .context("tmux window working directory is not UTF-8")?;
         let pane_id_text = pane_id.to_string();
         let agent_env = agent_env(workspace_id, bot_id);
         let mut window_env = vec![
@@ -437,7 +453,36 @@ impl PtySession {
             ("COLORTERM", "truecolor"),
         ];
         window_env.extend(agent_env.iter().map(|(key, value)| (*key, value.as_str())));
-        let (window_id, tmux_pane_id, shell_pid) = client.new_window("shell", cwd, &window_env)?;
+        Self::spawn_window(pane_id, Some(cwd), &window_env, client)
+    }
+
+    /// A new window of HH's tmux server on an SSH host, started in
+    /// `remote_dir` (the login directory when `None`). Local paths such as
+    /// the service socket mean nothing there, so only terminal settings are
+    /// passed.
+    pub(crate) fn spawn_remote_tmux(
+        pane_id: Uuid,
+        remote_dir: Option<&str>,
+        client: &Arc<TmuxControlClient>,
+    ) -> Result<Arc<Self>> {
+        let pane_id_text = pane_id.to_string();
+        let window_env = [
+            (hh_protocol::pane_id_env(), pane_id_text.as_str()),
+            ("COLORTERM", "truecolor"),
+            ("PI_FORCE_IMAGE_PROTOCOL", "kitty"),
+            ("PI_KITTY_PLACEHOLDERS", "1"),
+        ];
+        Self::spawn_window(pane_id, remote_dir, &window_env, client)
+    }
+
+    fn spawn_window(
+        pane_id: Uuid,
+        cwd: Option<&str>,
+        window_env: &[(&str, &str)],
+        client: &Arc<TmuxControlClient>,
+    ) -> Result<Arc<Self>> {
+        let (window_id, tmux_pane_id, shell_pid) =
+            client.new_window("shell", cwd, window_env, pane_id)?;
         let session = Self::new_tmux_transport(
             pane_id,
             Arc::clone(client),
@@ -459,6 +504,19 @@ impl PtySession {
         session
     }
 
+    /// The interactive terminal a remote sign-in runs in (see `tmux_remote`).
+    pub(crate) fn spawn_sign_in(pane_id: Uuid, remote: &RemoteTmux) -> Result<Arc<Self>> {
+        Self::spawn_command(
+            pane_id,
+            remote.sign_in_command(pane_id)?,
+            "system OpenSSH sign-in",
+        )
+    }
+
+    /// Reattaches to an existing window, rebuilding the terminal from its
+    /// whole scrollback. If only reading the scrollback fails while the
+    /// connection is still up, the window is attached with a blank screen:
+    /// its program keeps running and redraws on the next output or resize.
     pub(crate) fn attach_tmux(
         pane_id: Uuid,
         client: Arc<TmuxControlClient>,
@@ -466,17 +524,64 @@ impl PtySession {
         tmux_pane_id: String,
         shell_pid: u32,
     ) -> Result<Arc<Self>> {
-        let captured = client.capture_pane(&tmux_pane_id)?;
+        let captured = match client.capture_pane(&tmux_pane_id) {
+            Ok(captured) => Some(captured),
+            Err(error) if client.is_alive() => {
+                eprintln!("attaching pane {pane_id} without its scrollback: {error:#}");
+                None
+            }
+            Err(error) => return Err(error).context("read the window's scrollback"),
+        };
         let session = Self::new_tmux_transport(
             pane_id,
             client,
             window_id,
             tmux_pane_id,
             shell_pid,
-            Some(captured),
+            captured,
         )?;
         session.restore_saved_input_modes();
         Ok(session)
+    }
+
+    /// A pane whose saved window exists but could not be attached; see
+    /// `Transport::Unattached`.
+    pub(crate) fn unattached_tmux(
+        pane_id: Uuid,
+        window_id: String,
+        tmux_pane_id: String,
+        reason: String,
+    ) -> Arc<Self> {
+        let terminal = Arc::new(Mutex::new(TerminalModel::new(
+            usize::from(INITIAL_COLUMNS),
+            usize::from(INITIAL_ROWS),
+        )));
+        {
+            let mut model = terminal.lock();
+            model.process_output(
+                format!(
+                    "\r\nHarness Harlot could not reattach this terminal: {reason}\r\n\
+                     Its program is still running in tmux window {window_id}.\r\n\
+                     Use Reattach Exited Terminal to try again.\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        Arc::new(Self {
+            pane_id,
+            transport: Transport::Unattached {
+                window_id,
+                tmux_pane_id,
+                reason,
+            },
+            terminal,
+            revision: Arc::new(AtomicU64::new(1)),
+            content_revision: Arc::new(AtomicU64::new(1)),
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            paste_events: Arc::new(PasteEvents::default()),
+            images: Arc::new(TerminalImageStore::for_pane(pane_id)),
+            saved_input_modes: Mutex::new(String::new()),
+        })
     }
 
     fn new_tmux_transport(
@@ -527,7 +632,7 @@ impl PtySession {
         let session = Arc::new(Self {
             pane_id,
             transport: Transport::Tmux {
-                client,
+                client: RwLock::new(client),
                 window_id,
                 tmux_pane_id,
                 pane_pid: shell_pid,
@@ -673,6 +778,7 @@ impl PtySession {
                         "terminal process has exited",
                     ));
                 }
+                let client = Arc::clone(&client.read());
                 client.send_keys_hex(tmux_pane_id, bytes).map_err(|error| {
                     let message = format!("write terminal input through tmux: {error:#}");
                     if error.to_string().starts_with("tmux did not answer") {
@@ -684,6 +790,9 @@ impl PtySession {
                     }
                 })
             }
+            Transport::Unattached { .. } => Err(InputDeliveryError::definitely_unsent(
+                "terminal is not attached",
+            )),
             Transport::Pty { .. } => self.write_pty(bytes.to_vec(), PTY_INPUT_COMPLETION_BOUND),
         }
     }
@@ -707,6 +816,7 @@ impl PtySession {
                         "terminal process has exited",
                     ));
                 }
+                let client = Arc::clone(&client.read());
                 let result = if bytes.len() <= TMUX_SEND_KEYS_REPLY_LIMIT {
                     client.send_keys_hex(tmux_pane_id, &bytes)
                 } else {
@@ -718,6 +828,9 @@ impl PtySession {
                     ))
                 })
             }
+            Transport::Unattached { .. } => Err(InputDeliveryError::definitely_unsent(
+                "terminal is not attached",
+            )),
             Transport::Pty { .. } => self.write_pty(bytes, PTY_REPLY_COMPLETION_BOUND),
         }
     }
@@ -790,8 +903,17 @@ impl PtySession {
                 })
                 .context("resize PTY")?,
             Transport::Tmux {
-                client, window_id, ..
-            } => client.resize_window(window_id, columns, rows)?,
+                client,
+                window_id,
+                exited,
+                ..
+            } => {
+                // An exited or disconnected window keeps its last screen.
+                if exited.lock().is_none() {
+                    client.read().resize_window(window_id, columns, rows)?;
+                }
+            }
+            Transport::Unattached { .. } => {}
         }
         let mut terminal = self.terminal.lock();
         terminal.resize(usize::from(columns), usize::from(rows));
@@ -894,6 +1016,8 @@ impl PtySession {
         Ok(())
     }
 
+    /// Ends the pane for good: the user closed it. A tmux window (local or
+    /// remote) is killed with its program. See `detach` for leaving it running.
     pub(crate) fn terminate_and_wait(&self) -> Result<()> {
         match &self.transport {
             Transport::Pty { child, .. } => {
@@ -908,6 +1032,7 @@ impl PtySession {
                 exited,
                 ..
             } => {
+                let client = Arc::clone(&client.read());
                 client.unregister_sink(tmux_pane_id);
                 if exited.lock().is_some() {
                     return Ok(());
@@ -916,6 +1041,28 @@ impl PtySession {
                 *exited.lock() = Some("exited".to_owned());
                 Ok(())
             }
+            // A later restart's cleanup removes the window once its tab is gone.
+            Transport::Unattached { .. } => Ok(()),
+        }
+    }
+
+    /// Stops showing the pane without ending its program: a tmux window
+    /// keeps running (a disconnect, or a reconnect that failed part-way).
+    /// A plain PTY cannot outlive the service, so it is terminated.
+    pub(crate) fn detach(&self, reason: &str) -> Result<()> {
+        match &self.transport {
+            Transport::Tmux {
+                client,
+                tmux_pane_id,
+                exited,
+                ..
+            } => {
+                client.read().unregister_sink(tmux_pane_id);
+                exited.lock().get_or_insert_with(|| reason.to_owned());
+                Ok(())
+            }
+            Transport::Unattached { .. } => Ok(()),
+            Transport::Pty { .. } => self.terminate_and_wait(),
         }
     }
 
@@ -957,6 +1104,9 @@ impl PtySession {
                 .map(|status| status.map(|status| status.to_string()))
                 .context("observe PTY child exit"),
             Transport::Tmux { exited, .. } => Ok(exited.lock().clone()),
+            Transport::Unattached { reason, .. } => {
+                Ok(Some(format!("{PANE_NOT_REATTACHED_PREFIX} {reason}")))
+            }
         }
     }
 
@@ -964,7 +1114,9 @@ impl PtySession {
     pub(crate) fn terminate_child_for_test(&self) -> Result<()> {
         match &self.transport {
             Transport::Pty { child, .. } => terminate_child_bounded(child.lock().as_mut()),
-            Transport::Tmux { .. } => bail!("test termination is only available for PTY panes"),
+            Transport::Tmux { .. } | Transport::Unattached { .. } => {
+                bail!("test termination is only available for PTY panes")
+            }
         }
     }
 
@@ -972,7 +1124,10 @@ impl PtySession {
     /// missing/dead target by exiting immediately, so do not register a tab
     /// until it survived a short bounded startup window.
     pub(crate) fn confirm_live_for_tmux_attach(&self) -> Result<()> {
-        if matches!(self.transport, Transport::Tmux { .. }) {
+        if matches!(
+            self.transport,
+            Transport::Tmux { .. } | Transport::Unattached { .. }
+        ) {
             bail!("HH-managed tmux windows do not use the attach startup check");
         }
         let deadline = Instant::now() + TMUX_ATTACH_STARTUP_GRACE;
@@ -991,12 +1146,20 @@ impl PtySession {
         match &self.transport {
             Transport::Pty { child, .. } => child.lock().process_id(),
             Transport::Tmux { pane_pid, .. } => Some(*pane_pid),
+            Transport::Unattached { .. } => None,
         }
     }
 
+    /// The tmux window and pane this terminal belongs to, kept for an
+    /// unattached pane so its window is found again later.
     pub(crate) fn tmux_ids(&self) -> Option<(&str, &str)> {
         match &self.transport {
             Transport::Tmux {
+                window_id,
+                tmux_pane_id,
+                ..
+            }
+            | Transport::Unattached {
                 window_id,
                 tmux_pane_id,
                 ..
@@ -1005,12 +1168,28 @@ impl PtySession {
         }
     }
 
+    /// The control connection a live tmux pane talks through.
+    pub(crate) fn tmux_client(&self) -> Option<Arc<TmuxControlClient>> {
+        match &self.transport {
+            Transport::Tmux { client, .. } => Some(Arc::clone(&client.read())),
+            Transport::Pty { .. } | Transport::Unattached { .. } => None,
+        }
+    }
+
+    /// Points this pane at a re-established connection whose sinks already
+    /// hold this pane (the old and new clients share one sink map).
+    pub(crate) fn replace_tmux_client(&self, replacement: &Arc<TmuxControlClient>) {
+        if let Transport::Tmux { client, .. } = &self.transport {
+            *client.write() = Arc::clone(replacement);
+        }
+    }
+
     pub(crate) fn rename_tmux_window(&self, title: &str) -> Result<()> {
         if let Transport::Tmux {
             client, window_id, ..
         } = &self.transport
         {
-            client.rename_window(window_id, title)?;
+            client.read().rename_window(window_id, title)?;
         }
         Ok(())
     }
@@ -1050,6 +1229,7 @@ impl PtySession {
                 .as_ref()
                 .is_some_and(thread::JoinHandle::is_finished),
             Transport::Tmux { exited, .. } => exited.lock().is_some(),
+            Transport::Unattached { .. } => true,
         }
     }
 
@@ -1443,7 +1623,7 @@ mod tests {
                 .list_panes()
                 .unwrap()
                 .iter()
-                .any(|(window, pane, _, _)| window == &window_id && pane == &tmux_pane_id)
+                .any(|pane| pane.window_id == window_id && pane.pane_id == tmux_pane_id)
         );
 
         let attached_id = Uuid::new_v4();

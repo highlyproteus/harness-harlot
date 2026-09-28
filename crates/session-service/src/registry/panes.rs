@@ -16,6 +16,7 @@ use crate::registry::bots::{bot_for_pane, bot_spawn_dir, prune_bot_threads};
 use crate::registry::identity::{
     refresh_workspace_activity, resolve_pane_identity, set_pane_runtime_label,
 };
+use crate::registry::recovery::find_window;
 use crate::registry::workspaces::remember_recent_color;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -298,7 +299,12 @@ impl SessionRegistry {
                 tab_title: "Terminals".to_owned(),
             }),
             WorkspaceConnection::SystemSsh { destination, .. } => Ok(InitialTerminalSpawn {
-                session: PtySession::spawn_ssh(pane_id, workspace_id, destination, working_dir)?,
+                session: self.spawn_ssh_transport(
+                    pane_id,
+                    workspace_id,
+                    destination,
+                    working_dir,
+                )?,
                 kind: RuntimePaneKind::SystemSsh {
                     host: destination.clone(),
                 },
@@ -448,7 +454,7 @@ impl SessionRegistry {
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
-        let session = PtySession::spawn_ssh(pane_id, workspace_id, host, None)?;
+        let session = self.spawn_ssh_transport(pane_id, workspace_id, host, None)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -882,7 +888,7 @@ impl SessionRegistry {
     /// session that no longer exists fails here instead of registering a fake
     /// live tab.
     pub fn reattach_pane(&self, pane_id: Uuid) -> Result<()> {
-        let (kind, cwd, workspace_id, managed_tmux, bot_id) = {
+        let (kind, cwd, workspace_id, saved_tmux, bot_id) = {
             let state = self.state.read();
             let runtime = state.terminal_pane(pane_id)?;
             if runtime.exit_status.is_none() {
@@ -901,31 +907,49 @@ impl SessionRegistry {
                 runtime.kind.clone(),
                 cwd,
                 workspace_id,
-                runtime.session.tmux_ids().is_some(),
+                runtime
+                    .session
+                    .tmux_ids()
+                    .map(|(window, pane)| (window.to_owned(), pane.to_owned())),
                 bot_id,
             )
         };
-        // Managed tmux, plain PTY and direct SSH panes get a new shell; a
-        // user tmux session is attached again with its programs still running.
+        // A managed tmux pane gets its still-running window back (one left
+        // unattached by recovery) or, if its program exited, a new window.
+        // Plain PTY panes get a new shell; SSH panes reattach their remote
+        // window when it still runs; a user tmux session is attached again
+        // with its programs still running.
         let (session, behind) = match &kind {
-            RuntimePaneKind::Local if managed_tmux => (
-                PtySession::spawn_tmux(
-                    pane_id,
-                    workspace_id,
-                    bot_id,
-                    &cwd,
-                    &self.client_for_workspace(workspace_id)?,
-                )?,
-                Reattached::FreshShell,
-            ),
+            RuntimePaneKind::Local if saved_tmux.is_some() => {
+                let client = self.client_for_workspace(workspace_id)?;
+                let listed = client.list_panes()?;
+                match find_window(&listed, saved_tmux.as_ref(), pane_id) {
+                    Some(existing) => (
+                        PtySession::attach_tmux(
+                            pane_id,
+                            Arc::clone(&client),
+                            existing.window_id.clone(),
+                            existing.pane_id.clone(),
+                            existing.pane_pid,
+                        )?,
+                        Reattached::RunningProgram,
+                    ),
+                    None => (
+                        PtySession::spawn_tmux(pane_id, workspace_id, bot_id, &cwd, &client)?,
+                        Reattached::FreshShell,
+                    ),
+                }
+            }
             RuntimePaneKind::Local => (
                 PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)?,
                 Reattached::FreshShell,
             ),
-            RuntimePaneKind::SystemSsh { host } => (
-                PtySession::spawn_ssh(pane_id, workspace_id, host, None)?,
-                Reattached::FreshShell,
-            ),
+            RuntimePaneKind::SystemSsh { host } => self
+                .spawn_ssh_sessions(workspace_id, host, None, &[pane_id])?
+                .into_iter()
+                .next()
+                .map(|(_, session, behind)| (session, behind))
+                .context("no SSH terminal was started")?,
             RuntimePaneKind::TmuxLocal { session_id } => (
                 PtySession::spawn_tmux_local(pane_id, session_id)?,
                 Reattached::RunningProgram,
@@ -943,6 +967,11 @@ impl SessionRegistry {
         }
         let mut state = self.state.write();
         let previous = state.install_reattached_session(pane_id, session, behind)?;
+        if let RuntimePaneKind::SystemSsh { host } = &kind
+            && let Some(pane) = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
+        {
+            pane.title = ssh_pane_title(host);
+        }
         refresh_workspace_activity(&mut state);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;

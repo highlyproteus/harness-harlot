@@ -11,6 +11,7 @@ use crate::registry::bots::{forget_bots, workstation_count};
 use crate::registry::identity::{
     PANE_DISCONNECTED, refresh_workspace_activity, set_pane_runtime_label,
 };
+use crate::registry::panes::Reattached;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     AppearanceColor, MAX_PANES, MAX_WORKSTATION_DEPTH, Pane, PaneLayout, SessionSnapshot, Tab,
@@ -41,29 +42,6 @@ struct ReconnectionPlan {
     destination: String,
     working_dir: Option<String>,
     pane_ids: Vec<Uuid>,
-}
-
-/// Spawns every SSH session a reconnect needs, terminating any already
-/// spawned session when one fails.
-fn spawn_reconnect_sessions(
-    workspace_id: Uuid,
-    destination: &str,
-    working_dir: Option<&str>,
-    pane_ids: &[Uuid],
-) -> Result<Vec<(Uuid, Arc<PtySession>)>> {
-    let mut sessions = Vec::with_capacity(pane_ids.len());
-    for pane_id in pane_ids {
-        match PtySession::spawn_ssh(*pane_id, workspace_id, destination, working_dir) {
-            Ok(session) => sessions.push((*pane_id, session)),
-            Err(error) => {
-                for (_, session) in sessions {
-                    let _ = session.terminate_and_wait();
-                }
-                return Err(error);
-            }
-        }
-    }
-    Ok(sessions)
 }
 
 pub(crate) fn normalize_workspace_title(title: Option<&str>) -> Result<Option<String>> {
@@ -423,7 +401,7 @@ impl SessionRegistry {
         };
         let cwd = fallback_cwd()?;
         self.persist_ssh_workspace_intent(title, destination, ids)?;
-        let session = PtySession::spawn_ssh(ids.pane, ids.workspace, destination, None)?;
+        let session = self.spawn_ssh_transport(ids.pane, ids.workspace, destination, None)?;
         let result = self.attach_ssh_workspace(destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
@@ -807,8 +785,12 @@ impl SessionRegistry {
             }
             targets
         };
+        // The windows keep running on the host; Reconnect reattaches them.
         for (_, session) in targets.iter().flat_map(|(_, sessions)| sessions) {
-            let _ = session.terminate_and_wait();
+            let _ = session.detach(PANE_DISCONNECTED);
+        }
+        for (id, _) in &targets {
+            self.close_remote_clients(*id);
         }
 
         let mut state = self.state.write();
@@ -881,7 +863,9 @@ impl SessionRegistry {
         if created_layout {
             pane_ids.push(Uuid::new_v4());
         }
-        let sessions = spawn_reconnect_sessions(
+        // Reattaches every window still running on the host, with its
+        // scrollback; a host that needs a prompt gets a sign-in tab first.
+        let sessions = self.spawn_ssh_sessions(
             workspace_id,
             &plan.destination,
             plan.working_dir.as_deref(),
@@ -895,8 +879,8 @@ impl SessionRegistry {
             &sessions,
         );
         if result.is_err() {
-            for (_, session) in sessions {
-                let _ = session.terminate_and_wait();
+            for (_, session, _) in sessions {
+                let _ = session.detach("reconnect failed");
             }
         }
         result.map(|()| pane_ids.first().copied())
@@ -942,14 +926,15 @@ impl SessionRegistry {
     }
 
     /// Publishes respawned SSH sessions into the desired state and marks the
-    /// workstation connected again.
+    /// workstation connected again. A pane that reattached its still-running
+    /// remote window keeps its status and progress.
     fn apply_workspace_reconnection(
         &self,
         workspace_id: Uuid,
         destination: &str,
         created_layout: bool,
         pane_ids: &[Uuid],
-        sessions: &[(Uuid, Arc<PtySession>)],
+        sessions: &[(Uuid, Arc<PtySession>, Reattached)],
     ) -> Result<()> {
         let cwd = fallback_cwd()?;
         let mut state = self.state.write();
@@ -1009,7 +994,16 @@ impl SessionRegistry {
             .active_terminal_count
             .saturating_add(u32::try_from(sessions.len()).unwrap_or(u32::MAX));
 
-        for (pane_id, session) in sessions {
+        let mut replaced = Vec::new();
+        for (pane_id, session, behind) in sessions {
+            if state.terminal_pane(*pane_id).is_ok() {
+                replaced.push(state.install_reattached_session(
+                    *pane_id,
+                    Arc::clone(session),
+                    *behind,
+                )?);
+                continue;
+            }
             state.panes.insert(
                 *pane_id,
                 RuntimePane {
@@ -1023,7 +1017,7 @@ impl SessionRegistry {
                         exit_status: None,
                         process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
-                        title_baseline_pending: false,
+                        title_baseline_pending: *behind == Reattached::RunningProgram,
                     }),
                 },
             );
@@ -1031,6 +1025,7 @@ impl SessionRegistry {
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
+        drop(replaced);
         self.write_snapshot(&bytes)
     }
 
@@ -1038,7 +1033,7 @@ impl SessionRegistry {
     /// terminals, removes their galleries and kills their tmux sessions. The
     /// home workstation is refused.
     pub fn delete_workspace(&self, workspace_id: Uuid) -> Result<()> {
-        let (removed_ids, pane_ids, sessions, tmux_clients) = {
+        let (removed_ids, pane_ids, sessions, tmux_clients, remote_hosts) = {
             let state = self.state.read();
             let workspace = state
                 .snapshot
@@ -1076,10 +1071,37 @@ impl SessionRegistry {
                 .iter()
                 .filter_map(|id| state.tmux_clients.get(id).cloned())
                 .collect::<Vec<_>>();
-            (removed_ids, pane_ids, sessions, tmux_clients)
+            // Every host each removed workstation ran tmux on: its own
+            // destination and those of its direct SSH tabs.
+            let remote_hosts = state
+                .snapshot
+                .workspaces
+                .iter()
+                .filter(|workspace| removed_ids.contains(&workspace.id))
+                .map(|workspace| {
+                    let mut hosts = pane_ids_for_workspace(workspace)
+                        .iter()
+                        .filter_map(|pane_id| state.panes.get(pane_id)?.terminal())
+                        .filter_map(|terminal| match &terminal.kind {
+                            RuntimePaneKind::SystemSsh { host } => Some(host.clone()),
+                            _ => None,
+                        })
+                        .collect::<HashSet<_>>();
+                    if let WorkspaceConnection::SystemSsh { destination, .. } =
+                        &workspace.connection
+                    {
+                        hosts.insert(destination.clone());
+                    }
+                    (workspace.id, hosts)
+                })
+                .collect::<Vec<_>>();
+            (removed_ids, pane_ids, sessions, tmux_clients, remote_hosts)
         };
         for session in &sessions {
             let _ = session.terminate_and_wait();
+        }
+        for (id, hosts) in &remote_hosts {
+            self.kill_remote_sessions(*id, hosts);
         }
         let mut cleanup_errors: Vec<anyhow::Error> = Vec::new();
         for id in &removed_ids {

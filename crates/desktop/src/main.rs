@@ -642,7 +642,9 @@ impl HhApp {
                 }
                 // Returning from System Settings is the usual moment a grant changes.
                 #[cfg(target_os = "macos")]
-                this.refresh_privacy_status(cx);
+                if this.permissions_panel_visible() {
+                    this.refresh_privacy_status(cx);
+                }
                 cx.notify();
                 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
                 {

@@ -19,6 +19,7 @@ mod rpc;
 mod terminal_images;
 mod tmux;
 mod tmux_control;
+mod tmux_remote;
 
 pub use registry::{PaneUpdateBatch, SessionRegistry, TmuxAttachmentResult, TmuxScanResult};
 pub use rpc::serve_connection;

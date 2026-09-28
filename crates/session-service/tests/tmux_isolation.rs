@@ -7,17 +7,12 @@ use hh_session_service::SessionRegistry;
 use support::{TestStateDir, tmux_binary};
 
 #[test]
-fn only_the_default_state_directory_uses_the_app_tmux_socket() {
-    let default_name = if cfg!(debug_assertions) {
-        "hh-dev"
-    } else {
-        "hh"
-    };
-    if std::env::var_os(hh_protocol::STATE_DIR_ENV).is_none()
-        && let Some(default_dir) = hh_protocol::state_directory()
-    {
-        assert_eq!(managed_tmux_socket_name(&default_dir), default_name);
-    }
+fn test_state_directories_never_use_the_app_tmux_socket() {
+    // Test binaries resolve a private default state directory, so even it
+    // must not address the app's `hh`/`hh-dev` server.
+    let default_name = managed_tmux_socket_name(&hh_protocol::state_directory().unwrap());
+    assert!(default_name != "hh" && default_name != "hh-dev");
+    assert!(default_name.starts_with("hh-"));
 
     let first = TestStateDir::new("tmux-name-a");
     let second = TestStateDir::new("tmux-name-b");

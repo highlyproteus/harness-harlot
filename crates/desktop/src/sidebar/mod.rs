@@ -328,10 +328,6 @@ impl HhApp {
             self.editor.modal,
             crate::view_models::Modal::AppearanceSettings
         );
-        #[cfg(target_os = "macos")]
-        let privacy_notice = self.render_privacy_notice(cx);
-        #[cfg(not(target_os = "macos"))]
-        let privacy_notice: Option<AnyElement> = None;
         div()
             .h(px(40.0))
             .px(px(8.0))
@@ -397,7 +393,6 @@ impl HhApp {
                         }),
                 )
             })
-            .children(privacy_notice)
             .child(
                 div()
                     .id("appearance-settings")

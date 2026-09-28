@@ -1,8 +1,11 @@
 //! Private tmux control-mode server and command client.
+//!
+//! The same client drives HH's local tmux server and, through `ssh`, the
+//! tmux server HH keeps on a remote host (see `tmux_remote`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -16,15 +19,36 @@ use crate::paste_events::PasteEvents;
 use crate::persistence::validate_title;
 use crate::process::{configured_shell, is_trusted_executable_file, run_bounded_command};
 use crate::pty::{RawPaneEvent, ingest_output};
+use crate::registry::PANE_CONNECTION_LOST;
 use crate::terminal_images::TerminalImageStore;
 use crate::tmux::{TMUX_PROBE_TIMEOUT, system_tmux_binary};
+use crate::tmux_remote::{RemoteConnectError, RemoteTmux, classify_ssh_failure};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hh_terminal_model::TerminalModel;
 use parking_lot::Mutex;
+use uuid::Uuid;
 
-const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const ANCHOR_WINDOW_NAME: &str = "hh-anchor";
+const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// A command to a remote tmux crosses the network twice.
+const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+/// Reading a pane's whole scrollback on reattach can take seconds on a busy
+/// machine; a timeout here must not drop the connection mid-recovery.
+const SCROLLBACK_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Covers ssh connection setup (`ConnectTimeout`) plus the bootstrap.
+const REMOTE_STARTUP_TIMEOUT: Duration = Duration::from_secs(40);
+pub(crate) const ANCHOR_WINDOW_NAME: &str = "hh-anchor";
 const MINIMUM_TMUX_VERSION: (u32, u32) = (3, 2);
+/// Window user option naming the HH pane a window belongs to, so a window
+/// can be found again without saved window ids (remote reconnects) and
+/// windows of closed tabs can be told apart from live ones.
+pub(crate) const PANE_TAG_OPTION: &str = "@hh-pane";
+/// Remote pastes cannot use a local file, so they are sent as hex keys.
+const REMOTE_PASTE_CHUNK: usize = 1024;
+/// Bytes of ssh diagnostics kept to explain a failed remote connection.
+const MAX_STDERR_BYTES: usize = 8 * 1024;
+/// First stdout line of the remote bootstrap when tmux cannot run there.
+pub(crate) const NO_TMUX_MARKER: &str = "HH-NO-TMUX";
 
 pub(crate) type PaneSinks = Arc<Mutex<HashMap<String, PaneSink>>>;
 
@@ -46,6 +70,16 @@ struct PendingReply {
     sender: SyncSender<Result<Vec<String>>>,
 }
 
+/// One window of a tmux session, as listed by `list-panes -s`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ListedPane {
+    pub window_id: String,
+    pub pane_id: String,
+    pub pane_pid: u32,
+    /// The HH pane this window was created for (`@hh-pane`), if tagged.
+    pub tag: Option<Uuid>,
+}
+
 pub(crate) struct TmuxControlClient {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
@@ -54,6 +88,8 @@ pub(crate) struct TmuxControlClient {
     alive: Arc<AtomicBool>,
     next_reply_id: AtomicU64,
     reader: Mutex<Option<thread::JoinHandle<()>>>,
+    command_timeout: Duration,
+    remote: bool,
 }
 
 impl std::fmt::Debug for TmuxControlClient {
@@ -61,6 +97,7 @@ impl std::fmt::Debug for TmuxControlClient {
         formatter
             .debug_struct("TmuxControlClient")
             .field("alive", &self.is_alive())
+            .field("remote", &self.remote)
             .field("sinks", &self.sinks.lock().len())
             .finish_non_exhaustive()
     }
@@ -168,6 +205,17 @@ fn parse_tmux_version(value: &str) -> Option<(u32, u32)> {
     Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
+/// What a control client says when its connection ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseBehavior {
+    /// Local: the registry reconnects and resumes every pane, so a lost
+    /// connection says nothing about the panes' programs.
+    KeepPanes,
+    /// Remote: panes stay running on the host but are unreachable until the
+    /// user reconnects the workstation.
+    MarkDisconnected,
+}
+
 impl TmuxControlClient {
     pub(crate) fn spawn(
         server: &TmuxServer,
@@ -175,42 +223,83 @@ impl TmuxControlClient {
         sinks: PaneSinks,
     ) -> Result<Arc<Self>> {
         ensure_control_atom(session_name, "tmux session name")?;
-        let mut child = Command::new(&server.binary)
+        let mut command = Command::new(&server.binary);
+        command
             .args(["-L", &server.socket_name, "-f"])
             .arg(&server.config_path)
-            .args([
-                "-C",
-                "new-session",
-                "-A",
-                "-s",
-                session_name,
-                "-n",
-                ANCHOR_WINDOW_NAME,
-                "--",
-                "/bin/sh",
-                "-c",
-                "while :; do sleep 3600; done",
-            ])
+            .args(control_session_args(session_name))
             .env("TERM", "xterm-256color")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .stderr(Stdio::null());
+        Self::start(
+            command,
+            session_name,
+            sinks,
+            ClientSettings {
+                close: CloseBehavior::KeepPanes,
+                command_timeout: LOCAL_COMMAND_TIMEOUT,
+                startup_timeout: LOCAL_STARTUP_TIMEOUT,
+                remote: false,
+            },
+        )
+        .map_err(|failure| anyhow!("tmux control client did not start: {failure}"))
+    }
+
+    /// Connects to HH's tmux server on `remote` through `ssh` without any
+    /// prompt. Failures carry a `RemoteConnectError` explaining what the user
+    /// can do about them.
+    pub(crate) fn spawn_remote(
+        remote: &RemoteTmux,
+        session_name: &str,
+        sinks: PaneSinks,
+    ) -> Result<Arc<Self>> {
+        ensure_control_atom(session_name, "tmux session name")?;
+        let mut command = remote.control_command(session_name)?;
+        command.stderr(Stdio::piped());
+        let client = Self::start(
+            command,
+            session_name,
+            sinks,
+            ClientSettings {
+                close: CloseBehavior::MarkDisconnected,
+                command_timeout: REMOTE_COMMAND_TIMEOUT,
+                startup_timeout: REMOTE_STARTUP_TIMEOUT,
+                remote: true,
+            },
+        )
+        .map_err(|failure| anyhow::Error::new(failure.into_remote_error()))?;
+        client.apply_bundled_options()?;
+        Ok(client)
+    }
+
+    fn start(
+        mut command: Command,
+        session_name: &str,
+        sinks: PaneSinks,
+        settings: ClientSettings,
+    ) -> std::result::Result<Arc<Self>, StartFailure> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("start tmux control client for {session_name}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("tmux control stdin was not piped")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("tmux control stdout was not piped")?;
+            .map_err(|error| StartFailure::Spawn(error.to_string()))?;
+        let stdin = child.stdin.take().expect("tmux control stdin is piped");
+        let stdout = child.stdout.take().expect("tmux control stdout is piped");
+        let stderr = Arc::new(Mutex::new(String::new()));
+        if let Some(pipe) = child.stderr.take() {
+            let stderr = Arc::clone(&stderr);
+            let _ = thread::Builder::new()
+                .name(format!("rmux-tmux-stderr-{session_name}"))
+                .spawn(move || collect_stderr(pipe, &stderr));
+        }
         let pending = Arc::new(Mutex::new(VecDeque::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let reader_pending = Arc::clone(&pending);
         let reader_sinks = Arc::clone(&sinks);
         let reader_alive = Arc::clone(&alive);
         let (startup_sender, startup_receiver) = sync_channel(1);
+        let close = settings.close;
         let reader = thread::Builder::new()
             .name(format!("rmux-tmux-{session_name}"))
             .spawn(move || {
@@ -220,9 +309,10 @@ impl TmuxControlClient {
                     &reader_sinks,
                     &reader_alive,
                     startup_sender,
+                    close,
                 );
             })
-            .context("start tmux control reader")?;
+            .map_err(|error| StartFailure::Spawn(error.to_string()))?;
         let client = Arc::new(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
@@ -231,15 +321,51 @@ impl TmuxControlClient {
             alive,
             next_reply_id: AtomicU64::new(1),
             reader: Mutex::new(Some(reader)),
+            command_timeout: settings.command_timeout,
+            remote: settings.remote,
         });
-        if startup_receiver
-            .recv_timeout(DEFAULT_COMMAND_TIMEOUT)
-            .is_err()
-        {
-            client.invalidate("tmux control client did not start");
-            bail!("tmux control client did not start");
+        match startup_receiver.recv_timeout(settings.startup_timeout) {
+            Ok(Ok(())) => Ok(client),
+            Ok(Err(reason)) => {
+                client.invalidate("tmux is unavailable");
+                Err(StartFailure::NoTmux(reason))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                client.invalidate("tmux control client did not start");
+                Err(StartFailure::Exited {
+                    stderr: stderr.lock().clone(),
+                    timed_out: true,
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Let the stderr collector finish reading what ssh printed.
+                let _ = client.child.lock().wait();
+                thread::sleep(Duration::from_millis(50));
+                client.invalidate("tmux control client exited");
+                Err(StartFailure::Exited {
+                    stderr: stderr.lock().clone(),
+                    timed_out: false,
+                })
+            }
         }
-        Ok(client)
+    }
+
+    /// Applies HH's tmux settings to a remote server, which is started with
+    /// no config file so the user's own `~/.tmux.conf` cannot change how
+    /// HH's panes behave.
+    fn apply_bundled_options(&self) -> Result<()> {
+        for line in include_str!("../bundled/hh.tmux.conf").lines() {
+            let line = line.trim();
+            if line.starts_with("set ") {
+                self.run(line, self.command_timeout)
+                    .with_context(|| format!("apply remote tmux option `{line}`"))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        self.remote
     }
 
     pub(crate) fn is_alive(&self) -> bool {
@@ -273,28 +399,31 @@ impl TmuxControlClient {
         }
     }
 
+    /// Creates a detached window for HH pane `tag`, started in `cwd` (the
+    /// session's directory when `None`), and marks it with `@hh-pane`.
     pub(crate) fn new_window(
         &self,
         name: &str,
-        cwd: &Path,
+        cwd: Option<&str>,
         env: &[(&str, &str)],
+        tag: Uuid,
     ) -> Result<(String, String, u32)> {
         validate_title(name, "tmux window")?;
-        let cwd = cwd
-            .to_str()
-            .context("tmux window working directory is not UTF-8")?;
-        ensure_control_atom(cwd, "tmux window working directory")?;
         let mut command = format!(
-            "new-window -d -P -F '#{{window_id}} #{{pane_id}} #{{pane_pid}}' -n {} -c {}",
+            "new-window -d -P -F '#{{window_id}} #{{pane_id}} #{{pane_pid}}' -n {}",
             shellquote(name),
-            shellquote(cwd)
         );
+        if let Some(cwd) = cwd {
+            ensure_control_atom(cwd, "tmux window working directory")?;
+            command.push_str(" -c ");
+            command.push_str(&shellquote(cwd));
+        }
         for (key, value) in env {
             ensure_env_assignment(key, value)?;
             command.push_str(" -e ");
             command.push_str(&shellquote(&format!("{key}={value}")));
         }
-        let lines = self.run(&command, DEFAULT_COMMAND_TIMEOUT)?;
+        let lines = self.run(&command, self.command_timeout)?;
         let result = lines.last().context("tmux new-window returned no target")?;
         let mut fields = result.split_whitespace();
         let window_id = fields.next().context("tmux omitted window id")?.to_owned();
@@ -310,6 +439,13 @@ impl TmuxControlClient {
         );
         validate_target_id(&window_id, '@', "window")?;
         validate_target_id(&pane_id, '%', "pane")?;
+        if let Err(error) = self.run(
+            &format!("set-option -w -t {window_id} {PANE_TAG_OPTION} {tag}"),
+            self.command_timeout,
+        ) {
+            let _ = self.kill_window(&window_id);
+            return Err(error).context("tag the new tmux window");
+        }
         Ok((window_id, pane_id, process_id))
     }
 
@@ -317,7 +453,7 @@ impl TmuxControlClient {
         validate_target_id(window_id, '@', "window")?;
         self.run(
             &format!("resize-window -t {window_id} -x {columns} -y {rows}"),
-            DEFAULT_COMMAND_TIMEOUT,
+            self.command_timeout,
         )?;
         Ok(())
     }
@@ -329,16 +465,28 @@ impl TmuxControlClient {
             for byte in chunk {
                 let _ = write!(command, " {byte:02x}");
             }
-            self.run(&command, DEFAULT_COMMAND_TIMEOUT)?;
+            self.run(&command, self.command_timeout)?;
         }
         Ok(())
     }
 
-    /// Writes `bytes` to the pane's input in one step through a private
-    /// temporary file and a uniquely named tmux paste buffer. Without `-p`
-    /// there is no bracketing, and `-r` keeps every byte as written.
+    /// Writes `bytes` to the pane's input in one step. Locally this goes
+    /// through a private temporary file and a uniquely named tmux paste
+    /// buffer (without `-p` there is no bracketing, and `-r` keeps every byte
+    /// as written). A remote tmux cannot read a local file, so the bytes are
+    /// sent as hex keys instead.
     pub(crate) fn paste_bytes(&self, pane_id: &str, bytes: &[u8]) -> Result<()> {
         validate_target_id(pane_id, '%', "pane")?;
+        if self.remote {
+            for chunk in bytes.chunks(REMOTE_PASTE_CHUNK) {
+                let mut command = format!("send-keys -t {pane_id} -H");
+                for byte in chunk {
+                    let _ = write!(command, " {byte:02x}");
+                }
+                self.run(&command, self.command_timeout)?;
+            }
+            return Ok(());
+        }
         let directory = std::env::temp_dir().join("harness-harlot-tmux-input");
         hh_protocol::ensure_private_directory(&directory)
             .with_context(|| format!("prepare tmux input directory {}", directory.display()))?;
@@ -356,7 +504,7 @@ impl TmuxControlClient {
             ensure_control_atom(path_text, "tmux input path")?;
             self.run(
                 &format!("load-buffer -b {buffer} {}", shellquote(path_text)),
-                DEFAULT_COMMAND_TIMEOUT,
+                self.command_timeout,
             )?;
             Ok(())
         })();
@@ -364,12 +512,9 @@ impl TmuxControlClient {
         load?;
         if let Err(error) = self.run(
             &format!("paste-buffer -b {buffer} -d -r -t {pane_id}"),
-            DEFAULT_COMMAND_TIMEOUT,
+            self.command_timeout,
         ) {
-            let _ = self.run(
-                &format!("delete-buffer -b {buffer}"),
-                DEFAULT_COMMAND_TIMEOUT,
-            );
+            let _ = self.run(&format!("delete-buffer -b {buffer}"), self.command_timeout);
             return Err(error);
         }
         Ok(())
@@ -381,7 +526,7 @@ impl TmuxControlClient {
         validate_user_option_name(name)?;
         let lines = self.run(
             &format!("show-options -p -q -v -t {pane_id} {name}"),
-            DEFAULT_COMMAND_TIMEOUT,
+            self.command_timeout,
         )?;
         Ok(lines.into_iter().next().filter(|value| !value.is_empty()))
     }
@@ -408,16 +553,13 @@ impl TmuxControlClient {
         } else {
             format!("set-option -p -t {pane_id} {name} {value}")
         };
-        self.run(&command, DEFAULT_COMMAND_TIMEOUT)?;
+        self.run(&command, self.command_timeout)?;
         Ok(())
     }
 
     pub(crate) fn kill_window(&self, window_id: &str) -> Result<()> {
         validate_target_id(window_id, '@', "window")?;
-        self.run(
-            &format!("kill-window -t {window_id}"),
-            DEFAULT_COMMAND_TIMEOUT,
-        )?;
+        self.run(&format!("kill-window -t {window_id}"), self.command_timeout)?;
         Ok(())
     }
 
@@ -431,7 +573,7 @@ impl TmuxControlClient {
                 "move-window -d -s {window_id} -t {}:",
                 shellquote(session_name)
             ),
-            DEFAULT_COMMAND_TIMEOUT,
+            self.command_timeout,
         )?;
         Ok(())
     }
@@ -441,7 +583,7 @@ impl TmuxControlClient {
         ensure_control_atom(session_name, "tmux session name")?;
         self.run(
             &format!("kill-session -t {}", shellquote(session_name)),
-            DEFAULT_COMMAND_TIMEOUT,
+            self.command_timeout,
         )?;
         Ok(())
     }
@@ -451,37 +593,62 @@ impl TmuxControlClient {
         validate_title(name, "tmux window")?;
         self.run(
             &format!("rename-window -t {window_id} {}", shellquote(name)),
-            DEFAULT_COMMAND_TIMEOUT,
+            self.command_timeout,
         )?;
         Ok(())
     }
 
-    pub(crate) fn list_panes(&self) -> Result<Vec<(String, String, u32, String)>> {
+    /// Every window of this client's session except the anchor.
+    pub(crate) fn list_panes(&self) -> Result<Vec<ListedPane>> {
         let lines = self.run(
-            "list-panes -s -F '#{window_id} #{pane_id} #{pane_pid} #{window_name}'",
-            DEFAULT_COMMAND_TIMEOUT,
+            &format!(
+                "list-panes -s -F '#{{window_id}} #{{pane_id}} #{{pane_pid}} #{{{PANE_TAG_OPTION}}} #{{window_name}}'"
+            ),
+            self.command_timeout,
         )?;
-        lines
-            .into_iter()
-            .map(|line| parse_listed_pane(&line))
-            .filter_map(|result| match result {
-                Ok((_, _, _, name)) if name == ANCHOR_WINDOW_NAME => None,
-                result => Some(result),
-            })
-            .collect()
+        let mut listed = Vec::new();
+        for line in lines {
+            let (pane, name) = parse_listed_pane(&line)?;
+            if name != ANCHOR_WINDOW_NAME {
+                listed.push(pane);
+            }
+        }
+        Ok(listed)
     }
 
+    /// The pane's full scrollback and screen with styles, for rebuilding a
+    /// terminal after a reattach. Allowed to take longer than other commands.
     pub(crate) fn capture_pane(&self, pane_id: &str) -> Result<Vec<u8>> {
         validate_target_id(pane_id, '%', "pane")?;
         let lines = self.run(
             &format!("capture-pane -p -e -S - -t {pane_id}"),
-            DEFAULT_COMMAND_TIMEOUT,
+            SCROLLBACK_READ_TIMEOUT.max(self.command_timeout),
         )?;
         Ok(lines.join("\r\n").into_bytes())
     }
 
+    /// Marks every registered pane whose tmux pane no longer exists as
+    /// exited, after a reconnect found `listed` windows.
+    pub(crate) fn mark_missing_panes_exited(&self, listed: &[ListedPane]) {
+        let present = listed
+            .iter()
+            .map(|pane| pane.pane_id.as_str())
+            .collect::<HashSet<_>>();
+        for (pane_id, sink) in self.sinks.lock().iter_mut() {
+            if !present.contains(pane_id.as_str()) {
+                *sink.exited.lock() = Some("exited".to_owned());
+            }
+        }
+    }
+
+    /// Ends this control connection. The session and its windows keep
+    /// running on the server.
+    pub(crate) fn close(&self) {
+        self.invalidate("tmux control client closed");
+    }
+
     pub(crate) fn kill_session(&self) -> Result<()> {
-        self.run("kill-session", DEFAULT_COMMAND_TIMEOUT)?;
+        self.run("kill-session", self.command_timeout)?;
         Ok(())
     }
 
@@ -503,7 +670,9 @@ impl TmuxControlClient {
             let _ = self.child.lock().kill();
         }
         fail_pending(&self.pending, message);
-        mark_all_sinks_exited(&self.sinks, message);
+        if self.remote {
+            mark_all_sinks_exited(&self.sinks, PANE_CONNECTION_LOST);
+        }
     }
 }
 
@@ -519,12 +688,17 @@ impl Drop for TmuxControlClient {
     }
 }
 
+/// Result of connecting: `Err` carries why tmux cannot run (a remote host
+/// without a supported tmux reports this through its bootstrap).
+type StartupSender = SyncSender<std::result::Result<(), String>>;
+
 fn read_control_output(
     stdout: impl std::io::Read,
     pending: &Mutex<VecDeque<PendingReply>>,
     sinks: &Mutex<HashMap<String, PaneSink>>,
     alive: &AtomicBool,
-    startup_sender: SyncSender<()>,
+    startup_sender: StartupSender,
+    close: CloseBehavior,
 ) {
     let mut startup_sender = Some(startup_sender);
     let mut response: Option<(String, Vec<String>)> = None;
@@ -565,6 +739,15 @@ fn read_control_output(
             continue;
         }
         let line = String::from_utf8_lossy(&raw).into_owned();
+        if startup_sender.is_some()
+            && response.is_none()
+            && let Some(reason) = line.strip_prefix(NO_TMUX_MARKER)
+        {
+            if let Some(sender) = startup_sender.take() {
+                let _ = sender.send(Err(reason.trim().to_owned()));
+            }
+            continue;
+        }
         if let Some((key, lines)) = &mut response {
             let mut fields = line.split_whitespace();
             let keyword = fields.next();
@@ -576,15 +759,18 @@ fn read_control_output(
                 let (_, lines) = response.take().expect("response block is active");
                 if keyword == Some("%error") {
                     let message = lines.join("\n");
-                    if let Some(reply) = pending.lock().pop_front() {
-                        let _ = reply.sender.send(Err(anyhow!(if message.is_empty() {
-                            "tmux command failed".to_owned()
-                        } else {
-                            message
-                        })));
+                    let message = if message.is_empty() {
+                        "tmux command failed".to_owned()
+                    } else {
+                        message
+                    };
+                    if let Some(startup_sender) = startup_sender.take() {
+                        let _ = startup_sender.send(Err(message));
+                    } else if let Some(reply) = pending.lock().pop_front() {
+                        let _ = reply.sender.send(Err(anyhow!(message)));
                     }
                 } else if let Some(startup_sender) = startup_sender.take() {
-                    let _ = startup_sender.send(());
+                    let _ = startup_sender.send(Ok(()));
                 } else if let Some(reply) = pending.lock().pop_front() {
                     let _ = reply.sender.send(Ok(lines));
                 }
@@ -614,7 +800,90 @@ fn read_control_output(
     }
     alive.store(false, Ordering::Release);
     fail_pending(pending, "tmux control client exited");
-    mark_all_sinks_exited(sinks, "tmux control client exited");
+    if close == CloseBehavior::MarkDisconnected {
+        mark_all_sinks_exited(sinks, PANE_CONNECTION_LOST);
+    }
+}
+
+/// Everything a control client needs besides its command line.
+#[derive(Clone, Copy, Debug)]
+struct ClientSettings {
+    close: CloseBehavior,
+    command_timeout: Duration,
+    startup_timeout: Duration,
+    remote: bool,
+}
+
+/// Why a control client did not come up.
+#[derive(Debug)]
+enum StartFailure {
+    Spawn(String),
+    /// tmux itself refused: missing, too old, or its first command failed.
+    NoTmux(String),
+    /// The process ended (or hung) before tmux answered.
+    Exited {
+        stderr: String,
+        timed_out: bool,
+    },
+}
+
+impl std::fmt::Display for StartFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(formatter, "could not start: {error}"),
+            Self::NoTmux(reason) => formatter.write_str(reason),
+            Self::Exited { stderr, timed_out } => {
+                let detail = stderr.trim();
+                match (timed_out, detail.is_empty()) {
+                    (true, true) => formatter.write_str("timed out"),
+                    (true, false) => write!(formatter, "timed out: {detail}"),
+                    (false, true) => formatter.write_str("exited"),
+                    (false, false) => formatter.write_str(detail),
+                }
+            }
+        }
+    }
+}
+
+impl StartFailure {
+    fn into_remote_error(self) -> RemoteConnectError {
+        match self {
+            Self::Spawn(error) => RemoteConnectError::Unreachable(format!("ssh: {error}")),
+            Self::NoTmux(reason) => RemoteConnectError::NoTmux(reason),
+            Self::Exited { stderr, timed_out } => classify_ssh_failure(&stderr, timed_out),
+        }
+    }
+}
+
+/// `new-session` arguments that attach the control client to `session_name`
+/// (creating it with an idle anchor window that keeps the session alive).
+pub(crate) fn control_session_args(session_name: &str) -> [&str; 11] {
+    [
+        "-C",
+        "new-session",
+        "-A",
+        "-s",
+        session_name,
+        "-n",
+        ANCHOR_WINDOW_NAME,
+        "--",
+        "/bin/sh",
+        "-c",
+        "while :; do sleep 3600; done",
+    ]
+}
+
+fn collect_stderr(mut pipe: impl Read, stderr: &Mutex<String>) {
+    let mut buffer = [0_u8; 1024];
+    while let Ok(read) = pipe.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let mut stderr = stderr.lock();
+        if stderr.len() < MAX_STDERR_BYTES {
+            stderr.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        }
+    }
 }
 
 fn fail_pending(pending: &Mutex<VecDeque<PendingReply>>, message: &str) {
@@ -639,8 +908,10 @@ fn mark_all_sinks_exited(sinks: &Mutex<HashMap<String, PaneSink>>, message: &str
     }
 }
 
-fn parse_listed_pane(line: &str) -> Result<(String, String, u32, String)> {
-    let mut fields = line.splitn(4, ' ');
+/// Parses `window pane pid tag name` from `list_panes`; `tag` is empty for
+/// windows HH did not tag. The name is only compared with the anchor's.
+fn parse_listed_pane(line: &str) -> Result<(ListedPane, &str)> {
+    let mut fields = line.splitn(5, ' ');
     let window_id = fields.next().context("tmux omitted window id")?.to_owned();
     let pane_id = fields.next().context("tmux omitted pane id")?.to_owned();
     let process_id = fields
@@ -648,14 +919,19 @@ fn parse_listed_pane(line: &str) -> Result<(String, String, u32, String)> {
         .context("tmux omitted pane pid")?
         .parse()
         .context("tmux returned an invalid pane pid")?;
-    let name = fields
-        .next()
-        .context("tmux omitted window name")?
-        .to_owned();
+    let tag = fields.next().context("tmux omitted window tag")?;
+    let name = fields.next().context("tmux omitted window name")?;
     validate_target_id(&window_id, '@', "window")?;
     validate_target_id(&pane_id, '%', "pane")?;
-    validate_title(&name, "tmux window")?;
-    Ok((window_id, pane_id, process_id, name))
+    Ok((
+        ListedPane {
+            window_id,
+            pane_id,
+            pane_pid: process_id,
+            tag: Uuid::parse_str(tag).ok(),
+        },
+        name,
+    ))
 }
 
 fn validate_target_id(value: &str, sigil: char, label: &str) -> Result<()> {
@@ -782,8 +1058,9 @@ mod tests {
             &sinks,
             &alive,
             startup_sender,
+            CloseBehavior::KeepPanes,
         );
-        startup_receiver.try_recv().unwrap();
+        startup_receiver.try_recv().unwrap().unwrap();
         assert!(!alive.load(Ordering::Acquire));
         assert!(pending.lock().is_empty());
     }
@@ -803,6 +1080,23 @@ mod tests {
         );
     }
 
+    fn test_sink(
+        terminal: &Arc<Mutex<TerminalModel>>,
+        exited: &Arc<Mutex<Option<String>>>,
+    ) -> PaneSink {
+        PaneSink {
+            terminal: Arc::clone(terminal),
+            revision: Arc::default(),
+            content_revision: Arc::default(),
+            events: Arc::default(),
+            paste_events: Arc::default(),
+            images: Arc::new(TerminalImageStore::in_directory(std::env::temp_dir())),
+            exited: Arc::clone(exited),
+            bell_count: 0,
+            window_id: "@1".to_owned(),
+        }
+    }
+
     #[test]
     fn output_splitting_a_utf8_character_neither_ends_the_client_nor_loses_bytes() {
         let alive = AtomicBool::new(true);
@@ -811,23 +1105,22 @@ mod tests {
         let (startup_sender, _startup) = sync_channel(1);
         let terminal = Arc::new(Mutex::new(TerminalModel::new(80, 24)));
         let exited = Arc::new(Mutex::new(None));
-        let sink = PaneSink {
-            terminal: Arc::clone(&terminal),
-            revision: Arc::default(),
-            content_revision: Arc::default(),
-            events: Arc::default(),
-            paste_events: Arc::default(),
-            images: Arc::new(TerminalImageStore::in_directory(std::env::temp_dir())),
-            exited: Arc::clone(&exited),
-            bell_count: 0,
-            window_id: "@1".to_owned(),
-        };
-        let sinks = Mutex::new(HashMap::from([("%1".to_owned(), sink)]));
+        let sinks = Mutex::new(HashMap::from([(
+            "%1".to_owned(),
+            test_sink(&terminal, &exited),
+        )]));
         // "é" is 0xC3 0xA9; tmux emitted its two bytes in separate notifications.
         let mut stream = b"%begin 1 1 0\n%end 1 1 0\n".to_vec();
         stream.extend_from_slice(b"%output %1 caf\xc3\n%output %1 \xa9!\n");
         stream.extend_from_slice(b"%begin 2 2 1\nstill reading\n%end 2 2 1\n");
-        read_control_output(stream.as_slice(), &pending, &sinks, &alive, startup_sender);
+        read_control_output(
+            stream.as_slice(),
+            &pending,
+            &sinks,
+            &alive,
+            startup_sender,
+            CloseBehavior::MarkDisconnected,
+        );
 
         assert_eq!(reply.try_recv().unwrap().unwrap(), ["still reading"]);
         let screen = terminal
@@ -838,7 +1131,61 @@ mod tests {
             .collect::<String>();
         assert!(screen.contains("café!"), "{screen}");
         // EOF ends the client only after every line was processed.
-        assert_eq!(exited.lock().as_deref(), Some("tmux control client exited"));
+        assert_eq!(exited.lock().as_deref(), Some(PANE_CONNECTION_LOST));
+    }
+
+    #[test]
+    fn a_lost_local_connection_leaves_panes_running_for_the_reconnect() {
+        let alive = AtomicBool::new(true);
+        let pending = Mutex::new(VecDeque::new());
+        let (startup_sender, _startup) = sync_channel(1);
+        let terminal = Arc::new(Mutex::new(TerminalModel::new(80, 24)));
+        let exited = Arc::new(Mutex::new(None));
+        let sinks = Mutex::new(HashMap::from([(
+            "%1".to_owned(),
+            test_sink(&terminal, &exited),
+        )]));
+        read_control_output(
+            b"%begin 1 1 0\n%end 1 1 0\n".as_slice(),
+            &pending,
+            &sinks,
+            &alive,
+            startup_sender,
+            CloseBehavior::KeepPanes,
+        );
+        assert!(!alive.load(Ordering::Acquire));
+        assert_eq!(*exited.lock(), None);
+
+        let (startup_sender, _startup) = sync_channel(1);
+        read_control_output(
+            b"%begin 1 1 0\n%end 1 1 0\n%window-close @1\n".as_slice(),
+            &pending,
+            &sinks,
+            &alive,
+            startup_sender,
+            CloseBehavior::KeepPanes,
+        );
+        assert_eq!(exited.lock().as_deref(), Some("exited"));
+    }
+
+    #[test]
+    fn a_host_without_tmux_is_reported_before_startup() {
+        let alive = AtomicBool::new(true);
+        let pending = Mutex::new(VecDeque::new());
+        let sinks = Mutex::new(HashMap::new());
+        let (startup_sender, startup) = sync_channel(1);
+        read_control_output(
+            b"HH-NO-TMUX tmux 3.2 or newer is not installed\n".as_slice(),
+            &pending,
+            &sinks,
+            &alive,
+            startup_sender,
+            CloseBehavior::MarkDisconnected,
+        );
+        assert_eq!(
+            startup.try_recv().unwrap(),
+            Err("tmux 3.2 or newer is not installed".to_owned())
+        );
     }
 
     #[test]
@@ -847,15 +1194,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_listed_panes_without_losing_spaces_in_names() {
+    fn parses_listed_panes_with_and_without_tags() {
+        let tag = Uuid::new_v4();
+        let line = format!("@12 %34 567 {tag} Agent shell");
+        let (pane, name) = parse_listed_pane(&line).unwrap();
         assert_eq!(
-            parse_listed_pane("@12 %34 567 Agent shell").unwrap(),
-            (
-                "@12".to_owned(),
-                "%34".to_owned(),
-                567,
-                "Agent shell".to_owned()
-            )
+            pane,
+            ListedPane {
+                window_id: "@12".to_owned(),
+                pane_id: "%34".to_owned(),
+                pane_pid: 567,
+                tag: Some(tag),
+            }
         );
+        assert_eq!(name, "Agent shell");
+        let (pane, name) = parse_listed_pane("@0 %0 8  hh-anchor").unwrap();
+        assert_eq!(pane.tag, None);
+        assert_eq!(name, ANCHOR_WINDOW_NAME);
     }
 }
