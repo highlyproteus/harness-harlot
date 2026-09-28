@@ -100,9 +100,9 @@ struct WorkspaceSectionCtx {
     tab_drop_into: bool,
     /// A bot card: its agent replaces the workstation number.
     bot: Option<TerminalProfile>,
-    /// A bot card whose thread needs the user or finished unseen: the agent
-    /// icon wears the orange ring.
-    bot_ring: bool,
+    /// A bot card's icon border: its threads' states summarized (needs you,
+    /// then finished unseen, then working).
+    bot_state: PaneIndicator,
 }
 
 impl HhApp {
@@ -252,7 +252,7 @@ impl HhApp {
             drop_below,
             tab_drop_into: self.sidebar.tab_drop_workspace == Some(workspace_id),
             bot: workspace.bot.as_ref().map(|bot| bot.agent),
-            bot_ring: crate::notifications::bot_wants_you(workspace, &self.session.pane_states),
+            bot_state: crate::notifications::bot_indicator(workspace, &self.session.pane_states),
         };
         let saved_threads = ctx
             .bot
@@ -672,15 +672,8 @@ impl HhApp {
         let exited = self.pane_exited(pane_id);
         let indicator = self.pane_indicator(pane);
         let indicator_tooltip = self.pane_indicator_tooltip(pane);
-        let awaits_input = self.pane_awaits_input(pane);
         let focused = self.layout.focused_pane == Some(pane_id);
-        let border = if focused {
-            THEME.accent
-        } else if indicator == PaneIndicator::NeedsYou {
-            indicator.color()
-        } else {
-            THEME.border
-        };
+        let border = if focused { THEME.accent } else { THEME.border };
         // In a bot, a chip is a thread: × deletes it.
         let (close_tooltip, close_thread) = match self.bot_for_pane(pane_id) {
             Some(bot_id) => (
@@ -689,9 +682,14 @@ impl HhApp {
             ),
             None => (format!("Close {title}…"), None),
         };
-        let tooltip = match activity_badge(pane, exited) {
+        let identity = match activity_badge(pane, exited) {
             Some(badge) => format!("{} — {badge}", identity_detail(pane)),
             None => identity_detail(pane),
+        };
+        // A working agent's task progress leads the hover text.
+        let tooltip = match indicator_tooltip {
+            Some(progress) => format!("{progress}\n{identity}"),
+            None => identity,
         };
         let drag = TabDrag {
             workspace_id,
@@ -762,11 +760,6 @@ impl HhApp {
                     .text_color(rgb(if exited { THEME.dim } else { THEME.foreground }))
                     .child(title),
             )
-            .child(self.render_pane_indicator_with_tooltip(
-                indicator,
-                ("tab-pane-chip-status", element_key(pane_id)),
-                indicator_tooltip,
-            ))
             .child(self.render_close_button(
                 ("close-tab-pane-chip", element_key(pane_id)),
                 THEME.foreground,
@@ -779,7 +772,7 @@ impl HhApp {
                 },
                 cx,
             ));
-        self.with_needs_input_border(chip, awaits_input, 4.0)
+        self.with_status_border(chip, indicator, 4.0)
             .into_any_element()
     }
 
@@ -832,7 +825,7 @@ impl HhApp {
         let tab_drop_into = ctx.tab_drop_into;
         let parent = ctx.parent;
         let bot = ctx.bot.is_some();
-        div()
+        let card = div()
             .id(("workspace", element_key(workspace_id)))
             .h(px(if workspace_dir.is_some() { 42.0 } else { 31.0 }))
             .px(px(8.0))
@@ -1005,13 +998,6 @@ impl HhApp {
                     .child(if expanded { "⌄" } else { "›" }),
             )
             .child(self.render_workspace_card_title(ctx))
-            .when(ctx.rollup != PaneIndicator::None, |element| {
-                element.child(self.render_pane_indicator_with_tooltip(
-                    ctx.rollup,
-                    ("workstation-rollup-status", element_key(ctx.workspace_id)),
-                    ctx.rollup.tooltip(),
-                ))
-            })
             .when(!bot, |element| {
                 element.child(self.render_workspace_tab_count(ctx))
             })
@@ -1019,7 +1005,10 @@ impl HhApp {
                 element.child(self.render_new_thread_button(workspace_id, cx))
             })
             .child(self.render_workspace_menu_button(ctx, cx))
-            .children(self.render_remote_card_controls(ctx, cx))
+            .children(self.render_remote_card_controls(ctx, cx));
+        // A collapsed card's border summarizes its tabs and every nested
+        // workstation's.
+        self.with_status_border(card, ctx.rollup, 6.0)
             .into_any_element()
     }
 
@@ -1171,9 +1160,9 @@ impl HhApp {
                             .items_center()
                             .justify_center()
                             .child(render_terminal_profile_icon(agent, text_color, 14.0));
-                        element.child(self.with_needs_input_border(
+                        element.child(self.with_status_border(
                             icon,
-                            ctx.bot_ring,
+                            ctx.bot_state,
                             BOT_ICON_RING_SIZE / 2.0,
                         ))
                     })

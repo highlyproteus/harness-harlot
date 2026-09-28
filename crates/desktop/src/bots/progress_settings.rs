@@ -1,5 +1,5 @@
 //! Settings → Bots → Agent task progress: the opt-in hooks that let omp,
-//! Claude Code, and Codex report their task lists as pane progress rings.
+//! Claude Code, and Codex report their task lists as the progress fill of their tab borders.
 //! Nothing is written until the user clicks Install.
 use std::path::PathBuf;
 
@@ -169,7 +169,7 @@ impl HhApp {
             .text_xs()
             .text_color(rgb(THEME.dim))
             .child(
-                "Show an agent's task list as a progress ring on its tab. Install adds a small hook to that agent's own settings.",
+                "Show an agent's task list as its tab border filling up as tasks finish. Install adds a small hook to that agent's own settings.",
             )
             .into_any_element();
         std::iter::once(intro)

@@ -140,11 +140,14 @@ impl HhApp {
         })
     }
 
-    /// Whether any bot wears the ring; rings the toolbar's Bots button.
-    pub(crate) fn any_bot_wants_you(&self) -> bool {
-        self.session.snapshot.as_ref().is_some_and(|snapshot| {
-            crate::notifications::any_bot_wants_you(snapshot, &self.session.pane_states)
-        })
+    /// Every bot's icon state in one: the toolbar Bots button's border.
+    pub(crate) fn bots_indicator(&self) -> crate::tab_chrome::PaneIndicator {
+        self.session
+            .snapshot
+            .as_ref()
+            .map_or_else(Default::default, |snapshot| {
+                crate::notifications::bots_indicator(snapshot, &self.session.pane_states)
+            })
     }
 
     /// The hammer, robot, and bell toolbar buttons; see `next_sidebar_mode`.

@@ -1,6 +1,7 @@
-//! Live status drawing: task-progress rings, the indeterminate running ring,
-//! and the needs-input comet border, plus the motion clock that paces them
-//! and the system "Reduce motion" preference that stills them.
+//! Live status drawing: the state border every tab wears (working blue with
+//! its task-progress fill, needs-you magenta, done green) with its comet,
+//! plus the motion clock that paces it and the system "Reduce motion"
+//! preference that stills it.
 //!
 //! Everything is stroked as anti-aliased GPU paths in logical pixels, so it
 //! stays crisp at any scale factor. Animation is driven by
@@ -14,32 +15,30 @@ use gpui::{Bounds, Hsla, PathBuilder, Pixels, Window, point, px, rgb};
 
 use crate::THEME;
 
-/// ~30 fps: smooth enough for the small travelling comet, and half the cost
-/// of redrawing at display rate.
+/// ~30 fps: the needs-you comet is the one that must catch the eye.
 const COMET_FRAME: Duration = Duration::from_millis(33);
-/// 10 fps: a small rotating ring reads as spinning at this rate, and every
-/// frame redraws the whole window.
-const SPINNER_FRAME: Duration = Duration::from_millis(100);
-/// One clockwise loop of the needs-input comet.
+/// ~12 fps for working and done comets: they move on the same 2 s loop but
+/// every frame redraws the whole window, and they can run for a long time.
+const CALM_FRAME: Duration = Duration::from_millis(83);
+/// One clockwise loop of a comet.
 pub(crate) const COMET_PERIOD_SECS: f32 = 2.0;
 /// Share of the perimeter the comet covers, tail included.
 pub(crate) const COMET_FRACTION: f32 = 0.2;
-/// One rotation of the indeterminate running ring.
-pub(crate) const SPINNER_PERIOD_SECS: f32 = 1.2;
 /// How often the reduce-motion preference may be re-read.
 const REDUCED_MOTION_RECHECK: Duration = Duration::from_secs(1);
 
 pub(crate) const BORDER_WIDTH: f32 = 1.5;
-const RING_RADIUS: f32 = 3.5;
-const RING_WIDTH: f32 = 1.5;
-/// Arc left open on the indeterminate ring.
-const SPINNER_GAP: f32 = FRAC_PI_2;
+/// The progress fill is a little heavier than its track.
+const FILL_WIDTH: f32 = 2.0;
 const COMET_BANDS: u8 = 6;
-const COMET_COLOR: u32 = 0xffd49a;
+/// How far the comet's tint leans from the state colour toward white.
+const COMET_TINT: f32 = 0.55;
 
-pub(crate) const PROGRESS_RED: u32 = 0xe5484d;
-pub(crate) const PROGRESS_AMBER: u32 = 0xf5a524;
-pub(crate) const PROGRESS_GREEN: u32 = 0x30a46c;
+/// Border colours (palette A): no red, amber, or orange anywhere, so a
+/// working tab, one that needs you, and one that finished can't be confused.
+pub(crate) const WORKING_COLOR: u32 = THEME.accent;
+pub(crate) const NEEDS_YOU_COLOR: u32 = 0xd6_5cf2;
+pub(crate) const DONE_COLOR: u32 = 0x3f_b950;
 
 /// The fastest-moving thing a frame drew, which sets the next frame's delay.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -47,9 +46,9 @@ pub(crate) enum FrameRate {
     /// Nothing moves: no timer.
     #[default]
     Still,
-    /// The indeterminate running ring.
-    Spinner,
-    /// The needs-input comet.
+    /// A working or done comet.
+    Calm,
+    /// The needs-you comet.
     Comet,
 }
 
@@ -58,7 +57,7 @@ impl FrameRate {
     pub(crate) const fn interval(self) -> Option<Duration> {
         match self {
             Self::Still => None,
-            Self::Spinner => Some(SPINNER_FRAME),
+            Self::Calm => Some(CALM_FRAME),
             Self::Comet => Some(COMET_FRAME),
         }
     }
@@ -176,7 +175,7 @@ fn system_prefers_reduced_motion() -> bool {
     false
 }
 
-/// How a needs-input border is drawn this frame.
+/// How a state border is drawn this frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum BorderMotion {
     /// The comet's head sits at this fraction of the perimeter.
@@ -200,10 +199,28 @@ pub(crate) fn comet_head(elapsed_secs: f32) -> f32 {
     (elapsed_secs / COMET_PERIOD_SECS).rem_euclid(1.0)
 }
 
-/// The indeterminate ring's rotation in radians, or `None` when motion is
-/// reduced and the ring stays still.
-pub(crate) fn spinner_rotation(reduced: bool, elapsed_secs: f32) -> Option<f32> {
-    (!reduced).then(|| (elapsed_secs / SPINNER_PERIOD_SECS).rem_euclid(1.0) * TAU)
+/// What one state border draws: its colour, the base border's opacity, the
+/// task-progress fill (a fraction clockwise from the top-left corner) when
+/// the agent reports a list, and the motion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BorderArt {
+    pub(crate) color: u32,
+    pub(crate) base_alpha: f32,
+    pub(crate) fill: Option<f32>,
+    pub(crate) motion: BorderMotion,
+}
+
+/// Opacity of the dim track under a progress fill.
+const FILL_TRACK_ALPHA: f32 = 0.18;
+
+/// The comet's colour: the state colour leaning toward white.
+pub(crate) fn comet_tint(color: u32) -> u32 {
+    let lift = |shift: u32| {
+        let channel = f32::from(((color >> shift) & 0xff) as u8);
+        let lifted = channel + (255.0 - channel) * COMET_TINT;
+        (lifted.round() as u32).min(255) << shift
+    };
+    lift(16) | lift(8) | lift(0)
 }
 
 /// Point at fraction `s` of the perimeter of a `width`×`height` rectangle
@@ -269,42 +286,13 @@ fn perimeter_length(width: f32, height: f32, radius: f32) -> f32 {
     2.0 * (width + height - 4.0 * radius).max(0.0) + TAU * radius
 }
 
-/// Task-progress color: red at 0, amber at ½, green at 1, interpolated in
-/// HSL along the shorter hue arc so the midway tones stay saturated.
-pub(crate) fn progress_color(fraction: f32) -> u32 {
-    let fraction = if fraction.is_nan() {
-        0.0
-    } else {
-        fraction.clamp(0.0, 1.0)
-    };
-    if fraction <= 0.5 {
-        lerp_hsl(PROGRESS_RED, PROGRESS_AMBER, fraction * 2.0)
-    } else {
-        lerp_hsl(PROGRESS_AMBER, PROGRESS_GREEN, (fraction - 0.5) * 2.0)
-    }
-}
-
-fn lerp_hsl(from: u32, to: u32, t: f32) -> u32 {
-    if t <= 0.0 {
-        return from;
-    }
-    if t >= 1.0 {
-        return to;
-    }
-    let (h1, s1, l1) = rgb_to_hsl(from);
-    let (h2, s2, l2) = rgb_to_hsl(to);
-    let delta = (h2 - h1 + 540.0).rem_euclid(360.0) - 180.0;
-    hsl_to_rgb(
-        (h1 + delta * t).rem_euclid(360.0),
-        s1 + (s2 - s1) * t,
-        l1 + (l2 - l1) * t,
-    )
-}
-
+#[cfg(test)]
 fn channels(color: u32) -> [f32; 3] {
     [16, 8, 0].map(|shift| f32::from(((color >> shift) & 0xff) as u8) / 255.0)
 }
 
+/// Hue in degrees, saturation, lightness.
+#[cfg(test)]
 fn rgb_to_hsl(color: u32) -> (f32, f32, f32) {
     let [red, green, blue] = channels(color);
     let max = red.max(green).max(blue);
@@ -323,23 +311,6 @@ fn rgb_to_hsl(color: u32) -> (f32, f32, f32) {
         60.0 * ((red - green) / chroma + 4.0)
     };
     (hue, saturation, lightness)
-}
-
-fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> u32 {
-    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
-    let sector = hue / 60.0;
-    let second = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
-    let (red, green, blue) = match sector as u8 {
-        0 => (chroma, second, 0.0),
-        1 => (second, chroma, 0.0),
-        2 => (0.0, chroma, second),
-        3 => (0.0, second, chroma),
-        4 => (second, 0.0, chroma),
-        _ => (chroma, 0.0, second),
-    };
-    let offset = lightness - chroma / 2.0;
-    let byte = |value: f32| u32::from(((value + offset).clamp(0.0, 1.0) * 255.0).round() as u8);
-    (byte(red) << 16) | (byte(green) << 8) | byte(blue)
 }
 
 fn color(rgb_value: u32, alpha: f32) -> Hsla {
@@ -375,71 +346,13 @@ fn stroke_polyline(
     }
 }
 
-/// Points along the ring of `radius` around `center`, from `start` radians
-/// clockwise through `sweep` radians.
-fn arc_points(center: (f32, f32), radius: f32, start: f32, sweep: f32) -> Vec<(f32, f32)> {
-    // One segment per ~6°: smooth at the ring's 7 px diameter even at 2x.
-    let segments = ((sweep.abs() / TAU) * 60.0).ceil().max(2.0) as u16;
-    (0..=segments)
-        .map(|index| {
-            let angle = start + sweep * f32::from(index) / f32::from(segments);
-            (
-                center.0 + radius * angle.cos(),
-                center.1 + radius * angle.sin(),
-            )
-        })
-        .collect()
-}
-
-/// A ring whose filled arc is `fraction` of the way around from 12 o'clock,
-/// over a faint full track.
-pub(crate) fn paint_progress_ring(bounds: Bounds<Pixels>, window: &mut Window, fraction: f32) {
-    let center = (
-        f32::from(bounds.size.width) / 2.0,
-        f32::from(bounds.size.height) / 2.0,
-    );
-    let track = arc_points(center, RING_RADIUS, 0.0, TAU);
-    stroke_polyline(
-        window,
-        bounds.origin,
-        &track,
-        true,
-        RING_WIDTH,
-        color(THEME.dim, 0.45),
-    );
-    let fraction = fraction.clamp(0.0, 1.0);
-    if fraction <= 0.0 {
-        return;
-    }
-    let arc = arc_points(center, RING_RADIUS, -FRAC_PI_2, fraction * TAU);
-    stroke_polyline(
-        window,
-        bounds.origin,
-        &arc,
-        fraction >= 1.0,
-        RING_WIDTH,
-        color(progress_color(fraction), 1.0),
-    );
-}
-
-/// The blue running ring without task data: open by a quarter that rotates
-/// clockwise, or closed and still when `rotation` is `None`.
-pub(crate) fn paint_spinner_ring(
-    bounds: Bounds<Pixels>,
-    window: &mut Window,
-    rotation: Option<f32>,
-) {
-    let center = (
-        f32::from(bounds.size.width) / 2.0,
-        f32::from(bounds.size.height) / 2.0,
-    );
-    let blue = color(THEME.accent, 1.0);
-    if let Some(rotation) = rotation {
-        let points = arc_points(center, RING_RADIUS, rotation - FRAC_PI_2, TAU - SPINNER_GAP);
-        stroke_polyline(window, bounds.origin, &points, false, RING_WIDTH, blue);
+/// Length of the run a progress fill covers, as a share of the perimeter:
+/// the fraction clamped to `0..=1`, with NaN treated as nothing done.
+pub(crate) fn fill_extent(fraction: f32) -> f32 {
+    if fraction.is_nan() {
+        0.0
     } else {
-        let points = arc_points(center, RING_RADIUS, 0.0, TAU);
-        stroke_polyline(window, bounds.origin, &points, true, RING_WIDTH, blue);
+        fraction.clamp(0.0, 1.0)
     }
 }
 
@@ -468,13 +381,15 @@ fn perimeter_run(
         .collect()
 }
 
-/// The needs-input frame: an orange border with either a bright comet at
-/// `head` running clockwise, or (reduced motion) a steady inner glow.
-pub(crate) fn paint_needs_input_border(
+/// A tab's state border: the base border in the state colour (or, with a
+/// task list, a dim track under a bright fill running clockwise from the
+/// top-left corner), then either the comet at `head` or, with reduced
+/// motion, a steady glow.
+pub(crate) fn paint_status_border(
     bounds: Bounds<Pixels>,
     window: &mut Window,
     radius: f32,
-    motion: BorderMotion,
+    art: BorderArt,
 ) {
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
@@ -483,15 +398,39 @@ pub(crate) fn paint_needs_input_border(
     }
     let inset = BORDER_WIDTH / 2.0;
     let ring = perimeter_run(width, height, radius, inset, 0.0, 1.0);
-    stroke_polyline(
-        window,
-        bounds.origin,
-        &ring,
-        true,
-        BORDER_WIDTH,
-        color(THEME.warning, 1.0),
-    );
-    match motion {
+    match art.fill {
+        Some(fraction) => {
+            stroke_polyline(
+                window,
+                bounds.origin,
+                &ring,
+                true,
+                BORDER_WIDTH,
+                color(art.color, FILL_TRACK_ALPHA),
+            );
+            let extent = fill_extent(fraction);
+            if extent > 0.0 {
+                let fill = perimeter_run(width, height, radius, inset, 0.0, extent);
+                stroke_polyline(
+                    window,
+                    bounds.origin,
+                    &fill,
+                    extent >= 1.0,
+                    FILL_WIDTH,
+                    color(art.color, 1.0),
+                );
+            }
+        }
+        None => stroke_polyline(
+            window,
+            bounds.origin,
+            &ring,
+            true,
+            BORDER_WIDTH,
+            color(art.color, art.base_alpha),
+        ),
+    }
+    match art.motion {
         BorderMotion::Glow => {
             for (depth, alpha) in [(2.0, 0.35), (3.25, 0.15)] {
                 let halo = perimeter_run(width, height, radius, inset + depth, 0.0, 1.0);
@@ -501,12 +440,13 @@ pub(crate) fn paint_needs_input_border(
                     &halo,
                     true,
                     BORDER_WIDTH,
-                    color(THEME.warning, alpha),
+                    color(art.color, alpha),
                 );
             }
         }
         BorderMotion::Comet { head } => {
             // The tail fades in bands from faint to the bright head.
+            let tint = comet_tint(art.color);
             let band = COMET_FRACTION / f32::from(COMET_BANDS);
             for index in 0..COMET_BANDS {
                 let from = head - COMET_FRACTION + band * f32::from(index);
@@ -518,7 +458,7 @@ pub(crate) fn paint_needs_input_border(
                     &points,
                     false,
                     BORDER_WIDTH,
-                    color(COMET_COLOR, alpha),
+                    color(tint, alpha),
                 );
             }
         }
@@ -528,9 +468,9 @@ pub(crate) fn paint_needs_input_border(
 #[cfg(test)]
 mod tests {
     use super::{
-        BorderMotion, COMET_PERIOD_SECS, FrameRate, Motion, PROGRESS_AMBER, PROGRESS_GREEN,
-        PROGRESS_RED, SPINNER_PERIOD_SECS, border_motion, channels, comet_head, perimeter_point,
-        progress_color, reduced_motion_recheck_due, rgb_to_hsl, spinner_rotation,
+        BorderMotion, COMET_PERIOD_SECS, DONE_COLOR, FrameRate, Motion, NEEDS_YOU_COLOR,
+        WORKING_COLOR, border_motion, comet_head, comet_tint, fill_extent, perimeter_point,
+        reduced_motion_recheck_due, rgb_to_hsl,
     };
     use std::time::{Duration, Instant};
 
@@ -538,29 +478,54 @@ mod tests {
         (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3
     }
 
+    /// Palette A: the three state colours are far apart in hue, and none of
+    /// them sits in the red/amber/orange band that reads as a warning.
     #[test]
-    fn progress_color_runs_red_to_amber_to_green() {
-        assert_eq!(progress_color(0.0), PROGRESS_RED);
-        assert_eq!(progress_color(0.5), PROGRESS_AMBER);
-        assert_eq!(progress_color(1.0), PROGRESS_GREEN);
-        assert_eq!(progress_color(-3.0), PROGRESS_RED, "clamped below");
-        assert_eq!(progress_color(7.0), PROGRESS_GREEN, "clamped above");
-        assert_eq!(progress_color(f32::NAN), PROGRESS_RED);
+    fn the_state_colours_are_distinct_and_none_is_red_amber_or_orange() {
+        let hues = [WORKING_COLOR, NEEDS_YOU_COLOR, DONE_COLOR].map(|color| {
+            let (hue, saturation, _) = rgb_to_hsl(color);
+            assert!(saturation > 0.4, "{color:06x} is a clear colour");
+            assert!(
+                (60.0..=330.0).contains(&hue),
+                "{color:06x} at {hue}° is in the red–orange–amber band"
+            );
+            hue
+        });
+        for (index, first) in hues.iter().enumerate() {
+            for second in &hues[index + 1..] {
+                let gap = (first - second).abs().min(360.0 - (first - second).abs());
+                assert!(gap > 60.0, "{first}° and {second}° are too close");
+            }
+        }
+    }
 
-        // A quarter of the way sits between red and amber in hue, going
-        // through orange rather than the long way round through blue.
-        let (red_hue, _, _) = rgb_to_hsl(PROGRESS_RED);
-        let (amber_hue, _, _) = rgb_to_hsl(PROGRESS_AMBER);
-        let (quarter_hue, saturation, _) = rgb_to_hsl(progress_color(0.25));
-        let unwrapped = |hue: f32| if hue > 180.0 { hue - 360.0 } else { hue };
+    #[test]
+    fn the_comet_is_a_lighter_tint_of_its_state_colour() {
+        for color in [WORKING_COLOR, NEEDS_YOU_COLOR, DONE_COLOR] {
+            let (hue, _, lightness) = rgb_to_hsl(color);
+            let (tint_hue, _, tint_lightness) = rgb_to_hsl(comet_tint(color));
+            assert!(tint_lightness > lightness, "{color:06x} tint is lighter");
+            assert!((tint_hue - hue).abs() < 8.0, "{color:06x} keeps its hue");
+        }
+    }
+
+    #[test]
+    fn the_progress_fill_covers_the_done_share_of_the_border() {
+        assert!(fill_extent(0.0).abs() < f32::EPSILON);
+        assert!((fill_extent(0.5) - 0.5).abs() < f32::EPSILON);
+        assert!((fill_extent(1.0) - 1.0).abs() < f32::EPSILON);
+        assert!((fill_extent(7.0) - 1.0).abs() < f32::EPSILON, "clamped");
+        assert!(fill_extent(-1.0).abs() < f32::EPSILON, "clamped");
         assert!(
-            unwrapped(red_hue) < unwrapped(quarter_hue)
-                && unwrapped(quarter_hue) < unwrapped(amber_hue),
-            "{red_hue} < {quarter_hue} < {amber_hue}"
+            fill_extent(f32::NAN).abs() < f32::EPSILON,
+            "NaN is nothing done"
         );
-        assert!(saturation > 0.6, "midway tones stay saturated");
-        let [r, g, b] = channels(progress_color(0.75));
-        assert!(g > r && g > b, "three quarters leans green");
+        // Half the tasks cover half the perimeter: from the top-left start to
+        // the point diametrically opposite on a symmetric box.
+        let (width, height, radius) = (100.0, 20.0, 4.0);
+        let start = perimeter_point(width, height, radius, 0.0);
+        let half = perimeter_point(width, height, radius, fill_extent(0.5));
+        assert!(close(half, (width - start.0, height)), "{half:?}");
     }
 
     #[test]
@@ -624,24 +589,18 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_stills_the_border_and_the_running_ring() {
+    fn reduced_motion_stills_every_border() {
         assert_eq!(border_motion(true, 0.7), BorderMotion::Glow);
         assert!(matches!(
             border_motion(false, 0.7),
             BorderMotion::Comet { head } if (head - comet_head(0.7)).abs() < 1e-6
         ));
-        assert_eq!(spinner_rotation(true, 0.4), None);
-        let rotation = spinner_rotation(false, SPINNER_PERIOD_SECS / 2.0).expect("animated");
-        assert!((rotation - std::f32::consts::PI).abs() < 1e-4);
     }
 
     #[test]
-    fn only_the_comet_runs_at_thirty_fps_and_the_spinner_at_ten() {
+    fn only_the_needs_you_comet_runs_at_thirty_fps_and_the_calm_ones_at_twelve() {
         assert_eq!(FrameRate::Still.interval(), None);
-        assert_eq!(
-            FrameRate::Spinner.interval(),
-            Some(Duration::from_millis(100))
-        );
+        assert_eq!(FrameRate::Calm.interval(), Some(Duration::from_millis(83)));
         assert_eq!(FrameRate::Comet.interval(), Some(Duration::from_millis(33)));
 
         let motion = Motion::new();
@@ -651,10 +610,10 @@ mod tests {
             None,
             "a still frame wants no timer"
         );
-        motion.request_frames(FrameRate::Spinner);
-        assert_eq!(motion.wanted_interval(), FrameRate::Spinner.interval());
+        motion.request_frames(FrameRate::Calm);
+        assert_eq!(motion.wanted_interval(), FrameRate::Calm.interval());
         motion.request_frames(FrameRate::Comet);
-        motion.request_frames(FrameRate::Spinner);
+        motion.request_frames(FrameRate::Calm);
         assert_eq!(
             motion.wanted_interval(),
             FrameRate::Comet.interval(),
@@ -667,8 +626,8 @@ mod tests {
         let mut motion = Motion::new();
         let now = Instant::now();
         motion.begin_frame();
-        motion.request_frames(FrameRate::Spinner);
-        assert_eq!(motion.next_tick(now), FrameRate::Spinner.interval());
+        motion.request_frames(FrameRate::Calm);
+        assert_eq!(motion.next_tick(now), FrameRate::Calm.interval());
         // Hidden or minimised: gpui draws no frame after the redraw request.
         assert_eq!(motion.next_tick(now), None);
 

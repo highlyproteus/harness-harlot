@@ -94,7 +94,7 @@ computer or on an SSH host. The hammer in the sidebar toolbar shows them.
 
 - **This Mac** (**This Computer** on Linux) is your home workstation. You can rename, recolor, and pin it or give it a root folder, but it can never be deleted.
 - Add more local workstations whenever you like. Each has a root folder, set from the workstation menu (**Set Root Folder…**); new tabs, the first terminal of a new workstation, and the first terminal after all its tabs close open there. Split panes keep following the directory of the pane they split from.
-- Workstations nest up to four levels deep: choose **New Workstation Inside…** on a workstation's menu. A nested workstation runs on the same machine as its parent and uses its parent's root folder until you give it its own. A collapsed workstation shows one status dot for itself and everything inside it (needs you, then running, then done). Deleting a workstation also removes the workstations nested inside it.
+- Workstations nest up to four levels deep: choose **New Workstation Inside…** on a workstation's menu. A nested workstation runs on the same machine as its parent and uses its parent's root folder until you give it its own. A collapsed workstation's card wears one status border for itself and everything inside it (needs you, then done, then working). Deleting a workstation also removes the workstations nested inside it.
 - Drag a tab onto another workstation on the same machine to move it there.
 - Rename workstations, give them their own colors, and pin the ones you use most; drag to reorder them among their siblings.
 - SSH workstations launch your installed OpenSSH client, so your `~/.ssh/config`, keys, agents, and host verification are always the authority. Saved SSH workstations reconnect into their saved layout, together with the workstations nested inside them; credentials are never stored.
@@ -162,34 +162,39 @@ Claude Code and Codex may ask once to trust the bot's folder. See
 
 ## Status and notifications
 
-Every terminal tab shows what its agent is doing:
+Every terminal tab shows what its agent is doing with its border — in the
+sidebar rows, the tab strip, pane headers, and the sidebar's pane chips. A
+bright segment runs clockwise around the border; with **Reduce motion** on
+(macOS Accessibility, or GNOME's animations switched off) the border keeps its
+colour and a steady glow instead.
 
-- **Orange border** — the agent waits for your input or approval. A bright
-  segment runs around the tab (in the tab strip, the sidebar, and pane
-  headers) so it catches your eye; with **Reduce motion** on (macOS
-  Accessibility, or GNOME's animations switched off) the border stays solid.
-- **Progress ring** — the agent is working. Agents that keep a task list fill
-  the ring as tasks complete, shading from red through amber to green; hover
-  it for "3 of 7 done" and the current task. Claude Code and Codex show it
-  while their task list is unfinished. Other running agents show a spinning
-  blue ring.
-- **Blue dot** — the agent finished (or needed you) while you were elsewhere.
-  It stays until you look: click the tab or pane, switch to its tab or
-  workstation, click its notification, or type into it. Merely having the
-  window in front does not clear it, and it survives restarts.
+- **Blue** — the agent is working. Agents that keep a task list fill the
+  border from the top-left corner as tasks complete (a dim blue track shows
+  the rest); hover the tab for "3 of 7 done" and the current task. Claude Code
+  and Codex show the fill while their task list is unfinished.
+- **Magenta** — the agent needs you: it asks for input or approval, or rang
+  the terminal bell.
+- **Green** — the agent finished while you were elsewhere. It stays until you
+  look: click the tab or pane, switch to its tab or workstation, click its
+  notification, or type into it. Merely having the window in front does not
+  clear it, and it survives restarts.
+- No border — idle, or finished and already seen.
+
+Where one border stands for several tabs — a collapsed workstation card, a
+bot's icon on its card, and the toolbar's Bots button — it shows the most
+urgent: magenta, then green, then blue.
 
 The bell switches the sidebar to Notifications: **Needs you** and **Running**
 list live terminal tabs and bots, and **Recent** keeps the last 200 finished
 and attention notifications across restarts, newest first, unread ones marked
 with a blue dot. **Mark all read** clears them; clicking any row jumps to its
 pane and marks it seen, and viewing a pane marks its notifications read. The
-bell counts unread notifications: orange when one of them needs you (an agent
-asks for input or approval), blue otherwise. The Dock icon shows the same count
-in macOS's standard red badge.
+bell counts unread notifications: magenta when one of them needs you, blue
+otherwise. The Dock icon shows the same count in macOS's standard red badge.
 
 ### Task progress from agents
 
-The progress ring is opt-in per agent. Enable it in **Settings → Bots → Agent
+Task progress is opt-in per agent. Enable it in **Settings → Bots → Agent
 task progress**, or from a terminal:
 
 ```bash

@@ -8,7 +8,7 @@ use crate::helpers::{
     top_level_workstation, workstation_banner_header_height,
 };
 use crate::notifications::SeenScope;
-use crate::tab_chrome::render_unread_dot;
+use crate::tab_chrome::PaneIndicator;
 use crate::view_models::{
     Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView, UpdateRestartConfirmation,
 };
@@ -345,7 +345,7 @@ impl HhApp {
                 render_hammer_icon,
                 0,
                 THEME.danger,
-                false,
+                PaneIndicator::None,
                 cx,
             ))
             .child(self.render_sidebar_mode_button(
@@ -354,7 +354,7 @@ impl HhApp {
                 render_robot_icon,
                 self.bots_needing_you(),
                 THEME.danger,
-                self.any_bot_wants_you(),
+                self.bots_indicator(),
                 cx,
             ))
             .child(
@@ -365,7 +365,7 @@ impl HhApp {
                     self.unread_badge().map_or(0, |badge| badge.count),
                     self.unread_badge()
                         .map_or(THEME.accent, |badge| badge.color()),
-                    false,
+                    PaneIndicator::None,
                     cx,
                 ),
             )
@@ -437,8 +437,8 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// A toolbar button for one sidebar mode, with a count badge and, when
-    /// `ring`, the orange needs-you ring (the needs-input border).
+    /// A toolbar button for one sidebar mode, with a count badge and the
+    /// state border `ring` summarizes (none for `PaneIndicator::None`).
     #[allow(clippy::too_many_arguments)]
     fn render_sidebar_mode_button(
         &self,
@@ -447,7 +447,7 @@ impl HhApp {
         icon: fn(u32) -> AnyElement,
         count: usize,
         badge_color: u32,
-        ring: bool,
+        ring: PaneIndicator,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.sidebar.sidebar_mode == mode
@@ -491,7 +491,7 @@ impl HhApp {
                 THEME.muted
             }));
         // The ring goes under the count badge so the number stays readable.
-        self.with_needs_input_border(button, ring, 5.0)
+        self.with_status_border(button, ring, 5.0)
             .when(count > 0, |element| {
                 element.child(
                     div()
@@ -631,8 +631,6 @@ impl HhApp {
             .as_ref()
             .map_or_else(|| self.pane_indicator(pane), |activity| activity.indicator);
         let indicator_tooltip = self.pane_indicator_tooltip(pane);
-        let awaits_input = self.pane_awaits_input(pane);
-        let unread = activity.as_ref().map(|activity| activity.unread);
         let (close_tooltip, close_thread) = match bot_thread {
             Some(bot_id) => (
                 "Delete thread…".to_owned(),
@@ -673,7 +671,7 @@ impl HhApp {
                 element.hover(|element| element.border_1().border_color(rgb(row_text)))
             })
             .tooltip(move |_, cx| {
-                let text = input
+                let identity = input
                     .read(cx)
                     .session
                     .snapshot
@@ -687,6 +685,11 @@ impl HhApp {
                     })
                     .map(identity_detail)
                     .unwrap_or_default();
+                // A working agent's task progress leads the hover text.
+                let text = match &indicator_tooltip {
+                    Some(progress) => format!("{progress}\n{identity}"),
+                    None => identity,
+                };
                 cx.new(|_| TooltipView { text }).into()
             })
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -824,14 +827,6 @@ impl HhApp {
                         )
                     }),
             )
-            .when_some(unread, |element, unread| {
-                element.child(render_unread_dot(unread))
-            })
-            .child(self.render_pane_indicator_with_tooltip(
-                indicator,
-                ("workspace-tab-status", element_key(pane_id)),
-                indicator_tooltip,
-            ))
             .child(self.render_close_button(
                 ("close-workspace-tab", element_key(pane_id)),
                 row_text,
@@ -844,7 +839,7 @@ impl HhApp {
                 },
                 cx,
             ));
-        self.with_needs_input_border(row, awaits_input, 4.0)
+        self.with_status_border(row, indicator, 4.0)
             .into_any_element()
     }
 

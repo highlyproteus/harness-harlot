@@ -149,7 +149,6 @@ impl HhApp {
                 let selected = pane_id == active;
                 let indicator = self.pane_indicator(pane);
                 let indicator_tooltip = self.pane_indicator_tooltip(pane);
-                let awaits_input = self.pane_awaits_input(pane);
                 let pane_accent = pane
                     .color
                     .unwrap_or_else(|| self.terminal_accent(pane_id))
@@ -181,6 +180,11 @@ impl HhApp {
                         rgb(THEME.border)
                     })
                     .when(selected, |element| element.bg(rgb(THEME.selection)))
+                    .when_some(indicator_tooltip, |element, text| {
+                        element.tooltip(move |_, cx| {
+                            cx.new(|_| TooltipView { text: text.clone() }).into()
+                        })
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.activate_tab(pane_id, cx);
                         cx.stop_propagation();
@@ -263,11 +267,6 @@ impl HhApp {
                                 .child(label),
                         )
                     })
-                    .child(self.render_pane_indicator_with_tooltip(
-                        indicator,
-                        ("pane-tab-status", element_key(pane_id)),
-                        indicator_tooltip,
-                    ))
                     .child(self.render_close_button(
                         ("close-tab", element_key(pane_id)),
                         THEME.foreground,
@@ -275,7 +274,7 @@ impl HhApp {
                         move |this, cx| this.begin_close(pane_id, cx),
                         cx,
                     ));
-                self.with_needs_input_border(tab, awaits_input, 0.0)
+                self.with_status_border(tab, indicator, 0.0)
                     .into_any_element()
             })
             .collect()

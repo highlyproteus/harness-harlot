@@ -8,24 +8,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- A bot's icon on its sidebar card, and the toolbar's Bots button when any bot
-  qualifies, wear the same orange ring as the needs-input border while one of
-  its threads needs your input, approval, or attention, or has finished and
-  you haven't opened it yet. Opening that thread (or answering it) clears the
-  ring. It stays still with **Reduce motion**.
-- Tabs whose agent waits for your input or approval get an orange border with
-  a bright segment running around it, in the tab strip, the sidebar, pane
-  headers, and the sidebar's pane chips. It animates only while visible and
-  stays solid with **Reduce motion** (macOS) or GNOME animations off.
-- Task progress: a working agent's status dot becomes a ring that fills as its
-  task list completes, shading from red through amber to green, with "3 of 7
-  done · phase — current task" on hover. Claude Code and Codex, which don't
-  report when they are working, show the ring while their task list is
-  unfinished. Collapsed workstations, tab strip tabs, and Notifications'
-  **Running** rows add up their panes' progress. Agents without a task list
-  show a spinning blue ring while working (static with reduced motion).
-  omp's ring also follows `/todo` edits and tasks its subagents complete.
-  Progress disappears once the agent exits back to its shell.
+- Every tab shows its agent's state with its border instead of a dot or
+  spinner — in sidebar rows, the tab strip, pane headers, and the sidebar's
+  pane chips: **blue** while working, **magenta** when it needs your input or
+  approval or rang the bell, and **green** when it finished and you haven't
+  looked yet (until you click, switch to, or type into it). A bright segment
+  runs clockwise around the border; with **Reduce motion** (macOS) or GNOME
+  animations off it keeps its colour and a steady glow. Borders animate only
+  while visible: the magenta one at about 30 fps, blue and green at about
+  12 fps.
+- Task progress: while an agent works through a task list, its blue border
+  fills clockwise from the top-left corner as tasks complete, over a dim track,
+  with "3 of 7 done · phase — current task" on hover. Claude Code and Codex,
+  which don't report when they are working, show it while their task list is
+  unfinished. omp's fill also follows `/todo` edits and tasks its subagents
+  complete. Progress disappears once the agent exits back to its shell.
+- One border summarizes several where needed — a collapsed workstation card,
+  a bot's icon on its card, and the toolbar's Bots button — showing magenta,
+  then green, then blue. A bot's icon therefore turns green when one of its
+  threads finished unseen and clears once you open it.
 - `hh progress install|uninstall omp|claude|codex` and `hh progress status
   [--json]` enable task progress per agent (also under **Settings → Bots →
   Agent task progress**): an omp extension in the omp agent directory's
@@ -44,7 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   progress. `--current` and `--phase` text may start with `--`.
 - Notifications keeps a **Recent** list of the last 200 finished and attention
   notifications across restarts, with unread ones marked, and a **Mark all
-  read** button.
+  read** button. Rows are marked magenta for attention and green for finished.
 
 ### Changed
 
@@ -59,8 +60,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Workstations nest up to four levels deep: **New Workstation Inside…** on a
   workstation's menu replaces **New Project…**. A nested workstation runs on
   its parent's machine and uses its parent's root folder until you set its own
-  with **Set Root Folder…**. A collapsed workstation shows one status dot for
-  itself and everything inside it. Deleting a workstation also removes the
+  with **Set Root Folder…**. A collapsed workstation's card wears one status
+  border for itself and everything inside it. Deleting a workstation also removes the
   workstations nested inside it (the confirmation says how many), and
   disconnecting or reconnecting an SSH workstation includes them too.
 - Projects become nested workstations on upgrade, keeping their folder, title,
@@ -78,7 +79,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   state, notifications, and task progress; desktop and service must be
   upgraded together, so the update restarts the terminal service. Session
   snapshots move to schema 17.
-- The bell counts unread notifications, orange when one needs you (including
+- The bell counts unread notifications, magenta when one needs you (including
   an agent asking for approval or input) and blue otherwise. The Dock icon
   shows the same count in macOS's standard red badge.
 
@@ -89,12 +90,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Named single-terminal tabs, such as a bot's worker tabs, are compact
   sidebar rows showing their name, like every other tab, instead of a tall box
   holding one terminal chip. Only tabs with several panes show the pane map.
-- The blue "done" dot stays until you look at the pane: clicking it or its
-  tab, switching to its tab or workstation, clicking its notification, or
-  typing into it. Merely focusing the window no longer clears it, it is set
+- A finished tab's green border stays until you look at the pane: clicking it
+  or its tab, switching to its tab or workstation, clicking its notification,
+  or typing into it. Merely focusing the window no longer clears it, it is set
   for every finish or request for attention (including omp title changes,
   bells, and exits), and it survives restarts. Viewing a pane also marks its
-  unread notifications read, including bells and messages that set no dot.
+  unread notifications read, including bells and messages that change no
+  border.
 - SSH tabs whose connection drops are no longer reported as finished: they
   keep their status and progress and post no notification.
 - Notifications no longer go blind after the terminal service restarts; the

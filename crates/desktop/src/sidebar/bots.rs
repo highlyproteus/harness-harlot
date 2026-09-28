@@ -2,7 +2,6 @@
 //! thread tabs are ordinary tab rows), followed by the bot's saved threads.
 use crate::bots::{now_ms, relative_time, saved_threads};
 use crate::helpers::{element_key, render_terminal_profile_icon};
-use crate::tab_chrome::PaneIndicator;
 use crate::view_models::TooltipView;
 use crate::{HhApp, THEME};
 use gpui::prelude::FluentBuilder;
@@ -232,8 +231,6 @@ impl HhApp {
                     .flex_none()
                     .child(relative_time(now, thread.updated_ms)),
             )
-            // A saved thread has no pane, so its status slot stays empty.
-            .child(self.render_pane_indicator(PaneIndicator::None))
             .child(self.render_close_button(
                 gpui::ElementId::Name(format!("delete-saved-thread-{}", thread.id).into()),
                 THEME.foreground,

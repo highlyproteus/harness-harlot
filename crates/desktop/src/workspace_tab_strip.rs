@@ -87,7 +87,11 @@ impl HhApp {
                         aggregate_indicators(panes.iter().map(|pane| self.pane_indicator(pane)));
                     (panes.len(), indicator)
                 };
-                let awaits_input = self.layout_awaits_input(&tab.layout);
+                // One pane's hover text names its phase and task; a tab of
+                // several sums their counts.
+                let progress_tooltip = standalone_pane
+                    .and_then(|pane| self.pane_indicator_tooltip(pane))
+                    .or_else(|| indicator.tooltip());
                 let tab_id = tab.id;
                 let close_tooltip = if is_standalone {
                     format!("Close {label}…")
@@ -145,6 +149,11 @@ impl HhApp {
                         element.border_r_2().border_color(rgb(THEME.accent))
                     })
                     .hover(|element| element.bg(rgb(THEME.elevated)))
+                    .when_some(progress_tooltip, |element, text| {
+                        element.tooltip(move |_, cx| {
+                            cx.new(|_| TooltipView { text: text.clone() }).into()
+                        })
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if click_suppression_active(
                             &mut this.sidebar.suppress_tab_click_until,
@@ -248,11 +257,6 @@ impl HhApp {
                                 .child(pane_count.to_string()),
                         )
                     })
-                    .child(self.render_pane_indicator_with_tooltip(
-                        indicator,
-                        ("workspace-strip-tab-status", element_key(tab_id)),
-                        indicator.tooltip(),
-                    ))
                     .child(self.render_close_button(
                         ("close-workspace-strip-tab", element_key(tab_id)),
                         THEME.foreground,
@@ -260,7 +264,7 @@ impl HhApp {
                         move |this, cx| this.dismiss_workspace_tab(tab_id, cx),
                         cx,
                     ));
-                self.with_needs_input_border(strip_tab, awaits_input, 0.0)
+                self.with_status_border(strip_tab, indicator, 0.0)
                     .into_any_element()
             });
         div()

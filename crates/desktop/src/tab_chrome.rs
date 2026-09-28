@@ -1,28 +1,28 @@
 //! Chrome shared by every place a tab or terminal appears (top bar, pane
-//! headers, sidebar rows, window ring chips, bot threads): one status
-//! indicator slot, the needs-input border, and an always-visible close button.
+//! headers, sidebar rows, window ring chips, bot threads): the state border
+//! (working blue with task progress, needs-you magenta, done green) and an
+//! always-visible close button.
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AppContext, BoxShadow, Context, Div, ElementId, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, StatefulInteractiveElement, Styled, canvas, div,
-    point, px, rgb, rgba,
+    AnyElement, AppContext, BoxShadow, Context, ElementId, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, StatefulInteractiveElement, Styled, canvas, div, point, px, rgb,
+    rgba,
 };
-use hh_protocol::{Pane, PaneLayout, PaneProgress, PaneStatus, Workspace, workstation_descendants};
+use hh_protocol::{Pane, PaneProgress, PaneStatus, Workspace, workstation_descendants};
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::status_art::{
-    BorderMotion, FrameRate, border_motion, paint_needs_input_border, paint_progress_ring,
-    paint_spinner_ring, spinner_rotation,
+    BorderArt, BorderMotion, DONE_COLOR, FrameRate, NEEDS_YOU_COLOR, WORKING_COLOR, border_motion,
+    paint_status_border,
 };
 use crate::view_models::TooltipView;
 use crate::{HhApp, THEME};
 
-/// Side of the indicator slot; reserved even when empty so labels never shift.
-const INDICATOR_SIZE: f32 = 10.0;
-const STATUS_DOT_SIZE: f32 = 7.0;
 const UNREAD_DOT_SIZE: f32 = 6.0;
 const CLOSE_BUTTON_SIZE: f32 = 16.0;
+/// Opacity of a plain working border (no task list) under its comet.
+const WORKING_BASE_ALPHA: f32 = 0.5;
 
 /// Completed and total tasks, for one pane or summed over several.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -59,40 +59,43 @@ impl TaskCount {
     }
 }
 
-/// What a status slot shows.
+/// A tab's state, drawn as its border.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum PaneIndicator {
-    /// Idle, or a finished pane the user has opened since: the slot stays empty.
+    /// Idle, or a finished pane the user has opened since: no border.
     #[default]
     None,
     /// Finished (done or exited) and not opened since (`Pane.unseen`).
     Done,
     /// Working, with the agent's task counts when it reports them.
     Running(Option<TaskCount>),
+    /// Needs input or approval, or rang a bell.
     NeedsYou,
 }
 
 impl PaneIndicator {
-    /// Urgency, which decides what an aggregate over several panes shows.
+    /// Precedence when one border summarizes several tabs or panes: needs
+    /// you, then finished unseen, then working.
     const fn rank(self) -> u8 {
         match self {
             Self::None => 0,
-            Self::Done => 1,
-            Self::Running(_) => 2,
+            Self::Running(_) => 1,
+            Self::Done => 2,
             Self::NeedsYou => 3,
         }
     }
 
-    /// Symbol color: needs-you orange, running and done blue, else dim.
-    pub(crate) const fn color(self) -> u32 {
+    /// Border colour; `None` has no border.
+    pub(crate) const fn color(self) -> Option<u32> {
         match self {
-            Self::None => THEME.dim,
-            Self::Done | Self::Running(_) => THEME.accent,
-            Self::NeedsYou => THEME.warning,
+            Self::None => None,
+            Self::Running(_) => Some(WORKING_COLOR),
+            Self::Done => Some(DONE_COLOR),
+            Self::NeedsYou => Some(NEEDS_YOU_COLOR),
         }
     }
 
-    /// Hover text for a slot that summarizes task counts.
+    /// Hover text for a border that summarizes task counts.
     pub(crate) fn tooltip(self) -> Option<String> {
         match self {
             Self::Running(Some(count)) => Some(count_tooltip(count)),
@@ -155,15 +158,36 @@ pub(crate) fn pane_indicator(
     }
 }
 
-/// Whether a pane is blocked on an answer, which frames its tabs with the
-/// travelling needs-input border. Bells (`Attention`) only get the dot.
-pub(crate) const fn awaits_input(status: PaneStatus, exited: bool) -> bool {
-    !exited && matches!(status, PaneStatus::NeedsInput | PaneStatus::NeedsApproval)
+/// What one state border draws this frame, or `None` for no border.
+pub(crate) fn border_art(indicator: PaneIndicator, motion: BorderMotion) -> Option<BorderArt> {
+    let color = indicator.color()?;
+    let (base_alpha, fill) = match indicator {
+        PaneIndicator::Running(None) => (WORKING_BASE_ALPHA, None),
+        PaneIndicator::Running(Some(count)) => (1.0, Some(count.fraction())),
+        PaneIndicator::None | PaneIndicator::Done | PaneIndicator::NeedsYou => (1.0, None),
+    };
+    Some(BorderArt {
+        color,
+        base_alpha,
+        fill,
+        motion,
+    })
 }
 
-/// Several panes in one slot: the most urgent indicator wins; running
-/// progress sums the task counts of every running pane that reports them,
-/// and stays indeterminate when none does.
+/// How often a visible border of this state asks for frames: the needs-you
+/// comet at ~30 fps, working and done comets at ~12 fps, nothing when motion
+/// is reduced or there is no border.
+pub(crate) const fn border_frame_rate(indicator: PaneIndicator, reduced: bool) -> FrameRate {
+    match (indicator, reduced) {
+        (PaneIndicator::None, _) | (_, true) => FrameRate::Still,
+        (PaneIndicator::NeedsYou, false) => FrameRate::Comet,
+        (PaneIndicator::Running(_) | PaneIndicator::Done, false) => FrameRate::Calm,
+    }
+}
+
+/// Several panes in one border: needs you beats finished-unseen beats
+/// working; working progress sums the task counts of every running pane that
+/// reports them, and stays indeterminate when none does.
 pub(crate) fn aggregate_indicators(
     indicators: impl IntoIterator<Item = PaneIndicator>,
 ) -> PaneIndicator {
@@ -224,26 +248,6 @@ pub(crate) fn progress_tooltip(progress: &PaneProgress) -> String {
 
 pub(crate) fn count_tooltip(count: TaskCount) -> String {
     format!("{} of {} done", count.done, count.total)
-}
-
-/// What the status slot draws this frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum IndicatorArt {
-    Empty,
-    Dot(u32),
-    /// A ring filled to this fraction.
-    Progress(f32),
-    /// The indeterminate running ring at this rotation; `None` is still.
-    Spinner(Option<f32>),
-}
-
-pub(crate) fn indicator_art(indicator: PaneIndicator, reduced: bool, elapsed: f32) -> IndicatorArt {
-    match indicator {
-        PaneIndicator::None => IndicatorArt::Empty,
-        PaneIndicator::Done | PaneIndicator::NeedsYou => IndicatorArt::Dot(indicator.color()),
-        PaneIndicator::Running(Some(count)) => IndicatorArt::Progress(count.fraction()),
-        PaneIndicator::Running(None) => IndicatorArt::Spinner(spinner_rotation(reduced, elapsed)),
-    }
 }
 
 /// The blue unread dot beside a Notifications row's status symbol; an empty
@@ -319,100 +323,33 @@ impl HhApp {
         }
     }
 
-    pub(crate) fn pane_awaits_input(&self, pane: &Pane) -> bool {
-        awaits_input(pane.status, self.pane_exited(pane.id))
-    }
-
-    /// Whether any terminal of a tab is blocked on an answer.
-    pub(crate) fn layout_awaits_input(&self, layout: &PaneLayout) -> bool {
-        let mut panes = Vec::new();
-        crate::helpers::collect_terminal_tabs(layout, &mut panes);
-        panes.iter().any(|pane| self.pane_awaits_input(pane))
-    }
-
-    fn indicator_slot(&self, indicator: PaneIndicator) -> Div {
-        let slot = div()
-            .flex_none()
-            .w(px(INDICATOR_SIZE))
-            .h(px(INDICATOR_SIZE))
-            .flex()
-            .items_center()
-            .justify_center();
-        let art = indicator_art(indicator, self.motion.reduced(), self.motion.elapsed_secs());
-        match art {
-            IndicatorArt::Empty => slot,
-            IndicatorArt::Dot(color) => slot.child(
-                div()
-                    .w(px(STATUS_DOT_SIZE))
-                    .h(px(STATUS_DOT_SIZE))
-                    .rounded_full()
-                    .bg(rgb(color)),
-            ),
-            IndicatorArt::Progress(fraction) => slot.child(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, (), window, _| paint_progress_ring(bounds, window, fraction),
-                )
-                .size_full(),
-            ),
-            IndicatorArt::Spinner(rotation) => {
-                if rotation.is_some() {
-                    self.motion.request_frames(FrameRate::Spinner);
-                }
-                slot.child(
-                    canvas(
-                        |_, _, _| {},
-                        move |bounds, (), window, _| paint_spinner_ring(bounds, window, rotation),
-                    )
-                    .size_full(),
-                )
-            }
-        }
-    }
-
-    /// The fixed-size status slot: an orange dot when the pane needs the
-    /// user, a progress ring (or the indeterminate blue ring) while it runs,
-    /// a blue dot when it finished unseen, otherwise empty space.
-    pub(crate) fn render_pane_indicator(&self, indicator: PaneIndicator) -> AnyElement {
-        self.indicator_slot(indicator).into_any_element()
-    }
-
-    /// [`Self::render_pane_indicator`] with hover text, e.g. task progress.
-    pub(crate) fn render_pane_indicator_with_tooltip(
+    /// Frames `element` with its state border: the state colour (with the
+    /// task-progress fill while working through a list) and a comet running
+    /// clockwise, or a steady glow under reduced motion. `radius` is the
+    /// element's corner radius. No border for `PaneIndicator::None`.
+    pub(crate) fn with_status_border<E>(
         &self,
+        element: E,
         indicator: PaneIndicator,
-        id: impl Into<ElementId>,
-        tooltip: Option<String>,
-    ) -> AnyElement {
-        let slot = self.indicator_slot(indicator);
-        match tooltip {
-            Some(text) => slot
-                .id(id)
-                .tooltip(move |_, cx| cx.new(|_| TooltipView { text: text.clone() }).into())
-                .into_any_element(),
-            None => slot.into_any_element(),
-        }
-    }
-
-    /// Frames `element` with the needs-input border when `awaits`: orange
-    /// with a comet running clockwise, or a steady glow under reduced motion.
-    /// `radius` is the element's corner radius.
-    pub(crate) fn with_needs_input_border<E>(&self, element: E, awaits: bool, radius: f32) -> E
+        radius: f32,
+    ) -> E
     where
         E: Styled + ParentElement + FluentBuilder,
     {
-        if !awaits {
+        let reduced = self.motion.reduced();
+        let Some(art) = border_art(
+            indicator,
+            border_motion(reduced, self.motion.elapsed_secs()),
+        ) else {
             return element;
-        }
-        let motion = border_motion(self.motion.reduced(), self.motion.elapsed_secs());
-        if matches!(motion, BorderMotion::Comet { .. }) {
-            self.motion.request_frames(FrameRate::Comet);
-        }
-        let mut glow = Hsla::from(rgb(THEME.warning));
+        };
+        self.motion
+            .request_frames(border_frame_rate(indicator, reduced));
+        let mut glow = Hsla::from(rgb(art.color));
         glow.a = 0.45;
         element
             .relative()
-            .when(motion == BorderMotion::Glow, |element| {
+            .when(art.motion == BorderMotion::Glow, |element| {
                 element.shadow(vec![BoxShadow {
                     color: glow,
                     offset: point(px(0.0), px(0.0)),
@@ -424,7 +361,7 @@ impl HhApp {
                 canvas(
                     |_, _, _| {},
                     move |bounds, (), window, _| {
-                        paint_needs_input_border(bounds, window, radius, motion);
+                        paint_status_border(bounds, window, radius, art);
                     },
                 )
                 .absolute()
@@ -485,9 +422,10 @@ impl HhApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        IndicatorArt, PaneIndicator, TaskCount, aggregate_indicators, awaits_input, indicator_art,
+        PaneIndicator, TaskCount, aggregate_indicators, border_art, border_frame_rate,
         pane_indicator, progress_tooltip, workstation_rollup_indicator,
     };
+    use crate::status_art::{BorderMotion, DONE_COLOR, FrameRate, NEEDS_YOU_COLOR, WORKING_COLOR};
     use hh_protocol::{
         PaneLayout, PaneProgress, PaneStatus, ProgressSource, SessionSnapshot, Workspace,
     };
@@ -651,36 +589,24 @@ mod tests {
     }
 
     #[test]
-    fn only_questions_and_approvals_get_the_needs_input_border() {
-        assert!(awaits_input(PaneStatus::NeedsInput, false));
-        assert!(awaits_input(PaneStatus::NeedsApproval, false));
-        assert!(
-            !awaits_input(PaneStatus::Attention, false),
-            "bells keep the dot"
-        );
-        assert!(!awaits_input(PaneStatus::Working, false));
-        assert!(!awaits_input(PaneStatus::NeedsInput, true), "exited");
-    }
-
-    #[test]
-    fn aggregation_takes_the_most_urgent_and_sums_reported_progress() {
+    fn aggregation_ranks_needs_you_then_done_then_working() {
         assert_eq!(
-            aggregate_indicators([
-                PaneIndicator::Done,
-                running(1, 3),
-                PaneIndicator::Running(None),
-                running(2, 5),
-            ]),
+            aggregate_indicators([running(1, 3), PaneIndicator::Running(None), running(2, 5),]),
             running(3, 8),
             "panes without progress do not dilute the sum"
         );
         assert_eq!(
-            aggregate_indicators([PaneIndicator::Running(None), PaneIndicator::Done]),
+            aggregate_indicators([PaneIndicator::Running(None), PaneIndicator::None]),
             PaneIndicator::Running(None),
             "indeterminate when no running pane reports progress"
         );
         assert_eq!(
-            aggregate_indicators([running(1, 2), PaneIndicator::NeedsYou]),
+            aggregate_indicators([running(1, 3), PaneIndicator::Done]),
+            PaneIndicator::Done,
+            "a finished unseen tab outranks one still working"
+        );
+        assert_eq!(
+            aggregate_indicators([PaneIndicator::Done, running(1, 2), PaneIndicator::NeedsYou]),
             PaneIndicator::NeedsYou
         );
         assert_eq!(
@@ -691,30 +617,56 @@ mod tests {
     }
 
     #[test]
-    fn running_draws_a_ring_that_holds_still_under_reduced_motion() {
+    fn each_state_draws_its_own_border_colour_and_working_carries_its_progress() {
+        let comet = BorderMotion::Comet { head: 0.3 };
+        assert_eq!(border_art(PaneIndicator::None, comet), None, "no border");
+        let needs = border_art(PaneIndicator::NeedsYou, comet).expect("border");
+        let done = border_art(PaneIndicator::Done, comet).expect("border");
+        let plain = border_art(PaneIndicator::Running(None), comet).expect("border");
+        let list = border_art(running(1, 4), comet).expect("border");
+        assert_eq!(needs.color, NEEDS_YOU_COLOR);
+        assert_eq!(done.color, DONE_COLOR);
+        assert_eq!(plain.color, WORKING_COLOR);
+        assert_eq!(list.color, WORKING_COLOR);
+        assert_eq!((needs.fill, done.fill, plain.fill), (None, None, None));
+        assert_eq!(list.fill, Some(0.25), "the fill covers the done share");
+        assert!(plain.base_alpha < 1.0, "a plain working border is quieter");
         assert_eq!(
-            indicator_art(running(1, 4), false, 0.3),
-            IndicatorArt::Progress(0.25)
+            border_art(running(0, 0), comet).and_then(|art| art.fill),
+            Some(1.0),
+            "an empty list counts as complete"
         );
         assert_eq!(
-            indicator_art(running(1, 4), true, 0.3),
-            IndicatorArt::Progress(0.25)
+            border_art(PaneIndicator::Done, BorderMotion::Glow).map(|art| art.motion),
+            Some(BorderMotion::Glow),
+            "reduced motion keeps the colour and drops the comet"
         );
+    }
+
+    #[test]
+    fn only_needs_you_animates_fast_and_reduced_motion_stops_every_border() {
         assert_eq!(
-            indicator_art(PaneIndicator::Running(None), true, 0.3),
-            IndicatorArt::Spinner(None)
+            border_frame_rate(PaneIndicator::NeedsYou, false),
+            FrameRate::Comet
         );
-        assert!(matches!(
-            indicator_art(PaneIndicator::Running(None), false, 0.3),
-            IndicatorArt::Spinner(Some(_))
-        ));
+        for calm in [
+            PaneIndicator::Done,
+            PaneIndicator::Running(None),
+            running(2, 3),
+        ] {
+            assert_eq!(border_frame_rate(calm, false), FrameRate::Calm, "{calm:?}");
+        }
+        for indicator in [
+            PaneIndicator::None,
+            PaneIndicator::NeedsYou,
+            PaneIndicator::Done,
+            running(2, 3),
+        ] {
+            assert_eq!(border_frame_rate(indicator, true), FrameRate::Still);
+        }
         assert_eq!(
-            indicator_art(PaneIndicator::NeedsYou, false, 0.0),
-            IndicatorArt::Dot(PaneIndicator::NeedsYou.color())
-        );
-        assert_eq!(
-            indicator_art(PaneIndicator::None, false, 0.0),
-            IndicatorArt::Empty
+            border_frame_rate(PaneIndicator::None, false),
+            FrameRate::Still
         );
     }
 

@@ -42,12 +42,11 @@ pub(crate) struct SidebarPaneRowContext {
     pub(crate) activity: Option<ActivityRow>,
 }
 
-/// The status symbol, unread dot, and location line of one Notifications row.
+/// The status and location line of one Notifications row.
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityRow {
-    /// Replaces the row's tab indicator.
+    /// Replaces the row's own state border.
     pub(crate) indicator: PaneIndicator,
-    pub(crate) unread: bool,
     pub(crate) location: String,
     pub(crate) bot: bool,
 }

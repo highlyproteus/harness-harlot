@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::helpers::{collect_terminal_tabs, find_pane, find_pane_mut, zoom_projection};
-use crate::tab_chrome::shows_running;
+use crate::tab_chrome::{PaneIndicator, aggregate_indicators, pane_indicator, shows_running};
 use crate::{HhApp, THEME};
 
 #[cfg(target_os = "macos")]
@@ -141,62 +141,51 @@ pub(crate) fn bots_needing_you(
         .count()
 }
 
-/// Whether a bot thread pane should ring its bot's icon: it is waiting on the
-/// user (input, approval, or a bell) or it finished and the user has not
-/// opened it since. Opening the thread clears `unseen` (the blue-dot rule);
-/// a waiting pane rings until it is answered.
-pub(crate) fn pane_wants_you(pane: &Pane, exited: bool) -> bool {
-    pane.unseen
-        || (!exited
-            && matches!(
-                pane.status,
-                PaneStatus::NeedsInput | PaneStatus::NeedsApproval | PaneStatus::Attention
-            ))
-}
-
-fn layout_wants_you(layout: &PaneLayout, pane_states: &HashMap<Uuid, PaneStreamState>) -> bool {
-    let wants = |pane: &Pane| {
-        pane_wants_you(
-            pane,
-            pane_states.get(&pane.id).is_some_and(|state| state.exited),
-        )
-    };
-    match layout {
-        PaneLayout::Leaf { pane } => wants(pane),
-        PaneLayout::Stack { panes, .. } => panes.iter().any(wants),
-        PaneLayout::Split { first, second, .. } => {
-            layout_wants_you(first, pane_states) || layout_wants_you(second, pane_states)
-        }
-    }
-}
-
-/// Whether bot workspace `workspace` should wear the orange ring: any of its
-/// threads wants the user. Always false for workstations.
-pub(crate) fn bot_wants_you(
+/// The state border of bot workspace `workspace`'s icon: its threads'
+/// states aggregated (needs you, then finished unseen, then working), so it
+/// clears exactly when each thread's own border does. `None` for
+/// workstations.
+pub(crate) fn bot_indicator(
     workspace: &Workspace,
     pane_states: &HashMap<Uuid, PaneStreamState>,
-) -> bool {
-    workspace.is_bot()
-        && workspace
-            .tabs
-            .iter()
-            .any(|tab| layout_wants_you(&tab.layout, pane_states))
+) -> PaneIndicator {
+    if !workspace.is_bot() {
+        return PaneIndicator::None;
+    }
+    aggregate_indicators(workspace.tabs.iter().flat_map(|tab| {
+        let mut panes = Vec::new();
+        collect_terminal_tabs(&tab.layout, &mut panes);
+        panes
+            .into_iter()
+            .map(|pane| {
+                pane_indicator(
+                    pane.status,
+                    pane_states.get(&pane.id).is_some_and(|state| state.exited),
+                    pane.unseen,
+                    pane.progress.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>()
+    }))
 }
 
-/// Whether any bot wants the user; rings the toolbar's Bots button.
-pub(crate) fn any_bot_wants_you(
+/// Every bot's icon state in one: the toolbar Bots button's border.
+pub(crate) fn bots_indicator(
     snapshot: &SessionSnapshot,
     pane_states: &HashMap<Uuid, PaneStreamState>,
-) -> bool {
-    snapshot
-        .workspaces
-        .iter()
-        .any(|workspace| bot_wants_you(workspace, pane_states))
+) -> PaneIndicator {
+    aggregate_indicators(
+        snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| bot_indicator(workspace, pane_states)),
+    )
 }
 
 /// The unread count shared by the in-app bell and the Dock, and whether any
-/// unread item asks for the user. Only the in-app bell is tinted (orange for
-/// asks, blue for reports); macOS always draws the Dock number in red.
+/// unread item asks for the user. Only the in-app bell is tinted (the
+/// needs-you magenta for asks, blue for reports); macOS always draws the
+/// Dock number in red.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnreadBadge {
     pub(crate) count: usize,
@@ -206,7 +195,7 @@ pub(crate) struct UnreadBadge {
 impl UnreadBadge {
     pub(crate) const fn color(self) -> u32 {
         if self.attention {
-            THEME.warning
+            crate::status_art::NEEDS_YOU_COLOR
         } else {
             THEME.accent
         }
@@ -495,9 +484,10 @@ impl HhApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivitySection, UnreadBadge, activity_badge, activity_entries, any_bot_wants_you,
-        bot_wants_you, bots_needing_you, pane_has_unseen, panes_shown_with, unread_badge,
+        ActivitySection, UnreadBadge, activity_badge, activity_entries, bot_indicator,
+        bots_indicator, bots_needing_you, pane_has_unseen, panes_shown_with, unread_badge,
     };
+    use crate::tab_chrome::PaneIndicator;
     use hh_protocol::{
         NotificationKind, PaneLayout, PaneStatus, PaneStreamState, SessionNotification,
         SessionSnapshot, Tab, TerminalProfile, Workspace, WorkspaceKind,
@@ -556,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn the_badge_counts_unread_and_turns_orange_for_unread_attention() {
+    fn the_badge_counts_unread_and_turns_magenta_for_unread_attention() {
         assert_eq!(unread_badge(&[]), None);
         assert_eq!(
             unread_badge(&[
@@ -579,13 +569,13 @@ mod tests {
             }),
             "read attention does not tint the badge"
         );
-        let orange = unread_badge(&[
+        let magenta = unread_badge(&[
             stored(1, NotificationKind::Completed, false),
             stored(2, NotificationKind::Attention, false),
         ])
         .expect("unread");
-        assert_eq!(orange.count, 2);
-        assert_ne!(orange.color(), blue.expect("unread").color());
+        assert_eq!(magenta.count, 2);
+        assert_ne!(magenta.color(), blue.expect("unread").color());
     }
 
     #[test]
@@ -614,11 +604,13 @@ mod tests {
         tab
     }
 
-    /// A bot's icon rings while any thread needs the user or finished unseen,
-    /// including an exited thread nobody opened and a thread hidden in a
-    /// stack; working, idle, and seen threads never ring it.
+    /// A bot's icon border is its threads' states summarized: needs you
+    /// (including a bell and a thread hidden in a stack), then finished
+    /// unseen (an exited thread nobody opened too), then working. Seen,
+    /// idle, and exited-while-waiting threads leave it bare.
     #[test]
-    fn a_bot_rings_when_any_thread_wants_the_user_and_the_toolbar_when_any_bot_does() {
+    fn a_bot_icon_summarizes_its_threads_and_the_toolbar_summarizes_every_bot() {
+        use PaneIndicator::{Done, NeedsYou, Running};
         let mut snapshot = SessionSnapshot::seeded();
         let workstation = snapshot.workspaces[0].clone();
         let template = workstation.tabs[0].clone();
@@ -642,59 +634,81 @@ mod tests {
         };
 
         let cases = [
-            (vec![quiet(PaneStatus::NeedsInput)], true),
-            (vec![quiet(PaneStatus::NeedsApproval)], true),
-            (vec![quiet(PaneStatus::Attention)], true),
-            (vec![unseen(quiet(PaneStatus::Done))], true),
-            (vec![stacked], true),
-            (vec![exited_unseen], true),
-            (vec![quiet(PaneStatus::Done)], false),
+            (vec![quiet(PaneStatus::NeedsInput)], NeedsYou),
+            (vec![quiet(PaneStatus::NeedsApproval)], NeedsYou),
+            (vec![quiet(PaneStatus::Attention)], NeedsYou),
+            (vec![stacked], NeedsYou),
+            (vec![unseen(quiet(PaneStatus::Done))], Done),
+            (vec![exited_unseen], Done),
             (
                 vec![quiet(PaneStatus::Working), quiet(PaneStatus::Idle)],
-                false,
+                Running(None),
             ),
-            (vec![exited_tab], false),
+            (
+                vec![quiet(PaneStatus::Working), unseen(quiet(PaneStatus::Done))],
+                Done,
+            ),
+            (
+                vec![
+                    unseen(quiet(PaneStatus::Done)),
+                    quiet(PaneStatus::NeedsInput),
+                ],
+                NeedsYou,
+            ),
+            (vec![quiet(PaneStatus::Done)], PaneIndicator::None),
+            (vec![exited_tab], PaneIndicator::None),
         ];
         let mut states = exited(exited_pane);
         states.extend(exited(exited_unseen_id));
-        for (index, (tabs, rings)) in cases.into_iter().enumerate() {
+        for (index, (tabs, expected)) in cases.into_iter().enumerate() {
             let one = bot(&workstation, tabs);
-            assert_eq!(bot_wants_you(&one, &states), rings, "case {index}");
+            assert_eq!(bot_indicator(&one, &states), expected, "case {index}");
         }
 
-        // A workstation's panes never ring a bot, and the toolbar rings when
-        // any single bot does.
+        // A workstation's panes never mark a bot; the toolbar takes the most
+        // urgent state across every bot.
         snapshot.workspaces[0].tabs = vec![quiet(PaneStatus::NeedsInput)];
-        assert!(!bot_wants_you(&snapshot.workspaces[0], &states));
+        assert_eq!(
+            bot_indicator(&snapshot.workspaces[0], &states),
+            PaneIndicator::None
+        );
+        assert_eq!(bots_indicator(&snapshot, &states), PaneIndicator::None);
         snapshot
             .workspaces
             .push(bot(&workstation, vec![quiet(PaneStatus::Working)]));
-        assert!(!any_bot_wants_you(&snapshot, &states));
+        assert_eq!(bots_indicator(&snapshot, &states), Running(None));
         snapshot
             .workspaces
             .push(bot(&workstation, vec![unseen(quiet(PaneStatus::Done))]));
-        assert!(any_bot_wants_you(&snapshot, &states));
+        assert_eq!(bots_indicator(&snapshot, &states), Done);
+        snapshot
+            .workspaces
+            .push(bot(&workstation, vec![quiet(PaneStatus::NeedsApproval)]));
+        assert_eq!(bots_indicator(&snapshot, &states), NeedsYou);
     }
 
-    /// Opening a finished thread (the blue-dot seen rule clears `unseen`)
-    /// takes the ring off its bot and off the toolbar.
+    /// Opening a finished thread (the seen rule clears `unseen`) takes the
+    /// green border off its bot icon and off the toolbar.
     #[test]
-    fn viewing_the_finished_thread_clears_the_bot_ring() {
+    fn viewing_the_finished_thread_clears_the_bot_border() {
         let mut snapshot = SessionSnapshot::seeded();
         let workstation = snapshot.workspaces[0].clone();
         let template = workstation.tabs[0].clone();
         let finished = unseen(tab_with(&template, PaneStatus::Done).0);
         snapshot.workspaces.push(bot(&workstation, vec![finished]));
         let states = HashMap::new();
-        assert!(any_bot_wants_you(&snapshot, &states));
+        assert_eq!(bots_indicator(&snapshot, &states), PaneIndicator::Done);
 
         let bot_index = snapshot.workspaces.len() - 1;
         let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[bot_index].tabs[0].layout else {
             unreachable!();
         };
         pane.unseen = false;
-        assert!(!bot_wants_you(&snapshot.workspaces[bot_index], &states));
-        assert!(!any_bot_wants_you(&snapshot, &states));
+        assert_eq!(
+            bot_indicator(&snapshot.workspaces[bot_index], &states),
+            PaneIndicator::None
+        );
+        assert_eq!(bots_indicator(&snapshot, &states), PaneIndicator::None);
     }
 
     #[test]

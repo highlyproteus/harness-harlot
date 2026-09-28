@@ -86,7 +86,6 @@ impl HhApp {
                             title: None,
                             activity: Some(ActivityRow {
                                 indicator: self.pane_indicator(entry.pane),
-                                unread: entry.pane.unseen,
                                 location: if bot {
                                     format!("Bot · {}", entry.workspace.title)
                                 } else {
@@ -182,8 +181,9 @@ impl HhApp {
                 let id = notification.id;
                 let unread = !notification.read;
                 let marker = match notification.kind {
-                    NotificationKind::Attention => THEME.warning,
-                    NotificationKind::Completed | NotificationKind::Message => THEME.accent,
+                    NotificationKind::Attention => crate::status_art::NEEDS_YOU_COLOR,
+                    NotificationKind::Completed => crate::status_art::DONE_COLOR,
+                    NotificationKind::Message => THEME.accent,
                 };
                 div()
                     .id(("sidebar-notification", id))
