@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-09-28
+
 ### Added
 
 - Every tab shows its agent's state with its border instead of a dot or
