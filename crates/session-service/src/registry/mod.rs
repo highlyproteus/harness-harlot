@@ -986,6 +986,47 @@ fn append_tmux_notification(state: &mut RegistryState, message: String) {
     }
 }
 
+/// Tells the user what recovery could not do: tmux is unavailable (with its
+/// reason, if known), windows fell back to plain shells, or saved windows
+/// still run but could not be reattached.
+fn append_recovery_notifications(
+    state: &mut RegistryState,
+    tmux_unavailable: bool,
+    tmux_unavailable_reason: Option<String>,
+    tmux_failures: Vec<(Uuid, String)>,
+    unattached: Vec<Uuid>,
+) {
+    if tmux_unavailable && cfg!(not(test)) {
+        append_tmux_notification(
+            state,
+            match tmux_unavailable_reason {
+                Some(reason) => format!(
+                    "managed tmux is unavailable ({reason}); terminals will not survive a service restart"
+                ),
+                None => "tmux 3.2+ was not found; terminals will not survive a service restart"
+                    .to_owned(),
+            },
+        );
+    }
+    for (_, error) in tmux_failures {
+        append_tmux_notification(
+            state,
+            format!("tmux window could not be created; using a plain shell: {error}"),
+        );
+    }
+    for pane_id in unattached {
+        state.append_notification(
+            pane_id,
+            NotificationKind::Message,
+            Some(
+                "couldn't reattach this terminal; its program is still running. Use Reattach Exited Terminal to try again"
+                    .to_owned(),
+            ),
+            crate::now_ms(),
+        );
+    }
+}
+
 impl SessionRegistry {
     pub fn new() -> Result<Self> {
         let tmux_socket_name = hh_protocol::state_directory().map_or_else(
@@ -1254,40 +1295,13 @@ impl SessionRegistry {
             next_terminal_number,
             last_identity_refresh: None,
         }));
-        {
-            let mut state = state.write();
-            if tmux_unavailable && cfg!(not(test)) {
-                append_tmux_notification(
-                    &mut state,
-                    match tmux_unavailable_reason {
-                        Some(reason) => format!(
-                            "managed tmux is unavailable ({reason}); terminals will not survive a service restart"
-                        ),
-                        None => {
-                            "tmux 3.2+ was not found; terminals will not survive a service restart"
-                                .to_owned()
-                        }
-                    },
-                );
-            }
-            for (_, error) in tmux_failures {
-                append_tmux_notification(
-                    &mut state,
-                    format!("tmux window could not be created; using a plain shell: {error}"),
-                );
-            }
-            for pane_id in unattached {
-                state.append_notification(
-                    pane_id,
-                    NotificationKind::Message,
-                    Some(
-                        "couldn't reattach this terminal; its program is still running. Use Reattach Exited Terminal to try again"
-                            .to_owned(),
-                    ),
-                    crate::now_ms(),
-                );
-            }
-        }
+        append_recovery_notifications(
+            &mut state.write(),
+            tmux_unavailable,
+            tmux_unavailable_reason,
+            tmux_failures,
+            unattached,
+        );
         let registry = Self::from_state(state, Some(files));
         registry.persist()?;
         for (bot_id, pane_id) in fresh_bot_panes {

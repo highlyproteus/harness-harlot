@@ -753,8 +753,17 @@ mod tests {
             }
         });
 
+        // A cargo test binary ignores `HH_SOCKET` (test isolation), so the
+        // child runs from a link outside `target/*/deps` and uses it like
+        // the real `hh` does.
+        let child_exe = dir.join("hook");
+        let test_exe = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&test_exe, &child_exe).is_err() {
+            std::fs::copy(&test_exe, &child_exe).unwrap();
+        }
+
         let started = Instant::now();
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut child = Command::new(&child_exe)
             .args([
                 "--exact",
                 "cli::progress::tests::hook_child_process",

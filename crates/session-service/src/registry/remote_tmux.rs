@@ -381,13 +381,7 @@ impl SessionRegistry {
                         }),
                     },
                 );
-                set_pane_runtime_label(
-                    &mut state.snapshot,
-                    pane_id,
-                    false,
-                    None,
-                    "system OpenSSH",
-                );
+                set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, "system OpenSSH");
                 if behind == Reattached::FreshShell {
                     state.set_pane_status(pane_id, PaneStatus::Idle);
                 }
