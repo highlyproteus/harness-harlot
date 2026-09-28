@@ -195,7 +195,7 @@ fn a_bot_workspace_is_not_a_workstation() {
     let workstation = registry.snapshot().unwrap().workspaces[0].id;
 
     let error = registry.delete_workspace(workstation).unwrap_err();
-    assert_eq!(error.to_string(), "the last workstation cannot be deleted");
+    assert_eq!(error.to_string(), "the home workstation cannot be deleted");
     for error in [
         registry.create_workspace_tab(bots_id).unwrap_err(),
         registry.scan_tmux_sessions(bots_id).unwrap_err(),
@@ -208,7 +208,7 @@ fn a_bot_workspace_is_not_a_workstation() {
             "a bot only holds its threads; open a new thread instead"
         );
     }
-    let (created, _) = registry.create_workspace(None).unwrap();
+    let (created, _) = registry.create_workspace(None, None, None).unwrap();
     let snapshot = registry.snapshot().unwrap();
     let created = snapshot
         .workspaces

@@ -16,7 +16,6 @@ use crate::helpers::{
     split_target_for_drag, split_target_for_drag_ids, terminal_tab_secondary_label,
     workspace_layout_for_focused_pane, workspace_tab_standalone_pane, zoom_projection,
 };
-use crate::tab_chrome::render_pane_indicator;
 use crate::view_models::{
     DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag, SearchEditor, SplitControlId,
     TabDrag, TooltipView, WorkspaceDrag,
@@ -95,7 +94,7 @@ impl HhApp {
                     active,
                     "new-browser-tab",
                     PaneControlIcon::Web,
-                    "New browser in this group",
+                    "New browser in this tab",
                     cx,
                     |this, _pane_id, cx| this.new_browser_tab(cx),
                 ))
@@ -106,7 +105,7 @@ impl HhApp {
                         active,
                         "new-tab",
                         PaneControlIcon::Add,
-                        "New terminal in this group",
+                        "New terminal in this tab",
                         cx,
                         HhApp::new_tab_at,
                     ))
@@ -149,6 +148,7 @@ impl HhApp {
                 let secondary_label = terminal_tab_secondary_label(pane).map(str::to_owned);
                 let selected = pane_id == active;
                 let indicator = self.pane_indicator(pane);
+                let indicator_tooltip = self.pane_indicator_tooltip(pane);
                 let pane_accent = pane
                     .color
                     .unwrap_or_else(|| self.terminal_accent(pane_id))
@@ -159,7 +159,7 @@ impl HhApp {
                     title: label.clone(),
                     position: Point::default(),
                 };
-                div()
+                let tab = div()
                     .id(("pane-tab", element_key(pane_id)))
                     .h_full()
                     .min_w(px(54.0))
@@ -180,6 +180,11 @@ impl HhApp {
                         rgb(THEME.border)
                     })
                     .when(selected, |element| element.bg(rgb(THEME.selection)))
+                    .when_some(indicator_tooltip, |element, text| {
+                        element.tooltip(move |_, cx| {
+                            cx.new(|_| TooltipView { text: text.clone() }).into()
+                        })
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.activate_tab(pane_id, cx);
                         cx.stop_propagation();
@@ -187,7 +192,12 @@ impl HhApp {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.open_tab_menu(pane_id, event.position, cx);
+                            this.open_tab_menu(
+                                pane_id,
+                                event.position,
+                                crate::notifications::SeenScope::Pane,
+                                cx,
+                            );
                             cx.stop_propagation();
                         }),
                     )
@@ -257,14 +267,14 @@ impl HhApp {
                                 .child(label),
                         )
                     })
-                    .child(render_pane_indicator(indicator))
                     .child(self.render_close_button(
                         ("close-tab", element_key(pane_id)),
                         THEME.foreground,
                         close_tooltip,
                         move |this, cx| this.begin_close(pane_id, cx),
                         cx,
-                    ))
+                    ));
+                self.with_status_border(tab, indicator, 0.0)
                     .into_any_element()
             })
             .collect()
@@ -427,6 +437,7 @@ impl HhApp {
             .flex()
             .flex_col()
             .on_click(cx.listener(move |this, _, window, cx| {
+                this.mark_pane_seen(active);
                 this.focus_pane_with_snapshot(active, cx);
                 this.focus_handle.focus(window);
                 cx.notify();

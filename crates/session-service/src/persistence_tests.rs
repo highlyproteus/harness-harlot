@@ -107,16 +107,15 @@ fn bot_workspaces_and_owners_round_trip() {
     bot.kind = WorkspaceKind::Bot;
     bot.bot = Some(spec.clone());
     bot.owner_bot = None;
+    bot.home = false;
     bot.working_dir = Some("/tmp".to_owned());
     bot.tabs = vec![Tab {
         owner_thread: None,
         id: Uuid::new_v4(),
         title: "New thread".to_owned(),
         custom_title: None,
-        project_dir: None,
         color: None,
         custom_icon: None,
-        parent_tab: None,
         pinned: false,
         owner_bot: None,
         layout: PaneLayout::Leaf {
@@ -361,7 +360,7 @@ fn schema_v14_shared_bots_workspace_splits_into_one_workspace_per_bot() {
     };
     assert_eq!(pane.id, nova_pane);
 
-    // The migrated state writes back as schema 15 and loads unchanged.
+    // The migrated state writes back as the current schema and loads unchanged.
     let bytes = SnapshotStore::encode_with_offline(
         snapshot,
         &recovered.cwd_by_pane,
@@ -370,7 +369,7 @@ fn schema_v14_shared_bots_workspace_splits_into_one_workspace_per_bot() {
     )
     .unwrap();
     let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(written["schema_version"], 15);
+    assert_eq!(written["schema_version"], 17);
     assert_eq!(written["workspaces"][2]["kind"], "bot");
     assert!(written["workspaces"][2]["tabs"][0].get("bot").is_none());
     store.write_snapshot(&bytes).unwrap();
@@ -492,11 +491,13 @@ fn schema_v13_snapshot_holding_only_an_assistant_workspace_gains_an_empty_workst
         }]
     }))
     .unwrap();
-    desired.drop_legacy_assistants();
+    desired.migrate();
     desired.validate().unwrap();
     let workspaces = desired.into_runtime().snapshot.workspaces;
     assert_eq!(workspaces.len(), 1);
     assert_eq!(workspaces[0].kind, WorkspaceKind::Workstation);
+    assert!(workspaces[0].home);
+    assert_eq!(workspaces[0].title, hh_protocol::this_machine_title());
     assert!(workspaces[0].tabs.is_empty());
 }
 
@@ -523,6 +524,8 @@ fn ssh_workspace_layout_recovers_offline_without_runtime_or_secret_material() {
         custom_title: None,
         profile_override: None,
         custom_icon: None,
+        unseen: false,
+        progress: None,
     };
     let first_id = first.id;
     let second_id = second.id;
@@ -533,6 +536,7 @@ fn ssh_workspace_layout_recovers_offline_without_runtime_or_secret_material() {
         destination: "admin@build-node".to_owned(),
         status: WorkspaceConnectionStatus::Connected,
     };
+    workspace.home = false;
     workspace.tabs[0].layout = PaneLayout::Split {
         axis: SplitAxis::Horizontal,
         ratio: 0.4,
@@ -542,6 +546,7 @@ fn ssh_workspace_layout_recovers_offline_without_runtime_or_secret_material() {
         }),
     };
 
+    snapshot.workspaces.push(home_workstation());
     store.save(&snapshot, &HashMap::new()).unwrap();
     let recovered = store.load_or_quarantine().unwrap().unwrap();
     let recovered_workspace = &recovered.snapshot.workspaces[0];
@@ -754,7 +759,7 @@ fn schema_v1_custom_names_migrate_to_explicit_overrides() {
 
 #[test]
 fn schema_v4_snapshot_with_retired_tmux_setting_loads_and_stops_being_written() {
-    let stored: DesiredState = serde_json::from_str(
+    let mut stored: DesiredState = serde_json::from_str(
         r#"{
             "schema_version": 4,
             "revision": 7,
@@ -778,10 +783,12 @@ fn schema_v4_snapshot_with_retired_tmux_setting_loads_and_stops_being_written() 
         }"#,
     )
     .unwrap();
+    stored.migrate();
     stored.validate().unwrap();
 
     let recovered = stored.into_runtime();
     assert_eq!(recovered.snapshot.workspaces[0].title, "Workstation");
+    assert!(recovered.snapshot.workspaces[0].home);
 
     let rewritten = DesiredState::from_runtime(
         &recovered.snapshot,
@@ -924,6 +931,7 @@ fn overlong_bot_instructions_are_rejected() {
     let mut bot = desired.workspaces[0].clone();
     bot.id = Uuid::new_v4();
     bot.kind = DesiredWorkspaceKind::Bot;
+    bot.home = false;
     bot.tabs.clear();
     bot.bot = Some(BotSpec {
         pinned_threads: Vec::new(),
@@ -937,4 +945,292 @@ fn overlong_bot_instructions_are_rejected() {
         desired.validate().unwrap_err().to_string(),
         "bot instructions too long"
     );
+}
+
+/// An empty local home workstation, for fixtures whose first workstation is
+/// remote.
+fn home_workstation() -> Workspace {
+    let mut home = SessionSnapshot::seeded().workspaces.remove(0);
+    home.tabs.clear();
+    home.active_terminal_count = 0;
+    home.order = 2;
+    home
+}
+
+fn leaf(pane: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut pane = serde_json::json!({"id": pane, "title": "Terminal", "local_cwd": "/tmp"});
+    if let (Some(pane), serde_json::Value::Object(extra)) = (pane.as_object_mut(), extra) {
+        pane.extend(extra);
+    }
+    serde_json::json!({"kind": "leaf", "pane": pane})
+}
+
+#[test]
+fn schema_v15_projects_become_nested_workstations_on_their_parents_machine() {
+    let id = |n: u32| format!("00000000-0000-0000-0000-{n:012}");
+    let mut desired: DesiredState = serde_json::from_value(serde_json::json!({
+        "schema_version": 15,
+        "revision": 3,
+        "workspaces": [
+            {
+                "id": id(1), "title": "Workstation 1", "order": 1, "kind": "workstation",
+                "tabs": [
+                    {"id": id(10), "title": "Shell", "custom_title": "Group 3",
+                     "layout": leaf(&id(100), serde_json::json!({}))},
+                    {"id": id(11), "title": "api", "custom_title": "API", "project_dir": "/srv/api",
+                     "color": {"red": 1, "green": 2, "blue": 3}, "pinned": true,
+                     "layout": leaf(&id(110), serde_json::json!({"tmux_window": "@4", "tmux_pane": "%7"}))},
+                    {"id": id(12), "title": "tests", "parent_tab": id(11),
+                     "layout": leaf(&id(120), serde_json::json!({"kind": {"type": "gallery"}, "title": "Gallery", "local_cwd": null}))},
+                    {"id": id(13), "title": "stray", "parent_tab": id(99),
+                     "layout": leaf(&id(130), serde_json::json!({}))},
+                ],
+            },
+            {
+                "id": id(2), "title": "Workstation 2", "order": 2, "kind": "workstation",
+                "connection": {"kind": "system_ssh", "destination": "dev@box", "status": "offline"},
+                "tabs": [
+                    {"id": id(20), "title": "web", "project_dir": "/home/dev/web",
+                     "layout": leaf(&id(200), serde_json::json!({"local_cwd": null}))},
+                ],
+            },
+        ],
+    }))
+    .unwrap();
+    desired.migrate();
+    desired.validate().unwrap();
+    let recovered = desired.into_runtime();
+    let workspaces = &recovered.snapshot.workspaces;
+    let uuid = |n: u32| Uuid::parse_str(&id(n)).unwrap();
+    let tab_ids =
+        |workspace: &Workspace| workspace.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+
+    assert_eq!(workspaces.len(), 4);
+    let home = &workspaces[0];
+    assert!(home.home);
+    assert_eq!(home.title, hh_protocol::this_machine_title());
+    assert_eq!(tab_ids(home), vec![uuid(10), uuid(13)]);
+    assert_eq!(
+        home.tabs[0].custom_title, None,
+        "tab-level \"Group N\" names are dropped"
+    );
+    let remote = &workspaces[1];
+    assert!(!remote.home);
+    assert_eq!(remote.title, "Workstation 2", "only the home is retitled");
+    assert!(remote.tabs.is_empty());
+
+    let api = &workspaces[2];
+    assert_eq!(api.parent_workstation, Some(uuid(1)));
+    assert_eq!(api.title, "API");
+    assert_eq!(api.working_dir.as_deref(), Some("/srv/api"));
+    assert_eq!(api.color, Some(AppearanceColor::new(1, 2, 3)));
+    assert!(api.pinned);
+    assert_eq!(api.connection, WorkspaceConnection::Local);
+    assert_eq!(tab_ids(api), vec![uuid(11), uuid(12)]);
+    assert_eq!(api.tabs[0].custom_title, None);
+    assert_eq!(api.tabs[0].color, None);
+    assert!(!api.tabs[0].pinned);
+    assert_eq!(
+        collect_layout_ids(api),
+        vec![uuid(110), uuid(120)],
+        "pane ids are preserved"
+    );
+
+    let web = &workspaces[3];
+    assert_eq!(web.parent_workstation, Some(uuid(2)));
+    assert_eq!(web.title, "web");
+    assert_eq!(web.working_dir.as_deref(), Some("/home/dev/web"));
+    assert_eq!(
+        web.connection,
+        WorkspaceConnection::SystemSsh {
+            destination: "dev@box".to_owned(),
+            status: WorkspaceConnectionStatus::Offline,
+        }
+    );
+    assert_eq!(collect_layout_ids(web), vec![uuid(200)]);
+
+    assert_eq!(
+        recovered.legacy_tmux_workspace,
+        HashMap::from([(uuid(110), uuid(1))]),
+        "the moved tmux window is adopted from the parent's session"
+    );
+    assert_eq!(recovered.gallery_copies, vec![(uuid(1), api.id)]);
+    assert_eq!(
+        recovered.tmux_by_pane.get(&uuid(110)),
+        Some(&("@4".to_owned(), "%7".to_owned()))
+    );
+}
+
+fn collect_layout_ids(workspace: &Workspace) -> Vec<Uuid> {
+    let mut ids = Vec::new();
+    for tab in &workspace.tabs {
+        collect_pane_ids(&tab.layout, &mut ids);
+    }
+    ids
+}
+
+#[test]
+fn schema_v15_home_is_the_first_local_workstation_in_display_order() {
+    let id = |n: u32| format!("00000000-0000-0000-0000-{n:012}");
+    let mut desired: DesiredState = serde_json::from_value(serde_json::json!({
+        "schema_version": 15,
+        "revision": 1,
+        "workspaces": [
+            {"id": id(1), "title": "Workstation 1", "order": 1, "tabs": []},
+            {"id": id(2), "title": "Workstation 4", "pinned": true, "pin_order": 1, "tabs": []},
+        ],
+    }))
+    .unwrap();
+    desired.migrate();
+    desired.validate().unwrap();
+    let workspaces = desired.into_runtime().snapshot.workspaces;
+    assert!(!workspaces[0].home);
+    assert_eq!(workspaces[0].title, "Workstation 1");
+    assert!(workspaces[1].home, "pinned workstations are listed first");
+    assert_eq!(workspaces[1].title, hh_protocol::this_machine_title());
+}
+
+#[test]
+fn schema_v15_state_with_only_remote_workstations_gains_an_empty_home() {
+    let mut desired: DesiredState = serde_json::from_value(serde_json::json!({
+        "schema_version": 15,
+        "revision": 1,
+        "workspaces": [{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "title": "Build box",
+            "order": 1,
+            "connection": {"kind": "system_ssh", "destination": "dev@box", "status": "offline"},
+            "tabs": [],
+        }],
+    }))
+    .unwrap();
+    desired.migrate();
+    desired.validate().unwrap();
+    let workspaces = desired.into_runtime().snapshot.workspaces;
+    assert_eq!(workspaces.len(), 2);
+    assert!(!workspaces[0].home);
+    let home = &workspaces[1];
+    assert!(home.home);
+    assert_eq!(home.title, hh_protocol::this_machine_title());
+    assert_eq!(home.connection, WorkspaceConnection::Local);
+    assert!(home.tabs.is_empty());
+    assert!(home.order > workspaces[0].order);
+}
+
+#[test]
+fn nesting_rejects_excess_depth_cross_machine_parents_and_nested_homes() {
+    let snapshot = SessionSnapshot::seeded();
+    let base = DesiredState::from_runtime(
+        &snapshot,
+        &cwd_map(&snapshot),
+        &HashMap::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let nested = |parent: Uuid| {
+        let mut child = base.workspaces[0].clone();
+        child.id = Uuid::new_v4();
+        child.home = false;
+        child.parent_workstation = Some(parent);
+        child.tabs.clear();
+        child
+    };
+
+    let mut chain = base.clone();
+    let mut parent = chain.workspaces[0].id;
+    for _ in 1..MAX_WORKSTATION_DEPTH {
+        let child = nested(parent);
+        parent = child.id;
+        chain.workspaces.push(child);
+    }
+    chain.validate().unwrap();
+    chain.workspaces.push(nested(parent));
+    assert!(
+        chain
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("nests deeper")
+    );
+
+    let mut remote_child = base.clone();
+    let mut child = nested(remote_child.workspaces[0].id);
+    child.connection = WorkspaceConnection::SystemSsh {
+        destination: "dev@box".to_owned(),
+        status: WorkspaceConnectionStatus::Offline,
+    };
+    remote_child.workspaces.push(child);
+    assert!(
+        remote_child
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("parent's machine")
+    );
+
+    let mut nested_home = base.clone();
+    let mut child = nested(nested_home.workspaces[0].id);
+    child.home = true;
+    nested_home.workspaces[0].home = false;
+    nested_home.workspaces.push(child);
+    assert!(nested_home.validate().is_err());
+
+    let mut two_homes = base.clone();
+    let mut second = two_homes.workspaces[0].clone();
+    second.id = Uuid::new_v4();
+    second.tabs.clear();
+    two_homes.workspaces.push(second);
+    assert!(two_homes.validate().is_err());
+}
+
+#[test]
+fn unseen_and_progress_round_trip_and_invalid_progress_is_rejected() {
+    let directory = test_directory("unseen-progress");
+    let store = SnapshotStore::new(directory.join("sessions.json"));
+    let mut snapshot = SessionSnapshot::seeded();
+    let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[0].tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    pane.unseen = true;
+    pane.progress = Some(PaneProgress {
+        done: 2,
+        total: 5,
+        current: Some("Write tests".to_owned()),
+        phase: Some("Verify".to_owned()),
+        source: hh_protocol::ProgressSource::Omp,
+    });
+    let expected = pane.progress.clone();
+    store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
+    let recovered = store.load().unwrap().snapshot;
+    let PaneLayout::Leaf { pane } = &recovered.workspaces[0].tabs[0].layout else {
+        panic!("expected recovered leaf");
+    };
+    assert!(pane.unseen);
+    assert_eq!(pane.progress, expected);
+
+    // A seen pane without progress writes neither field, so the defaults
+    // are what an older snapshot without them loads as.
+    let mut plain = SessionSnapshot::seeded();
+    store.save(&plain, &cwd_map(&plain)).unwrap();
+    let text = fs::read_to_string(directory.join("sessions.json")).unwrap();
+    assert!(!text.contains("unseen") && !text.contains("progress"));
+    let recovered = store.load().unwrap().snapshot;
+    let PaneLayout::Leaf { pane } = &recovered.workspaces[0].tabs[0].layout else {
+        panic!("expected recovered leaf");
+    };
+    assert!(!pane.unseen);
+    assert_eq!(pane.progress, None);
+
+    let PaneLayout::Leaf { pane } = &mut plain.workspaces[0].tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    pane.progress = Some(PaneProgress {
+        done: 6,
+        total: 5,
+        current: None,
+        phase: None,
+        source: hh_protocol::ProgressSource::Claude,
+    });
+    assert!(store.save(&plain, &cwd_map(&plain)).is_err());
+    fs::remove_dir_all(directory).unwrap();
 }

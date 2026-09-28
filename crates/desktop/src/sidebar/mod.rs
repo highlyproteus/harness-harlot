@@ -2,12 +2,13 @@
 use crate::appearance::workstation_banner_artwork;
 use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
-    SidebarSection, banner_fit_size, click_suppression_active, composite_rgb, element_key,
+    banner_fit_size, child_workstations, click_suppression_active, composite_rgb, element_key,
     find_pane, identity_detail, readable_text_color, render_bell_icon, render_hammer_icon,
     render_robot_icon, render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
-    workstation_banner_header_height,
+    top_level_workstation, workstation_banner_header_height,
 };
-use crate::tab_chrome::{render_pane_indicator, render_unread_dot};
+use crate::notifications::SeenScope;
+use crate::tab_chrome::PaneIndicator;
 use crate::view_models::{
     Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView, UpdateRestartConfirmation,
 };
@@ -75,23 +76,8 @@ impl HhApp {
         cx.notify();
     }
 
-    pub(crate) fn toggle_group_collapsed(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        if !self.sidebar.collapsed_groups.remove(&tab_id) {
-            self.sidebar.collapsed_groups.insert(tab_id);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn toggle_sidebar_section(
-        &mut self,
-        workspace_id: Uuid,
-        section: SidebarSection,
-        cx: &mut Context<Self>,
-    ) {
-        let collapsed = match section {
-            SidebarSection::Pinned => &mut self.sidebar.collapsed_pinned_sections,
-            SidebarSection::Projects => &mut self.sidebar.collapsed_project_sections,
-        };
+    pub(crate) fn toggle_pinned_section(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        let collapsed = &mut self.sidebar.collapsed_pinned_sections;
         if !collapsed.remove(&workspace_id) {
             collapsed.insert(workspace_id);
         }
@@ -358,6 +344,8 @@ impl HhApp {
                 "Workstations",
                 render_hammer_icon,
                 0,
+                THEME.danger,
+                PaneIndicator::None,
                 cx,
             ))
             .child(self.render_sidebar_mode_button(
@@ -365,15 +353,22 @@ impl HhApp {
                 "Bots",
                 render_robot_icon,
                 self.bots_needing_you(),
+                THEME.danger,
+                self.bots_indicator(),
                 cx,
             ))
-            .child(self.render_sidebar_mode_button(
-                SidebarMode::Notifications,
-                "Notifications",
-                render_bell_icon,
-                self.needs_you_count(),
-                cx,
-            ))
+            .child(
+                self.render_sidebar_mode_button(
+                    SidebarMode::Notifications,
+                    "Notifications",
+                    render_bell_icon,
+                    self.unread_badge().map_or(0, |badge| badge.count),
+                    self.unread_badge()
+                        .map_or(THEME.accent, |badge| badge.color()),
+                    PaneIndicator::None,
+                    cx,
+                ),
+            )
             .when_some(self.editor.update_available.as_ref(), |toolbar, update| {
                 let label = update.label();
                 toolbar.child(
@@ -442,13 +437,17 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// A toolbar button for one sidebar mode, with a red count badge.
+    /// A toolbar button for one sidebar mode, with a count badge and the
+    /// state border `ring` summarizes (none for `PaneIndicator::None`).
+    #[allow(clippy::too_many_arguments)]
     fn render_sidebar_mode_button(
         &self,
         mode: SidebarMode,
         label: &'static str,
         icon: fn(u32) -> AnyElement,
         count: usize,
+        badge_color: u32,
+        ring: PaneIndicator,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.sidebar.sidebar_mode == mode
@@ -461,7 +460,7 @@ impl HhApp {
         } else {
             count.to_string()
         };
-        div()
+        let button = div()
             .id(label)
             .relative()
             .flex_none()
@@ -490,7 +489,9 @@ impl HhApp {
                 THEME.foreground
             } else {
                 THEME.muted
-            }))
+            }));
+        // The ring goes under the count badge so the number stays readable.
+        self.with_status_border(button, ring, 5.0)
             .when(count > 0, |element| {
                 element.child(
                     div()
@@ -501,7 +502,7 @@ impl HhApp {
                         .h(px(14.0))
                         .px(px(3.0))
                         .rounded_full()
-                        .bg(rgb(THEME.danger))
+                        .bg(rgb(badge_color))
                         .font_family(".SystemUIFont")
                         .text_size(px(9.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -581,8 +582,9 @@ impl HhApp {
             workspace_id,
             tab_id,
             tab_color,
-            from_group,
+            from_pane_map,
             indent,
+            title,
             activity,
         } = row;
         let pane_id = pane.id;
@@ -597,18 +599,18 @@ impl HhApp {
         let drag_tab_id = tab_id.filter(|_| activity.is_none());
         let selected = self.layout.focused_pane == Some(pane_id);
         let input = cx.entity();
-        let label = self.pane_label(pane);
+        let label = title.unwrap_or_else(|| self.pane_label(pane));
         let drag_title = label.clone();
-        let drop_above = !from_group
+        let drop_above = !from_pane_map
             && tab_id.is_some_and(|tab_id| {
                 self.sidebar.tab_drop_preview.is_some_and(|preview| {
-                    preview.target_tab_id == tab_id && !preview.into_group && !preview.after
+                    preview.target_tab_id == tab_id && !preview.into_tab && !preview.after
                 })
             });
-        let drop_below = !from_group
+        let drop_below = !from_pane_map
             && tab_id.is_some_and(|tab_id| {
                 self.sidebar.tab_drop_preview.is_some_and(|preview| {
-                    preview.target_tab_id == tab_id && !preview.into_group && preview.after
+                    preview.target_tab_id == tab_id && !preview.into_tab && preview.after
                 })
             });
         let user_color = pane.color.or(tab_color);
@@ -628,7 +630,7 @@ impl HhApp {
         let indicator = activity
             .as_ref()
             .map_or_else(|| self.pane_indicator(pane), |activity| activity.indicator);
-        let unread = activity.as_ref().map(|activity| activity.unread);
+        let indicator_tooltip = self.pane_indicator_tooltip(pane);
         let (close_tooltip, close_thread) = match bot_thread {
             Some(bot_id) => (
                 "Delete thread…".to_owned(),
@@ -636,7 +638,7 @@ impl HhApp {
             ),
             None => (format!("Close {label}…"), None),
         };
-        div()
+        let row = div()
             .id(("workspace-tab", element_key(pane_id)))
             .ml(px(indent))
             .mr(px(4.0))
@@ -669,7 +671,7 @@ impl HhApp {
                 element.hover(|element| element.border_1().border_color(rgb(row_text)))
             })
             .tooltip(move |_, cx| {
-                let text = input
+                let identity = input
                     .read(cx)
                     .session
                     .snapshot
@@ -683,6 +685,11 @@ impl HhApp {
                     })
                     .map(identity_detail)
                     .unwrap_or_default();
+                // A working agent's task progress leads the hover text.
+                let text = match &indicator_tooltip {
+                    Some(progress) => format!("{progress}\n{identity}"),
+                    None => identity,
+                };
                 cx.new(|_| TooltipView { text }).into()
             })
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -696,9 +703,9 @@ impl HhApp {
                 if let Some(tab_id) = tab_id.filter(|_| bot_row) {
                     this.open_bot_pane(workspace_id, tab_id, pane_id, cx);
                 } else if let Some(tab_id) = tab_id {
-                    this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+                    this.select_sidebar_pane(workspace_id, tab_id, pane_id, SeenScope::Pane, cx);
                 } else {
-                    this.select_workspace_tab(workspace_id, pane_id, cx);
+                    this.select_workspace_tab(workspace_id, pane_id, SeenScope::Pane, cx);
                 }
                 cx.stop_propagation();
             }))
@@ -707,7 +714,7 @@ impl HhApp {
                     workspace_id,
                     tab_id,
                     pane_id: Some(pane_id),
-                    from_group,
+                    from_pane_map,
                     title: drag_title,
                     position: Point::default(),
                 };
@@ -718,13 +725,13 @@ impl HhApp {
                             ..info.clone()
                         })
                     })
-                    .when(!from_group, |element| {
+                    .when(!from_pane_map, |element| {
                         element
                             .on_drag_move::<TabDrag>(cx.listener(
                                 move |this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
                                     let drag = event.drag(cx);
                                     if drag.workspace_id != workspace_id
-                                        || (drag.tab_id == tab_id && !drag.from_group)
+                                        || (drag.tab_id == tab_id && !drag.from_pane_map)
                                     {
                                         if this.sidebar.tab_drop_preview.take().is_some() {
                                             cx.notify();
@@ -735,7 +742,7 @@ impl HhApp {
                                         let next = Some(TabDropPreview {
                                             target_tab_id: tab_id,
                                             after: event.event.position.y > event.bounds.center().y,
-                                            into_group: false,
+                                            into_tab: false,
                                         });
                                         cx.stop_propagation();
                                         if this.sidebar.tab_drop_preview != next {
@@ -752,13 +759,12 @@ impl HhApp {
                                             preview.target_tab_id == tab_id && preview.after
                                         });
                                     if let Some(source_pane) =
-                                        info.pane_id.filter(|_| info.from_group)
+                                        info.pane_id.filter(|_| info.from_pane_map)
                                     {
                                         this.move_sidebar_pane_to_new_tab(
                                             source_pane,
                                             tab_id,
                                             after,
-                                            None,
                                             cx,
                                         );
                                     } else if info.tab_id != tab_id {
@@ -775,7 +781,7 @@ impl HhApp {
                     if bot_row {
                         this.open_bot_menu(workspace_id, event.position, cx);
                     } else {
-                        this.open_tab_menu(pane_id, event.position, cx);
+                        this.open_tab_menu(pane_id, event.position, SeenScope::Pane, cx);
                     }
                     cx.stop_propagation();
                 }),
@@ -821,10 +827,6 @@ impl HhApp {
                         )
                     }),
             )
-            .when_some(unread, |element, unread| {
-                element.child(render_unread_dot(unread))
-            })
-            .child(render_pane_indicator(indicator))
             .child(self.render_close_button(
                 ("close-workspace-tab", element_key(pane_id)),
                 row_text,
@@ -836,7 +838,8 @@ impl HhApp {
                     None => this.begin_close(pane_id, cx),
                 },
                 cx,
-            ))
+            ));
+        self.with_status_border(row, indicator, 4.0)
             .into_any_element()
     }
 
@@ -877,19 +880,18 @@ impl HhApp {
     }
 
     pub(crate) fn render_global_navigation(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut workspaces = self
+        let workspaces = self
             .session
             .snapshot
             .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .workspaces
-                    .iter()
-                    .filter(|workspace| !workspace.is_bot())
-                    .collect::<Vec<_>>()
-            })
+            .map(|snapshot| child_workstations(&snapshot.workspaces, None))
             .unwrap_or_default();
-        workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
+        let active_top_level = self.sidebar.active_workspace.and_then(|active| {
+            self.session
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| top_level_workstation(&snapshot.workspaces, active))
+        });
         let sidebar_visible = self.sidebar.sidebar_visible;
         let navigation_hint = format!(
             "{} · {} · ⇧⌘P commands",
@@ -997,7 +999,7 @@ impl HhApp {
                             .enumerate()
                             .map(|(index, workspace)| {
                                 let workspace_id = workspace.id;
-                                let active = Some(workspace_id) == self.sidebar.active_workspace;
+                                let active = Some(workspace_id) == active_top_level;
                                 let title = workspace.title.clone();
                                 let color = self.workspace_color(workspace_id).as_rgb();
                                 let tooltip_title = title.clone();
@@ -1034,7 +1036,7 @@ impl HhApp {
                                         .into()
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.select_workspace(workspace_id, cx)
+                                        this.select_workspace(workspace_id, SeenScope::Tab, cx)
                                     }))
                                     .on_key_down(cx.listener(
                                         move |this, event: &KeyDownEvent, _, cx| {
@@ -1042,7 +1044,11 @@ impl HhApp {
                                                 event.keystroke.key.as_str(),
                                                 "enter" | "space"
                                             ) {
-                                                this.select_workspace(workspace_id, cx);
+                                                this.select_workspace(
+                                                    workspace_id,
+                                                    SeenScope::Tab,
+                                                    cx,
+                                                );
                                                 cx.stop_propagation();
                                             }
                                         },

@@ -20,7 +20,8 @@ pub struct AppTheme {
     pub accent_soft: u32,
     pub selection: u32,
     pub danger: u32,
-    /// Needs-the-user orange, distinct from destructive `danger` red.
+    /// Caution orange (e.g. missing permissions), distinct from destructive
+    /// `danger` red. Tab states use the palette in `status_art`.
     pub warning: u32,
     pub ansi: [u32; 16],
 }

@@ -81,3 +81,37 @@ pub(crate) fn import_gallery_image(workspace_id: Uuid, source: &Path) -> Result<
         .with_context(|| format!("write gallery image {}", destination.display()))?;
     Ok(destination)
 }
+
+/// Copies every regular file of workstation `from`'s gallery into `to`'s, so
+/// gallery panes that moved to `to` keep showing their images. Existing files
+/// in `to` are kept.
+pub(crate) fn copy_gallery_contents(from: Uuid, to: Uuid) -> Result<()> {
+    let source = hh_protocol::gallery_directory(from)
+        .context("Harness Harlot state directory is unavailable")?;
+    let entries = match fs::read_dir(&source) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read gallery {}", source.display()));
+        }
+    };
+    let destination = hh_protocol::gallery_directory(to)
+        .context("Harness Harlot state directory is unavailable")?;
+    hh_protocol::ensure_private_directory(&destination)
+        .with_context(|| format!("create gallery directory {}", destination.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read gallery {}", source.display()))?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if target.exists() {
+            continue;
+        }
+        let bytes = fs::read(entry.path())
+            .with_context(|| format!("read gallery image {}", entry.path().display()))?;
+        hh_protocol::atomic_write_private(&target, &bytes)
+            .with_context(|| format!("write gallery image {}", target.display()))?;
+    }
+    Ok(())
+}

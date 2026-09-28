@@ -9,9 +9,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
 
-use hh_protocol::{
-    NotificationKind, PaneStreamState, SessionNotification, SessionSnapshot, TerminalScreen,
-};
+use hh_protocol::{PaneStreamState, SessionNotification, SessionSnapshot, TerminalScreen};
 use uuid::Uuid;
 
 use crate::helpers::{
@@ -32,7 +30,8 @@ pub(crate) struct ReconcileOutcome {
     /// Focus moved to a pane the desktop has not focused yet; resync its
     /// snapshot.
     pub focus_resync: Option<Uuid>,
-    /// The notification ring was reset by a stale id; refetch the full list.
+    /// The notification mirror belongs to a replaced ring, or skipped items;
+    /// refetch the full list.
     pub notifications_need_refresh: bool,
 }
 
@@ -43,6 +42,7 @@ pub(crate) struct UpdatePayload {
     pub screens: Vec<TerminalScreen>,
     pub pane_states: Vec<PaneStreamState>,
     pub notification_deltas: Vec<SessionNotification>,
+    pub notifications_epoch: Uuid,
 }
 
 const NOTIFICATION_RING_CAPACITY: usize = 200;
@@ -62,6 +62,7 @@ pub(crate) fn reconcile_updates(
         screens,
         pane_states,
         notification_deltas,
+        notifications_epoch,
     } = payload;
     let mut outcome = ReconcileOutcome::default();
     let current_session_revision = session.snapshot.as_ref().map(|snapshot| snapshot.revision);
@@ -127,9 +128,6 @@ pub(crate) fn reconcile_updates(
             .flat_map(|workspace| workspace.tabs.iter().map(|tab| tab.id))
             .collect::<HashSet<_>>();
         sidebar
-            .collapsed_groups
-            .retain(|tab_id| live_tab_ids.contains(tab_id));
-        sidebar
             .dismissed_workspace_tabs
             .retain(|tab_id| live_tab_ids.contains(tab_id));
         session.snapshot = Some(snapshot);
@@ -165,42 +163,98 @@ pub(crate) fn reconcile_updates(
             .map(|state| (state.pane_id, state))
             .collect();
     }
-    let notifications_changed = if notification_deltas
-        .iter()
-        .any(|notification| notification.id <= session.notifications_latest_id)
-    {
-        session.notifications.clear();
-        session.notifications_latest_id = 0;
-        outcome.notifications_need_refresh = true;
-        true
-    } else if notification_deltas.is_empty() {
-        false
-    } else {
-        session.notifications_latest_id = notification_deltas
-            .iter()
-            .map(|notification| notification.id)
-            .max()
-            .unwrap_or(session.notifications_latest_id);
-        session.notifications.extend(
-            notification_deltas
-                .into_iter()
-                .filter(|notification| notification.kind == NotificationKind::Message),
-        );
-        let overflow = session
-            .notifications
-            .len()
-            .saturating_sub(NOTIFICATION_RING_CAPACITY);
-        if overflow > 0 {
-            session.notifications.drain(..overflow);
-        }
-        true
-    };
+    let notifications = sync_notifications(
+        &mut session.notifications,
+        &mut session.notifications_latest_id,
+        session.notifications_epoch,
+        &mut session.notifications_reloading,
+        notifications_epoch,
+        notification_deltas,
+    );
+    outcome.notifications_need_refresh = notifications.refresh;
+    let notifications_changed = notifications.changed;
     let connection_changed = session.connection_error.take().is_some();
     session.connection_error = None;
     outcome.state_changed = pane_update_requires_repaint(snapshot_changed, screens_applied)
         || connection_changed
         || notifications_changed;
     outcome
+}
+
+/// What one `Updates` payload did to the notification mirror.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct NotificationSync {
+    pub changed: bool,
+    pub refresh: bool,
+}
+
+/// Merges notification deltas into the mirror.
+///
+/// A new `epoch` means the service replaced its ring (restart), so ids from
+/// the old ring mean nothing: the mirror keeps showing the previous list and
+/// badge, ignores deltas, and asks once for the full reload that replaces
+/// it (`reloading` stays set until that reload answers).
+///
+/// Within one epoch, deltas at or below the cursor are late duplicates and
+/// ignored; newer ones are applied directly, replacing their unread
+/// predecessors by the service's own rule. Only a gap in the ids (items the
+/// service replaced or dropped before this poll saw them) asks for a reload.
+pub(crate) fn sync_notifications(
+    notifications: &mut Vec<SessionNotification>,
+    latest_id: &mut u64,
+    current_epoch: Option<Uuid>,
+    reloading: &mut bool,
+    epoch: Uuid,
+    deltas: Vec<SessionNotification>,
+) -> NotificationSync {
+    if current_epoch != Some(epoch) {
+        return NotificationSync {
+            changed: false,
+            refresh: !std::mem::replace(reloading, true),
+        };
+    }
+    let mut fresh = deltas
+        .into_iter()
+        .filter(|notification| notification.id > *latest_id)
+        .collect::<Vec<_>>();
+    if fresh.is_empty() {
+        return NotificationSync::default();
+    }
+    fresh.sort_by_key(|notification| notification.id);
+    let gap = fresh
+        .iter()
+        .zip(latest_id.saturating_add(1)..)
+        .any(|(notification, expected)| notification.id != expected);
+    for incoming in fresh {
+        notifications.retain(|existing| !existing.replaced_by(&incoming));
+        *latest_id = incoming.id;
+        notifications.push(incoming);
+    }
+    let overflow = notifications
+        .len()
+        .saturating_sub(NOTIFICATION_RING_CAPACITY);
+    notifications.drain(..overflow);
+    NotificationSync {
+        changed: true,
+        refresh: gap && !std::mem::replace(reloading, true),
+    }
+}
+
+/// Applies a full notification reload: the mirror, its cursor, and its
+/// epoch become the service's, and deltas apply again.
+pub(crate) fn replace_notifications(
+    session: &mut SessionState,
+    items: Vec<SessionNotification>,
+    epoch: Uuid,
+) {
+    session.notifications_latest_id = items
+        .iter()
+        .map(|notification| notification.id)
+        .max()
+        .unwrap_or(0);
+    session.notifications = items;
+    session.notifications_epoch = Some(epoch);
+    session.notifications_reloading = false;
 }
 #[cfg(test)]
 mod tests {
@@ -209,6 +263,8 @@ mod tests {
     use crate::view_models::{DragHoverState, SidebarResizeLifecycle};
     use gpui::ScrollHandle;
     use hh_protocol::{NotificationKind, StreamDiagnostics, TerminalModes, TerminalProfile};
+
+    const EPOCH: Uuid = Uuid::from_u128(0xe90c);
     use parking_lot::Mutex;
     use std::sync::Arc;
 
@@ -229,8 +285,9 @@ mod tests {
             pane_states: HashMap::new(),
             notifications: Vec::new(),
             notifications_latest_id: 0,
+            notifications_epoch: Some(EPOCH),
+            notifications_reloading: false,
             dock_badge: None,
-            pane_views: crate::notifications::PaneViews::default(),
             last_delivery: HashMap::new(),
             window_active: true,
             stream_diagnostics: StreamDiagnostics::default(),
@@ -241,17 +298,15 @@ mod tests {
     fn sidebar() -> SidebarUi {
         SidebarUi {
             active_workspace: None,
-            workspace_tab_scope: crate::helpers::WorkspaceTabScope::Workstation,
             expanded_workspaces: HashSet::new(),
-            collapsed_groups: HashSet::new(),
             collapsed_pinned_sections: HashSet::new(),
-            collapsed_project_sections: HashSet::new(),
             dismissed_workspace_tabs: HashSet::new(),
             workstation_tab_scroll: ScrollHandle::new(),
             dragging_workspace: None,
             workspace_drop_preview: None,
             suppress_workspace_click_until: None,
             tab_drop_preview: None,
+            tab_drop_workspace: None,
             suppress_tab_click_until: None,
             sidebar_resize: SidebarResizeLifecycle::default(),
             preferred_sidebar_width: 200.0,
@@ -346,6 +401,7 @@ mod tests {
                     enhanced_paste: false,
                 }],
                 notification_deltas: Vec::new(),
+                notifications_epoch: EPOCH,
             },
             Instant::now(),
         );
@@ -393,6 +449,7 @@ mod tests {
                     enhanced_paste: false,
                 }],
                 notification_deltas: Vec::new(),
+                notifications_epoch: EPOCH,
             },
             Instant::now(),
         );
@@ -405,13 +462,13 @@ mod tests {
         assert!(!outcome.state_changed, "nothing visible changed");
     }
 
-    #[test]
-    fn stale_notification_delta_resets_the_ring_and_requests_refetch() {
-        let mut session = session_state();
-        session.notifications_latest_id = 30;
-        session.notifications = vec![notification(30)];
-        let outcome = reconcile_updates(
-            &mut session,
+    fn deltas(
+        session: &mut SessionState,
+        epoch: Uuid,
+        deltas: Vec<SessionNotification>,
+    ) -> ReconcileOutcome {
+        reconcile_updates(
+            session,
             &mut sidebar(),
             &mut layout(),
             &mut HashMap::new(),
@@ -420,38 +477,112 @@ mod tests {
                 snapshot: None,
                 screens: Vec::new(),
                 pane_states: Vec::new(),
-                notification_deltas: vec![notification(12)],
+                notification_deltas: deltas,
+                notifications_epoch: epoch,
             },
             Instant::now(),
-        );
-        assert!(session.notifications.is_empty());
-        assert_eq!(session.notifications_latest_id, 0);
-        assert!(outcome.notifications_need_refresh);
-        assert!(outcome.state_changed);
+        )
     }
 
     #[test]
-    fn only_service_messages_are_kept_while_the_cursor_tracks_every_delta() {
+    fn a_new_epoch_keeps_the_previous_list_until_the_full_reload_replaces_it() {
         let mut session = session_state();
+        session.notifications_latest_id = 30;
+        session.notifications = vec![notification(29), notification(30)];
+        let shown = session.notifications.clone();
+        let restarted = Uuid::from_u128(0xbeef);
+        // The restarted service's ids mean nothing against the old cursor.
+        let outcome = deltas(&mut session, restarted, vec![notification(2)]);
+        assert_eq!(session.notifications, shown, "list and badge stay up");
+        assert_eq!(session.notifications_latest_id, 30);
+        assert!(outcome.notifications_need_refresh);
+        assert!(!outcome.state_changed);
+
+        // Polls before the reload answers neither apply deltas nor ask again.
+        let outcome = deltas(&mut session, restarted, vec![notification(3)]);
+        assert_eq!(session.notifications, shown);
+        assert!(!outcome.notifications_need_refresh);
+
+        replace_notifications(
+            &mut session,
+            vec![notification(2), notification(3)],
+            restarted,
+        );
+        assert_eq!(
+            session.notifications,
+            vec![notification(2), notification(3)]
+        );
+        assert_eq!(session.notifications_latest_id, 3, "the new ring's cursor");
+        let mut message = notification(4);
+        message.kind = NotificationKind::Message;
+        let outcome = deltas(&mut session, restarted, vec![message]);
+        assert_eq!(session.notifications.len(), 3, "deltas apply again");
+        assert!(!outcome.notifications_need_refresh);
+    }
+
+    #[test]
+    fn new_deltas_apply_directly_and_only_a_gap_triggers_a_full_reload() {
+        let mut session = session_state();
+        session.notifications_latest_id = 6;
+        let mut earlier = notification(6);
+        earlier.at_ms = 1_000;
+        let mut other_pane = notification(5);
+        other_pane.pane_id = Uuid::from_u128(5);
+        session.notifications = vec![other_pane.clone(), earlier];
+
+        // The pane finishes again within the dedupe window: the service
+        // replaced id 6 with id 7, and the mirror does the same.
+        let mut repeat = notification(7);
+        repeat.at_ms = 3_000;
+        let outcome = deltas(&mut session, EPOCH, vec![repeat.clone()]);
+        assert_eq!(
+            session.notifications,
+            vec![other_pane.clone(), repeat.clone()]
+        );
+        assert_eq!(session.notifications_latest_id, 7);
+        assert!(outcome.state_changed);
+        assert!(
+            !outcome.notifications_need_refresh,
+            "an ordinary delta needs no 200-item reload"
+        );
+
+        // Id 8 never arrived (replaced before this poll): reload once.
+        let outcome = deltas(&mut session, EPOCH, vec![notification(9)]);
+        assert_eq!(session.notifications_latest_id, 9);
+        assert!(outcome.notifications_need_refresh);
+        let outcome = deltas(&mut session, EPOCH, vec![notification(11)]);
+        assert!(
+            !outcome.notifications_need_refresh,
+            "one reload in flight at a time"
+        );
+    }
+
+    #[test]
+    fn every_kind_is_kept_and_late_duplicates_are_ignored() {
+        let mut session = session_state();
+        session.notifications_latest_id = 6;
         let mut message = notification(8);
         message.kind = NotificationKind::Message;
-        let outcome = reconcile_updates(
+        let mut attention = notification(9);
+        attention.kind = NotificationKind::Attention;
+        let outcome = deltas(
             &mut session,
-            &mut sidebar(),
-            &mut layout(),
-            &mut HashMap::new(),
-            UpdatePayload {
-                session_revision: 0,
-                snapshot: None,
-                screens: Vec::new(),
-                pane_states: Vec::new(),
-                notification_deltas: vec![notification(7), message.clone(), notification(9)],
-            },
-            Instant::now(),
+            EPOCH,
+            vec![notification(7), message.clone(), attention.clone()],
         );
-        assert_eq!(session.notifications, vec![message]);
+        assert_eq!(
+            session.notifications,
+            vec![notification(7), message, attention]
+        );
         assert_eq!(session.notifications_latest_id, 9);
+        assert!(outcome.state_changed);
+
+        // A response computed with an older cursor repeats items already held.
+        let before = session.notifications.clone();
+        let outcome = deltas(&mut session, EPOCH, vec![notification(8), notification(9)]);
+        assert_eq!(session.notifications, before);
         assert!(!outcome.notifications_need_refresh);
+        assert!(!outcome.state_changed);
     }
 
     #[test]
@@ -476,6 +607,7 @@ mod tests {
                 screens: Vec::new(),
                 pane_states: Vec::new(),
                 notification_deltas: Vec::new(),
+                notifications_epoch: EPOCH,
             },
             Instant::now(),
         );

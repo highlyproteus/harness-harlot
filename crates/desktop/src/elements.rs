@@ -34,18 +34,19 @@ pub(crate) struct SidebarPaneRowContext {
     pub(crate) workspace_id: Uuid,
     pub(crate) tab_id: Option<Uuid>,
     pub(crate) tab_color: Option<AppearanceColor>,
-    pub(crate) from_group: bool,
+    pub(crate) from_pane_map: bool,
     pub(crate) indent: f32,
+    /// Row title in place of the pane's own label: a named tab's name.
+    pub(crate) title: Option<String>,
     /// Set on Notifications rows, which never drag-reorder.
     pub(crate) activity: Option<ActivityRow>,
 }
 
-/// The status symbol, unread dot, and location line of one Notifications row.
+/// The status and location line of one Notifications row.
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityRow {
-    /// Replaces the row's tab indicator; see `notification_indicator`.
+    /// Replaces the row's own state border.
     pub(crate) indicator: PaneIndicator,
-    pub(crate) unread: bool,
     pub(crate) location: String,
     pub(crate) bot: bool,
 }

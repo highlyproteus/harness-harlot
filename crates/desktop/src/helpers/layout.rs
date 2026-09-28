@@ -26,6 +26,18 @@ pub(crate) fn find_pane(layout: &PaneLayout, pane_id: Uuid) -> Option<&Pane> {
     }
 }
 
+pub(crate) fn find_pane_mut(layout: &mut PaneLayout, pane_id: Uuid) -> Option<&mut Pane> {
+    match layout {
+        PaneLayout::Leaf { pane } if pane.id == pane_id => Some(pane),
+        PaneLayout::Leaf { .. } => None,
+        PaneLayout::Stack { panes, .. } => panes.iter_mut().find(|pane| pane.id == pane_id),
+        PaneLayout::Split { first, second, .. } => match find_pane_mut(first, pane_id) {
+            Some(pane) => Some(pane),
+            None => find_pane_mut(second, pane_id),
+        },
+    }
+}
+
 pub(crate) fn inactive_stack_contains(layout: &PaneLayout, pane_id: Uuid) -> bool {
     match layout {
         PaneLayout::Leaf { .. } => false,
@@ -152,6 +164,8 @@ mod tests {
     fn workspace_rail_lists_every_terminal_tab_across_stacks_and_splits() {
         let make_pane = |id: u128, title: &str, profile: TerminalProfile| Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
@@ -214,14 +228,14 @@ mod tests {
             id: Uuid::from_u128(0x88),
             title: "buzz".to_owned(),
             custom_title: None,
-            project_dir: None,
             color: None,
             custom_icon: None,
-            parent_tab: None,
             pinned: false,
             layout: PaneLayout::Leaf {
                 pane: Pane {
                     status_changed_at_ms: 0,
+                    unseen: false,
+                    progress: None,
 
                     id: tmux_pane,
                     kind: hh_protocol::PaneKind::Terminal,
@@ -271,6 +285,8 @@ mod tests {
     fn zoom_is_a_projection_that_does_not_mutate_canonical_layout() {
         let first = Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(101),
             kind: hh_protocol::PaneKind::Terminal,
@@ -285,6 +301,8 @@ mod tests {
         };
         let second = Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(102),
             kind: hh_protocol::PaneKind::Terminal,
@@ -325,6 +343,8 @@ mod tests {
     fn equalize_is_a_controlled_mutation_over_all_current_split_identities() {
         let pane = |id| Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,

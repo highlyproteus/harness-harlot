@@ -111,22 +111,23 @@ pub(crate) fn handle_request(
         | ClientRequest::GetNotifications
         | ClientRequest::MarkNotificationsRead { .. }
         | ClientRequest::ClearNotifications
+        | ClientRequest::MarkPaneSeen { .. }
+        | ClientRequest::ReportPaneProgress { .. }
         | ClientRequest::GetPaneSnapshot { .. }
         | ClientRequest::GetAuthorizedPaneSnapshot { .. } => {
             handle_streaming_request(sessions, request)
         }
         ClientRequest::CreatePane { .. }
-        | ClientRequest::CreateGroupTerminal { .. }
+        | ClientRequest::CreateTabTerminal { .. }
         | ClientRequest::CreateWorkspaceTerminal { .. }
         | ClientRequest::CreateWorkspaceTab { .. }
         | ClientRequest::CreateBrowserTab { .. }
-        | ClientRequest::CreateGroupBrowser { .. }
+        | ClientRequest::CreateTabBrowser { .. }
         | ClientRequest::CreateGalleryTab { .. }
-        | ClientRequest::CreateGroupGallery { .. }
+        | ClientRequest::CreateTabGallery { .. }
         | ClientRequest::AddGalleryImage { .. }
         | ClientRequest::BrowserCommand { .. }
         | ClientRequest::BrowserCommandResult { .. }
-        | ClientRequest::CreateWorkspaceGroup { .. }
         | ClientRequest::ConnectSsh { .. }
         | ClientRequest::RenamePane { .. }
         | ClientRequest::SetPaneProfile { .. }
@@ -140,18 +141,14 @@ pub(crate) fn handle_request(
         | ClientRequest::SwapPanes { .. }
         | ClientRequest::MovePaneToSplit { .. }
         | ClientRequest::MovePaneToTab { .. }
-        | ClientRequest::MovePaneToGroup { .. }
+        | ClientRequest::MovePaneIntoTab { .. }
         | ClientRequest::MovePaneToNewTab { .. }
         | ClientRequest::RenameTab { .. }
         | ClientRequest::SetTabCustomIcon { .. }
         | ClientRequest::CloseTab { .. }
         | ClientRequest::SetTabColor { .. }
-        | ClientRequest::CreateWorkspaceProject { .. }
-        | ClientRequest::CreateAuthorizedWorkspaceProject { .. }
-        | ClientRequest::CreateAuthorizedWorktreeProject { .. }
-        | ClientRequest::SetTabWorkingDir { .. }
         | ClientRequest::ReorderTab { .. }
-        | ClientRequest::MoveTabToProject { .. }
+        | ClientRequest::MoveTabToWorkstation { .. }
         | ClientRequest::SetTabPinned { .. } => handle_tabs_request(sessions, request),
         ClientRequest::SetDefaultTerminalAccent { .. }
         | ClientRequest::SetDefaultWorkspaceColor { .. }
@@ -240,7 +237,16 @@ fn handle_streaming_request(
         ),
         ClientRequest::GetNotifications => Ok(ServiceResponse::Notifications {
             items: sessions.notifications()?,
+            epoch: sessions.notifications_epoch(),
         }),
+        ClientRequest::MarkPaneSeen { pane_id } => {
+            sessions.mark_pane_seen(pane_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ReportPaneProgress { pane_id, progress } => {
+            sessions.report_pane_progress(pane_id, progress)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::MarkNotificationsRead { ids } => {
             sessions.mark_notifications_read(&ids);
             Ok(ServiceResponse::Ack)
@@ -269,8 +275,8 @@ fn handle_panes_request(
         ClientRequest::CreatePane { target_pane, axis } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.create_pane(target_pane, axis)?,
         }),
-        ClientRequest::CreateGroupTerminal { target_pane } => Ok(ServiceResponse::PaneCreated {
-            pane_id: sessions.create_group_terminal(target_pane)?,
+        ClientRequest::CreateTabTerminal { target_pane } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_tab_terminal(target_pane)?,
         }),
         ClientRequest::CreateWorkspaceTerminal { workspace_id } => {
             Ok(ServiceResponse::PaneCreated {
@@ -283,16 +289,14 @@ fn handle_panes_request(
         ClientRequest::CreateBrowserTab { workspace_id, url } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.create_browser_tab(workspace_id, url.as_deref())?,
         }),
-        ClientRequest::CreateGroupBrowser { target_pane, url } => {
-            Ok(ServiceResponse::PaneCreated {
-                pane_id: sessions.create_group_browser(target_pane, url.as_deref())?,
-            })
-        }
+        ClientRequest::CreateTabBrowser { target_pane, url } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_tab_browser(target_pane, url.as_deref())?,
+        }),
         ClientRequest::CreateGalleryTab { workspace_id } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.create_gallery_tab(workspace_id)?,
         }),
-        ClientRequest::CreateGroupGallery { target_pane } => Ok(ServiceResponse::PaneCreated {
-            pane_id: sessions.create_group_gallery(target_pane, true)?,
+        ClientRequest::CreateTabGallery { target_pane } => Ok(ServiceResponse::PaneCreated {
+            pane_id: sessions.create_tab_gallery(target_pane, true)?,
         }),
         ClientRequest::AddGalleryImage {
             workspace_id,
@@ -317,12 +321,6 @@ fn handle_panes_request(
             sessions.resolve_browser_command(request_id, outcome);
             Ok(ServiceResponse::Ack)
         }
-        ClientRequest::CreateWorkspaceGroup {
-            workspace_id,
-            parent_tab,
-        } => Ok(ServiceResponse::PaneCreated {
-            pane_id: sessions.create_workspace_group(workspace_id, parent_tab)?,
-        }),
         ClientRequest::ConnectSsh { target_pane, host } => Ok(ServiceResponse::PaneCreated {
             pane_id: sessions.connect_ssh(target_pane, &host)?,
         }),
@@ -397,20 +395,19 @@ fn handle_tabs_request(
             sessions.move_pane_to_tab(source_pane, target_pane)?;
             Ok(ServiceResponse::Ack)
         }
-        ClientRequest::MovePaneToGroup {
+        ClientRequest::MovePaneIntoTab {
             source_pane,
             target_tab,
         } => {
-            sessions.move_pane_to_group(source_pane, target_tab)?;
+            sessions.move_pane_into_tab(source_pane, target_tab)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::MovePaneToNewTab {
             source_pane,
             target_tab,
             after,
-            parent_tab,
         } => {
-            sessions.move_pane_to_new_tab(source_pane, target_tab, after, parent_tab)?;
+            sessions.move_pane_to_new_tab(source_pane, target_tab, after)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::RenameTab { tab_id, title } => {
@@ -429,61 +426,6 @@ fn handle_tabs_request(
             sessions.set_tab_color(tab_id, color)?;
             Ok(ServiceResponse::Ack)
         }
-        ClientRequest::CreateWorkspaceProject {
-            workspace_id,
-            working_dir,
-            title,
-        } => Ok(ServiceResponse::PaneCreated {
-            pane_id: sessions.create_workspace_project(
-                workspace_id,
-                &working_dir,
-                title.as_deref(),
-            )?,
-        }),
-        ClientRequest::CreateAuthorizedWorkspaceProject {
-            workspace_id,
-            working_dir,
-            authorized_root,
-            title,
-        } => {
-            let working_dir = canonical_directory_within(&working_dir, &authorized_root)?;
-            Ok(ServiceResponse::PaneCreated {
-                pane_id: sessions.create_workspace_project(
-                    workspace_id,
-                    &working_dir,
-                    title.as_deref(),
-                )?,
-            })
-        }
-        ClientRequest::CreateAuthorizedWorktreeProject {
-            workspace_id,
-            repo_dir,
-            authorized_root,
-            branch,
-            base,
-        } => {
-            let repo_dir = canonical_directory_within(&repo_dir, &authorized_root)?;
-            let worktree =
-                create_git_worktree_within(&repo_dir, &authorized_root, &branch, base.as_deref())?;
-            match sessions.create_workspace_project(workspace_id, worktree.path(), Some(&branch)) {
-                Ok(pane_id) => Ok(ServiceResponse::PaneCreated { pane_id }),
-                Err(error) => {
-                    if let Err(cleanup_error) = worktree.rollback() {
-                        bail!(
-                            "{error:#}; additionally failed to roll back worktree: {cleanup_error:#}"
-                        );
-                    }
-                    Err(error)
-                }
-            }
-        }
-        ClientRequest::SetTabWorkingDir {
-            tab_id,
-            working_dir,
-        } => {
-            sessions.set_tab_working_dir(tab_id, working_dir)?;
-            Ok(ServiceResponse::Ack)
-        }
         ClientRequest::ReorderTab {
             tab_id,
             target_tab_id,
@@ -492,11 +434,11 @@ fn handle_tabs_request(
             sessions.reorder_tab(tab_id, target_tab_id, after)?;
             Ok(ServiceResponse::Ack)
         }
-        ClientRequest::MoveTabToProject {
+        ClientRequest::MoveTabToWorkstation {
             tab_id,
-            project_tab,
+            workspace_id,
         } => {
-            sessions.move_tab_to_project(tab_id, project_tab)?;
+            sessions.move_tab_to_workstation(tab_id, workspace_id)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::SetTabPinned { tab_id, pinned } => {
@@ -538,8 +480,13 @@ fn handle_workspaces_request(
             sessions.set_workspace_custom_icon(workspace_id, icon)?;
             Ok(ServiceResponse::Ack)
         }
-        ClientRequest::CreateWorkspace { title } => {
-            let (workspace_id, pane_id) = sessions.create_workspace(title.as_deref())?;
+        ClientRequest::CreateWorkspace {
+            title,
+            parent_workstation,
+            working_dir,
+        } => {
+            let (workspace_id, pane_id) =
+                sessions.create_workspace(title.as_deref(), parent_workstation, working_dir)?;
             Ok(ServiceResponse::WorkspaceCreated {
                 workspace_id,
                 pane_id,
@@ -551,12 +498,8 @@ fn handle_workspaces_request(
             authorized_root,
         } => {
             let working_dir = canonical_directory_within(&working_dir, &authorized_root)?;
-            let (workspace_id, pane_id) = sessions.create_workspace(title.as_deref())?;
-            if let Err(error) = sessions.set_workspace_working_dir(workspace_id, Some(working_dir))
-            {
-                let _ = sessions.delete_workspace(workspace_id);
-                return Err(error);
-            }
+            let (workspace_id, pane_id) =
+                sessions.create_workspace(title.as_deref(), None, Some(working_dir))?;
             Ok(ServiceResponse::WorkspaceCreated {
                 workspace_id,
                 pane_id,
@@ -821,6 +764,7 @@ pub(crate) fn handle_get_updates(
         screens: update.screens,
         pane_states: update.pane_states,
         notifications: update.notifications,
+        notifications_epoch: update.notifications_epoch,
         diagnostics: update.diagnostics,
         browser_commands: update.browser_commands,
     })
@@ -888,215 +832,6 @@ fn canonical_directory_within(path: &str, authorized_root: &str) -> Result<Strin
         root.display()
     );
     Ok(directory.to_string_lossy().into_owned())
-}
-
-#[derive(Debug)]
-struct CreatedGitWorktree {
-    repo: std::path::PathBuf,
-    parent: std::path::PathBuf,
-    target: std::path::PathBuf,
-    branch: String,
-    parent_created: bool,
-}
-
-impl CreatedGitWorktree {
-    fn path(&self) -> &str {
-        self.target
-            .to_str()
-            .expect("canonical worktree path was validated as UTF-8")
-    }
-
-    fn rollback(&self) -> Result<()> {
-        if std::fs::symlink_metadata(&self.target).is_ok() {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&self.repo)
-                .args(["worktree", "remove", "--force", "--"])
-                .arg(&self.target)
-                .output()
-                .context("launch git worktree remove")?;
-            ensure!(
-                output.status.success(),
-                "git worktree remove failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let branch_ref = format!("refs/heads/{}", self.branch);
-        let branch_exists = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["show-ref", "--verify", "--quiet", &branch_ref])
-            .status()
-            .context("inspect Git branch during cleanup")?
-            .success();
-        if branch_exists {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&self.repo)
-                .args(["branch", "-D", "--", &self.branch])
-                .output()
-                .context("launch git branch cleanup")?;
-            ensure!(
-                output.status.success(),
-                "git branch cleanup failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        if self.parent_created {
-            std::fs::remove_dir(&self.parent)
-                .with_context(|| format!("remove worktree parent {}", self.parent.display()))?;
-        }
-        Ok(())
-    }
-}
-
-fn create_git_worktree_within(
-    repo_dir: &str,
-    authorized_root: &str,
-    branch: &str,
-    base: Option<&str>,
-) -> Result<CreatedGitWorktree> {
-    ensure!(
-        !branch.is_empty()
-            && branch.len() <= 100
-            && branch
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric()
-                    || matches!(byte, b'.' | b'_' | b'/' | b'-')),
-        "branch must match [A-Za-z0-9._/-]{{1,100}}"
-    );
-    if let Some(base) = base {
-        let valid = !base.is_empty()
-            && base.len() <= 200
-            && !base.starts_with(['-', '/'])
-            && !base.ends_with(['/', '.'])
-            && !base.contains("..")
-            && !base.contains("//")
-            && !base.contains("@{")
-            && base.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-')
-            });
-        ensure!(valid, "base must be a conservative Git ref");
-    }
-
-    let root = std::fs::canonicalize(authorized_root)
-        .with_context(|| format!("resolve authorized root {authorized_root}"))?;
-    ensure!(root.is_dir(), "authorized root must be a directory");
-    let repo = std::fs::canonicalize(repo_dir)
-        .with_context(|| format!("resolve repository directory {repo_dir}"))?;
-    ensure!(
-        repo.is_dir() && repo.starts_with(&root),
-        "repository {} is outside authorized root {}",
-        repo.display(),
-        root.display()
-    );
-    ensure!(
-        repo.join(".git").exists(),
-        "repository directory must contain .git"
-    );
-    let repo_name = repo
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("repository directory has no UTF-8 name")?;
-    let parent = repo
-        .parent()
-        .context("repository directory has no parent")?
-        .join(format!("{repo_name}-worktrees"));
-    let parent_created = match std::fs::create_dir(&parent) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("create worktree parent {}", parent.display()));
-        }
-    };
-    let parent = std::fs::canonicalize(&parent)
-        .with_context(|| format!("resolve worktree parent {}", parent.display()))?;
-    if !parent.starts_with(&root) {
-        if parent_created {
-            let _ = std::fs::remove_dir(&parent);
-        }
-        bail!(
-            "worktree parent {} is outside authorized root {}",
-            parent.display(),
-            root.display()
-        );
-    }
-    let target = parent.join(branch.replace('/', "-"));
-    if std::fs::symlink_metadata(&target).is_ok() {
-        if parent_created {
-            let _ = std::fs::remove_dir(&parent);
-        }
-        bail!("worktree target {} already exists", target.display());
-    }
-
-    let mut command = std::process::Command::new("git");
-    command
-        .arg("-C")
-        .arg(&repo)
-        .arg("worktree")
-        .arg("add")
-        .arg("-b")
-        .arg(branch)
-        .arg("--")
-        .arg(&target);
-    if let Some(base) = base {
-        command.arg(base);
-    }
-    let cleanup = CreatedGitWorktree {
-        repo: repo.clone(),
-        parent: parent.clone(),
-        target: target.clone(),
-        branch: branch.to_owned(),
-        parent_created,
-    };
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = cleanup.rollback();
-            return Err(error).context("launch git worktree add");
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        if let Err(cleanup_error) = cleanup.rollback() {
-            bail!(
-                "git worktree add failed: {stderr}; additionally failed to clean partial worktree: {cleanup_error:#}"
-            );
-        }
-        bail!("git worktree add failed: {stderr}");
-    }
-    let target = match std::fs::canonicalize(&target)
-        .with_context(|| format!("resolve created worktree {}", target.display()))
-    {
-        Ok(target) if target.starts_with(&root) => target,
-        Ok(target) => {
-            let cleanup_error = cleanup.rollback().err();
-            if let Some(cleanup_error) = cleanup_error {
-                bail!(
-                    "created worktree {} is outside authorized root {}; additionally failed to roll back: {cleanup_error:#}",
-                    target.display(),
-                    root.display()
-                );
-            }
-            bail!(
-                "created worktree {} is outside authorized root {}",
-                target.display(),
-                root.display()
-            );
-        }
-        Err(error) => {
-            if let Err(cleanup_error) = cleanup.rollback() {
-                bail!("{error:#}; additionally failed to roll back: {cleanup_error:#}");
-            }
-            return Err(error);
-        }
-    };
-    ensure!(
-        target.to_str().is_some(),
-        "created worktree path is not UTF-8"
-    );
-    Ok(CreatedGitWorktree { target, ..cleanup })
 }
 
 #[cfg(test)]

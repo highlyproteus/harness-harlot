@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use hh_protocol::{
     ClientRequest, Pane, PaneLayout, PaneStatus, ServiceResponse, SessionSnapshot, Tab, Workspace,
+    effective_working_dir,
 };
 use hh_session_client::SessionClient;
 use regex::Regex;
@@ -212,12 +213,6 @@ fn layout_panes(layout: &PaneLayout) -> Vec<&Pane> {
     panes
 }
 
-fn tab_cwd<'a>(workspace: &'a Workspace, tab: &'a Tab) -> Option<&'a str> {
-    tab.project_dir
-        .as_deref()
-        .or(workspace.working_dir.as_deref())
-}
-
 fn list(context: &AgentContext, mine: bool) -> Result<Value> {
     let mut client = client()?;
     let session = Session::fetch(&mut client)?;
@@ -228,6 +223,7 @@ fn list(context: &AgentContext, mine: bool) -> Result<Value> {
         .iter()
         .filter(|workspace| !workspace.is_bot())
         .filter_map(|workspace| {
+            let cwd = effective_working_dir(&session.snapshot.workspaces, workspace.id);
             let tabs = workspace
                 .tabs
                 .iter()
@@ -251,7 +247,7 @@ fn list(context: &AgentContext, mine: bool) -> Result<Value> {
                         json!({
                             "tab_id": tab.id,
                             "title": tab.title,
-                            "cwd": tab_cwd(workspace, tab),
+                            "cwd": cwd,
                             "owner_bot": tab.owner_bot,
                             "owner_thread": tab.owner_thread,
                             "owner_thread_live": tab
@@ -266,6 +262,7 @@ fn list(context: &AgentContext, mine: bool) -> Result<Value> {
                 json!({
                     "workstation_id": workspace.id,
                     "title": workspace.title,
+                    "parent_workstation": workspace.parent_workstation,
                     "working_dir": workspace.working_dir,
                     "owner_bot": workspace.owner_bot,
                     "tabs": tabs,

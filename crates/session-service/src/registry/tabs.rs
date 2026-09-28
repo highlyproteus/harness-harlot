@@ -1,7 +1,7 @@
 //! Tab operations: layout moves, tab metadata, and reorder within workstations.
 use super::{
-    RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry, TerminalRuntimePane,
-    encode_desired_state,
+    ProcessScan, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
+    TerminalRuntimePane, encode_desired_state, tmux_session_name,
 };
 use crate::layout::{
     activate_tab, add_tab, collect_pane_ids, detach_pane, first_layout_pane, layout_contains,
@@ -11,147 +11,46 @@ use crate::layout::{
 use crate::persistence;
 use crate::persistence::{MAX_TABS_PER_WORKSPACE, validate_title};
 use crate::process::local_spawn_dir;
+use crate::pty::PtySession;
 use crate::registry::bots::prune_bot_threads;
-use crate::registry::workspaces::remember_recent_color;
+use crate::registry::identity::refresh_workspace_activity;
+use crate::registry::workspaces::{remember_recent_color, same_machine};
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    AppearanceColor, DropPlacement, MAX_PANES, PaneLayout, Tab, Workspace, validate_workspace_dir,
+    AppearanceColor, DropPlacement, MAX_PANES, PaneLayout, Tab, effective_working_dir,
 };
-use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
-fn repair_removed_tab_children(
-    workspace: &mut Workspace,
-    removed_tab: Uuid,
-    replacement_parent: Option<Uuid>,
-) {
-    let replacement_parent = replacement_parent.filter(|replacement| {
-        *replacement != removed_tab
-            && workspace.tabs.iter().any(|tab| {
-                tab.id == *replacement && tab.parent_tab.is_none() && tab.project_dir.is_some()
-            })
-    });
-    for tab in &mut workspace.tabs {
-        if tab.parent_tab == Some(removed_tab) {
-            tab.parent_tab = replacement_parent;
-        }
-    }
-}
-
 impl SessionRegistry {
-    /// Appends one more top-level tab to a workstation that already has a layout.
-    /// Unlike `create_workspace_terminal` this is deliberately not idempotent:
-    /// every request adds a tab, which is what the workstation menu's "New Tab"
+    /// Appends one more top-level tab to a workstation, opening its terminal
+    /// in the workstation's effective root folder. Unlike
+    /// `create_workspace_terminal` this is deliberately not idempotent: every
+    /// request adds a tab, which is what the workstation menu's "New Tab"
     /// means.
     pub fn create_workspace_tab(&self, workspace_id: Uuid) -> Result<Uuid> {
         self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
-        self.append_workspace_tab(workspace_id, None, None, None)
-    }
-
-    /// Appends a named group holding its first terminal, so the group is visible
-    /// and right-clickable before a second terminal exists.
-    pub fn create_workspace_group(
-        &self,
-        workspace_id: Uuid,
-        parent_tab: Option<Uuid>,
-    ) -> Result<Uuid> {
-        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
-        let number = {
-            let mut state = self.state.write();
-            let number = state.next_group_number;
-            state.next_group_number = state.next_group_number.saturating_add(1);
-            number
-        };
-        self.append_workspace_tab(
-            workspace_id,
-            Some(format!("Group {number}")),
-            None,
-            parent_tab,
-        )
-    }
-
-    pub fn create_workspace_project(
-        &self,
-        workspace_id: Uuid,
-        working_dir: &str,
-        title: Option<&str>,
-    ) -> Result<Uuid> {
-        self.ensure_workspace_accepts_workstation_tabs(workspace_id)?;
-        validate_workspace_dir(working_dir).map_err(anyhow::Error::from)?;
-        let title = title.map_or_else(
-            || {
-                working_dir
-                    .rsplit('/')
-                    .find(|component| !component.is_empty())
-                    .unwrap_or("Project")
-                    .to_owned()
-            },
-            str::to_owned,
-        );
-        self.append_workspace_tab(
-            workspace_id,
-            Some(title),
-            Some(working_dir.to_owned()),
-            None,
-        )
-    }
-
-    pub(crate) fn workspace_tab_dir_override(
-        &self,
-        workspace_id: Uuid,
-        project_dir: Option<&str>,
-        parent_tab: Option<Uuid>,
-    ) -> Result<Option<String>> {
-        let state = self.state.read();
-        if state.panes.len() >= MAX_PANES {
-            bail!("pane limit of {MAX_PANES} reached");
-        }
-        let workspace = state
-            .snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-        if workspace.tabs.len() >= MAX_TABS_PER_WORKSPACE {
-            bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
-        }
-        let parent_project_dir = if let Some(parent_id) = parent_tab {
-            if project_dir.is_some() {
-                bail!("parent tab {parent_id} must be a project in the same workstation");
+        let root = {
+            let state = self.state.read();
+            if state.panes.len() >= MAX_PANES {
+                bail!("pane limit of {MAX_PANES} reached");
             }
-            let parent = workspace
-                .tabs
+            let workspace = state
+                .snapshot
+                .workspaces
                 .iter()
-                .find(|tab| tab.id == parent_id)
-                .filter(|tab| tab.parent_tab.is_none() && tab.project_dir.is_some())
-                .with_context(|| {
-                    format!("parent tab {parent_id} must be a project in the same workstation")
-                })?;
-            parent.project_dir.clone()
-        } else {
-            None
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+            if workspace.tabs.len() >= MAX_TABS_PER_WORKSPACE {
+                bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
+            }
+            effective_working_dir(&state.snapshot.workspaces, workspace_id).map(str::to_owned)
         };
-        Ok(project_dir
-            .map(str::to_owned)
-            .or(parent_project_dir)
-            .or_else(|| workspace.working_dir.clone()))
-    }
-
-    pub(crate) fn append_workspace_tab(
-        &self,
-        workspace_id: Uuid,
-        custom_title: Option<String>,
-        project_dir: Option<String>,
-        parent_tab: Option<Uuid>,
-    ) -> Result<Uuid> {
-        let dir_override =
-            self.workspace_tab_dir_override(workspace_id, project_dir.as_deref(), parent_tab)?;
 
         let pane_id = Uuid::new_v4();
-        let cwd = local_spawn_dir(dir_override.as_deref())?;
+        let cwd = local_spawn_dir(root.as_deref())?;
         let (session, kind) =
-            self.spawn_pane_for_workspace(pane_id, workspace_id, &cwd, dir_override.as_deref())?;
+            self.spawn_pane_for_workspace(pane_id, workspace_id, &cwd, root.as_deref())?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -167,46 +66,18 @@ impl SessionRegistry {
                 bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
             }
             let pane = state.new_runtime_pane(pane_id, &cwd, &kind);
-            let tab = Tab {
+            let workspace = &mut state.snapshot.workspaces[workspace_index];
+            workspace.tabs.push(Tab {
                 owner_thread: None,
                 id: Uuid::new_v4(),
                 title: pane.title.clone(),
-                custom_title,
-                project_dir,
+                custom_title: None,
                 color: None,
                 custom_icon: None,
-                parent_tab,
                 pinned: false,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
-            };
-            let workspace = &mut state.snapshot.workspaces[workspace_index];
-            let insertion_index = if let Some(parent_id) = parent_tab {
-                let parent_index = workspace
-                    .tabs
-                    .iter()
-                    .position(|candidate| {
-                        candidate.id == parent_id
-                            && candidate.parent_tab.is_none()
-                            && candidate.project_dir.is_some()
-                    })
-                    .with_context(|| {
-                        format!("parent tab {parent_id} must be a project in the same workstation")
-                    })?;
-                workspace
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, candidate)| {
-                        (candidate.parent_tab == Some(parent_id)).then_some(index)
-                    })
-                    .next_back()
-                    .unwrap_or(parent_index)
-                    + 1
-            } else {
-                workspace.tabs.len()
-            };
-            workspace.tabs.insert(insertion_index, tab);
+            });
             workspace.active_terminal_count = workspace.active_terminal_count.saturating_add(1);
             state.panes.insert(
                 pane_id,
@@ -217,8 +88,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -361,8 +233,9 @@ impl SessionRegistry {
                         kind: RuntimePaneKind::Local,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -405,7 +278,7 @@ impl SessionRegistry {
         Ok(())
     }
 
-    pub fn move_pane_to_group(&self, source_pane: Uuid, target_tab: Uuid) -> Result<()> {
+    pub fn move_pane_into_tab(&self, source_pane: Uuid, target_tab: Uuid) -> Result<()> {
         let mut state = self.state.write();
         if !state.panes.contains_key(&source_pane) {
             bail!("source pane {source_pane} does not exist");
@@ -435,9 +308,9 @@ impl SessionRegistry {
                     .position(|tab| tab.id == target_tab)
                     .map(|tab_index| (workspace_index, tab_index))
             })
-            .with_context(|| format!("target group {target_tab} does not exist"))?;
+            .with_context(|| format!("target tab {target_tab} does not exist"))?;
         if source_location.0 != target_location.0 {
-            bail!("panes can only move between groups in the same workstation");
+            bail!("panes can only move between tabs in the same workstation");
         }
         if source_location == target_location {
             return Ok(());
@@ -450,14 +323,12 @@ impl SessionRegistry {
         let mut target_layout = workspace.tabs[target_location.1].layout.clone();
         let target_pane = first_layout_pane(&target_layout);
         if !add_tab(&mut target_layout, target_pane, pane, true) {
-            bail!("target group {target_tab} cannot accept pane {source_pane}");
+            bail!("target tab {target_tab} cannot accept pane {source_pane}");
         }
         workspace.tabs[target_location.1].layout = target_layout;
         if let Some(remaining) = remaining {
             workspace.tabs[source_location.1].layout = remaining;
         } else {
-            let removed_tab = workspace.tabs[source_location.1].id;
-            repair_removed_tab_children(workspace, removed_tab, Some(target_tab));
             workspace.tabs.remove(source_location.1);
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
@@ -467,35 +338,11 @@ impl SessionRegistry {
         Ok(())
     }
 
-    pub(crate) fn resolve_move_parent(
-        workspace: &Workspace,
-        target_index: usize,
-        parent_tab: Option<Uuid>,
-    ) -> Result<Option<Uuid>> {
-        match parent_tab {
-            Some(parent) => {
-                let valid = workspace.tabs.iter().any(|tab| {
-                    tab.id == parent && tab.parent_tab.is_none() && tab.project_dir.is_some()
-                });
-                if !valid {
-                    bail!("parent tab {parent} must be a project in the same workstation");
-                }
-                Ok(Some(parent))
-            }
-            None => Ok(workspace.tabs[target_index].parent_tab.filter(|parent| {
-                workspace.tabs.iter().any(|tab| {
-                    tab.id == *parent && tab.parent_tab.is_none() && tab.project_dir.is_some()
-                })
-            })),
-        }
-    }
-
     pub fn move_pane_to_new_tab(
         &self,
         source_pane: Uuid,
         target_tab: Uuid,
         after: bool,
-        parent_tab: Option<Uuid>,
     ) -> Result<()> {
         let mut state = self.state.write();
         if !state.panes.contains_key(&source_pane) {
@@ -532,17 +379,11 @@ impl SessionRegistry {
         }
 
         let workspace = &mut state.snapshot.workspaces[source_location.0];
-        let append_to_project = parent_tab == Some(target_tab);
-        let mut resolved_parent =
-            Self::resolve_move_parent(workspace, target_location.1, parent_tab)?;
         let source_layout = workspace.tabs[source_location.1].layout.clone();
         let (pane, remaining) = detach_pane(source_layout, source_pane);
         let pane = pane.with_context(|| format!("source pane {source_pane} does not exist"))?;
         if remaining.is_none() && workspace.tabs[source_location.1].id == target_tab {
             return Ok(());
-        }
-        if remaining.is_none() && resolved_parent == Some(workspace.tabs[source_location.1].id) {
-            resolved_parent = None;
         }
         if remaining.is_some() && workspace.tabs.len() >= MAX_TABS_PER_WORKSPACE {
             bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
@@ -550,8 +391,6 @@ impl SessionRegistry {
         if let Some(remaining) = remaining {
             workspace.tabs[source_location.1].layout = remaining;
         } else {
-            let removed_tab = workspace.tabs[source_location.1].id;
-            repair_removed_tab_children(workspace, removed_tab, resolved_parent);
             workspace.tabs.remove(source_location.1);
         }
         let target_index = workspace
@@ -559,20 +398,7 @@ impl SessionRegistry {
             .iter()
             .position(|tab| tab.id == target_tab)
             .with_context(|| format!("target tab {target_tab} disappeared during the move"))?;
-        let insertion_index = if append_to_project {
-            workspace
-                .tabs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, candidate)| {
-                    (candidate.parent_tab == Some(target_tab)).then_some(index)
-                })
-                .next_back()
-                .unwrap_or(target_index)
-                + 1
-        } else {
-            target_index + usize::from(after)
-        };
+        let insertion_index = target_index + usize::from(after);
         workspace.tabs.insert(
             insertion_index,
             Tab {
@@ -580,10 +406,8 @@ impl SessionRegistry {
                 id: Uuid::new_v4(),
                 title: pane.title.clone(),
                 custom_title: None,
-                project_dir: None,
                 color: None,
                 custom_icon: None,
-                parent_tab: resolved_parent,
                 pinned: false,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
@@ -598,7 +422,7 @@ impl SessionRegistry {
 
     pub fn rename_tab(&self, tab_id: Uuid, title: &str) -> Result<()> {
         let title = title.trim();
-        validate_title(title, "group")?;
+        validate_title(title, "tab")?;
         let mut state = self.state.write();
         let tab = state
             .snapshot
@@ -606,7 +430,7 @@ impl SessionRegistry {
             .iter_mut()
             .flat_map(|workspace| workspace.tabs.iter_mut())
             .find(|tab| tab.id == tab_id)
-            .with_context(|| format!("group {tab_id} does not exist"))?;
+            .with_context(|| format!("tab {tab_id} does not exist"))?;
         tab.custom_title = Some(title.to_owned());
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
@@ -647,35 +471,14 @@ impl SessionRegistry {
                 .iter()
                 .position(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id))
                 .with_context(|| format!("tab {tab_id} does not exist"))?;
-            let (tab_ids, pane_ids) = {
-                let workspace = &state.snapshot.workspaces[workspace_index];
-                let mut tab_ids = HashSet::from([tab_id]);
-                loop {
-                    let previous_len = tab_ids.len();
-                    let children = workspace
-                        .tabs
-                        .iter()
-                        .filter_map(|tab| {
-                            tab.parent_tab
-                                .is_some_and(|parent| tab_ids.contains(&parent))
-                                .then_some(tab.id)
-                        })
-                        .collect::<Vec<_>>();
-                    tab_ids.extend(children);
-                    if tab_ids.len() == previous_len {
-                        break;
-                    }
-                }
-                let mut pane_ids = Vec::new();
-                for tab in workspace
-                    .tabs
-                    .iter()
-                    .filter(|tab| tab_ids.contains(&tab.id))
-                {
-                    collect_pane_ids(&tab.layout, &mut pane_ids);
-                }
-                (tab_ids, pane_ids)
-            };
+            let mut pane_ids = Vec::new();
+            for tab in state.snapshot.workspaces[workspace_index]
+                .tabs
+                .iter()
+                .filter(|tab| tab.id == tab_id)
+            {
+                collect_pane_ids(&tab.layout, &mut pane_ids);
+            }
             let sessions = pane_ids
                 .iter()
                 .filter_map(|pane_id| {
@@ -688,7 +491,7 @@ impl SessionRegistry {
                 .collect::<Vec<_>>();
             let terminal_count = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
             let workspace = &mut state.snapshot.workspaces[workspace_index];
-            workspace.tabs.retain(|tab| !tab_ids.contains(&tab.id));
+            workspace.tabs.retain(|tab| tab.id != tab_id);
             workspace.active_terminal_count = workspace
                 .active_terminal_count
                 .saturating_sub(terminal_count);
@@ -736,29 +539,6 @@ impl SessionRegistry {
         self.write_snapshot(&bytes)
     }
 
-    pub fn set_tab_working_dir(&self, tab_id: Uuid, working_dir: String) -> Result<()> {
-        validate_workspace_dir(&working_dir).map_err(anyhow::Error::from)?;
-        let mut state = self.state.write();
-        let tab = state
-            .snapshot
-            .workspaces
-            .iter_mut()
-            .find_map(|workspace| workspace.tabs.iter_mut().find(|tab| tab.id == tab_id))
-            .with_context(|| format!("tab {tab_id} does not exist"))?;
-        let project_dir = tab
-            .project_dir
-            .as_mut()
-            .with_context(|| format!("tab {tab_id} is not a project"))?;
-        if *project_dir == working_dir {
-            return Ok(());
-        }
-        *project_dir = working_dir;
-        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
-        let bytes = encode_desired_state(&state)?;
-        drop(state);
-        self.write_snapshot(&bytes)
-    }
-
     pub fn reorder_tab(&self, tab_id: Uuid, target_tab_id: Uuid, after: bool) -> Result<()> {
         let mut state = self.state.write();
         let source_workspace = state
@@ -784,21 +564,7 @@ impl SessionRegistry {
             .iter()
             .position(|tab| tab.id == tab_id)
             .context("source tab disappeared while reordering")?;
-        let target = tabs
-            .iter()
-            .position(|tab| tab.id == target_tab_id)
-            .context("target tab disappeared while reordering")?;
-        let target_parent = tabs[target].parent_tab.filter(|parent| {
-            tabs.iter().any(|tab| {
-                tab.id == *parent && tab.parent_tab.is_none() && tab.project_dir.is_some()
-            })
-        });
-        let mut tab = tabs.remove(source);
-        tab.parent_tab = if tab.project_dir.is_some() {
-            None
-        } else {
-            target_parent
-        };
+        let tab = tabs.remove(source);
         let target = tabs
             .iter()
             .position(|candidate| candidate.id == target_tab_id)
@@ -810,62 +576,125 @@ impl SessionRegistry {
         self.write_snapshot(&bytes)
     }
 
-    pub fn move_tab_to_project(&self, tab_id: Uuid, project_tab: Uuid) -> Result<()> {
-        let mut state = self.state.write();
-        let source_workspace = state
-            .snapshot
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id))
-            .with_context(|| format!("tab {tab_id} does not exist"))?;
-        let project_workspace = state
-            .snapshot
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.tabs.iter().any(|tab| tab.id == project_tab))
-            .with_context(|| format!("project {project_tab} does not exist"))?;
-        if source_workspace != project_workspace {
-            bail!("tabs can only move within the same workstation");
+    /// Moves a tab, with its panes, to the end of another workstation on the
+    /// same machine. Live managed tmux windows move into the target
+    /// workstation's tmux session and are reattached there, so their
+    /// processes keep running and survive the next restart.
+    pub fn move_tab_to_workstation(&self, tab_id: Uuid, workspace_id: Uuid) -> Result<()> {
+        let (source_id, relocations) = {
+            let state = self.state.read();
+            let source = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id))
+                .with_context(|| format!("tab {tab_id} does not exist"))?;
+            let target = state
+                .snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .with_context(|| format!("workstation {workspace_id} does not exist"))?;
+            if source.id == target.id {
+                return Ok(());
+            }
+            if source.is_bot() || target.is_bot() {
+                bail!("tabs of a bot cannot move between workstations");
+            }
+            if !same_machine(&source.connection, &target.connection) {
+                bail!("tabs can only move between workstations on the same machine");
+            }
+            if target.tabs.len() >= MAX_TABS_PER_WORKSPACE {
+                bail!("tab limit of {MAX_TABS_PER_WORKSPACE} reached");
+            }
+            let mut pane_ids = Vec::new();
+            for tab in source.tabs.iter().filter(|tab| tab.id == tab_id) {
+                collect_pane_ids(&tab.layout, &mut pane_ids);
+            }
+            let relocations = pane_ids
+                .into_iter()
+                .filter_map(|pane_id| {
+                    let terminal = state.panes.get(&pane_id)?.terminal()?;
+                    if terminal.kind != RuntimePaneKind::Local
+                        || terminal.session.exit_status().ok()?.is_some()
+                    {
+                        return None;
+                    }
+                    let (window_id, tmux_pane_id) = terminal.session.tmux_ids()?;
+                    Some((
+                        pane_id,
+                        window_id.to_owned(),
+                        tmux_pane_id.to_owned(),
+                        terminal.session.process_id()?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            (source.id, relocations)
+        };
+
+        let mut reattached = Vec::with_capacity(relocations.len());
+        if !relocations.is_empty() {
+            let client = self.client_for_workspace(workspace_id)?;
+            let relocated = (|| {
+                for (pane_id, window_id, tmux_pane_id, pane_pid) in &relocations {
+                    client.move_window_to_session(window_id, &tmux_session_name(workspace_id))?;
+                    reattached.push((
+                        *pane_id,
+                        PtySession::attach_tmux(
+                            *pane_id,
+                            Arc::clone(&client),
+                            window_id.clone(),
+                            tmux_pane_id.clone(),
+                            *pane_pid,
+                        )?,
+                    ));
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            if let Err(error) = relocated {
+                reattached.clear();
+                for (_, window_id, _, _) in &relocations {
+                    let _ = client.move_window_to_session(window_id, &tmux_session_name(source_id));
+                }
+                return Err(error).context("move the tab's tmux windows");
+            }
         }
 
-        let tabs = &mut state.snapshot.workspaces[source_workspace].tabs;
-        let source_index = tabs
+        let mut state = self.state.write();
+        let source_index = state
+            .snapshot
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == source_id)
+            .context("source workstation disappeared while moving a tab")?;
+        let tab_index = state.snapshot.workspaces[source_index]
+            .tabs
             .iter()
             .position(|tab| tab.id == tab_id)
-            .context("source tab disappeared while moving to a project")?;
-        let project_index = tabs
+            .context("tab disappeared while moving it")?;
+        let target_index = state
+            .snapshot
+            .workspaces
             .iter()
-            .position(|tab| tab.id == project_tab)
-            .context("project tab disappeared while moving a tab")?;
-        if tabs[project_index].project_dir.is_none() || tabs[project_index].parent_tab.is_some() {
-            bail!("target {project_tab} is not a project");
+            .position(|workspace| workspace.id == workspace_id)
+            .context("target workstation disappeared while moving a tab")?;
+        let tab = state.snapshot.workspaces[source_index]
+            .tabs
+            .remove(tab_index);
+        let mut pane_ids = Vec::new();
+        collect_pane_ids(&tab.layout, &mut pane_ids);
+        state.snapshot.workspaces[target_index].tabs.push(tab);
+        let mut replaced = Vec::with_capacity(reattached.len());
+        for (pane_id, session) in reattached {
+            if let Ok(terminal) = state.terminal_pane_mut(pane_id) {
+                replaced.push(std::mem::replace(&mut terminal.session, session));
+            }
         }
-        if tabs[source_index].project_dir.is_some() {
-            bail!("a project cannot nest inside another project");
-        }
-        if tabs[source_index].parent_tab == Some(project_tab) {
-            return Ok(());
-        }
-
-        let mut tab = tabs.remove(source_index);
-        tab.parent_tab = Some(project_tab);
-        let project_index = tabs
-            .iter()
-            .position(|candidate| candidate.id == project_tab)
-            .context("project tab disappeared while moving a tab")?;
-        let insertion_index = tabs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, candidate)| {
-                (candidate.parent_tab == Some(project_tab)).then_some(index)
-            })
-            .next_back()
-            .unwrap_or(project_index)
-            + 1;
-        tabs.insert(insertion_index, tab);
+        refresh_workspace_activity(&mut state);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
+        drop(replaced);
         self.write_snapshot(&bytes)
     }
 
@@ -898,22 +727,22 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn group_names_are_validated_and_survive_restart() {
-        let directory = std::env::temp_dir().join(format!("hh-group-name-test-{}", Uuid::new_v4()));
+    fn tab_names_are_validated_and_survive_restart() {
+        let directory = std::env::temp_dir().join(format!("hh-tab-name-test-{}", Uuid::new_v4()));
         create_owner_only_directory(&directory);
         let snapshot_path = directory.join("sessions.json");
         let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
         let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
 
-        let pane_id = registry.create_workspace_group(workspace_id, None).unwrap();
+        let pane_id = registry.create_workspace_tab(workspace_id).unwrap();
         let snapshot = registry.snapshot().unwrap();
         let tab = snapshot.workspaces[0]
             .tabs
             .iter()
             .find(|tab| layout_contains(&tab.layout, pane_id))
-            .expect("new group owns the returned pane");
+            .expect("new tab owns the returned pane");
         let tab_id = tab.id;
-        assert_eq!(tab.custom_title.as_deref(), Some("Group 1"));
+        assert_eq!(tab.custom_title, None);
 
         registry.rename_tab(tab_id, "  Design bank  ").unwrap();
         assert!(registry.rename_tab(tab_id, "").is_err());
@@ -923,7 +752,7 @@ mod tests {
             .tabs
             .iter()
             .find(|tab| tab.id == tab_id)
-            .expect("renamed group remains present");
+            .expect("renamed tab remains present");
         assert_eq!(tab.custom_title.as_deref(), Some("Design bank"));
 
         drop(registry);
@@ -934,7 +763,7 @@ mod tests {
             .tabs
             .iter()
             .find(|tab| tab.id == tab_id)
-            .expect("renamed group survives restart");
+            .expect("renamed tab survives restart");
         assert_eq!(tab.custom_title.as_deref(), Some("Design bank"));
 
         drop(recovered);
@@ -995,7 +824,9 @@ mod tests {
         );
         drop(snapshot);
 
-        let (other_workspace, _) = registry.create_workspace(Some("Other")).unwrap();
+        let (other_workspace, _) = registry
+            .create_workspace(Some("Other"), None, None)
+            .unwrap();
         let other_tab = registry
             .snapshot()
             .unwrap()
@@ -1015,7 +846,7 @@ mod tests {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
         let target = registry.create_pane(first, SplitAxis::Horizontal).unwrap();
-        let moved = registry.create_group_terminal(first).unwrap();
+        let moved = registry.create_tab_terminal(first).unwrap();
         let moved_pid = registry.pane_process_id(moved).unwrap();
 
         registry.move_pane_to_tab(moved, target).unwrap();
@@ -1042,11 +873,11 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_drag_moves_browser_into_group_and_back_to_a_top_level_tab() {
+    fn sidebar_drag_moves_browser_into_a_tab_and_back_to_its_own_tab() {
         let registry = SessionRegistry::new().unwrap();
         let snapshot = registry.snapshot().unwrap();
         let workspace_id = snapshot.workspaces[0].id;
-        let group_pane = registry.create_workspace_group(workspace_id, None).unwrap();
+        let group_pane = registry.create_workspace_tab(workspace_id).unwrap();
         let group_tab = registry.snapshot().unwrap().workspaces[0]
             .tabs
             .iter()
@@ -1057,7 +888,7 @@ mod tests {
             .create_browser_tab(workspace_id, Some("https://example.com"))
             .unwrap();
 
-        registry.move_pane_to_group(browser, group_tab).unwrap();
+        registry.move_pane_into_tab(browser, group_tab).unwrap();
 
         let grouped = registry.snapshot().unwrap();
         assert_eq!(grouped.workspaces[0].tabs.len(), 2);
@@ -1067,7 +898,7 @@ mod tests {
             .find(|tab| tab.id == group_tab)
             .unwrap();
         let PaneLayout::Stack { panes, active } = &group.layout else {
-            panic!("browser must join the target sidebar group");
+            panic!("browser must join the target tab");
         };
         assert_eq!(
             panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
@@ -1076,7 +907,7 @@ mod tests {
         assert_eq!(*active, browser);
 
         registry
-            .move_pane_to_new_tab(browser, group_tab, true, None)
+            .move_pane_to_new_tab(browser, group_tab, true)
             .unwrap();
 
         let extracted = registry.snapshot().unwrap();
@@ -1103,7 +934,7 @@ mod tests {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
         let first_pid = registry.pane_process_id(first).unwrap();
-        let closing = registry.create_group_terminal(first).unwrap();
+        let closing = registry.create_tab_terminal(first).unwrap();
 
         registry.close_pane(closing).unwrap();
 
@@ -1121,7 +952,7 @@ mod tests {
         let registry = SessionRegistry::new().unwrap();
         let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
         let second = registry.create_pane(first, SplitAxis::Horizontal).unwrap();
-        let second_tab = registry.create_group_terminal(second).unwrap();
+        let second_tab = registry.create_tab_terminal(second).unwrap();
         registry.rename_pane(second_tab, "Second pane tab").unwrap();
 
         let snapshot = registry.snapshot().unwrap();
@@ -1160,260 +991,6 @@ mod tests {
     }
 
     #[test]
-    fn reorder_next_to_a_project_child_adopts_the_project() {
-        let registry = SessionRegistry::new().unwrap();
-        let initial = registry.snapshot().unwrap();
-        let workspace_id = initial.workspaces[0].id;
-        let moved_tab = initial.workspaces[0].tabs[0].id;
-        let project_pane = registry
-            .create_workspace_project(workspace_id, "/tmp", Some("Project"))
-            .unwrap();
-        let project_tab = tab_id_for_pane(&registry.snapshot().unwrap(), project_pane);
-        let child_pane = registry
-            .create_workspace_group(workspace_id, Some(project_tab))
-            .unwrap();
-        let child_tab = tab_id_for_pane(&registry.snapshot().unwrap(), child_pane);
-
-        registry.reorder_tab(moved_tab, child_tab, true).unwrap();
-
-        let snapshot = registry.snapshot().unwrap();
-        let tabs = &snapshot.workspaces[0].tabs;
-        let moved_index = tabs.iter().position(|tab| tab.id == moved_tab).unwrap();
-        let child_index = tabs.iter().position(|tab| tab.id == child_tab).unwrap();
-        assert_eq!(tabs[moved_index].parent_tab, Some(project_tab));
-        assert_eq!(moved_index, child_index + 1);
-    }
-
-    #[test]
-    fn reorder_next_to_a_root_tab_unnests_a_project_child() {
-        let registry = SessionRegistry::new().unwrap();
-        let initial = registry.snapshot().unwrap();
-        let workspace_id = initial.workspaces[0].id;
-        let root_tab = initial.workspaces[0].tabs[0].id;
-        let project_pane = registry
-            .create_workspace_project(workspace_id, "/tmp", Some("Project"))
-            .unwrap();
-        let project_tab = tab_id_for_pane(&registry.snapshot().unwrap(), project_pane);
-        let child_pane = registry
-            .create_workspace_group(workspace_id, Some(project_tab))
-            .unwrap();
-        let child_tab = tab_id_for_pane(&registry.snapshot().unwrap(), child_pane);
-
-        registry.reorder_tab(child_tab, root_tab, true).unwrap();
-
-        let snapshot = registry.snapshot().unwrap();
-        let tabs = &snapshot.workspaces[0].tabs;
-        let root_index = tabs.iter().position(|tab| tab.id == root_tab).unwrap();
-        let child_index = tabs.iter().position(|tab| tab.id == child_tab).unwrap();
-        assert_eq!(tabs[child_index].parent_tab, None);
-        assert_eq!(child_index, root_index + 1);
-    }
-
-    #[test]
-    fn projects_never_nest() {
-        let registry = SessionRegistry::new().unwrap();
-        let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
-        let parent_project = {
-            let pane = registry
-                .create_workspace_project(workspace_id, "/tmp", Some("Project A"))
-                .unwrap();
-            tab_id_for_pane(&registry.snapshot().unwrap(), pane)
-        };
-        let child_pane = registry
-            .create_workspace_group(workspace_id, Some(parent_project))
-            .unwrap();
-        let child = tab_id_for_pane(&registry.snapshot().unwrap(), child_pane);
-        let moving_project = {
-            let pane = registry
-                .create_workspace_project(workspace_id, "/tmp", Some("Project B"))
-                .unwrap();
-            tab_id_for_pane(&registry.snapshot().unwrap(), pane)
-        };
-
-        let error = registry
-            .move_tab_to_project(moving_project, parent_project)
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("a project cannot nest inside another project")
-        );
-
-        registry.reorder_tab(moving_project, child, true).unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let moved_project = snapshot.workspaces[0]
-            .tabs
-            .iter()
-            .find(|tab| tab.id == moving_project)
-            .unwrap();
-        assert_eq!(moved_project.parent_tab, None);
-    }
-
-    #[test]
-    fn move_tab_to_project_appends_after_the_last_child() {
-        let registry = SessionRegistry::new().unwrap();
-        let initial = registry.snapshot().unwrap();
-        let workspace_id = initial.workspaces[0].id;
-        let moved_tab = initial.workspaces[0].tabs[0].id;
-        let project_pane = registry
-            .create_workspace_project(workspace_id, "/tmp", Some("Project"))
-            .unwrap();
-        let project_tab = tab_id_for_pane(&registry.snapshot().unwrap(), project_pane);
-        let first_child_pane = registry
-            .create_workspace_group(workspace_id, Some(project_tab))
-            .unwrap();
-        let first_child = tab_id_for_pane(&registry.snapshot().unwrap(), first_child_pane);
-        let second_child_pane = registry
-            .create_workspace_group(workspace_id, Some(project_tab))
-            .unwrap();
-        let second_child = tab_id_for_pane(&registry.snapshot().unwrap(), second_child_pane);
-
-        registry
-            .move_tab_to_project(moved_tab, project_tab)
-            .unwrap();
-
-        let snapshot = registry.snapshot().unwrap();
-        let tabs = &snapshot.workspaces[0].tabs;
-        let project_index = tabs.iter().position(|tab| tab.id == project_tab).unwrap();
-        assert_eq!(tabs[project_index + 1].id, first_child);
-        assert_eq!(tabs[project_index + 2].id, second_child);
-        assert_eq!(tabs[project_index + 3].id, moved_tab);
-        assert_eq!(tabs[project_index + 3].parent_tab, Some(project_tab));
-
-        let revision = snapshot.revision;
-        registry
-            .move_tab_to_project(moved_tab, project_tab)
-            .unwrap();
-        assert_eq!(registry.snapshot().unwrap().revision, revision);
-    }
-
-    #[test]
-    fn pane_detached_into_a_project_becomes_a_child_tab() {
-        let registry = SessionRegistry::new().unwrap();
-        let initial = registry.snapshot().unwrap();
-        let workspace_id = initial.workspaces[0].id;
-        let initial_pane = first_pane_id(&initial).unwrap();
-        let detached_pane = registry.create_group_terminal(initial_pane).unwrap();
-        let project_pane = registry
-            .create_workspace_project(workspace_id, "/tmp", Some("Project"))
-            .unwrap();
-        let project_tab = tab_id_for_pane(&registry.snapshot().unwrap(), project_pane);
-        let target_child_pane = registry
-            .create_workspace_group(workspace_id, Some(project_tab))
-            .unwrap();
-        let target_child = tab_id_for_pane(&registry.snapshot().unwrap(), target_child_pane);
-
-        registry
-            .move_pane_to_new_tab(detached_pane, project_tab, false, Some(project_tab))
-            .unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let detached_tab = tab_id_for_pane(&snapshot, detached_pane);
-        assert_eq!(
-            snapshot.workspaces[0]
-                .tabs
-                .iter()
-                .find(|tab| tab.id == detached_tab)
-                .unwrap()
-                .parent_tab,
-            Some(project_tab)
-        );
-
-        let source_group_pane = registry.create_workspace_group(workspace_id, None).unwrap();
-        let adopted_pane = registry.create_group_terminal(source_group_pane).unwrap();
-        registry
-            .move_pane_to_new_tab(adopted_pane, target_child, true, None)
-            .unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let adopted_tab = tab_id_for_pane(&snapshot, adopted_pane);
-        assert_eq!(
-            snapshot.workspaces[0]
-                .tabs
-                .iter()
-                .find(|tab| tab.id == adopted_tab)
-                .unwrap()
-                .parent_tab,
-            Some(project_tab)
-        );
-    }
-
-    #[test]
-    fn moving_a_project_pane_into_a_group_unnests_its_children() {
-        let registry = SessionRegistry::new().unwrap();
-        let initial = registry.snapshot().unwrap();
-        let workspace_id = initial.workspaces[0].id;
-        let target_tab = initial.workspaces[0].tabs[0].id;
-        let project_pane = registry
-            .create_workspace_project(workspace_id, "/tmp", Some("Project"))
-            .unwrap();
-        let project_tab = tab_id_for_pane(&registry.snapshot().unwrap(), project_pane);
-        let child_pane = registry
-            .create_workspace_group(workspace_id, Some(project_tab))
-            .unwrap();
-        let child_tab = tab_id_for_pane(&registry.snapshot().unwrap(), child_pane);
-
-        registry
-            .move_pane_to_group(project_pane, target_tab)
-            .unwrap();
-
-        let snapshot = registry.snapshot().unwrap();
-        let child = snapshot.workspaces[0]
-            .tabs
-            .iter()
-            .find(|tab| tab.id == child_tab)
-            .unwrap();
-        assert_eq!(child.parent_tab, None);
-        assert!(
-            snapshot.workspaces[0]
-                .tabs
-                .iter()
-                .all(|tab| tab.id != project_tab)
-        );
-    }
-
-    #[test]
-    fn moving_a_project_pane_next_to_its_child_unnests_both_tabs() {
-        let registry = SessionRegistry::new().unwrap();
-        let initial = registry.snapshot().unwrap();
-        let workspace_id = initial.workspaces[0].id;
-        let project_pane = registry
-            .create_workspace_project(workspace_id, "/tmp", Some("Project"))
-            .unwrap();
-        let project_tab = tab_id_for_pane(&registry.snapshot().unwrap(), project_pane);
-        let child_pane = registry
-            .create_workspace_group(workspace_id, Some(project_tab))
-            .unwrap();
-        let child_tab = tab_id_for_pane(&registry.snapshot().unwrap(), child_pane);
-
-        registry
-            .move_pane_to_new_tab(project_pane, child_tab, false, None)
-            .unwrap();
-
-        let snapshot = registry.snapshot().unwrap();
-        let child = snapshot.workspaces[0]
-            .tabs
-            .iter()
-            .find(|tab| tab.id == child_tab)
-            .unwrap();
-        assert_eq!(child.parent_tab, None);
-        let moved_tab = tab_id_for_pane(&snapshot, project_pane);
-        assert_eq!(
-            snapshot.workspaces[0]
-                .tabs
-                .iter()
-                .find(|tab| tab.id == moved_tab)
-                .unwrap()
-                .parent_tab,
-            None
-        );
-        assert!(
-            snapshot.workspaces[0]
-                .tabs
-                .iter()
-                .all(|tab| tab.id != project_tab)
-        );
-    }
-
-    #[test]
     fn move_pane_to_new_tab_keeps_a_full_workspace_at_its_limit() {
         let registry = SessionRegistry::new().unwrap();
         let initial = registry.snapshot().unwrap();
@@ -1428,7 +1005,7 @@ mod tests {
         let target_tab = tab_id_for_pane(&before, target_pane.unwrap());
 
         registry
-            .move_pane_to_new_tab(source_pane, target_tab, false, None)
+            .move_pane_to_new_tab(source_pane, target_tab, false)
             .unwrap();
 
         let after = registry.snapshot().unwrap();
@@ -1449,5 +1026,42 @@ mod tests {
 
         let error = registry.set_tab_pinned(Uuid::new_v4(), true).unwrap_err();
         assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn a_tab_moves_only_to_another_workstation_on_the_same_machine() {
+        let registry = SessionRegistry::new().unwrap();
+        let initial = registry.snapshot().unwrap();
+        let home = initial.workspaces[0].id;
+        let tab_id = initial.workspaces[0].tabs[0].id;
+        let pane_id = first_pane_id(&initial).unwrap();
+        let pid = registry.pane_process_id(pane_id).unwrap();
+        let (remote, _) = registry
+            .create_simulated_ssh_workspace(Some("Remote"), "test@local-host")
+            .unwrap();
+        let (nested, _) = registry.create_workspace(None, Some(home), None).unwrap();
+
+        let error = registry
+            .move_tab_to_workstation(tab_id, remote)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "tabs can only move between workstations on the same machine"
+        );
+
+        registry.move_tab_to_workstation(tab_id, nested).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        let find = |id| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == id)
+                .unwrap()
+        };
+        assert!(find(home).tabs.is_empty());
+        assert_eq!(find(nested).tabs.last().map(|tab| tab.id), Some(tab_id));
+        assert_eq!(find(nested).active_terminal_count, 2);
+        assert_eq!(find(home).active_terminal_count, 0);
+        assert_eq!(registry.pane_process_id(pane_id).unwrap(), pid);
     }
 }

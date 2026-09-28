@@ -559,6 +559,8 @@ pub(crate) fn pane_fixture(id: Uuid) -> Pane {
         custom_title: None,
         profile_override: None,
         custom_icon: None,
+        unseen: false,
+        progress: None,
     }
 }
 

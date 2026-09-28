@@ -14,7 +14,8 @@ use gpui::{
     rgb, rgba,
 };
 use gpui::{ParentElement, StatefulInteractiveElement, Styled};
-use hh_protocol::TmuxScanScope;
+use hh_protocol::{TmuxScanScope, this_machine_title};
+use std::fmt::Write as _;
 
 impl HhApp {
     pub(crate) fn confirm_dialog(
@@ -101,7 +102,7 @@ impl HhApp {
                                             this.submit_workspace_rename(cx);
                                         }
                                         DialogAction::RenameTab => {
-                                            this.submit_group_rename(cx);
+                                            this.submit_tab_rename(cx);
                                         }
                                         DialogAction::DeleteWorkspace => {
                                             this.confirm_workspace_delete(cx);
@@ -128,7 +129,7 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// One parameterized rename dialog covering terminal, group, and
+    /// One parameterized rename dialog covering terminal, tab, and
     /// workstation renames. `input_id` opts into the focused inline editor
     /// chrome; workstation renames render the plain value instead.
     pub(crate) fn render_rename_dialog(
@@ -322,7 +323,13 @@ impl HhApp {
         let field = dialog.field;
         let error = dialog.error.clone();
         let bot = kind == WorkspaceCreationKind::Bot;
-        let heading = if bot { "New bot" } else { "New Workstation" };
+        let heading = match &dialog.parent {
+            _ if bot => "New bot".to_owned(),
+            Some(parent) => format!("New workstation in {}", parent.title),
+            None => "New Workstation".to_owned(),
+        };
+        let choose_location = !bot && dialog.parent.is_none();
+        let asks_local_root = dialog.asks_local_root();
         let name_label = if bot {
             "Bot name (optional)"
         } else {
@@ -346,14 +353,14 @@ impl HhApp {
                     .text_color(rgb(THEME.foreground))
                     .child(heading),
             )
-            .when(!bot, |element| {
+            .when(choose_location, |element| {
                 element.child(
                 div()
                     .flex()
                     .gap(px(8.0))
                     .child(Self::render_workspace_kind_card(
                         "new-workspace-local",
-                        "Local shell",
+                        this_machine_title(),
                         WorkspaceCreationKind::Local,
                         WorkspaceCreationField::Name,
                         kind,
@@ -361,7 +368,7 @@ impl HhApp {
                     ))
                     .child(Self::render_workspace_kind_card(
                         "new-workspace-ssh",
-                        "System SSH",
+                        "Remote (SSH)",
                         WorkspaceCreationKind::SystemSsh,
                         WorkspaceCreationField::Destination,
                         kind,
@@ -384,6 +391,54 @@ impl HhApp {
                 ".SystemUIFont",
                 cx,
             ))
+            .when(asks_local_root, |element| {
+                element
+                    .child(
+                        div()
+                            .font_family(".SystemUIFont")
+                            .text_xs()
+                            .text_color(rgb(THEME.dim))
+                            .child("Root folder (optional)"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div().flex_1().min_w(px(0.0)).child(
+                                    self.render_workspace_creation_input(
+                                        "workspace-root-folder-input",
+                                        field,
+                                        WorkspaceCreationField::WorkingDir,
+                                        "New terminals open here; empty inherits",
+                                        "SF Mono",
+                                        cx,
+                                    ),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .id("choose-workspace-root-folder")
+                                    .flex_none()
+                                    .px(px(12.0))
+                                    .py(px(7.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(rgb(THEME.border_strong))
+                                    .bg(rgb(THEME.surface))
+                                    .font_family(".SystemUIFont")
+                                    .text_sm()
+                                    .text_color(rgb(THEME.foreground))
+                                    .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.choose_workspace_creation_folder(cx);
+                                    }))
+                                    .child("Choose folder…"),
+                            ),
+                    )
+            })
             .when(bot, |element| {
                 element
                     .child(
@@ -450,7 +505,7 @@ impl HhApp {
                         .text_sm()
                         .text_color(rgb(THEME.muted))
                         .child(
-                            "The workstation connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Harness Harlot stores no credentials or SSH config contents.",
+                            "The remote workstation connects immediately after confirmation and saves only its name, destination, pin/order, and offline/connected intent locally. System OpenSSH keeps authority over config, agent, keys, proxies, and known_hosts. Harness Harlot stores no credentials or SSH config contents.",
                         ),
                 )
             })
@@ -587,9 +642,7 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (title, confirm_label) = match editor.target {
-            DirEditorTarget::WorkspaceDefault(_) => ("Set working directory", "Set"),
-            DirEditorTarget::NewProject(_) => ("New project", "Create"),
-            DirEditorTarget::ProjectDir(_) => ("Change project directory", "Set"),
+            DirEditorTarget::WorkspaceRoot(_) => ("Set root folder", "Set"),
         };
         let body = div()
             .flex()
@@ -689,7 +742,7 @@ impl HhApp {
                 cx,
             );
         }
-        let message = if confirmation.active_terminal_count == 0 {
+        let mut message = if confirmation.active_terminal_count == 0 {
             "This removes the saved workstation metadata from this machine. No active terminal process will be ended.".to_owned()
         } else {
             format!(
@@ -702,6 +755,18 @@ impl HhApp {
                 }
             )
         };
+        if confirmation.nested_count > 0 {
+            let _ = write!(
+                message,
+                " Its {} nested workstation{} will also be removed.",
+                confirmation.nested_count,
+                if confirmation.nested_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
         let body = div()
             .text_sm()
             .text_color(rgb(THEME.muted))
@@ -725,47 +790,24 @@ impl HhApp {
         confirmation: &TabCloseConfirmation,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let kind = if confirmation.is_project {
-            "project"
-        } else {
-            "group"
-        };
-        let child_detail = if confirmation.child_count == 0 {
-            String::new()
-        } else {
-            format!(
-                " Its {} nested group{} will also be removed.",
-                confirmation.child_count,
-                if confirmation.child_count == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )
-        };
         let body = div()
             .text_sm()
             .text_color(rgb(THEME.muted))
             .child(format!(
-                "This permanently removes the {kind} and ends {} terminal process{}.{}",
+                "This permanently removes the tab and ends {} terminal process{}.",
                 confirmation.terminal_count,
                 if confirmation.terminal_count == 1 {
                     ""
                 } else {
                     "es"
                 },
-                child_detail,
             ))
             .into_any_element();
         self.confirm_dialog(
             body,
             DialogSpec {
-                title: format!("Delete {kind} {}?", confirmation.title),
-                confirm_label: if confirmation.is_project {
-                    "Delete project"
-                } else {
-                    "Delete group"
-                },
+                title: format!("Delete tab {}?", confirmation.title),
+                confirm_label: "Delete tab",
                 confirm_tone: DialogTone::Danger,
                 confirm_id: "confirm-tab-close",
                 action: DialogAction::CloseTab,
@@ -1038,7 +1080,7 @@ impl HhApp {
                     .text_sm()
                     .text_color(rgb(THEME.muted))
                     .child(
-                        "This closes the active system OpenSSH terminal. The saved workstation stays available for reconnect.",
+                        "This closes the active system OpenSSH terminals of the workstation and its nested workstations. They stay saved and available for reconnect.",
                     ),
             )
             .child(

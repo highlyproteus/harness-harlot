@@ -223,6 +223,7 @@ impl SessionRegistry {
             .filter(|notification| notification.id > notifications_after)
             .cloned()
             .collect();
+        let notifications_epoch = state.notifications_epoch;
         drop(state);
         let browser_commands = if browser_executor {
             self.take_browser_commands()
@@ -274,6 +275,7 @@ impl SessionRegistry {
             screens,
             pane_states,
             notifications,
+            notifications_epoch,
             diagnostics,
             browser_commands,
         })
@@ -286,18 +288,36 @@ impl SessionRegistry {
 
     pub fn mark_notifications_read(&self, ids: &[u64]) {
         let ids = ids.iter().copied().collect::<HashSet<_>>();
-        let mut state = self.state.write();
-        for notification in &mut state.notifications {
-            if ids.contains(&notification.id) {
-                notification.read = true;
+        {
+            let mut state = self.state.write();
+            let mut changed = false;
+            for notification in &mut state.notifications {
+                if ids.contains(&notification.id) && !notification.read {
+                    notification.read = true;
+                    changed = true;
+                }
             }
+            state.notifications_dirty |= changed;
         }
+        self.flush_notifications_or_log();
     }
 
     pub fn clear_notifications(&self) {
-        let mut state = self.state.write();
-        state.drain_pane_events();
-        state.notifications.clear();
+        {
+            let mut state = self.state.write();
+            state.drain_pane_events();
+            if !state.notifications.is_empty() {
+                state.notifications.clear();
+                state.notifications_dirty = true;
+            }
+        }
+        self.flush_notifications_or_log();
+    }
+
+    fn flush_notifications_or_log(&self) {
+        if let Err(error) = self.flush_notifications() {
+            eprintln!("failed to persist notifications: {error:#}");
+        }
     }
 
     /// Returns one current screen for deterministic focus/reconnect resync.

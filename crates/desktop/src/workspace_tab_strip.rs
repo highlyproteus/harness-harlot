@@ -10,11 +10,11 @@ use hh_protocol::{AppearanceColor, Workspace};
 use std::time::Instant;
 
 use crate::helpers::{
-    IDENTITY_MARK_SIZE, WorkspaceTabScope, click_suppression_active, collect_terminal_tabs,
-    composite_rgb, element_key, workspace_strip_active_tab, workspace_tab_focus_target,
-    workspace_tab_set, workspace_tab_standalone_pane,
+    IDENTITY_MARK_SIZE, click_suppression_active, collect_terminal_tabs, composite_rgb,
+    element_key, workspace_strip_active_tab, workspace_tab_focus_target, workspace_tab_set,
+    workspace_tab_standalone_pane,
 };
-use crate::tab_chrome::render_pane_indicator;
+use crate::tab_chrome::aggregate_indicators;
 use crate::view_models::{CreateMenu, Modal, TabDrag, TabDropPreview, TooltipView};
 use crate::{HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
 
@@ -26,16 +26,9 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let workspace_id = workspace.id;
-        let tab_set = workspace_tab_set(workspace, self.sidebar.workspace_tab_scope);
-        let scope = tab_set.scope;
-        let target_tab = match scope {
-            WorkspaceTabScope::Workstation => None,
-            WorkspaceTabScope::Project(project_id) => Some(project_id),
-        };
-        let active_tab = workspace_strip_active_tab(workspace, scope, self.layout.focused_pane);
+        let active_tab = workspace_strip_active_tab(workspace, self.layout.focused_pane);
         let bot = workspace.is_bot();
-        let tabs = tab_set
-            .tabs
+        let tabs = workspace_tab_set(workspace)
             .into_iter()
             .filter(|tab| !self.sidebar.dismissed_workspace_tabs.contains(&tab.id))
             .map(|tab| {
@@ -90,13 +83,15 @@ impl HhApp {
                 let (pane_count, indicator) = {
                     let mut panes = Vec::new();
                     collect_terminal_tabs(&tab.layout, &mut panes);
-                    let indicator = panes
-                        .iter()
-                        .map(|pane| self.pane_indicator(pane))
-                        .max()
-                        .unwrap_or_default();
+                    let indicator =
+                        aggregate_indicators(panes.iter().map(|pane| self.pane_indicator(pane)));
                     (panes.len(), indicator)
                 };
+                // One pane's hover text names its phase and task; a tab of
+                // several sums their counts.
+                let progress_tooltip = standalone_pane
+                    .and_then(|pane| self.pane_indicator_tooltip(pane))
+                    .or_else(|| indicator.tooltip());
                 let tab_id = tab.id;
                 let close_tooltip = if is_standalone {
                     format!("Close {label}…")
@@ -118,17 +113,17 @@ impl HhApp {
                     workspace_id,
                     tab_id,
                     pane_id,
-                    from_group: false,
+                    from_pane_map: false,
                     title: label.clone(),
                     position: Point::default(),
                 };
                 let drop_before = self.sidebar.tab_drop_preview.is_some_and(|preview| {
-                    preview.target_tab_id == tab_id && !preview.into_group && !preview.after
+                    preview.target_tab_id == tab_id && !preview.into_tab && !preview.after
                 });
                 let drop_after = self.sidebar.tab_drop_preview.is_some_and(|preview| {
-                    preview.target_tab_id == tab_id && !preview.into_group && preview.after
+                    preview.target_tab_id == tab_id && !preview.into_tab && preview.after
                 });
-                div()
+                let strip_tab = div()
                     .id(("workspace-strip-tab", element_key(tab_id)))
                     .group("workspace-strip-tab")
                     .h_full()
@@ -154,6 +149,11 @@ impl HhApp {
                         element.border_r_2().border_color(rgb(THEME.accent))
                     })
                     .hover(|element| element.bg(rgb(THEME.elevated)))
+                    .when_some(progress_tooltip, |element, text| {
+                        element.tooltip(move |_, cx| {
+                            cx.new(|_| TooltipView { text: text.clone() }).into()
+                        })
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if click_suppression_active(
                             &mut this.sidebar.suppress_tab_click_until,
@@ -174,7 +174,7 @@ impl HhApp {
                         move |this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
                             let drag = event.drag(cx);
                             if drag.workspace_id != workspace_id
-                                || (drag.tab_id == tab_id && !drag.from_group)
+                                || (drag.tab_id == tab_id && !drag.from_pane_map)
                             {
                                 if this.sidebar.tab_drop_preview.take().is_some() {
                                     cx.notify();
@@ -185,7 +185,7 @@ impl HhApp {
                                 let next = Some(TabDropPreview {
                                     target_tab_id: tab_id,
                                     after: event.event.position.x > event.bounds.center().x,
-                                    into_group: false,
+                                    into_tab: false,
                                 });
                                 cx.stop_propagation();
                                 if this.sidebar.tab_drop_preview != next {
@@ -200,14 +200,8 @@ impl HhApp {
                             let after = this.sidebar.tab_drop_preview.is_some_and(|preview| {
                                 preview.target_tab_id == tab_id && preview.after
                             });
-                            if let Some(source_pane) = info.pane_id.filter(|_| info.from_group) {
-                                this.move_sidebar_pane_to_new_tab(
-                                    source_pane,
-                                    tab_id,
-                                    after,
-                                    None,
-                                    cx,
-                                );
+                            if let Some(source_pane) = info.pane_id.filter(|_| info.from_pane_map) {
+                                this.move_sidebar_pane_to_new_tab(source_pane, tab_id, after, cx);
                             } else if info.tab_id != tab_id {
                                 this.reorder_workspace_tab(info.tab_id, tab_id, after, cx);
                             }
@@ -223,7 +217,12 @@ impl HhApp {
                             let Some(pane_id) = pane_id else {
                                 return;
                             };
-                            this.open_tab_menu(pane_id, event.position, cx);
+                            this.open_tab_menu(
+                                pane_id,
+                                event.position,
+                                crate::notifications::SeenScope::Tab,
+                                cx,
+                            );
                             cx.stop_propagation();
                         }),
                     )
@@ -258,14 +257,14 @@ impl HhApp {
                                 .child(pane_count.to_string()),
                         )
                     })
-                    .child(render_pane_indicator(indicator))
                     .child(self.render_close_button(
                         ("close-workspace-strip-tab", element_key(tab_id)),
                         THEME.foreground,
                         close_tooltip,
                         move |this, cx| this.dismiss_workspace_tab(tab_id, cx),
                         cx,
-                    ))
+                    ));
+                self.with_status_border(strip_tab, indicator, 0.0)
                     .into_any_element()
             });
         div()
@@ -313,7 +312,7 @@ impl HhApp {
                             text: if bot {
                                 "New thread".to_owned()
                             } else {
-                                "Add project, terminal, browser, or group".to_owned()
+                                "Add terminal, browser, or gallery".to_owned()
                             },
                         })
                         .into()
@@ -327,7 +326,6 @@ impl HhApp {
                         this.editor.modal = Modal::CreateMenu(CreateMenu {
                             position: event.position(),
                             workspace_id,
-                            target_tab,
                         });
                         cx.notify();
                     }))
