@@ -8,7 +8,8 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::helpers::{collect_terminal_tabs, find_pane, find_pane_mut};
+use crate::helpers::{collect_terminal_tabs, find_pane, find_pane_mut, zoom_projection};
+use crate::tab_chrome::shows_running;
 use crate::{HhApp, THEME};
 
 #[cfg(target_os = "macos")]
@@ -37,31 +38,37 @@ impl ActivitySection {
     }
 }
 
-/// The live section a pane belongs in; an exited pane is in none.
-pub(crate) const fn activity_section(status: PaneStatus, exited: bool) -> Option<ActivitySection> {
+/// The live section a pane belongs in; an exited pane is in none. Running
+/// follows [`shows_running`], the same rule as the tab indicator.
+pub(crate) fn activity_section(pane: &Pane, exited: bool) -> Option<ActivitySection> {
     if exited {
         return None;
     }
-    match status {
+    match pane.status {
         PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention => {
             Some(ActivitySection::NeedsYou)
         }
-        PaneStatus::Working => Some(ActivitySection::Running),
-        PaneStatus::Done | PaneStatus::Idle => None,
+        status => shows_running(status, pane.unseen, pane.progress.as_ref())
+            .then_some(ActivitySection::Running),
     }
 }
 
-pub(crate) const fn activity_badge(status: PaneStatus, exited: bool) -> &'static str {
+/// A pane's status word; `None` for a plain idle pane, which shows none.
+pub(crate) fn activity_badge(pane: &Pane, exited: bool) -> Option<&'static str> {
     if exited {
-        return "Exited";
+        return Some("Exited");
     }
-    match status {
-        PaneStatus::NeedsApproval => "Needs approval",
-        PaneStatus::NeedsInput => "Needs input",
-        PaneStatus::Attention => "Attention",
-        PaneStatus::Working => "Running",
-        PaneStatus::Done => "Done",
-        PaneStatus::Idle => "Idle",
+    match activity_section(pane, exited) {
+        Some(ActivitySection::Running) => return Some("Running"),
+        Some(ActivitySection::NeedsYou) | None => {}
+    }
+    match pane.status {
+        PaneStatus::NeedsApproval => Some("Needs approval"),
+        PaneStatus::NeedsInput => Some("Needs input"),
+        PaneStatus::Attention => Some("Attention"),
+        PaneStatus::Working => Some("Running"),
+        PaneStatus::Done => Some("Done"),
+        PaneStatus::Idle => None,
     }
 }
 
@@ -87,7 +94,7 @@ pub(crate) fn activity_entries<'a>(
             collect_terminal_tabs(&tab.layout, &mut panes);
             for pane in panes {
                 let exited = pane_states.get(&pane.id).is_some_and(|state| state.exited);
-                if let Some(section) = activity_section(pane.status, exited) {
+                if let Some(section) = activity_section(pane, exited) {
                     entries.push(ActivityEntry {
                         section,
                         workspace,
@@ -105,7 +112,7 @@ pub(crate) fn activity_entries<'a>(
 fn needs_you_in(layout: &PaneLayout, pane_states: &HashMap<Uuid, PaneStreamState>) -> usize {
     let needs_you = |pane: &Pane| {
         let exited = pane_states.get(&pane.id).is_some_and(|state| state.exited);
-        usize::from(activity_section(pane.status, exited) == Some(ActivitySection::NeedsYou))
+        usize::from(activity_section(pane, exited) == Some(ActivitySection::NeedsYou))
     };
     match layout {
         PaneLayout::Leaf { pane } => needs_you(pane),
@@ -134,8 +141,9 @@ pub(crate) fn bots_needing_you(
         .count()
 }
 
-/// The bell and Dock badge: how many stored notifications are unread, and
-/// whether any of them asks for the user (orange) rather than reports (blue).
+/// The unread count shared by the in-app bell and the Dock, and whether any
+/// unread item asks for the user. Only the in-app bell is tinted (orange for
+/// asks, blue for reports); macOS always draws the Dock number in red.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnreadBadge {
     pub(crate) count: usize,
@@ -168,8 +176,59 @@ pub(crate) fn unread_badge(notifications: &[SessionNotification]) -> Option<Unre
     (badge.count > 0).then_some(badge)
 }
 
+/// Whether opening `pane` has anything to clear: its unseen dot, or any
+/// unread stored notification (plain-shell bells and messages leave the dot
+/// unset but still count as unread).
+pub(crate) fn pane_has_unseen(pane: &Pane, notifications: &[SessionNotification]) -> bool {
+    pane.unseen
+        || notifications
+            .iter()
+            .any(|notification| notification.pane_id == pane.id && !notification.read)
+}
+
+/// What showing a pane counts as having looked at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SeenScope {
+    /// Switching to its tab: every pane that tab puts on screen.
+    Tab,
+    /// A click on the pane itself (a chip, a Notifications row): that pane.
+    Pane,
+    /// Restoring a view the user did not pick (e.g. leaving a bot): nothing.
+    Nothing,
+}
+
+/// Panes on screen once `pane_id`'s tab `layout` is shown with `pane_id`
+/// active in its stack: each split side's active stack member, narrowed to
+/// the zoomed slot when `zoomed` covers `pane_id`.
+pub(crate) fn panes_shown_with(
+    layout: &PaneLayout,
+    pane_id: Uuid,
+    zoomed: Option<Uuid>,
+) -> Vec<Uuid> {
+    fn collect(layout: &PaneLayout, pane_id: Uuid, shown: &mut Vec<Uuid>) {
+        match layout {
+            PaneLayout::Leaf { pane } => shown.push(pane.id),
+            PaneLayout::Stack { panes, active } => {
+                let holds_target = panes.iter().any(|pane| pane.id == pane_id);
+                shown.push(if holds_target { pane_id } else { *active });
+            }
+            PaneLayout::Split { first, second, .. } => {
+                collect(first, pane_id, shown);
+                collect(second, pane_id, shown);
+            }
+        }
+    }
+    let zoomed_slot = zoomed
+        .and_then(|zoomed| zoom_projection(layout, zoomed))
+        .filter(|slot| find_pane(slot, pane_id).is_some());
+    let mut shown = Vec::new();
+    collect(zoomed_slot.as_ref().unwrap_or(layout), pane_id, &mut shown);
+    shown
+}
+
 impl HhApp {
-    /// Replaces the notification mirror with the service's full ring.
+    /// Replaces the notification mirror with the service's full ring. Until
+    /// it answers, the mirror keeps showing what it had.
     pub(crate) fn refresh_notifications(&mut self) {
         self.dispatch_with(
             ClientRequest::GetNotifications,
@@ -177,17 +236,18 @@ impl HhApp {
                 let previous = this.session.notifications.clone();
                 match result {
                     Ok(ServiceResponse::Notifications { items, epoch }) => {
-                        this.session.notifications_latest_id = items
-                            .iter()
-                            .map(|notification| notification.id)
-                            .max()
-                            .unwrap_or(0);
-                        this.session.notifications = items;
-                        this.session.notifications_epoch = Some(epoch);
+                        crate::reconcile::replace_notifications(&mut this.session, items, epoch);
                         this.session.connection_error = None;
                     }
-                    Ok(response) => this.report_unexpected(&response),
-                    Err(error) => this.report(&error),
+                    Ok(response) => {
+                        this.session.notifications_reloading = false;
+                        this.report_unexpected(&response);
+                    }
+                    Err(error) => {
+                        // The next poll that still sees a replaced ring retries.
+                        this.session.notifications_reloading = false;
+                        this.report(&error);
+                    }
                 }
                 this.sync_dock_badge();
                 if this.session.notifications != previous {
@@ -201,6 +261,7 @@ impl HhApp {
         unread_badge(&self.session.notifications)
     }
 
+    /// Mirrors the unread count onto the Dock icon, which macOS draws red.
     pub(crate) fn sync_dock_badge(&mut self) {
         let count = self.unread_badge().map_or(0, |badge| badge.count);
         if self.session.dock_badge == Some(count) {
@@ -216,7 +277,7 @@ impl HhApp {
 
     /// The user opened pane `pane_id` (clicked it, typed into it, or switched
     /// to its tab): clears its unseen dot and reads its notifications. Sends
-    /// nothing unless the pane is unseen.
+    /// nothing when the pane has neither.
     pub(crate) fn mark_pane_seen(&mut self, pane_id: Uuid) {
         let Some(pane) = self.session.snapshot.as_mut().and_then(|snapshot| {
             snapshot
@@ -227,7 +288,7 @@ impl HhApp {
         }) else {
             return;
         };
-        if !pane.unseen {
+        if !pane_has_unseen(pane, &self.session.notifications) {
             return;
         }
         // Optimistic: the next snapshot and notification refresh confirm it.
@@ -251,7 +312,9 @@ impl HhApp {
         );
     }
 
-    /// Switching to a tab shows every pane in it.
+    /// Switching to `pane_id`'s tab (with `pane_id` active in its stack)
+    /// shows only the panes on screen: not the stack's hidden members, and
+    /// only the zoomed pane while zoom covers it.
     pub(crate) fn mark_tab_seen(&mut self, pane_id: Uuid) {
         let panes = self
             .session
@@ -264,18 +327,19 @@ impl HhApp {
                     .flat_map(|workspace| &workspace.tabs)
                     .find(|tab| find_pane(&tab.layout, pane_id).is_some())
             })
-            .map(|tab| {
-                let mut panes = Vec::new();
-                collect_terminal_tabs(&tab.layout, &mut panes);
-                panes
-                    .into_iter()
-                    .filter(|pane| pane.unseen)
-                    .map(|pane| pane.id)
-                    .collect::<Vec<_>>()
-            })
+            .map(|tab| panes_shown_with(&tab.layout, pane_id, self.layout.zoomed_pane))
             .unwrap_or_default();
         for pane_id in panes {
             self.mark_pane_seen(pane_id);
+        }
+    }
+
+    /// Marks what showing `pane_id` in `scope` counts as having looked at.
+    pub(crate) fn mark_seen(&mut self, pane_id: Uuid, scope: SeenScope) {
+        match scope {
+            SeenScope::Tab => self.mark_tab_seen(pane_id),
+            SeenScope::Pane => self.mark_pane_seen(pane_id),
+            SeenScope::Nothing => {}
         }
     }
 
@@ -315,8 +379,8 @@ impl HhApp {
         self.mark_notifications_read(unread);
     }
 
-    /// A Recent row was clicked: show its pane (which marks the pane seen)
-    /// and read the notification itself.
+    /// A Recent row was clicked: show its pane (which marks only that pane
+    /// seen) and read the notification itself.
     pub(crate) fn open_notification(&mut self, id: u64, cx: &mut gpui::Context<Self>) {
         let Some(notification) = self
             .session
@@ -342,11 +406,10 @@ impl HhApp {
                 self.open_bot_pane(workspace_id, tab_id, pane_id, cx);
             }
             Some((workspace_id, false, tab_id)) => {
-                self.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+                self.select_sidebar_pane(workspace_id, tab_id, pane_id, SeenScope::Pane, cx);
             }
             None => {}
         }
-        self.mark_pane_seen(pane_id);
         let still_unread = unread
             && self
                 .session
@@ -378,11 +441,15 @@ impl HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivitySection, UnreadBadge, activity_entries, bots_needing_you, unread_badge};
+    use super::{
+        ActivitySection, UnreadBadge, activity_badge, activity_entries, bots_needing_you,
+        pane_has_unseen, panes_shown_with, unread_badge,
+    };
     use hh_protocol::{
         NotificationKind, PaneLayout, PaneStatus, PaneStreamState, SessionNotification,
         SessionSnapshot, Tab, TerminalProfile, Workspace, WorkspaceKind,
     };
+    use hh_protocol::{Pane, PaneProgress, ProgressSource, SplitAxis};
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -528,6 +595,106 @@ mod tests {
                 (ActivitySection::Running, ids[0]),
             ],
             "finished, idle, and exited panes live in Recent, not here"
+        );
+    }
+
+    fn pane(id: u128) -> Pane {
+        let snapshot = SessionSnapshot::seeded();
+        let PaneLayout::Leaf { pane } = &snapshot.workspaces[0].tabs[0].layout else {
+            unreachable!("seeded tabs are single panes");
+        };
+        let mut pane = pane.clone();
+        pane.id = Uuid::from_u128(id);
+        pane
+    }
+
+    #[test]
+    fn an_idle_seen_pane_with_unfinished_tasks_is_listed_as_running() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let template = snapshot.workspaces[0].tabs[0].clone();
+        let (mut tab, pane_id) = tab_with(&template, PaneStatus::Idle);
+        let PaneLayout::Leaf { pane } = &mut tab.layout else {
+            unreachable!("seeded tabs are single panes");
+        };
+        pane.unseen = false;
+        pane.progress = Some(PaneProgress {
+            done: 1,
+            total: 3,
+            current: None,
+            phase: None,
+            source: ProgressSource::Codex,
+        });
+        assert_eq!(activity_badge(pane, false), Some("Running"));
+        let finished = {
+            let mut finished = pane.clone();
+            finished.progress.as_mut().expect("progress").done = 3;
+            finished
+        };
+        assert_eq!(activity_badge(&finished, false), None);
+        snapshot.workspaces[0].tabs = vec![tab];
+
+        let entries = activity_entries(&snapshot, &HashMap::new());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.section, entry.pane.id))
+                .collect::<Vec<_>>(),
+            vec![(ActivitySection::Running, pane_id)]
+        );
+    }
+
+    #[test]
+    fn a_pane_with_unread_notifications_needs_marking_even_without_its_dot() {
+        let mut shell = pane(1);
+        shell.unseen = false;
+        let mut bell = stored(1, NotificationKind::Attention, false);
+        bell.pane_id = shell.id;
+        let mut elsewhere = stored(2, NotificationKind::Attention, false);
+        elsewhere.pane_id = Uuid::from_u128(2);
+        assert!(
+            pane_has_unseen(&shell, std::slice::from_ref(&bell)),
+            "a plain-shell bell sets no dot but is unread"
+        );
+        assert!(!pane_has_unseen(&shell, std::slice::from_ref(&elsewhere)));
+        bell.read = true;
+        assert!(!pane_has_unseen(&shell, &[bell]));
+        shell.unseen = true;
+        assert!(pane_has_unseen(&shell, &[]));
+    }
+
+    #[test]
+    fn switching_to_a_tab_marks_only_the_panes_it_puts_on_screen() {
+        let stack = PaneLayout::Stack {
+            panes: vec![pane(1), pane(2)],
+            active: Uuid::from_u128(1),
+        };
+        let layout = PaneLayout::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(stack),
+            second: Box::new(PaneLayout::Leaf { pane: pane(3) }),
+        };
+        let ids = |raw: &[u128]| raw.iter().copied().map(Uuid::from_u128).collect::<Vec<_>>();
+
+        assert_eq!(
+            panes_shown_with(&layout, Uuid::from_u128(1), None),
+            ids(&[1, 3]),
+            "the stack's hidden member stays unseen"
+        );
+        assert_eq!(
+            panes_shown_with(&layout, Uuid::from_u128(2), None),
+            ids(&[2, 3]),
+            "selecting the hidden member brings it to the front"
+        );
+        assert_eq!(
+            panes_shown_with(&layout, Uuid::from_u128(3), Some(Uuid::from_u128(3))),
+            ids(&[3]),
+            "zoom hides the other side"
+        );
+        assert_eq!(
+            panes_shown_with(&layout, Uuid::from_u128(3), Some(Uuid::from_u128(1))),
+            ids(&[1, 3]),
+            "a zoom that does not cover the target does not apply"
         );
     }
 }

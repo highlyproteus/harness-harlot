@@ -27,6 +27,43 @@ pub(crate) struct AgentProgressRow {
     error: Option<String>,
 }
 
+impl AgentProgressRow {
+    /// A background re-read: a readable state replaces any earlier error.
+    fn apply_refresh(&mut self, state: Result<InstallState, String>, path: Option<PathBuf>) {
+        self.path = path;
+        match state {
+            Ok(state) => {
+                self.state = Some(state);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    /// An install or removal finished: its note or error, then the re-read
+    /// state (whose error only shows when the action itself succeeded).
+    fn apply_action(
+        &mut self,
+        outcome: Result<Option<&'static str>, String>,
+        state: Result<InstallState, String>,
+        path: Option<PathBuf>,
+    ) {
+        self.busy = false;
+        self.path = path;
+        self.error = None;
+        match outcome {
+            Ok(note) => self.note = note,
+            Err(error) => self.error = Some(error),
+        }
+        match state {
+            Ok(state) => self.state = Some(state),
+            Err(error) => {
+                self.error.get_or_insert(error);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AgentProgressUi {
     rows: [AgentProgressRow; 3],
@@ -78,13 +115,8 @@ impl HhApp {
             let _ = this.update(cx, |this, cx| {
                 for (agent, (state, path)) in probes {
                     let row = &mut this.editor.agent_progress.rows[row_index(agent)];
-                    if row.busy {
-                        continue;
-                    }
-                    row.path = path;
-                    match state {
-                        Ok(state) => row.state = Some(state),
-                        Err(error) => row.error = Some(error),
+                    if !row.busy {
+                        row.apply_refresh(state, path);
                     }
                 }
                 cx.notify();
@@ -123,19 +155,8 @@ impl HhApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                let row = &mut this.editor.agent_progress.rows[row_index(agent)];
-                row.busy = false;
-                row.path = path;
-                match outcome {
-                    Ok(note) => row.note = note,
-                    Err(error) => row.error = Some(error),
-                }
-                match state {
-                    Ok(state) => row.state = Some(state),
-                    Err(error) => {
-                        row.error.get_or_insert(error);
-                    }
-                }
+                this.editor.agent_progress.rows[row_index(agent)]
+                    .apply_action(outcome, state, path);
                 cx.notify();
             });
         })
@@ -262,8 +283,31 @@ impl HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::action_for;
+    use super::{AgentProgressRow, action_for};
     use crate::agent_progress::InstallState;
+
+    #[test]
+    fn a_successful_refresh_or_install_clears_the_rows_error() {
+        let mut row = AgentProgressRow::default();
+        row.apply_refresh(Err("settings.json is not JSON".to_owned()), None);
+        assert!(row.error.is_some());
+        row.apply_refresh(Ok(InstallState::NotInstalled), None);
+        assert_eq!(row.error, None, "refresh");
+        assert_eq!(row.state, Some(InstallState::NotInstalled));
+
+        row.apply_action(
+            Err("permission denied".to_owned()),
+            Ok(InstallState::NotInstalled),
+            None,
+        );
+        assert_eq!(row.error.as_deref(), Some("permission denied"));
+        row.apply_action(Ok(None), Ok(InstallState::Installed), None);
+        assert_eq!(row.error, None, "install");
+        assert_eq!(row.state, Some(InstallState::Installed));
+
+        row.apply_action(Ok(None), Err("unreadable".to_owned()), None);
+        assert_eq!(row.error.as_deref(), Some("unreadable"));
+    }
 
     #[test]
     fn a_hand_edited_integration_offers_no_action() {

@@ -32,6 +32,17 @@ on the same machine moves its live windows into that workstation's session.
 Recovery retains windows referenced by a saved pane even if the window contains
 additional tmux panes; only unreferenced windows are removed.
 
+A reattached pane keeps its task progress, because the program that reported it
+is still running; a pane that starts a fresh shell loses it. The first omp title
+a reattached pane shows only restates where it already was, so it sets the
+pane's status without a notification or an unread dot. A pane HH lets go of on
+purpose (a disconnected SSH workstation, a bot restarting its agent) only
+changes its label; it is never reported as finished.
+
+`sessions.json` (including a pane's unread dot) and `notifications.json` are
+saved every 2 s, which also records bells and notifications that arrive while no
+desktop is connected; marking a pane seen saves both immediately.
+
 Protocol-changing in-app updates explain this boundary and request confirmation
 before restarting the service. The updater downloads and verifies the package
 before the desktop quits, then uses `--restart-service` to request shutdown and,

@@ -6,7 +6,7 @@ use crate::helpers::{
     render_terminal_profile_icon, split_control_id, terminal_tab_count_label,
     visible_workstation_tree, workspace_tab_entries, workspace_terminal_tabs,
 };
-use crate::notifications::activity_badge;
+use crate::notifications::{SeenScope, activity_badge};
 use crate::tab_chrome::{PaneIndicator, workstation_rollup_indicator};
 use crate::view_models::{
     TabDrag, TabDropPreview, TooltipView, WorkspaceDrag, WorkspaceDropPreview,
@@ -19,8 +19,8 @@ use gpui::{
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{
-    AppearanceColor, Pane, PaneLayout, PaneStatus, SplitAxis, TerminalProfile, Workspace,
-    WorkspaceConnection, WorkspaceConnectionStatus, effective_working_dir,
+    AppearanceColor, Pane, PaneLayout, SplitAxis, TerminalProfile, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus, effective_working_dir,
 };
 use std::time::Instant;
 use uuid::Uuid;
@@ -452,7 +452,7 @@ impl HhApp {
                     return;
                 }
                 if let Some(pane_id) = tab_focus_target {
-                    this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+                    this.select_sidebar_pane(workspace_id, tab_id, pane_id, SeenScope::Tab, cx);
                 }
                 cx.stop_propagation();
             }))
@@ -683,14 +683,9 @@ impl HhApp {
             ),
             None => (format!("Close {title}…"), None),
         };
-        let tooltip = if exited || pane.status != PaneStatus::Idle {
-            format!(
-                "{} — {}",
-                identity_detail(pane),
-                activity_badge(pane.status, exited)
-            )
-        } else {
-            identity_detail(pane)
+        let tooltip = match activity_badge(pane, exited) {
+            Some(badge) => format!("{} — {badge}", identity_detail(pane)),
+            None => identity_detail(pane),
         };
         let drag = TabDrag {
             workspace_id,
@@ -730,7 +725,7 @@ impl HhApp {
                     cx.notify();
                     return;
                 }
-                this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+                this.select_sidebar_pane(workspace_id, tab_id, pane_id, SeenScope::Pane, cx);
                 cx.stop_propagation();
             }))
             .on_drag(drag, |info: &TabDrag, position, _, cx| {
@@ -742,7 +737,7 @@ impl HhApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.open_tab_menu(pane_id, event.position, cx);
+                    this.open_tab_menu(pane_id, event.position, SeenScope::Pane, cx);
                     cx.stop_propagation();
                 }),
             )
@@ -868,7 +863,7 @@ impl HhApp {
                     if bot {
                         this.open_bot(workspace_id, cx);
                     } else {
-                        this.select_workspace(workspace_id, cx);
+                        this.select_workspace(workspace_id, SeenScope::Tab, cx);
                     }
                 }))
             })

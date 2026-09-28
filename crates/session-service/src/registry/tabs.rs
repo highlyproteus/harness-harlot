@@ -1,7 +1,7 @@
 //! Tab operations: layout moves, tab metadata, and reorder within workstations.
 use super::{
-    RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry, TerminalRuntimePane,
-    encode_desired_state, tmux_session_name,
+    ProcessScan, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
+    TerminalRuntimePane, encode_desired_state, tmux_session_name,
 };
 use crate::layout::{
     activate_tab, add_tab, collect_pane_ids, detach_pane, first_layout_pane, layout_contains,
@@ -88,8 +88,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -232,8 +233,9 @@ impl SessionRegistry {
                         kind: RuntimePaneKind::Local,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );

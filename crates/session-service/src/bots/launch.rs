@@ -130,7 +130,7 @@ pub(crate) fn prepare_launch(
                 let bytes = serde_json::to_vec(&json).context("encode bot MCP config")?;
                 write_if_changed(&config, &bytes)?;
                 argv.extend(["--mcp-config".to_owned(), utf8_path(&config)?]);
-                // Task progress: report every TodoWrite to Harness Harlot.
+                // Task progress: report every todo or task tool call to Harness Harlot.
                 let settings = bots_dir.join(format!("{}.settings.json", bot.bot_id));
                 let hook = format!(
                     "'{}' progress hook claude",
@@ -139,7 +139,7 @@ pub(crate) fn prepare_launch(
                 let json = serde_json::json!({
                     "hooks": {
                         "PostToolUse": [{
-                            "matcher": "TodoWrite",
+                            "matcher": hh_protocol::CLAUDE_PROGRESS_HOOK_MATCHER,
                             "hooks": [{ "type": "command", "command": hook }]
                         }]
                     }
@@ -481,7 +481,7 @@ mod tests {
             settings,
             serde_json::json!({
                 "hooks": {"PostToolUse": [{
-                    "matcher": "TodoWrite",
+                    "matcher": "TodoWrite|TaskCreate|TaskUpdate",
                     "hooks": [{
                         "type": "command",
                         "command": "'/Applications/Harness Harlot.app/Contents/MacOS/hh' progress hook claude",

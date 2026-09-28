@@ -1,7 +1,7 @@
 //! Remote workstation operations: tmux scans/attach and bounded remote directory listing.
 use super::{
-    RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry, TerminalRuntimePane,
-    encode_desired_state,
+    ProcessScan, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
+    TerminalRuntimePane, encode_desired_state,
 };
 use crate::layout::pane_ids_for_workspace;
 use crate::process::{fallback_cwd, run_bounded_command};
@@ -405,8 +405,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );

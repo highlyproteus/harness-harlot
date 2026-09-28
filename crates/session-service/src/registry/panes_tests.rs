@@ -41,7 +41,8 @@ fn agent_progress_clears_when_the_agent_leaves_the_pane() {
             assert!(Instant::now() < deadline, "title {title:?} never arrived");
             thread::sleep(Duration::from_millis(10));
         }
-        refresh_runtime_metadata(&mut registry.state.write());
+        // The worker's scan, now: the rule reads what runs in the pane.
+        crate::registry::identity::refresh_process_metadata(&registry.state, true);
     };
     let progress = || {
         find_pane_in_snapshot(&registry.snapshot().unwrap(), pane_id)
@@ -601,4 +602,105 @@ fn add_gallery_image_rejects_non_images() {
 
     assert!(error.to_string().contains("not a PNG"));
     fs::remove_file(source).unwrap();
+}
+
+fn claude_progress() -> hh_protocol::PaneProgress {
+    hh_protocol::PaneProgress {
+        done: 1,
+        total: 3,
+        current: Some("Write tests".to_owned()),
+        phase: None,
+        source: hh_protocol::ProgressSource::Claude,
+    }
+}
+
+/// A pinned profile is only the pane's label: progress follows the agent
+/// actually detected in the pane, and nothing detected is no evidence.
+#[test]
+fn progress_follows_the_detected_agent_not_the_pinned_profile() {
+    let registry = SessionRegistry::new().unwrap();
+    let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+    registry
+        .set_pane_profile(pane_id, Some(TerminalProfile::Codex))
+        .unwrap();
+    registry
+        .report_pane_progress(pane_id, Some(claude_progress()))
+        .unwrap();
+    // Each scan result and its refresh share one lock, so the background
+    // worker's own scan cannot interleave.
+    let refresh_with = |scan: ProcessScan| {
+        let mut state = registry.state.write();
+        state.terminal_pane_mut(pane_id).unwrap().process_scan = scan;
+        refresh_runtime_metadata(&mut state);
+        find_pane_in_snapshot(&state.snapshot, pane_id)
+            .unwrap()
+            .progress
+            .clone()
+    };
+
+    assert_eq!(
+        refresh_with(ProcessScan::Agent(TerminalProfile::Claude)),
+        Some(claude_progress()),
+        "Claude runs under the pinned Codex label"
+    );
+    assert_eq!(
+        refresh_with(ProcessScan::Unknown),
+        Some(claude_progress()),
+        "an inconclusive scan keeps the progress"
+    );
+    assert_eq!(
+        refresh_with(ProcessScan::NoAgent),
+        None,
+        "Claude quit back to its shell"
+    );
+}
+
+#[test]
+fn reattaching_a_running_program_keeps_its_status_and_progress() {
+    let registry = SessionRegistry::new().unwrap();
+    let snapshot = registry.snapshot().unwrap();
+    let pane_id = first_pane_id(&snapshot).unwrap();
+    let workspace_id = snapshot.workspaces[0].id;
+    let reattach = |behind: Reattached| {
+        registry
+            .report_pane_progress(pane_id, Some(claude_progress()))
+            .unwrap();
+        let session =
+            PtySession::spawn_local(pane_id, workspace_id, None, &fallback_cwd().unwrap()).unwrap();
+        let mut state = registry.state.write();
+        state.set_pane_status(pane_id, PaneStatus::NeedsApproval);
+        state.terminal_pane_mut(pane_id).unwrap().exit_status = Some("connection lost".to_owned());
+        let previous = state
+            .install_reattached_session(pane_id, session, behind)
+            .unwrap();
+        let pane = find_pane_in_snapshot(&state.snapshot, pane_id)
+            .unwrap()
+            .clone();
+        let terminal = state.terminal_pane(pane_id).unwrap();
+        let outcome = (
+            pane.status,
+            pane.progress,
+            terminal.exit_status.clone(),
+            terminal.title_baseline_pending,
+        );
+        drop(state);
+        previous.terminate_and_wait().unwrap();
+        outcome
+    };
+
+    assert_eq!(
+        reattach(Reattached::RunningProgram),
+        (
+            PaneStatus::NeedsApproval,
+            Some(claude_progress()),
+            None,
+            true
+        ),
+        "the program never stopped: its status and ring stay, its next title is a baseline"
+    );
+    assert_eq!(
+        reattach(Reattached::FreshShell),
+        (PaneStatus::Idle, None, None, false),
+        "a new shell starts over"
+    );
 }

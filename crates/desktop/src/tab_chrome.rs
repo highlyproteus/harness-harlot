@@ -12,7 +12,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::status_art::{
-    ANIMATION_FRAME, BorderMotion, border_motion, paint_needs_input_border, paint_progress_ring,
+    BorderMotion, FrameRate, border_motion, paint_needs_input_border, paint_progress_ring,
     paint_spinner_ring, spinner_rotation,
 };
 use crate::view_models::TooltipView;
@@ -101,6 +101,28 @@ impl PaneIndicator {
     }
 }
 
+/// The shared Running rule for the indicator, the Notifications Running
+/// section, and aggregation: the pane is working, or it is idle, seen, and
+/// its reported task list is unfinished (Claude and Codex rarely report
+/// `Working`, so their progress keeps the ring up between turns). Callers
+/// rank needs-you above this and treat exited panes as not running.
+pub(crate) fn shows_running(
+    status: PaneStatus,
+    unseen: bool,
+    progress: Option<&PaneProgress>,
+) -> bool {
+    match status {
+        PaneStatus::Working => true,
+        PaneStatus::Idle => {
+            !unseen && progress.is_some_and(|progress| progress.done < progress.total)
+        }
+        PaneStatus::NeedsApproval
+        | PaneStatus::NeedsInput
+        | PaneStatus::Attention
+        | PaneStatus::Done => false,
+    }
+}
+
 /// The one mapping from pane state to its indicator, by precedence: needs
 /// you, then running, then finished-and-unseen. An exited pane is finished
 /// whatever its last status said.
@@ -110,20 +132,26 @@ pub(crate) fn pane_indicator(
     unseen: bool,
     progress: Option<&PaneProgress>,
 ) -> PaneIndicator {
-    let finished = if unseen {
+    if exited {
+        return if unseen {
+            PaneIndicator::Done
+        } else {
+            PaneIndicator::None
+        };
+    }
+    if matches!(
+        status,
+        PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention
+    ) {
+        return PaneIndicator::NeedsYou;
+    }
+    if shows_running(status, unseen, progress) {
+        return PaneIndicator::Running(progress.map(TaskCount::of));
+    }
+    if unseen {
         PaneIndicator::Done
     } else {
         PaneIndicator::None
-    };
-    if exited {
-        return finished;
-    }
-    match status {
-        PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention => {
-            PaneIndicator::NeedsYou
-        }
-        PaneStatus::Working => PaneIndicator::Running(progress.map(TaskCount::of)),
-        PaneStatus::Done | PaneStatus::Idle => finished,
     }
 }
 
@@ -234,28 +262,34 @@ pub(crate) fn render_unread_dot(unread: bool) -> AnyElement {
 }
 
 impl HhApp {
-    /// Keeps frames coming at ~30 fps while the last frame drew something
-    /// animated (a comet border or a spinning ring), and stops as soon as a
-    /// frame draws none: no timer runs while nothing moves.
+    /// Keeps frames coming while the window draws something moving: ~30 fps
+    /// for a comet border, 10 fps for a spinning ring. Stops as soon as a
+    /// frame draws nothing moving, or when the window stops drawing frames
+    /// (hidden or minimised); the pending redraw restarts it on return.
     pub(crate) fn ensure_animation_tick(&mut self, cx: &mut Context<Self>) {
-        if !self.motion.wants_frames() || self.motion.tick_running {
+        if self.motion.tick_running {
             return;
         }
+        let Some(first) = self.motion.wanted_interval() else {
+            return;
+        };
         self.motion.tick_running = true;
         cx.spawn(async move |this, cx| {
+            let mut interval = first;
             loop {
-                gpui::Timer::after(ANIMATION_FRAME).await;
-                let Ok(true) = this.update(cx, |this, cx| {
-                    if !this.motion.wants_frames() {
+                gpui::Timer::after(interval).await;
+                let Ok(Some(next)) = this.update(cx, |this, cx| {
+                    let next = this.motion.next_tick(Instant::now());
+                    if next.is_some() {
+                        cx.notify();
+                    } else {
                         this.motion.tick_running = false;
-                        return false;
                     }
-                    this.motion.refresh_reduced(Instant::now());
-                    cx.notify();
-                    true
+                    next
                 }) else {
                     break;
                 };
+                interval = next;
             }
         })
         .detach();
@@ -323,7 +357,7 @@ impl HhApp {
             ),
             IndicatorArt::Spinner(rotation) => {
                 if rotation.is_some() {
-                    self.motion.request_frames();
+                    self.motion.request_frames(FrameRate::Spinner);
                 }
                 slot.child(
                     canvas(
@@ -372,7 +406,7 @@ impl HhApp {
         }
         let motion = border_motion(self.motion.reduced(), self.motion.elapsed_secs());
         if matches!(motion, BorderMotion::Comet { .. }) {
-            self.motion.request_frames();
+            self.motion.request_frames(FrameRate::Comet);
         }
         let mut glow = Hsla::from(rgb(THEME.warning));
         glow.a = 0.45;
@@ -554,6 +588,47 @@ mod tests {
                 PaneIndicator::None
             );
         }
+    }
+
+    #[test]
+    fn an_idle_seen_pane_with_unfinished_tasks_shows_running() {
+        let unfinished = Some(progress(2, 5));
+        assert_eq!(
+            pane_indicator(PaneStatus::Idle, false, false, unfinished.as_ref()),
+            running(2, 5),
+            "Claude and Codex stay Idle while they work through their list"
+        );
+        assert_eq!(
+            pane_indicator(PaneStatus::Idle, false, true, unfinished.as_ref()),
+            PaneIndicator::Done,
+            "an unseen finish keeps its dot"
+        );
+        assert_eq!(
+            pane_indicator(PaneStatus::Idle, false, false, Some(&progress(5, 5))),
+            PaneIndicator::None,
+            "a finished list is not running"
+        );
+        assert_eq!(
+            pane_indicator(PaneStatus::Done, false, false, unfinished.as_ref()),
+            PaneIndicator::None
+        );
+        assert_eq!(
+            pane_indicator(PaneStatus::NeedsInput, false, false, unfinished.as_ref()),
+            PaneIndicator::NeedsYou
+        );
+        assert_eq!(
+            pane_indicator(PaneStatus::Idle, true, false, unfinished.as_ref()),
+            PaneIndicator::None,
+            "exited"
+        );
+        assert_eq!(
+            aggregate_indicators([
+                pane_indicator(PaneStatus::Idle, false, false, unfinished.as_ref()),
+                pane_indicator(PaneStatus::Working, false, false, Some(&progress(1, 1))),
+            ]),
+            running(3, 6),
+            "aggregation sums idle-running panes too"
+        );
     }
 
     #[test]

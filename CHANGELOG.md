@@ -14,22 +14,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stays solid with **Reduce motion** (macOS) or GNOME animations off.
 - Task progress: a working agent's status dot becomes a ring that fills as its
   task list completes, shading from red through amber to green, with "3 of 7
-  done · phase — current task" on hover. Collapsed workstations, tab strip
-  tabs, and Notifications' **Running** rows add up their panes' progress.
-  Agents without a task list show a spinning blue ring (static with reduced
-  motion). Progress disappears once the agent exits back to its shell.
+  done · phase — current task" on hover. Claude Code and Codex, which don't
+  report when they are working, show the ring while their task list is
+  unfinished. Collapsed workstations, tab strip tabs, and Notifications'
+  **Running** rows add up their panes' progress. Agents without a task list
+  show a spinning blue ring while working (static with reduced motion).
+  omp's ring also follows `/todo` edits and tasks its subagents complete.
+  Progress disappears once the agent exits back to its shell.
 - `hh progress install|uninstall omp|claude|codex` and `hh progress status
   [--json]` enable task progress per agent (also under **Settings → Bots →
   Agent task progress**): an omp extension in the omp agent directory's
-  `extensions` folder, a Claude Code `TodoWrite` hook in
-  `~/.claude/settings.json`, or a Codex `update_plan` hook in
-  `~/.codex/hooks.json`. Installs keep all other settings and hooks, are
-  idempotent, and never replace an omp extension file you edited. omp and
-  Claude Code bots report progress automatically.
+  `extensions` folder, a Claude Code hook for its task tools (`TaskCreate` and
+  `TaskUpdate`, and `TodoWrite` in older versions) in `settings.json` of
+  `$CLAUDE_CONFIG_DIR` or `~/.claude`, or a Codex `update_plan` hook in
+  `hooks.json` of `$CODEX_HOME` or `~/.codex`. Installs keep all other
+  settings and hooks, write through a symlinked settings file, are idempotent,
+  and never replace an omp extension file you edited. omp and Claude Code bots
+  report progress automatically. Subagents' task lists never replace the
+  pane's, and a hook gives up after 2.5 seconds when the terminal service
+  doesn't answer, so the agent never waits on it.
 - `hh progress report --done N --total M [--current T] [--phase T] --source
   omp|claude|codex`, `hh progress clear`, and `hh progress hook claude|codex`
   (the hook entry point, which never fails and prints nothing) report a pane's
-  progress.
+  progress. `--current` and `--phase` text may start with `--`.
 - Notifications keeps a **Recent** list of the last 200 finished and attention
   notifications across restarts, with unread ones marked, and a **Mark all
   read** button.
@@ -61,13 +68,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `hh terminal list` (and MCP `terminal_list`) adds `parent_workstation` to each
   workstation, and a tab's `cwd` is its workstation's effective root folder.
   CLI, MCP, and omp plugin command names are unchanged.
-- Bumped the desktop/service wire protocol from 47 to 49 for nested and home
+- Bumped the desktop/service wire protocol from 47 to 50 for nested and home
   workstations, the removed project and tab-group requests, and pane seen
   state, notifications, and task progress; desktop and service must be
   upgraded together, so the update restarts the terminal service. Session
   snapshots move to schema 17.
-- The bell and Dock badges count unread notifications, orange when one needs
-  you and blue otherwise.
+- The bell counts unread notifications, orange when one needs you (including
+  an agent asking for approval or input) and blue otherwise. The Dock icon
+  shows the same count in macOS's standard red badge.
 
 ### Fixed
 
@@ -80,7 +88,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   tab, switching to its tab or workstation, clicking its notification, or
   typing into it. Merely focusing the window no longer clears it, it is set
   for every finish or request for attention (including omp title changes,
-  bells, and exits), and it survives restarts.
+  bells, and exits), and it survives restarts. Viewing a pane also marks its
+  unread notifications read, including bells and messages that set no dot.
+- SSH tabs whose connection drops are no longer reported as finished: they
+  keep their status and progress and post no notification.
 - Notifications no longer go blind after the terminal service restarts; the
   app reloads the list when the service's notification history changes.
 - omp completions and every other finish or request for attention are

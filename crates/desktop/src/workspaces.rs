@@ -5,6 +5,7 @@ use crate::helpers::{
     resolved_workspace_color, same_machine, visible_panes, workspace_tab_click_target,
     workspace_tab_standalone_pane,
 };
+use crate::notifications::SeenScope;
 use crate::view_models::{
     CreationParent, DialogTextEditor, DirEditor, DirEditorTarget, Modal, TmuxSelectionChange,
     TmuxSessionPicker, WorkspaceConnectionInfo, WorkspaceCreationDialog, WorkspaceCreationField,
@@ -110,7 +111,14 @@ impl HhApp {
         }
     }
 
-    pub(crate) fn select_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+    /// Shows workstation `workspace_id` on its first tab; `seen` says whether
+    /// that counts as the user looking at it.
+    pub(crate) fn select_workspace(
+        &mut self,
+        workspace_id: Uuid,
+        seen: SeenScope,
+        cx: &mut Context<Self>,
+    ) {
         self.reveal_workspace(workspace_id);
         self.sidebar.active_workspace = Some(workspace_id);
         let first_pane = self.session.snapshot.as_ref().and_then(|snapshot| {
@@ -122,7 +130,7 @@ impl HhApp {
                 .and_then(|tab| visible_panes(&tab.layout).first().copied())
         });
         if let Some(pane_id) = first_pane {
-            self.mark_tab_seen(pane_id);
+            self.mark_seen(pane_id, seen);
             self.focus_pane_with_snapshot(pane_id, cx);
         }
         self.layout.last_sizes.clear();
@@ -141,7 +149,7 @@ impl HhApp {
         }) else {
             return false;
         };
-        self.select_workspace(workspace_id, cx);
+        self.select_workspace(workspace_id, SeenScope::Tab, cx);
         self.sidebar.workstation_tab_scroll.scroll_to_item(index);
         true
     }
@@ -150,6 +158,7 @@ impl HhApp {
         &mut self,
         workspace_id: Uuid,
         pane_id: Uuid,
+        seen: SeenScope,
         cx: &mut Context<Self>,
     ) {
         let selected_tab_id = self.session.snapshot.as_ref().and_then(|snapshot| {
@@ -165,7 +174,7 @@ impl HhApp {
                         .map(|tab| tab.id)
                 })
         });
-        self.mark_tab_seen(pane_id);
+        self.mark_seen(pane_id, seen);
         self.dispatch_with(
             ClientRequest::ActivateTab { pane_id },
             Box::new(move |this, cx, result| {
@@ -215,7 +224,7 @@ impl HhApp {
         }) else {
             return;
         };
-        self.select_workspace_tab(workspace_id, pane_id, cx);
+        self.select_workspace_tab(workspace_id, pane_id, SeenScope::Tab, cx);
     }
 
     pub(crate) fn dismiss_workspace_tab(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
@@ -242,10 +251,11 @@ impl HhApp {
         workspace_id: Uuid,
         tab_id: Uuid,
         pane_id: Uuid,
+        seen: SeenScope,
         cx: &mut Context<Self>,
     ) {
         self.sidebar.dismissed_workspace_tabs.remove(&tab_id);
-        self.select_workspace_tab(workspace_id, pane_id, cx);
+        self.select_workspace_tab(workspace_id, pane_id, seen, cx);
         cx.notify();
     }
 

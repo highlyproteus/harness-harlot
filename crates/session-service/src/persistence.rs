@@ -74,11 +74,6 @@ impl SnapshotStore {
         }
     }
 
-    /// The directory holding the snapshot: the service's state directory.
-    pub(crate) fn directory(&self) -> Option<&Path> {
-        self.path.parent()
-    }
-
     pub(crate) fn load_or_quarantine(&self) -> Result<Option<RecoveredState>> {
         let Some(parent) = self.path.parent() else {
             bail!("snapshot path has no parent: {}", self.path.display());

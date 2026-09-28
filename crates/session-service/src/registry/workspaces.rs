@@ -1,14 +1,16 @@
 //! Workstation lifecycle: creation, SSH intents, pins, order, and appearance defaults.
 use super::{
-    InitialTerminalSpawn, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
-    SshWorkspaceIds, TerminalRuntimePane, encode_desired_state, ssh_pane_title,
+    InitialTerminalSpawn, ProcessScan, RuntimePane, RuntimePaneBackend, RuntimePaneKind,
+    SessionRegistry, SshWorkspaceIds, TerminalRuntimePane, encode_desired_state, ssh_pane_title,
 };
 use crate::layout::{find_pane_mut, pane_ids_for_workspace};
 use crate::persistence::{MAX_RECENT_COLORS, MAX_TITLE_CHARS, MAX_WORKSPACES, validate_title};
 use crate::process::{fallback_cwd, local_spawn_dir};
 use crate::pty::PtySession;
 use crate::registry::bots::{forget_bots, workstation_count};
-use crate::registry::identity::set_pane_runtime_label;
+use crate::registry::identity::{
+    PANE_DISCONNECTED, refresh_workspace_activity, set_pane_runtime_label,
+};
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     AppearanceColor, MAX_PANES, MAX_WORKSTATION_DEPTH, Pane, PaneLayout, SessionSnapshot, Tab,
@@ -389,8 +391,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -530,8 +533,9 @@ impl SessionRegistry {
                     },
                     recovered: false,
                     exit_status: None,
-                    detected_command_profile: None,
+                    process_scan: ProcessScan::Unknown,
                     omp_title_status: None,
+                    title_baseline_pending: false,
                 }),
             },
         );
@@ -752,7 +756,7 @@ impl SessionRegistry {
     /// their SSH sessions end and their saved tabs stay as offline panes.
     pub fn disconnect_workspace(&self, workspace_id: Uuid) -> Result<()> {
         let targets = {
-            let state = self.state.read();
+            let mut state = self.state.write();
             let workspace = state
                 .snapshot
                 .workspaces
@@ -762,7 +766,7 @@ impl SessionRegistry {
             if !matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. }) {
                 bail!("only a system-SSH workstation can be disconnected");
             }
-            std::iter::once(workspace_id)
+            let targets = std::iter::once(workspace_id)
                 .chain(workstation_descendants(
                     &state.snapshot.workspaces,
                     workspace_id,
@@ -786,7 +790,22 @@ impl SessionRegistry {
                         .collect::<Vec<_>>();
                     Some((id, sessions))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            // Marked before their SSH clients stop, under the same lock: the
+            // runtime refresh must see a disconnect, never an exit to report.
+            for (pane_id, _) in targets.iter().flat_map(|(_, sessions)| sessions) {
+                if let Ok(runtime) = state.terminal_pane_mut(*pane_id) {
+                    runtime.exit_status = Some(PANE_DISCONNECTED.to_owned());
+                }
+                set_pane_runtime_label(
+                    &mut state.snapshot,
+                    *pane_id,
+                    false,
+                    Some(PANE_DISCONNECTED),
+                    "system OpenSSH",
+                );
+            }
+            targets
         };
         for (_, session) in targets.iter().flat_map(|(_, sessions)| sessions) {
             let _ = session.terminate_and_wait();
@@ -801,33 +820,16 @@ impl SessionRegistry {
         {
             bail!("workstation {workspace_id} disappeared while disconnecting");
         }
-        for (id, sessions) in &targets {
-            let Some(workspace) = state
+        refresh_workspace_activity(&mut state);
+        for (id, _) in &targets {
+            if let Some(workspace) = state
                 .snapshot
                 .workspaces
                 .iter_mut()
                 .find(|workspace| workspace.id == *id)
-            else {
-                continue;
-            };
-            let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection else {
-                continue;
-            };
-            *status = WorkspaceConnectionStatus::Offline;
-            workspace.active_terminal_count = workspace
-                .active_terminal_count
-                .saturating_sub(u32::try_from(sessions.len()).unwrap_or(u32::MAX));
-            for (pane_id, _) in sessions {
-                if let Ok(runtime) = state.terminal_pane_mut(*pane_id) {
-                    runtime.exit_status = Some("disconnected".to_owned());
-                }
-                set_pane_runtime_label(
-                    &mut state.snapshot,
-                    *pane_id,
-                    false,
-                    Some("disconnected"),
-                    "system OpenSSH",
-                );
+                && let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection
+            {
+                *status = WorkspaceConnectionStatus::Offline;
             }
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
@@ -1019,8 +1021,9 @@ impl SessionRegistry {
                         },
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -1176,9 +1179,10 @@ mod tests {
         let before = registry.snapshot().unwrap();
         let workspace_id = before.workspaces[0].id;
         registry
-            .store
+            .files
             .as_ref()
             .unwrap()
+            .snapshot
             .inject_failure_before_replace(true);
 
         assert!(
@@ -1476,9 +1480,14 @@ mod tests {
                 .kind = RuntimePaneKind::SystemSsh {
                 host: "build-node".to_owned(),
             };
+            state.set_pane_status(pane_id, hh_protocol::PaneStatus::Working);
+            state.notifications.clear();
         }
 
         registry.disconnect_workspace(workspace_id).unwrap();
+        // The stopped SSH client's own exit is observable now; a disconnect
+        // is not an exit: no Done, no notification, no dot.
+        crate::registry::identity::refresh_runtime_metadata(&mut registry.state.write());
         let snapshot = registry.snapshot().unwrap();
         let workspace = &snapshot.workspaces[0];
 
@@ -1493,6 +1502,11 @@ mod tests {
             }
         );
         assert!(registry.state.read().panes.contains_key(&pane_id));
+        let pane = crate::layout::find_pane_in_snapshot(&snapshot, pane_id).unwrap();
+        assert_eq!(pane.status, hh_protocol::PaneStatus::Working);
+        assert!(!pane.unseen);
+        assert_eq!(pane.shell, "system OpenSSH · disconnected");
+        assert!(registry.notifications().unwrap().is_empty());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Runtime identity discovery: process profiles, titles, and workspace activity.
-use super::{PaneLocation, RegistryState, RuntimePane, StatusNotice, ssh_pane_title};
+use super::{PaneLocation, ProcessScan, RegistryState, RuntimePane, StatusNotice, ssh_pane_title};
 use crate::layout::{find_pane_in_snapshot, find_pane_mut_in_snapshot, pane_ids_for_workspace};
 use crate::process::valid_local_cwd;
 use crate::registry::status::omp_title_status;
@@ -46,9 +46,13 @@ pub(crate) fn refresh_process_metadata(shared: &Arc<RwLock<RegistryState>>, forc
                     .map(|process_id| (*pane_id, Pid::from_u32(process_id)))
             })
             .collect::<Vec<_>>();
+        // A pane with progress keeps discovery running even when every pane
+        // is renamed or pinned: the progress rule needs the detected agent.
         let discover_profiles = inputs.iter().any(|(pane_id, _)| {
-            find_pane_in_snapshot(&state.snapshot, *pane_id)
-                .is_some_and(|pane| pane.custom_title.is_none() && pane.profile_override.is_none())
+            find_pane_in_snapshot(&state.snapshot, *pane_id).is_some_and(|pane| {
+                (pane.custom_title.is_none() && pane.profile_override.is_none())
+                    || pane.progress.is_some()
+            })
         });
         (inputs, discover_profiles)
     };
@@ -108,25 +112,85 @@ pub(crate) fn refresh_process_metadata(shared: &Arc<RwLock<RegistryState>>, forc
             terminal.last_valid_cwd.clone_from(cwd);
         }
         if let Some(profiles) = &profiles {
-            terminal.detected_command_profile = profiles.get(&pane_id).copied().flatten();
+            terminal.process_scan = profiles
+                .get(&pane_id)
+                .copied()
+                .unwrap_or(ProcessScan::Unknown);
         }
     }
     state.last_identity_refresh = Some(started);
     refresh_runtime_metadata(&mut state);
 }
 
+/// Exit reason of a saved tmux window recovery could not reattach (session
+/// survival's `Transport::Unattached`, reported as `not reattached: <why>`).
+/// Its program is still running in the window.
+pub(crate) const PANE_NOT_REATTACHED_PREFIX: &str = "not reattached:";
+/// Exit reason of a remote tmux pane whose SSH connection dropped (session
+/// survival's `REMOTE_CONNECTION_LOST`). Its program keeps running on the host.
+pub(crate) const PANE_CONNECTION_LOST: &str = "connection lost";
+/// Exit reason of a pane whose SSH workstation the user disconnected.
+pub(crate) const PANE_DISCONNECTED: &str = "disconnected";
+/// Exit reason of a pane whose shell HH is replacing (a bot restart).
+pub(crate) const PANE_RESTARTING: &str = "restarting";
+
+/// How a terminal's transport ended, from the reason it reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PaneEnd<'a> {
+    /// The pane's program exited: its turn is over.
+    Exited(&'a str),
+    /// HH lost or let go of the pane while its program may still run: after
+    /// a failed reattach, a lost SSH connection, a disconnect or a restart.
+    /// Not news: only the pane's label changes.
+    Detached(&'a str),
+}
+
+impl<'a> PaneEnd<'a> {
+    /// The one classifier of exit reasons; every detached reason above is
+    /// recognised here and nowhere else.
+    pub(crate) fn classify(reason: &'a str) -> Self {
+        if reason.starts_with(PANE_NOT_REATTACHED_PREFIX)
+            || matches!(
+                reason,
+                PANE_CONNECTION_LOST | PANE_DISCONNECTED | PANE_RESTARTING
+            )
+        {
+            Self::Detached(reason)
+        } else {
+            Self::Exited(reason)
+        }
+    }
+}
+
+/// How an omp title status observed by the refresh applies to the pane.
+enum TitleStatus {
+    /// The first title after a reattach: where the program already was.
+    Baseline(PaneStatus),
+    Changed(PaneStatus),
+}
+
 pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
-    let mut labels = Vec::new();
+    let mut ends = Vec::new();
     for (pane_id, runtime) in &mut state.panes {
         let Some(runtime) = runtime.terminal_mut() else {
             continue;
         };
-        let Ok(observed) = runtime.session.exit_status() else {
+        // A detached end holds until the pane is reattached: the later exit
+        // of its transport (the SSH client a disconnect stopped, the shell a
+        // restart replaces) is not its program's.
+        if runtime
+            .exit_status
+            .as_deref()
+            .is_some_and(|reason| matches!(PaneEnd::classify(reason), PaneEnd::Detached(_)))
+        {
+            continue;
+        }
+        let Ok(Some(observed)) = runtime.session.exit_status() else {
             continue;
         };
-        if observed.is_some() && observed != runtime.exit_status {
-            runtime.exit_status.clone_from(&observed);
-            labels.push((
+        if runtime.exit_status.as_ref() != Some(&observed) {
+            runtime.exit_status = Some(observed.clone());
+            ends.push((
                 *pane_id,
                 runtime.recovered,
                 observed,
@@ -134,16 +198,16 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
             ));
         }
     }
-    if !labels.is_empty() {
-        for (pane_id, recovered, status, shell_label) in labels {
+    if !ends.is_empty() {
+        for (pane_id, recovered, reason, shell_label) in ends {
             set_pane_runtime_label(
                 &mut state.snapshot,
                 pane_id,
                 recovered,
-                status.as_deref(),
+                Some(&reason),
                 &shell_label,
             );
-            if status.is_some() {
+            if let PaneEnd::Exited(_) = PaneEnd::classify(&reason) {
                 state.clear_pane_progress(pane_id);
                 state.update_pane_status(
                     pane_id,
@@ -166,32 +230,44 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
                 (
                     *pane_id,
                     terminal.session.terminal_title(),
-                    terminal.detected_command_profile,
+                    terminal.process_scan,
                     terminal.location(),
                 )
             })
         })
         .collect::<Vec<_>>();
     let mut identity_changed = false;
-    for (pane_id, title_signal, command_profile, location) in identity_inputs {
-        let resolved =
-            find_pane_mut_in_snapshot(&mut state.snapshot, pane_id).map(|pane| {
-                identity_changed |= resolve_pane_identity(
-                    pane,
-                    title_signal.as_deref(),
-                    command_profile,
-                    Some(&location),
-                );
-                // Progress belongs to the agent that reported it; once the pane
-                // runs something else (the agent quit to its shell) it is stale.
-                if pane.progress.as_ref().is_some_and(|progress| {
-                    progress_profile(progress.source) != pane.identity.profile
-                }) {
-                    pane.progress = None;
-                    identity_changed = true;
-                }
-                (pane.identity.profile, pane.status)
-            });
+    for (pane_id, title_signal, process_scan, location) in identity_inputs {
+        let title_detected = title_signal.as_deref().and_then(title_profile);
+        // What actually runs in the pane, never the profile a user or a bot
+        // pinned: the program the title names, else what the process scan
+        // found, where a finished scan without an agent means the shell.
+        let detected_profile = title_detected.or(match process_scan {
+            ProcessScan::Agent(profile) => Some(profile),
+            ProcessScan::NoAgent => Some(TerminalProfile::Terminal),
+            ProcessScan::Unknown => None,
+        });
+        let resolved = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id).map(|pane| {
+            identity_changed |= resolve_pane_identity(
+                pane,
+                title_signal.as_deref(),
+                process_scan.agent(),
+                Some(&location),
+            );
+            // Progress belongs to the agent that reported it; once another
+            // program is detected in the pane, it is stale. Nothing
+            // detected is no evidence either way.
+            if let Some(detected) = detected_profile
+                && pane
+                    .progress
+                    .as_ref()
+                    .is_some_and(|progress| progress_profile(progress.source) != detected)
+            {
+                pane.progress = None;
+                identity_changed = true;
+            }
+            (pane.identity.profile, pane.status)
+        });
         let resolved_profile = resolved.map(|(profile, _)| profile);
         let current_status = resolved.map(|(_, status)| status);
         let status_update = state
@@ -211,20 +287,29 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
                     return None;
                 }
                 let previous = runtime.omp_title_status.replace(next);
-                Some(
+                if std::mem::take(&mut runtime.title_baseline_pending) {
+                    return Some(TitleStatus::Baseline(next));
+                }
+                Some(TitleStatus::Changed(
                     if previous == Some(PaneStatus::Working) && next == PaneStatus::Idle {
                         PaneStatus::Done
                     } else {
                         next
                     },
-                )
+                ))
             });
-        // A finished turn stays Done until the next one starts: the idle
-        // prompt after it, or a re-read once the tracker resets, is not news.
-        if let Some(status) = status_update
-            && !(status == PaneStatus::Idle && current_status == Some(PaneStatus::Done))
-        {
-            state.set_pane_status(pane_id, status);
+        match status_update {
+            Some(TitleStatus::Baseline(status)) => {
+                state.update_pane_status(pane_id, status, StatusNotice::Silent, crate::now_ms());
+            }
+            // A finished turn stays Done until the next one starts: the idle
+            // prompt after it, or a re-read once the tracker resets, is not news.
+            Some(TitleStatus::Changed(status))
+                if !(status == PaneStatus::Idle && current_status == Some(PaneStatus::Done)) =>
+            {
+                state.set_pane_status(pane_id, status);
+            }
+            Some(TitleStatus::Changed(_)) | None => {}
         }
     }
     if identity_changed {
@@ -326,7 +411,7 @@ pub(crate) fn discover_descendant_profile(
     system: &mut System,
     children: &HashMap<Pid, Vec<Pid>>,
     root: Pid,
-) -> Option<TerminalProfile> {
+) -> ProcessScan {
     let mut queue = VecDeque::from([(root, 0_usize)]);
     let mut inspected = 0_usize;
     while let Some((parent, depth)) = queue.pop_front() {
@@ -336,7 +421,7 @@ pub(crate) fn discover_descendant_profile(
         for child in children.get(&parent).into_iter().flatten() {
             inspected += 1;
             if inspected > MAX_DISCOVERY_DESCENDANTS_PER_PANE {
-                return None;
+                return ProcessScan::Unknown;
             }
             let profile = system.process(*child).and_then(|process| {
                 process
@@ -354,13 +439,13 @@ pub(crate) fn discover_descendant_profile(
                     .process(*child)
                     .and_then(|process| terminal_profile_for_arguments(process.cmd()))
             });
-            if profile.is_some() {
-                return profile;
+            if let Some(profile) = profile {
+                return ProcessScan::Agent(profile);
             }
             queue.push_back((*child, depth + 1));
         }
     }
-    None
+    ProcessScan::NoAgent
 }
 
 /// The agent a terminal title names: a known program title, or omp's live
@@ -434,9 +519,10 @@ pub(crate) fn set_pane_runtime_label(
     status: Option<&str>,
     shell_label: &str,
 ) {
-    let label = match status {
-        Some("terminating") => format!("{shell_label} · terminating"),
-        Some(status) => format!("{shell_label} · exited ({status})"),
+    let label = match status.map(PaneEnd::classify) {
+        Some(PaneEnd::Exited("terminating")) => format!("{shell_label} · terminating"),
+        Some(PaneEnd::Exited(status)) => format!("{shell_label} · exited ({status})"),
+        Some(PaneEnd::Detached(reason)) => format!("{shell_label} · {reason}"),
         None if recovered => format!("{shell_label} · recovered with a fresh shell"),
         None => shell_label.to_owned(),
     };
@@ -451,6 +537,26 @@ mod tests {
     use crate::layout::first_pane_id;
     use crate::registry::SessionRegistry;
     use uuid::Uuid;
+
+    #[test]
+    fn only_reasons_where_the_program_may_still_run_classify_as_detached() {
+        for reason in [
+            "not reattached: tmux window @4 is missing",
+            "connection lost",
+            "disconnected",
+            "restarting",
+        ] {
+            assert_eq!(PaneEnd::classify(reason), PaneEnd::Detached(reason));
+        }
+        for reason in [
+            "Exited with code 0",
+            "Exited with code 255",
+            "tmux control client exited",
+            "connection lost later",
+        ] {
+            assert_eq!(PaneEnd::classify(reason), PaneEnd::Exited(reason));
+        }
+    }
 
     #[test]
     fn custom_name_and_selected_profile_resolve_independently() {

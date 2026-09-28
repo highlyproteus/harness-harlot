@@ -238,6 +238,9 @@ struct SessionState {
     /// The service's notification ring identity; a new one means the ring
     /// was replaced and the mirror must be refetched.
     notifications_epoch: Option<Uuid>,
+    /// A full notification reload was requested for a replaced ring or a
+    /// gap and has not answered yet, so polls do not request another.
+    notifications_reloading: bool,
     /// Last unread count sent to the Dock, so polling never re-sends it.
     dock_badge: Option<usize>,
     /// When each pane's screen was last applied, used to pace on-screen panes
@@ -278,6 +281,7 @@ impl SessionState {
             notifications: Vec::new(),
             notifications_latest_id: 0,
             notifications_epoch: None,
+            notifications_reloading: false,
             dock_badge: None,
             last_delivery: HashMap::new(),
             window_active,

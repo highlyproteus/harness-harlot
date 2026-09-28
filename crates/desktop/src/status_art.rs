@@ -4,8 +4,8 @@
 //!
 //! Everything is stroked as anti-aliased GPU paths in logical pixels, so it
 //! stays crisp at any scale factor. Animation is driven by
-//! [`crate::HhApp::ensure_animation_tick`], which only runs while a frame
-//! actually drew something animated.
+//! [`crate::HhApp::ensure_animation_tick`], which only runs while the window
+//! keeps drawing frames that contain something animated.
 use std::cell::Cell;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::time::{Duration, Instant};
@@ -14,9 +14,12 @@ use gpui::{Bounds, Hsla, PathBuilder, Pixels, Window, point, px, rgb};
 
 use crate::THEME;
 
-/// ~30 fps: smooth enough for a small travelling highlight, and half the
-/// cost of redrawing at display rate.
-pub(crate) const ANIMATION_FRAME: Duration = Duration::from_millis(33);
+/// ~30 fps: smooth enough for the small travelling comet, and half the cost
+/// of redrawing at display rate.
+const COMET_FRAME: Duration = Duration::from_millis(33);
+/// 10 fps: a small rotating ring reads as spinning at this rate, and every
+/// frame redraws the whole window.
+const SPINNER_FRAME: Duration = Duration::from_millis(100);
 /// One clockwise loop of the needs-input comet.
 pub(crate) const COMET_PERIOD_SECS: f32 = 2.0;
 /// Share of the perimeter the comet covers, tail included.
@@ -24,7 +27,7 @@ pub(crate) const COMET_FRACTION: f32 = 0.2;
 /// One rotation of the indeterminate running ring.
 pub(crate) const SPINNER_PERIOD_SECS: f32 = 1.2;
 /// How often the reduce-motion preference may be re-read.
-const REDUCED_MOTION_RECHECK: Duration = Duration::from_secs(3);
+const REDUCED_MOTION_RECHECK: Duration = Duration::from_secs(1);
 
 pub(crate) const BORDER_WIDTH: f32 = 1.5;
 const RING_RADIUS: f32 = 3.5;
@@ -38,15 +41,48 @@ pub(crate) const PROGRESS_RED: u32 = 0xe5484d;
 pub(crate) const PROGRESS_AMBER: u32 = 0xf5a524;
 pub(crate) const PROGRESS_GREEN: u32 = 0x30a46c;
 
+/// The fastest-moving thing a frame drew, which sets the next frame's delay.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum FrameRate {
+    /// Nothing moves: no timer.
+    #[default]
+    Still,
+    /// The indeterminate running ring.
+    Spinner,
+    /// The needs-input comet.
+    Comet,
+}
+
+impl FrameRate {
+    /// Delay before the next frame, or `None` when nothing moves.
+    pub(crate) const fn interval(self) -> Option<Duration> {
+        match self {
+            Self::Still => None,
+            Self::Spinner => Some(SPINNER_FRAME),
+            Self::Comet => Some(COMET_FRAME),
+        }
+    }
+}
+
+/// Whether the reduce-motion preference last read at `read_at` is due for a
+/// re-read at `now`.
+pub(crate) fn reduced_motion_recheck_due(read_at: Option<Instant>, now: Instant) -> bool {
+    read_at.is_none_or(|read| now.saturating_duration_since(read) >= REDUCED_MOTION_RECHECK)
+}
+
 /// The shared animation clock and the reduce-motion switch.
 #[derive(Debug)]
 pub(crate) struct Motion {
     started: Instant,
     reduced: bool,
     reduced_read_at: Option<Instant>,
-    /// Set while rendering whenever something animated was drawn; the tick
-    /// keeps running only while the last frame set it.
-    animating: Cell<bool>,
+    /// What the frame being built (or last built) animates.
+    rate: Cell<FrameRate>,
+    /// Whether a frame was drawn since the tick last asked for one. gpui
+    /// stops drawing a minimised or fully hidden window, so a tick that finds
+    /// no frame since its last request stops instead of waking in the dark;
+    /// the pending redraw restarts it once the window shows again.
+    drawn: Cell<bool>,
     pub(crate) tick_running: bool,
 }
 
@@ -57,7 +93,8 @@ impl Motion {
             started: now,
             reduced: system_prefers_reduced_motion(),
             reduced_read_at: Some(now),
-            animating: Cell::new(false),
+            rate: Cell::new(FrameRate::Still),
+            drawn: Cell::new(false),
             tick_running: false,
         }
     }
@@ -74,26 +111,39 @@ impl Motion {
 
     /// Called at the top of each frame.
     pub(crate) fn begin_frame(&self) {
-        self.animating.set(false);
+        self.rate.set(FrameRate::Still);
+        self.drawn.set(true);
     }
 
-    /// Records that the frame being built draws something animated.
-    pub(crate) fn request_frames(&self) {
-        self.animating.set(true);
+    /// Records that the frame being built draws something moving at `rate`.
+    pub(crate) fn request_frames(&self, rate: FrameRate) {
+        self.rate.set(self.rate.get().max(rate));
     }
 
-    pub(crate) fn wants_frames(&self) -> bool {
-        self.animating.get()
+    /// Delay before the first frame of a new tick, or `None` when the last
+    /// frame drew nothing moving.
+    pub(crate) fn wanted_interval(&self) -> Option<Duration> {
+        self.rate.get().interval()
+    }
+
+    /// One tick of the animation timer: re-reads reduce motion (throttled)
+    /// and returns the delay before the next frame, or `None` to stop because
+    /// the last frame drew nothing moving or no frame was drawn since the
+    /// last tick (the window is hidden or minimised). A `Some` asks the
+    /// caller to redraw; a frame drawn after reduce motion turns on draws
+    /// everything still, so the tick after it stops.
+    pub(crate) fn next_tick(&mut self, now: Instant) -> Option<Duration> {
+        if !self.drawn.replace(false) {
+            return None;
+        }
+        self.refresh_reduced(now);
+        self.wanted_interval()
     }
 
     /// Re-reads the reduce-motion preference unless it was read within the
-    /// last few seconds. Returns whether it changed.
+    /// last second. Returns whether it changed.
     pub(crate) fn refresh_reduced(&mut self, now: Instant) -> bool {
-        if !cfg!(target_os = "macos")
-            || self
-                .reduced_read_at
-                .is_some_and(|read| now.duration_since(read) < REDUCED_MOTION_RECHECK)
-        {
+        if !cfg!(target_os = "macos") || !reduced_motion_recheck_due(self.reduced_read_at, now) {
             return false;
         }
         self.reduced_read_at = Some(now);
@@ -478,10 +528,11 @@ pub(crate) fn paint_needs_input_border(
 #[cfg(test)]
 mod tests {
     use super::{
-        BorderMotion, COMET_PERIOD_SECS, PROGRESS_AMBER, PROGRESS_GREEN, PROGRESS_RED,
-        SPINNER_PERIOD_SECS, border_motion, channels, comet_head, perimeter_point, progress_color,
-        rgb_to_hsl, spinner_rotation,
+        BorderMotion, COMET_PERIOD_SECS, FrameRate, Motion, PROGRESS_AMBER, PROGRESS_GREEN,
+        PROGRESS_RED, SPINNER_PERIOD_SECS, border_motion, channels, comet_head, perimeter_point,
+        progress_color, reduced_motion_recheck_due, rgb_to_hsl, spinner_rotation,
     };
+    use std::time::{Duration, Instant};
 
     fn close(a: (f32, f32), b: (f32, f32)) -> bool {
         (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3
@@ -582,5 +633,66 @@ mod tests {
         assert_eq!(spinner_rotation(true, 0.4), None);
         let rotation = spinner_rotation(false, SPINNER_PERIOD_SECS / 2.0).expect("animated");
         assert!((rotation - std::f32::consts::PI).abs() < 1e-4);
+    }
+
+    #[test]
+    fn only_the_comet_runs_at_thirty_fps_and_the_spinner_at_ten() {
+        assert_eq!(FrameRate::Still.interval(), None);
+        assert_eq!(
+            FrameRate::Spinner.interval(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(FrameRate::Comet.interval(), Some(Duration::from_millis(33)));
+
+        let motion = Motion::new();
+        motion.begin_frame();
+        assert_eq!(
+            motion.wanted_interval(),
+            None,
+            "a still frame wants no timer"
+        );
+        motion.request_frames(FrameRate::Spinner);
+        assert_eq!(motion.wanted_interval(), FrameRate::Spinner.interval());
+        motion.request_frames(FrameRate::Comet);
+        motion.request_frames(FrameRate::Spinner);
+        assert_eq!(
+            motion.wanted_interval(),
+            FrameRate::Comet.interval(),
+            "the fastest animation on screen sets the pace"
+        );
+    }
+
+    #[test]
+    fn the_tick_stops_when_the_window_stops_drawing_frames() {
+        let mut motion = Motion::new();
+        let now = Instant::now();
+        motion.begin_frame();
+        motion.request_frames(FrameRate::Spinner);
+        assert_eq!(motion.next_tick(now), FrameRate::Spinner.interval());
+        // Hidden or minimised: gpui draws no frame after the redraw request.
+        assert_eq!(motion.next_tick(now), None);
+
+        // Shown again: the pending redraw draws a frame that restarts it, and
+        // a frame with nothing moving stops it.
+        motion.begin_frame();
+        motion.request_frames(FrameRate::Comet);
+        assert_eq!(motion.next_tick(now), FrameRate::Comet.interval());
+        motion.begin_frame();
+        assert_eq!(motion.next_tick(now), None);
+    }
+
+    #[test]
+    fn reduce_motion_is_rechecked_at_most_once_a_second() {
+        let read = Instant::now();
+        assert!(reduced_motion_recheck_due(None, read), "never read yet");
+        assert!(!reduced_motion_recheck_due(Some(read), read));
+        assert!(!reduced_motion_recheck_due(
+            Some(read),
+            read + Duration::from_millis(999)
+        ));
+        assert!(reduced_motion_recheck_due(
+            Some(read),
+            read + Duration::from_secs(1)
+        ));
     }
 }

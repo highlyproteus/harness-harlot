@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::HhApp;
 use crate::helpers::{find_pane, visible_panes, workspace_is_selectable};
-use crate::notifications::bots_needing_you;
+use crate::notifications::{SeenScope, bots_needing_you};
 use crate::view_models::{
     BotMenu, Modal, SidebarMode, WorkspaceCreationDialog, WorkspaceDeleteConfirmation,
     WorkspaceRenameEditor,
@@ -178,6 +178,7 @@ impl HhApp {
     }
 
     /// Returns the main area from a bot to the workstation shown before it.
+    /// Coming back is not looking at anything new, so nothing is marked seen.
     fn leave_bot_view(&mut self, cx: &mut Context<Self>) {
         if self.active_workstation().is_some() || self.sidebar.active_workspace.is_none() {
             return;
@@ -197,7 +198,7 @@ impl HhApp {
             .filter(|id| workstations.iter().any(|workspace| workspace.id == *id))
             .or_else(|| workstations.first().map(|workspace| workspace.id));
         match target {
-            Some(workspace_id) => self.select_workspace(workspace_id, cx),
+            Some(workspace_id) => self.select_workspace(workspace_id, SeenScope::Nothing, cx),
             None => self.sidebar.active_workspace = None,
         }
     }
@@ -217,15 +218,17 @@ impl HhApp {
         self.remember_return_workstation();
         self.editor.modal = Modal::None;
         match entry {
-            Some((tab_id, pane_id)) => self.select_sidebar_pane(bot_id, tab_id, pane_id, cx),
-            None => self.select_workspace(bot_id, cx),
+            Some((tab_id, pane_id)) => {
+                self.select_sidebar_pane(bot_id, tab_id, pane_id, SeenScope::Tab, cx);
+            }
+            None => self.select_workspace(bot_id, SeenScope::Tab, cx),
         }
         self.sidebar.expanded_workspaces.insert(bot_id);
         self.refresh_bot_threads(bot_id);
     }
 
     /// Shows one pane of a bot (e.g. from Notifications) with the sidebar in
-    /// Bots mode.
+    /// Bots mode, marking only that pane seen.
     pub(crate) fn open_bot_pane(
         &mut self,
         bot_id: Uuid,
@@ -239,7 +242,7 @@ impl HhApp {
         if self.sidebar.sidebar_mode != SidebarMode::Bots {
             self.set_sidebar_mode(SidebarMode::Bots, cx);
         }
-        self.select_sidebar_pane(bot_id, tab_id, pane_id, cx);
+        self.select_sidebar_pane(bot_id, tab_id, pane_id, SeenScope::Pane, cx);
     }
 
     /// Shows a just-created bot, before its workspace reaches the snapshot.

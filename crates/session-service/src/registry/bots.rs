@@ -1,8 +1,8 @@
 //! Bots: bot workspaces, their thread terminals, and bot-owned workers.
 //! Each bot is its own `WorkspaceKind::Bot` workspace whose id is the bot id.
 use super::{
-    RegistryState, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
-    TerminalRuntimePane, encode_desired_state,
+    ProcessScan, RegistryState, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
+    StateFiles, TerminalRuntimePane, encode_desired_state,
 };
 use crate::bots::{
     BotLaunch, PreparedLaunch, bot_home, bots_directory, prepare_launch, remove_bot_files,
@@ -13,7 +13,9 @@ use crate::persistence::{
 };
 use crate::process::{fallback_cwd, hh_cli_path, local_spawn_dir, shell_title, valid_local_cwd};
 use crate::pty::{MAX_INPUT_FRAME, PtySession};
-use crate::registry::identity::{refresh_workspace_activity, set_pane_runtime_label};
+use crate::registry::identity::{
+    PANE_RESTARTING, refresh_workspace_activity, set_pane_runtime_label,
+};
 use crate::registry::workspaces::next_workspace_order;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -597,8 +599,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -683,9 +686,9 @@ impl SessionRegistry {
     /// The service's `<state>/bots` directory; bots need a persistent registry.
     pub(crate) fn bots_dir(&self) -> Result<PathBuf> {
         let state_dir = self
-            .store
+            .files
             .as_ref()
-            .and_then(|store| store.directory())
+            .map(StateFiles::directory)
             .context("bots need a persistent session state directory")?;
         Ok(bots_directory(state_dir))
     }
@@ -716,25 +719,47 @@ impl SessionRegistry {
     /// shell in the bot's home and types the launch command into it.
     fn relaunch_bot(&self, bot_id: Uuid, pane_id: Uuid, launch: PreparedLaunch) -> Result<()> {
         let previous = {
-            let state = self.state.read();
+            let mut state = self.state.write();
             let target = state.bot_target(bot_id)?;
             if !target.panes.contains(&pane_id) {
                 bail!("pane {pane_id} is not a thread of bot {bot_id}");
             }
-            state
+            // Marked under the lock before the old shell dies, so the runtime
+            // refresh sees a replacement, never an exit to report as Done.
+            // The old agent's progress goes with it.
+            let previous = state
                 .panes
-                .get(&pane_id)
-                .and_then(RuntimePane::terminal)
-                .map(|terminal| Arc::clone(&terminal.session))
-        };
-        if let Some(previous) = previous {
+                .get_mut(&pane_id)
+                .and_then(RuntimePane::terminal_mut)
+                .map(|terminal| {
+                    terminal.exit_status = Some(PANE_RESTARTING.to_owned());
+                    Arc::clone(&terminal.session)
+                });
+            state.clear_pane_progress(pane_id);
             previous
-                .terminate_and_wait()
-                .context("terminate the bot terminal")?;
-        }
-        let session = self.spawn_local_transport(pane_id, bot_id, Some(bot_id), &launch.home)?;
+        };
+        let session = previous
+            .map_or(Ok(()), |previous| {
+                previous
+                    .terminate_and_wait()
+                    .context("terminate the bot terminal")
+            })
+            .and_then(|()| self.spawn_local_transport(pane_id, bot_id, Some(bot_id), &launch.home));
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                // The restart failed: whatever the old shell does now is its
+                // own exit again.
+                self.state.write().abandon_restart(pane_id);
+                return Err(error);
+            }
+        };
         let mut state = self.state.write();
-        if !state.bot_target(bot_id)?.panes.contains(&pane_id) {
+        if !state
+            .bot_target(bot_id)
+            .is_ok_and(|target| target.panes.contains(&pane_id))
+        {
+            state.abandon_restart(pane_id);
             drop(state);
             let _ = session.terminate_and_wait();
             bail!("bot {bot_id} changed while restarting");
@@ -745,7 +770,6 @@ impl SessionRegistry {
         );
         set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, &shell_title());
         state.set_pane_status(pane_id, PaneStatus::Idle);
-        state.clear_pane_progress(pane_id);
         refresh_workspace_activity(&mut state);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
@@ -813,8 +837,9 @@ pub(super) fn local_terminal_runtime(session: Arc<PtySession>, cwd: PathBuf) -> 
             kind: RuntimePaneKind::Local,
             recovered: false,
             exit_status: None,
-            detected_command_profile: None,
+            process_scan: ProcessScan::Unknown,
             omp_title_status: None,
+            title_baseline_pending: false,
         }),
     }
 }

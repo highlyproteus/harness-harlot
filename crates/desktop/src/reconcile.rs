@@ -30,8 +30,8 @@ pub(crate) struct ReconcileOutcome {
     /// Focus moved to a pane the desktop has not focused yet; resync its
     /// snapshot.
     pub focus_resync: Option<Uuid>,
-    /// The notification mirror is stale (new ring, or new items that may
-    /// replace or re-read older ones); refetch the full list.
+    /// The notification mirror belongs to a replaced ring, or skipped items;
+    /// refetch the full list.
     pub notifications_need_refresh: bool,
 }
 
@@ -166,7 +166,8 @@ pub(crate) fn reconcile_updates(
     let notifications = sync_notifications(
         &mut session.notifications,
         &mut session.notifications_latest_id,
-        &mut session.notifications_epoch,
+        session.notifications_epoch,
+        &mut session.notifications_reloading,
         notifications_epoch,
         notification_deltas,
     );
@@ -187,50 +188,73 @@ pub(crate) struct NotificationSync {
     pub refresh: bool,
 }
 
-/// Merges notification deltas into the mirror. A new `epoch` means the
-/// service replaced its ring (restart), so ids from the old ring mean nothing:
-/// the mirror and cursor are dropped and a full refetch is requested. Within
-/// one epoch, deltas at or below the cursor are late duplicates and ignored;
-/// newer ones are appended, and a refetch picks up the older items the
-/// service replaced or marked read meanwhile.
+/// Merges notification deltas into the mirror.
+///
+/// A new `epoch` means the service replaced its ring (restart), so ids from
+/// the old ring mean nothing: the mirror keeps showing the previous list and
+/// badge, ignores deltas, and asks once for the full reload that replaces
+/// it (`reloading` stays set until that reload answers).
+///
+/// Within one epoch, deltas at or below the cursor are late duplicates and
+/// ignored; newer ones are applied directly, replacing their unread
+/// predecessors by the service's own rule. Only a gap in the ids (items the
+/// service replaced or dropped before this poll saw them) asks for a reload.
 pub(crate) fn sync_notifications(
     notifications: &mut Vec<SessionNotification>,
     latest_id: &mut u64,
-    current_epoch: &mut Option<Uuid>,
+    current_epoch: Option<Uuid>,
+    reloading: &mut bool,
     epoch: Uuid,
     deltas: Vec<SessionNotification>,
 ) -> NotificationSync {
-    if *current_epoch != Some(epoch) {
-        let changed = !notifications.is_empty();
-        notifications.clear();
-        *latest_id = 0;
-        *current_epoch = Some(epoch);
+    if current_epoch != Some(epoch) {
         return NotificationSync {
-            changed,
-            refresh: true,
+            changed: false,
+            refresh: !std::mem::replace(reloading, true),
         };
     }
-    let fresh = deltas
+    let mut fresh = deltas
         .into_iter()
         .filter(|notification| notification.id > *latest_id)
         .collect::<Vec<_>>();
     if fresh.is_empty() {
         return NotificationSync::default();
     }
-    *latest_id = fresh
+    fresh.sort_by_key(|notification| notification.id);
+    let gap = fresh
         .iter()
-        .map(|notification| notification.id)
-        .max()
-        .unwrap_or(*latest_id);
-    notifications.extend(fresh);
+        .zip(latest_id.saturating_add(1)..)
+        .any(|(notification, expected)| notification.id != expected);
+    for incoming in fresh {
+        notifications.retain(|existing| !existing.replaced_by(&incoming));
+        *latest_id = incoming.id;
+        notifications.push(incoming);
+    }
     let overflow = notifications
         .len()
         .saturating_sub(NOTIFICATION_RING_CAPACITY);
     notifications.drain(..overflow);
     NotificationSync {
         changed: true,
-        refresh: true,
+        refresh: gap && !std::mem::replace(reloading, true),
     }
+}
+
+/// Applies a full notification reload: the mirror, its cursor, and its
+/// epoch become the service's, and deltas apply again.
+pub(crate) fn replace_notifications(
+    session: &mut SessionState,
+    items: Vec<SessionNotification>,
+    epoch: Uuid,
+) {
+    session.notifications_latest_id = items
+        .iter()
+        .map(|notification| notification.id)
+        .max()
+        .unwrap_or(0);
+    session.notifications = items;
+    session.notifications_epoch = Some(epoch);
+    session.notifications_reloading = false;
 }
 #[cfg(test)]
 mod tests {
@@ -262,6 +286,7 @@ mod tests {
             notifications: Vec::new(),
             notifications_latest_id: 0,
             notifications_epoch: Some(EPOCH),
+            notifications_reloading: false,
             dock_badge: None,
             last_delivery: HashMap::new(),
             window_active: true,
@@ -460,31 +485,82 @@ mod tests {
     }
 
     #[test]
-    fn a_new_epoch_drops_the_mirror_and_its_cursor_and_refetches() {
+    fn a_new_epoch_keeps_the_previous_list_until_the_full_reload_replaces_it() {
         let mut session = session_state();
         session.notifications_latest_id = 30;
-        session.notifications = vec![notification(30)];
+        session.notifications = vec![notification(29), notification(30)];
+        let shown = session.notifications.clone();
         let restarted = Uuid::from_u128(0xbeef);
-        // The restarted service's ids start over below the old cursor.
+        // The restarted service's ids mean nothing against the old cursor.
         let outcome = deltas(&mut session, restarted, vec![notification(2)]);
-        assert!(session.notifications.is_empty());
-        assert_eq!(session.notifications_latest_id, 0);
-        assert_eq!(session.notifications_epoch, Some(restarted));
+        assert_eq!(session.notifications, shown, "list and badge stay up");
+        assert_eq!(session.notifications_latest_id, 30);
         assert!(outcome.notifications_need_refresh);
-        assert!(outcome.state_changed);
+        assert!(!outcome.state_changed);
 
+        // Polls before the reload answers neither apply deltas nor ask again.
         let outcome = deltas(&mut session, restarted, vec![notification(3)]);
-        assert_eq!(session.notifications, vec![notification(3)]);
+        assert_eq!(session.notifications, shown);
+        assert!(!outcome.notifications_need_refresh);
+
+        replace_notifications(
+            &mut session,
+            vec![notification(2), notification(3)],
+            restarted,
+        );
+        assert_eq!(
+            session.notifications,
+            vec![notification(2), notification(3)]
+        );
         assert_eq!(session.notifications_latest_id, 3, "the new ring's cursor");
+        let mut message = notification(4);
+        message.kind = NotificationKind::Message;
+        let outcome = deltas(&mut session, restarted, vec![message]);
+        assert_eq!(session.notifications.len(), 3, "deltas apply again");
+        assert!(!outcome.notifications_need_refresh);
+    }
+
+    #[test]
+    fn new_deltas_apply_directly_and_only_a_gap_triggers_a_full_reload() {
+        let mut session = session_state();
+        session.notifications_latest_id = 6;
+        let mut earlier = notification(6);
+        earlier.at_ms = 1_000;
+        let mut other_pane = notification(5);
+        other_pane.pane_id = Uuid::from_u128(5);
+        session.notifications = vec![other_pane.clone(), earlier];
+
+        // The pane finishes again within the dedupe window: the service
+        // replaced id 6 with id 7, and the mirror does the same.
+        let mut repeat = notification(7);
+        repeat.at_ms = 3_000;
+        let outcome = deltas(&mut session, EPOCH, vec![repeat.clone()]);
+        assert_eq!(
+            session.notifications,
+            vec![other_pane.clone(), repeat.clone()]
+        );
+        assert_eq!(session.notifications_latest_id, 7);
+        assert!(outcome.state_changed);
         assert!(
-            outcome.notifications_need_refresh,
-            "picks up replaced items"
+            !outcome.notifications_need_refresh,
+            "an ordinary delta needs no 200-item reload"
+        );
+
+        // Id 8 never arrived (replaced before this poll): reload once.
+        let outcome = deltas(&mut session, EPOCH, vec![notification(9)]);
+        assert_eq!(session.notifications_latest_id, 9);
+        assert!(outcome.notifications_need_refresh);
+        let outcome = deltas(&mut session, EPOCH, vec![notification(11)]);
+        assert!(
+            !outcome.notifications_need_refresh,
+            "one reload in flight at a time"
         );
     }
 
     #[test]
     fn every_kind_is_kept_and_late_duplicates_are_ignored() {
         let mut session = session_state();
+        session.notifications_latest_id = 6;
         let mut message = notification(8);
         message.kind = NotificationKind::Message;
         let mut attention = notification(9);

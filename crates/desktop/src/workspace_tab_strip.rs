@@ -208,7 +208,12 @@ impl HhApp {
                             let Some(pane_id) = pane_id else {
                                 return;
                             };
-                            this.open_tab_menu(pane_id, event.position, cx);
+                            this.open_tab_menu(
+                                pane_id,
+                                event.position,
+                                crate::notifications::SeenScope::Tab,
+                                cx,
+                            );
                             cx.stop_propagation();
                         }),
                     )

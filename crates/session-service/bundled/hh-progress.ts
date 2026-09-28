@@ -163,7 +163,17 @@ export default function harnessHarlotProgress(pi: ExtensionAPI): void {
     }
   });
 
-  for (const name of ["session_start", "session_switch", "session_branch", "session_tree"] as const) {
+  // Also after every turn and agent run: `/todo` edits and todos a subagent
+  // completes change the branch without a main-agent `todo` result. Repeats
+  // of the last report are skipped.
+  for (const name of [
+    "session_start",
+    "session_switch",
+    "session_branch",
+    "session_tree",
+    "turn_end",
+    "agent_end",
+  ] as const) {
     pi.on(name, async (_event: unknown, ctx: ExtensionContext) => {
       reconstruct(ctx);
     });

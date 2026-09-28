@@ -214,6 +214,26 @@ pub struct SessionNotification {
     pub read: bool,
 }
 
+/// Window within which a new finish or attention event replaces the same
+/// pane's unread event of the same kind instead of adding another row.
+pub const NOTIFICATION_DEDUPE_MS: u64 = 5_000;
+
+impl SessionNotification {
+    /// Whether `incoming` replaces this stored item: both are unread
+    /// `Completed` or `Attention` events of the same kind for the same pane,
+    /// at most `NOTIFICATION_DEDUPE_MS` apart in either direction. The
+    /// service and the desktop mirror apply the same rule.
+    pub fn replaced_by(&self, incoming: &Self) -> bool {
+        matches!(
+            incoming.kind,
+            NotificationKind::Completed | NotificationKind::Attention
+        ) && !self.read
+            && self.pane_id == incoming.pane_id
+            && self.kind == incoming.kind
+            && self.at_ms.abs_diff(incoming.at_ms) <= NOTIFICATION_DEDUPE_MS
+    }
+}
+
 /// Per-response, content-free measurements for the pane stream hot path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamDiagnostics {
@@ -366,6 +386,40 @@ pub enum DropPlacement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event(kind: NotificationKind, at_ms: u64) -> SessionNotification {
+        SessionNotification {
+            id: 1,
+            pane_id: Uuid::from_u128(1),
+            workspace_id: Uuid::from_u128(2),
+            kind,
+            message: None,
+            pane_title: "omp".to_owned(),
+            workspace_title: "Main".to_owned(),
+            profile: TerminalProfile::Omp,
+            at_ms,
+            read: false,
+        }
+    }
+
+    /// Audit finding 17: an event older than a stored one must not wipe
+    /// newer unread items outside the dedupe window.
+    #[test]
+    fn dedupe_is_symmetric_and_bounded_by_the_window() {
+        let stored = event(NotificationKind::Completed, 100_000);
+        assert!(stored.replaced_by(&event(NotificationKind::Completed, 104_000)));
+        assert!(stored.replaced_by(&event(NotificationKind::Completed, 96_000)));
+        assert!(!stored.replaced_by(&event(NotificationKind::Completed, 10_000)));
+        assert!(!stored.replaced_by(&event(NotificationKind::Completed, 190_000)));
+        assert!(!stored.replaced_by(&event(NotificationKind::Attention, 100_000)));
+        assert!(!stored.replaced_by(&event(NotificationKind::Message, 100_000)));
+        let mut read = stored.clone();
+        read.read = true;
+        assert!(!read.replaced_by(&event(NotificationKind::Completed, 100_000)));
+        let mut other_pane = event(NotificationKind::Completed, 100_000);
+        other_pane.pane_id = Uuid::from_u128(9);
+        assert!(!stored.replaced_by(&other_pane));
+    }
 
     fn progress(done: u32, total: u32) -> PaneProgress {
         PaneProgress {

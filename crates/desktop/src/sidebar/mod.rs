@@ -7,6 +7,7 @@ use crate::helpers::{
     render_robot_icon, render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
     top_level_workstation, workstation_banner_header_height,
 };
+use crate::notifications::SeenScope;
 use crate::tab_chrome::render_unread_dot;
 use crate::view_models::{
     Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView, UpdateRestartConfirmation,
@@ -691,9 +692,9 @@ impl HhApp {
                 if let Some(tab_id) = tab_id.filter(|_| bot_row) {
                     this.open_bot_pane(workspace_id, tab_id, pane_id, cx);
                 } else if let Some(tab_id) = tab_id {
-                    this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+                    this.select_sidebar_pane(workspace_id, tab_id, pane_id, SeenScope::Pane, cx);
                 } else {
-                    this.select_workspace_tab(workspace_id, pane_id, cx);
+                    this.select_workspace_tab(workspace_id, pane_id, SeenScope::Pane, cx);
                 }
                 cx.stop_propagation();
             }))
@@ -769,7 +770,7 @@ impl HhApp {
                     if bot_row {
                         this.open_bot_menu(workspace_id, event.position, cx);
                     } else {
-                        this.open_tab_menu(pane_id, event.position, cx);
+                        this.open_tab_menu(pane_id, event.position, SeenScope::Pane, cx);
                     }
                     cx.stop_propagation();
                 }),
@@ -1032,7 +1033,7 @@ impl HhApp {
                                         .into()
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.select_workspace(workspace_id, cx)
+                                        this.select_workspace(workspace_id, SeenScope::Tab, cx)
                                     }))
                                     .on_key_down(cx.listener(
                                         move |this, event: &KeyDownEvent, _, cx| {
@@ -1040,7 +1041,11 @@ impl HhApp {
                                                 event.keystroke.key.as_str(),
                                                 "enter" | "space"
                                             ) {
-                                                this.select_workspace(workspace_id, cx);
+                                                this.select_workspace(
+                                                    workspace_id,
+                                                    SeenScope::Tab,
+                                                    cx,
+                                                );
                                                 cx.stop_propagation();
                                             }
                                         },

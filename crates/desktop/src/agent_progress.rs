@@ -4,6 +4,7 @@
 //! install|uninstall|status` and by Settings. Nothing is written unless the
 //! user asks for it.
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -65,7 +66,7 @@ pub(crate) enum InstallState {
     Installed,
     /// The omp extension file was edited by hand; it is left alone.
     Modified,
-    /// An older Harness Harlot version (or another `hh` path) is installed.
+    /// An older Harness Harlot version (or another `hh` binary) is installed.
     Outdated,
 }
 
@@ -89,25 +90,30 @@ pub(crate) struct InstallReport {
 /// Where each integration lives and which `hh` the hooks run.
 #[derive(Clone, Debug)]
 struct Locations {
-    home: PathBuf,
     omp_agent_dir: PathBuf,
+    claude_config_dir: PathBuf,
+    codex_home: PathBuf,
+    /// Canonical (symlink-free) `hh`, so every install writes the same command.
     hh: PathBuf,
 }
 
 impl Locations {
     fn from_env() -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-            .context("HOME is not set")?;
-        let omp_agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
-            .filter(|dir| !dir.is_empty())
-            .map_or_else(|| home.join(".omp/agent"), PathBuf::from);
         let hh = std::env::current_exe().context("resolve the hh executable")?;
+        Self::from_vars(|name| std::env::var_os(name), &hh)
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<OsString>, hh: &Path) -> Result<Self> {
+        let var = |name: &str| var(name).filter(|value| !value.is_empty());
+        let home = var("HOME").map(PathBuf::from).context("HOME is not set")?;
+        let dir = |variable: &str, default: &str| {
+            var(variable).map_or_else(|| home.join(default), PathBuf::from)
+        };
         Ok(Self {
-            home,
-            omp_agent_dir,
-            hh,
+            omp_agent_dir: dir("PI_CODING_AGENT_DIR", ".omp/agent"),
+            claude_config_dir: dir("CLAUDE_CONFIG_DIR", ".claude"),
+            codex_home: dir("CODEX_HOME", ".codex"),
+            hh: canonical(hh),
         })
     }
 
@@ -117,10 +123,15 @@ impl Locations {
                 .omp_agent_dir
                 .join("extensions")
                 .join(OMP_EXTENSION_FILE),
-            ProgressAgent::Claude => self.home.join(".claude/settings.json"),
-            ProgressAgent::Codex => self.home.join(".codex/hooks.json"),
+            ProgressAgent::Claude => self.claude_config_dir.join("settings.json"),
+            ProgressAgent::Codex => self.codex_home.join("hooks.json"),
         }
     }
+}
+
+/// `path` without symlinks, or as given when it cannot be resolved.
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The file an install writes for `agent`.
@@ -251,6 +262,8 @@ fn omp_state(existing: Option<&str>) -> InstallState {
 struct HookSpec {
     matcher: &'static str,
     command: String,
+    /// Canonical `hh` of `command`.
+    hh: PathBuf,
     /// Arguments that identify our hook whatever `hh` path it runs.
     suffix: &'static str,
 }
@@ -258,12 +271,19 @@ struct HookSpec {
 impl HookSpec {
     fn new(agent: ProgressAgent, hh: &Path) -> Self {
         let (matcher, suffix) = match agent {
-            ProgressAgent::Codex => ("^update_plan$", " progress hook codex"),
-            ProgressAgent::Claude | ProgressAgent::Omp => ("TodoWrite", " progress hook claude"),
+            ProgressAgent::Codex => (
+                hh_protocol::CODEX_PROGRESS_HOOK_MATCHER,
+                " progress hook codex",
+            ),
+            ProgressAgent::Claude | ProgressAgent::Omp => (
+                hh_protocol::CLAUDE_PROGRESS_HOOK_MATCHER,
+                " progress hook claude",
+            ),
         };
         Self {
             matcher,
             command: format!("{}{suffix}", shell_quote(&hh.to_string_lossy())),
+            hh: canonical(hh),
             suffix,
         }
     }
@@ -273,11 +293,46 @@ impl HookSpec {
             .and_then(Value::as_str)
             .is_some_and(|command| command.trim_end().ends_with(self.suffix))
     }
+
+    /// Whether `command` runs this `hh`, through whatever symlinked path.
+    fn runs_our_hh(&self, command: &str) -> bool {
+        if command == self.command {
+            return true;
+        }
+        command
+            .trim_end()
+            .strip_suffix(self.suffix)
+            .and_then(shell_unquote)
+            .is_some_and(|program| canonical(Path::new(&program)) == self.hh)
+    }
 }
 
 /// Single-quotes `text` for POSIX shells.
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// Reverses `shell_quote`; also accepts a bare word without quoting or escapes.
+fn shell_unquote(text: &str) -> Option<String> {
+    let text = text.trim();
+    if !text.starts_with('\'') {
+        return (!text.is_empty() && !text.contains(['"', '\\', '$', '`', ' ', '\'']))
+            .then(|| text.to_owned());
+    }
+    let mut unquoted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(quoted) = rest.strip_prefix('\'') {
+        let (literal, after) = quoted.split_once('\'')?;
+        unquoted.push_str(literal);
+        rest = match after.strip_prefix(r"\'") {
+            Some(after) => {
+                unquoted.push('\'');
+                after
+            }
+            None => after,
+        };
+    }
+    rest.is_empty().then_some(unquoted)
 }
 
 fn post_tool_use(settings: &Value) -> Option<&Vec<Value>> {
@@ -295,7 +350,9 @@ fn hook_state(settings: &Value, spec: &HookSpec) -> InstallState {
             .filter(|hook| spec.is_ours(hook))
         {
             let command = hook.get("command").and_then(Value::as_str);
-            if matcher == Some(spec.matcher) && command == Some(spec.command.as_str()) {
+            if matcher == Some(spec.matcher)
+                && command.is_some_and(|command| spec.runs_our_hh(command))
+            {
                 return InstallState::Installed;
             }
             state = InstallState::Outdated;
@@ -394,8 +451,22 @@ fn write_json(path: &Path, settings: &Value) -> Result<()> {
 }
 
 /// Replaces `path` through a same-directory temporary and a rename. An existing
-/// file keeps its permissions; a new one is owner-only.
+/// file keeps its permissions; a new one is owner-only. A symlink (e.g. from a
+/// dotfile manager) stays in place and its target is replaced instead.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let resolved;
+    let path = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            resolved = fs::canonicalize(path).with_context(|| {
+                format!(
+                    "{} is a symlink whose target cannot be resolved; fix the link first",
+                    path.display()
+                )
+            })?;
+            resolved.as_path()
+        }
+        _ => path,
+    };
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
@@ -444,8 +515,9 @@ mod tests {
             fs::create_dir_all(&home).unwrap();
             let locations = Locations {
                 omp_agent_dir: home.join(".omp/agent"),
+                claude_config_dir: home.join(".claude"),
+                codex_home: home.join(".codex"),
                 hh: PathBuf::from("/Applications/Harness Harlot.app/Contents/MacOS/hh"),
-                home,
             };
             Self { root, locations }
         }
@@ -550,7 +622,7 @@ mod tests {
         assert_eq!(
             fixture.read_json(claude),
             json!({ "hooks": { "PostToolUse": [{
-                "matcher": "TodoWrite",
+                "matcher": "TodoWrite|TaskCreate|TaskUpdate",
                 "hooks": [{
                     "type": "command",
                     "command": "'/Applications/Harness Harlot.app/Contents/MacOS/hh' progress hook claude",
@@ -671,5 +743,197 @@ mod tests {
     #[test]
     fn shell_quoting_survives_single_quotes() {
         assert_eq!(shell_quote("/a b/it's/hh"), r"'/a b/it'\''s/hh'");
+        assert_eq!(
+            shell_unquote(&shell_quote("/a b/it's/hh")).as_deref(),
+            Some("/a b/it's/hh")
+        );
+        assert_eq!(
+            shell_unquote("/usr/local/bin/hh").as_deref(),
+            Some("/usr/local/bin/hh")
+        );
+        assert_eq!(shell_unquote("'/a' b"), None);
+        assert_eq!(shell_unquote("$(evil)"), None);
+    }
+
+    #[test]
+    fn a_todo_write_only_claude_hook_is_outdated_and_replaced() {
+        let fixture = Fixture::new();
+        let claude = ProgressAgent::Claude;
+        let path = fixture.locations.target(claude);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let command = "'/Applications/Harness Harlot.app/Contents/MacOS/hh' progress hook claude";
+        fs::write(
+            &path,
+            json!({ "hooks": { "PostToolUse": [{
+                "matcher": "TodoWrite",
+                "hooks": [{ "type": "command", "command": command }],
+            }]}})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            status_at(&fixture.locations, claude).unwrap(),
+            InstallState::Outdated
+        );
+        install_at(&fixture.locations, claude).unwrap();
+        assert_eq!(
+            fixture.read_json(claude),
+            json!({ "hooks": { "PostToolUse": [{
+                "matcher": hh_protocol::CLAUDE_PROGRESS_HOOK_MATCHER,
+                "hooks": [{ "type": "command", "command": command }],
+            }]}})
+        );
+    }
+
+    #[test]
+    fn install_writes_through_a_symlinked_settings_file() {
+        let fixture = Fixture::new();
+        let dotfiles = fixture.root.join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        for (agent, name) in [
+            (ProgressAgent::Claude, "claude-settings.json"),
+            (ProgressAgent::Codex, "codex-hooks.json"),
+        ] {
+            let target = dotfiles.join(name);
+            fs::write(&target, r#"{ "model": "opus" }"#).unwrap();
+            let link = fixture.locations.target(agent);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            install_at(&fixture.locations, agent).unwrap();
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            let installed: Value =
+                serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+            assert_eq!(installed["model"], "opus");
+            assert_eq!(
+                status_at(&fixture.locations, agent).unwrap(),
+                InstallState::Installed
+            );
+
+            uninstall_at(&fixture.locations, agent).unwrap();
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            let removed: Value =
+                serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+            assert_eq!(removed["model"], "opus");
+            assert_eq!(
+                status_at(&fixture.locations, agent).unwrap(),
+                InstallState::NotInstalled
+            );
+        }
+
+        // A dangling link is refused rather than replaced by a plain file.
+        let dangling = fixture.root.join("elsewhere/settings.json");
+        let claude = fixture.locations.target(ProgressAgent::Claude);
+        fs::remove_file(&claude).unwrap();
+        std::os::unix::fs::symlink(&dangling, &claude).unwrap();
+        assert!(install_at(&fixture.locations, ProgressAgent::Claude).is_err());
+        assert!(
+            fs::symlink_metadata(&claude)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn a_hook_through_a_symlink_to_the_same_hh_counts_as_installed() {
+        let mut fixture = Fixture::new();
+        let app = fixture.root.join("Harness Harlot.app/Contents/MacOS");
+        fs::create_dir_all(&app).unwrap();
+        let real = app.join("hh");
+        fs::write(&real, "").unwrap();
+        let bin = fixture.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let link = bin.join("hh");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Running `hh` through the link installs the canonical path.
+        let home = fixture.root.join("home");
+        fixture.locations =
+            Locations::from_vars(|name| (name == "HOME").then(|| home.clone().into()), &link)
+                .unwrap();
+        let codex = ProgressAgent::Codex;
+        install_at(&fixture.locations, codex).unwrap();
+        let canonical_real = fs::canonicalize(&real).unwrap();
+        assert_eq!(
+            fixture.read_json(codex)["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            format!(
+                "{} progress hook codex",
+                shell_quote(&canonical_real.to_string_lossy())
+            )
+        );
+
+        // An entry written with the symlinked path is still ours and current.
+        let path = fixture.locations.target(codex);
+        fs::write(
+            &path,
+            json!({ "hooks": { "PostToolUse": [{
+                "matcher": hh_protocol::CODEX_PROGRESS_HOOK_MATCHER,
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{} progress hook codex", shell_quote(&link.to_string_lossy())),
+                }],
+            }]}})
+            .to_string(),
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            status_at(&fixture.locations, codex).unwrap(),
+            InstallState::Installed
+        );
+        install_at(&fixture.locations, codex).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn locations_honor_config_directory_overrides() {
+        let hh = Path::new("/opt/hh");
+        let defaults = Locations::from_vars(
+            |name| (name == "HOME").then(|| OsString::from("/home/me")),
+            hh,
+        )
+        .unwrap();
+        assert_eq!(
+            defaults.target(ProgressAgent::Claude),
+            Path::new("/home/me/.claude/settings.json")
+        );
+        assert_eq!(
+            defaults.target(ProgressAgent::Codex),
+            Path::new("/home/me/.codex/hooks.json")
+        );
+        let custom = Locations::from_vars(
+            |name| match name {
+                "HOME" => Some("/home/me".into()),
+                "CLAUDE_CONFIG_DIR" => Some("/cfg/claude".into()),
+                "CODEX_HOME" => Some("/cfg/codex".into()),
+                "PI_CODING_AGENT_DIR" => Some("/cfg/omp".into()),
+                _ => None,
+            },
+            hh,
+        )
+        .unwrap();
+        assert_eq!(
+            custom.target(ProgressAgent::Claude),
+            Path::new("/cfg/claude/settings.json")
+        );
+        assert_eq!(
+            custom.target(ProgressAgent::Codex),
+            Path::new("/cfg/codex/hooks.json")
+        );
+        assert_eq!(
+            custom.target(ProgressAgent::Omp),
+            Path::new("/cfg/omp/extensions/harness-harlot-progress.ts")
+        );
     }
 }

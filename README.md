@@ -170,8 +170,9 @@ Every terminal tab shows what its agent is doing:
   Accessibility, or GNOME's animations switched off) the border stays solid.
 - **Progress ring** — the agent is working. Agents that keep a task list fill
   the ring as tasks complete, shading from red through amber to green; hover
-  it for "3 of 7 done" and the current task. Other running agents show a
-  spinning blue ring.
+  it for "3 of 7 done" and the current task. Claude Code and Codex show it
+  while their task list is unfinished. Other running agents show a spinning
+  blue ring.
 - **Blue dot** — the agent finished (or needed you) while you were elsewhere.
   It stays until you look: click the tab or pane, switch to its tab or
   workstation, click its notification, or type into it. Merely having the
@@ -181,8 +182,10 @@ The bell switches the sidebar to Notifications: **Needs you** and **Running**
 list live terminal tabs and bots, and **Recent** keeps the last 200 finished
 and attention notifications across restarts, newest first, unread ones marked
 with a blue dot. **Mark all read** clears them; clicking any row jumps to its
-pane and marks it seen. The bell and Dock badges count unread notifications:
-orange when one of them needs you, blue otherwise.
+pane and marks it seen, and viewing a pane marks its notifications read. The
+bell counts unread notifications: orange when one of them needs you (an agent
+asks for input or approval), blue otherwise. The Dock icon shows the same count
+in macOS's standard red badge.
 
 ### Task progress from agents
 
@@ -191,14 +194,16 @@ task progress**, or from a terminal:
 
 ```bash
 hh progress install omp      # omp extension in ~/.omp/agent/extensions (or $PI_CODING_AGENT_DIR)
-hh progress install claude   # TodoWrite hook in ~/.claude/settings.json
-hh progress install codex    # update_plan hook in ~/.codex/hooks.json
+hh progress install claude   # task tools hook in ~/.claude/settings.json (or $CLAUDE_CONFIG_DIR)
+hh progress install codex    # update_plan hook in ~/.codex/hooks.json (or $CODEX_HOME)
 hh progress status           # add --json for machine-readable output
 hh progress uninstall claude
 ```
 
-Installing keeps every other setting and hook and never replaces an omp
-extension file you edited. Codex asks you to trust the new hook the next time
+Installing keeps every other setting and hook, writes through a symlinked
+settings file, and never replaces an omp extension file you edited. The Claude
+Code hook follows `TaskCreate`/`TaskUpdate` (reading the session's task list)
+and the older `TodoWrite`; subagents' lists never replace the pane's. Codex asks you to trust the new hook the next time
 it starts. omp and Claude Code bots report progress without any setup. The
 integrations call `hh progress report --done N --total M [--current T]
 [--phase T] --source omp|claude|codex` and `hh progress clear` for the pane in

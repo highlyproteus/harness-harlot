@@ -188,7 +188,12 @@ impl HhApp {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.open_tab_menu(pane_id, event.position, cx);
+                            this.open_tab_menu(
+                                pane_id,
+                                event.position,
+                                crate::notifications::SeenScope::Pane,
+                                cx,
+                            );
                             cx.stop_propagation();
                         }),
                     )

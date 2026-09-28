@@ -84,16 +84,22 @@ Task progress is opt-in. Nothing is written until you click **Install** in
 - **omp**: copies the bundled progress extension to
   `~/.omp/agent/extensions/harness-harlot-progress.ts` (or the `extensions`
   folder of `$PI_CODING_AGENT_DIR`).
-- **Claude Code**: adds one `PostToolUse` hook for `TodoWrite` to
-  `~/.claude/settings.json`.
-- **Codex**: adds one `PostToolUse` hook for `update_plan` to
-  `~/.codex/hooks.json`.
+- **Claude Code**: adds one `PostToolUse` hook for `TodoWrite`, `TaskCreate`,
+  and `TaskUpdate` to `settings.json` in `$CLAUDE_CONFIG_DIR` or `~/.claude`.
+- **Codex**: adds one `PostToolUse` hook for `update_plan` to `hooks.json` in
+  `$CODEX_HOME` or `~/.codex`.
 
-The hooks run the local `hh` executable (by its absolute path). Existing
-settings and other hooks are kept; uninstalling removes only the Harness
+The hooks run the local `hh` executable (by its absolute path, with symlinks
+resolved). A symlinked settings file stays a symlink; its target is updated.
+Existing settings and other hooks are kept; uninstalling removes only the Harness
 Harlot entry, and an omp extension file you edited is never replaced or
 removed. omp and Claude Code bots get the same reporting at launch without
 changing your settings.
+
+After `TaskCreate` or `TaskUpdate`, the Claude Code hook reads Claude's task
+files for the current session (`tasks/<session or $CLAUDE_CODE_TASK_LIST_ID>/`
+in Claude's configuration folder) to count them; it reads no other files and
+changes nothing there.
 
 Inside a Harness Harlot terminal, the integrations send the pane's task counts
 (done and total), the title of the task in progress, and its phase name to the

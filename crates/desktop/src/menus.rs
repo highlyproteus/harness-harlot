@@ -2,6 +2,7 @@
 use crate::browser::{BrowserUrlEditor, browser_command_available, browser_unavailable_reason};
 use crate::commands::{AppCommand, descriptor, palette_matches};
 use crate::helpers::{element_key, find_pane};
+use crate::notifications::SeenScope;
 use crate::view_models::{
     ColorTarget, CommandPaletteState, CreateMenu, Modal, TabMenu, TabRowMenu, TooltipView,
     WorkspaceConnectionInfo, WorkspaceMenu,
@@ -44,13 +45,17 @@ pub(crate) fn menu_separator() -> AnyElement {
 }
 
 impl HhApp {
+    /// Right-click on a tab or pane: brings it on screen (which counts as
+    /// looking at it, per `seen`) and opens its menu.
     pub(crate) fn open_tab_menu(
         &mut self,
         pane_id: Uuid,
         position: Point<Pixels>,
+        seen: SeenScope,
         cx: &mut Context<Self>,
     ) {
         self.clear_menu_color_picker();
+        self.mark_seen(pane_id, seen);
         self.dispatch_with(
             ClientRequest::ActivateTab { pane_id },
             Box::new(move |this, cx, result| {

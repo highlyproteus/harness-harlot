@@ -133,7 +133,7 @@ fn heuristic_event_sets_status_and_preserves_message() {
         PaneStatus::NeedsApproval
     );
     assert_eq!(state.notifications.len(), 1);
-    assert_eq!(state.notifications[0].kind, NotificationKind::Message);
+    assert_eq!(state.notifications[0].kind, NotificationKind::Attention);
     assert_eq!(
         state.notifications[0].message.as_deref(),
         Some("Approval requested: edit src/lib.rs")

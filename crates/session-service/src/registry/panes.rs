@@ -1,7 +1,7 @@
 //! Pane lifecycle: creation, input, identity overrides, and close/reattach.
 use super::{
-    InitialTerminalSpawn, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
-    TerminalRuntimePane, encode_desired_state, ssh_pane_title,
+    InitialTerminalSpawn, ProcessScan, RegistryState, RuntimePane, RuntimePaneBackend,
+    RuntimePaneKind, SessionRegistry, TerminalRuntimePane, encode_desired_state, ssh_pane_title,
 };
 use crate::gallery::import_gallery_image;
 use crate::layout::{
@@ -105,8 +105,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -166,8 +167,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -401,8 +403,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -486,8 +489,9 @@ impl SessionRegistry {
                         },
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -715,7 +719,7 @@ impl SessionRegistry {
             Some(runtime) => runtime.terminal().map(|terminal| {
                 (
                     terminal.session.terminal_title(),
-                    terminal.detected_command_profile,
+                    terminal.process_scan.agent(),
                     terminal.location(),
                 )
             }),
@@ -769,7 +773,7 @@ impl SessionRegistry {
             Some(runtime) => runtime.terminal().map(|terminal| {
                 (
                     terminal.session.terminal_title(),
-                    terminal.detected_command_profile,
+                    terminal.process_scan.agent(),
                     terminal.location(),
                 )
             }),
@@ -901,24 +905,35 @@ impl SessionRegistry {
                 bot_id,
             )
         };
-        let session = match &kind {
-            RuntimePaneKind::Local if managed_tmux => PtySession::spawn_tmux(
-                pane_id,
-                workspace_id,
-                bot_id,
-                &cwd,
-                &self.client_for_workspace(workspace_id)?,
-            )?,
-            RuntimePaneKind::Local => PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)?,
-            RuntimePaneKind::SystemSsh { host } => {
-                PtySession::spawn_ssh(pane_id, workspace_id, host, None)?
-            }
-            RuntimePaneKind::TmuxLocal { session_id } => {
-                PtySession::spawn_tmux_local(pane_id, session_id)?
-            }
-            RuntimePaneKind::TmuxSystemSsh { host, session_id } => {
-                PtySession::spawn_tmux_ssh(pane_id, host, session_id)?
-            }
+        // Managed tmux, plain PTY and direct SSH panes get a new shell; a
+        // user tmux session is attached again with its programs still running.
+        let (session, behind) = match &kind {
+            RuntimePaneKind::Local if managed_tmux => (
+                PtySession::spawn_tmux(
+                    pane_id,
+                    workspace_id,
+                    bot_id,
+                    &cwd,
+                    &self.client_for_workspace(workspace_id)?,
+                )?,
+                Reattached::FreshShell,
+            ),
+            RuntimePaneKind::Local => (
+                PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)?,
+                Reattached::FreshShell,
+            ),
+            RuntimePaneKind::SystemSsh { host } => (
+                PtySession::spawn_ssh(pane_id, workspace_id, host, None)?,
+                Reattached::FreshShell,
+            ),
+            RuntimePaneKind::TmuxLocal { session_id } => (
+                PtySession::spawn_tmux_local(pane_id, session_id)?,
+                Reattached::RunningProgram,
+            ),
+            RuntimePaneKind::TmuxSystemSsh { host, session_id } => (
+                PtySession::spawn_tmux_ssh(pane_id, host, session_id)?,
+                Reattached::RunningProgram,
+            ),
         };
         if kind.is_runtime_only()
             && let Err(error) = session.confirm_live_for_tmux_attach()
@@ -927,22 +942,15 @@ impl SessionRegistry {
             return Err(error);
         }
         let mut state = self.state.write();
-        let runtime = state.terminal_pane_mut(pane_id)?;
-        let previous = std::mem::replace(&mut runtime.session, session);
-        runtime.exit_status = None;
-        runtime.recovered = false;
-        runtime.omp_title_status = None;
-        state.clear_pane_progress(pane_id);
-        let shell_label = kind.shell_label();
-        set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, &shell_label);
-        state.set_pane_status(pane_id, PaneStatus::Idle);
+        let previous = state.install_reattached_session(pane_id, session, behind)?;
         refresh_workspace_activity(&mut state);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
         let _ = previous.terminate_and_wait();
         drop(previous);
-        if let Some(bot_id) = bot_id {
+        // Only a fresh shell needs the bot's agent typed into it again.
+        if let Some(bot_id) = bot_id.filter(|_| behind == Reattached::FreshShell) {
             self.relaunch_recovered_bot(bot_id, pane_id);
         }
         self.write_snapshot(&bytes)
@@ -1108,6 +1116,42 @@ impl SessionRegistry {
 
     pub fn pane_process_id(&self, pane_id: Uuid) -> Result<Option<u32>> {
         Ok(self.pane(pane_id)?.process_id())
+    }
+}
+
+/// What a reattach put behind a pane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Reattached {
+    /// A new shell: the old program, its status and its progress are gone.
+    FreshShell,
+    /// The program that was running all along, attached again.
+    RunningProgram,
+}
+
+impl RegistryState {
+    /// Puts `session` behind terminal pane `pane_id` after a reattach and
+    /// returns the session it replaces. A fresh shell starts Idle without
+    /// progress; a still-running program keeps both, and its next omp title
+    /// is a baseline rather than news.
+    pub(crate) fn install_reattached_session(
+        &mut self,
+        pane_id: Uuid,
+        session: Arc<PtySession>,
+        behind: Reattached,
+    ) -> Result<Arc<PtySession>> {
+        let runtime = self.terminal_pane_mut(pane_id)?;
+        let previous = std::mem::replace(&mut runtime.session, session);
+        runtime.exit_status = None;
+        runtime.recovered = false;
+        runtime.omp_title_status = None;
+        runtime.title_baseline_pending = behind == Reattached::RunningProgram;
+        let shell_label = runtime.kind.shell_label();
+        set_pane_runtime_label(&mut self.snapshot, pane_id, false, None, &shell_label);
+        if behind == Reattached::FreshShell {
+            self.clear_pane_progress(pane_id);
+            self.set_pane_status(pane_id, PaneStatus::Idle);
+        }
+        Ok(previous)
     }
 }
 
