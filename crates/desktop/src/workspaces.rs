@@ -1,13 +1,13 @@
 //! Workstation selection, ordering, directory editors, and tmux trio.
 
 use crate::helpers::{
-    WorkspaceTabScope, append_rename_text, find_pane, resolved_terminal_accent,
-    resolved_workspace_color, visible_panes, workspace_scope_for_tab, workspace_tab_click_target,
+    append_rename_text, child_workstations, find_pane, resolved_terminal_accent,
+    resolved_workspace_color, same_machine, visible_panes, workspace_tab_click_target,
     workspace_tab_standalone_pane,
 };
 use crate::view_models::{
-    DirEditor, DirEditorTarget, Modal, TmuxSelectionChange, TmuxSessionPicker,
-    WorkspaceConnectionInfo, WorkspaceCreationDialog, WorkspaceCreationField,
+    CreationParent, DialogTextEditor, DirEditor, DirEditorTarget, Modal, TmuxSelectionChange,
+    TmuxSessionPicker, WorkspaceConnectionInfo, WorkspaceCreationDialog, WorkspaceCreationField,
     WorkspaceCreationKind, WorkspaceCreationStep, WorkspaceDeleteConfirmation,
     WorkspaceDisconnectConfirmation, WorkspaceRenameEditor,
 };
@@ -15,7 +15,8 @@ use crate::{DRAG_CLICK_SUPPRESSION_MS, HhApp};
 use gpui::{Context, Pixels, Point, Window};
 use hh_protocol::{
     AppearanceColor, ClientRequest, ServiceResponse, TmuxScanScope, Workspace, WorkspaceConnection,
-    WorkspaceConnectionStatus, validate_workspace_dir,
+    WorkspaceConnectionStatus, effective_working_dir, validate_workspace_dir,
+    workstation_descendants,
 };
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -88,9 +89,29 @@ impl HhApp {
         self.begin_workspace_creation(cx);
     }
 
-    pub(crate) fn select_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        self.sidebar.workspace_tab_scope = WorkspaceTabScope::Workstation;
+    /// Expands `workspace_id` and every workstation enclosing it, so its card
+    /// is visible in the sidebar tree.
+    pub(crate) fn reveal_workspace(&mut self, workspace_id: Uuid) {
         self.sidebar.expanded_workspaces.insert(workspace_id);
+        let Some(snapshot) = self.session.snapshot.as_ref() else {
+            return;
+        };
+        let mut current = Some(workspace_id);
+        for _ in 0..snapshot.workspaces.len() {
+            let Some(id) = current else {
+                break;
+            };
+            self.sidebar.expanded_workspaces.insert(id);
+            current = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == id)
+                .and_then(|workspace| workspace.parent_workstation);
+        }
+    }
+
+    pub(crate) fn select_workspace(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
+        self.reveal_workspace(workspace_id);
         self.sidebar.active_workspace = Some(workspace_id);
         let first_pane = self.session.snapshot.as_ref().and_then(|snapshot| {
             snapshot
@@ -112,30 +133,11 @@ impl HhApp {
         index: usize,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut workspace_ids = self
-            .session
-            .snapshot
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .workspaces
-                    .iter()
-                    .filter(|workspace| !workspace.is_bot())
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        workspace_ids.sort_by_key(|workspace| {
-            (
-                !workspace.pinned,
-                if workspace.pinned {
-                    workspace.pin_order
-                } else {
-                    u32::MAX
-                },
-            )
-        });
-        let Some(workspace_id) = workspace_ids.get(index).map(|workspace| workspace.id) else {
+        let Some(workspace_id) = self.session.snapshot.as_ref().and_then(|snapshot| {
+            child_workstations(&snapshot.workspaces, None)
+                .get(index)
+                .map(|workspace| workspace.id)
+        }) else {
             return false;
         };
         self.select_workspace(workspace_id, cx);
@@ -149,7 +151,6 @@ impl HhApp {
         pane_id: Uuid,
         cx: &mut Context<Self>,
     ) {
-        let switched_workspace = self.sidebar.active_workspace != Some(workspace_id);
         let selected_tab_id = self.session.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .workspaces
@@ -169,9 +170,6 @@ impl HhApp {
                 match result {
                     Ok(ServiceResponse::Ack) => {
                         this.sidebar.active_workspace = Some(workspace_id);
-                        if switched_workspace {
-                            this.sidebar.workspace_tab_scope = WorkspaceTabScope::Workstation;
-                        }
                         let refreshed_pane_id = selected_tab_id.map_or(Some(pane_id), |tab_id| {
                             this.session.snapshot.as_ref().and_then(|snapshot| {
                                 snapshot
@@ -244,23 +242,9 @@ impl HhApp {
         pane_id: Uuid,
         cx: &mut Context<Self>,
     ) {
-        let scope = self
-            .session
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.id == workspace_id)
-            })
-            .map_or(WorkspaceTabScope::Workstation, |workspace| {
-                workspace_scope_for_tab(workspace, tab_id)
-            });
         self.sidebar.dismissed_workspace_tabs.remove(&tab_id);
         self.mark_pane_viewed(pane_id);
         self.select_workspace_tab(workspace_id, pane_id, cx);
-        self.sidebar.workspace_tab_scope = scope;
         cx.notify();
     }
 
@@ -279,21 +263,55 @@ impl HhApp {
         })
     }
 
-    pub(crate) fn workspace_id_for_tab(&self, tab_id: Uuid) -> Option<Uuid> {
-        self.session.snapshot.as_ref().and_then(|snapshot| {
+    pub(crate) fn begin_workspace_creation(&mut self, cx: &mut Context<Self>) {
+        self.open_workspace_creation(WorkspaceCreationDialog::new(), cx);
+    }
+
+    /// Opens the New Workstation dialog for a workstation nested in
+    /// `parent_id`, on the parent's machine.
+    pub(crate) fn begin_nested_workspace_creation(
+        &mut self,
+        parent_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let parent = self.session.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .workspaces
                 .iter()
-                .find(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id))
-                .map(|workspace| workspace.id)
-        })
+                .find(|workspace| workspace.id == parent_id)
+                .map(|workspace| CreationParent {
+                    workspace_id: parent_id,
+                    title: workspace.title.clone(),
+                    remote: matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. }),
+                })
+        });
+        if let Some(parent) = parent {
+            self.open_workspace_creation(WorkspaceCreationDialog::nested(parent), cx);
+        }
     }
 
-    pub(crate) fn begin_workspace_creation(&mut self, cx: &mut Context<Self>) {
-        self.editor.modal = Modal::WorkspaceCreation(WorkspaceCreationDialog::new());
+    fn open_workspace_creation(&mut self, dialog: WorkspaceCreationDialog, cx: &mut Context<Self>) {
+        self.editor.modal = Modal::WorkspaceCreation(dialog);
         self.editor.workspace_input_layouts = [None, None, None, None];
         self.editor.workspace_input_bounds = [None, None, None, None];
         cx.notify();
+    }
+
+    /// Fills the New Workstation dialog's root folder from the native folder
+    /// chooser.
+    pub(crate) fn choose_workspace_creation_folder(&mut self, cx: &mut Context<Self>) {
+        self.prompt_local_directory(
+            "Choose root folder",
+            |this, dir, cx| {
+                if let Some(dialog) = this.editor.modal.workspace_creation_mut() {
+                    dialog.working_dir = DialogTextEditor::with_text(dir);
+                    dialog.field = WorkspaceCreationField::WorkingDir;
+                    dialog.error = None;
+                }
+                cx.notify();
+            },
+            cx,
+        );
     }
 
     pub(crate) fn focus_workspace_creation_field(
@@ -347,6 +365,13 @@ impl HhApp {
         else {
             return;
         };
+        let local_root = match &request_message {
+            ClientRequest::CreateWorkspace {
+                working_dir: Some(root),
+                ..
+            } => Some(root.clone()),
+            _ => None,
+        };
         self.dispatch_with(
             request_message,
             Box::new(move |this, cx, result| {
@@ -356,9 +381,12 @@ impl HhApp {
                         pane_id,
                     }) => {
                         this.sidebar.active_workspace = Some(workspace_id);
-                        this.sidebar.expanded_workspaces.insert(workspace_id);
+                        this.reveal_workspace(workspace_id);
                         this.focus_pane_with_snapshot(pane_id, cx);
                         this.editor.modal = Modal::None;
+                        if let Some(root) = local_root.clone() {
+                            this.detect_and_set_workstation_icon(workspace_id, root, cx);
+                        }
                     }
                     Ok(ServiceResponse::BotCreated {
                         workspace_id,
@@ -420,7 +448,13 @@ impl HhApp {
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
-                .map(|workspace| (workspace.connection.clone(), workspace.working_dir.clone()))
+                .map(|workspace| {
+                    (
+                        workspace.connection.clone(),
+                        effective_working_dir(&snapshot.workspaces, workspace_id)
+                            .map(str::to_owned),
+                    )
+                })
         });
         let Some((connection, working_dir)) = workspace else {
             self.editor.modal = Modal::None;
@@ -431,7 +465,7 @@ impl HhApp {
             WorkspaceConnection::Local => {
                 self.editor.modal = Modal::None;
                 self.prompt_local_directory(
-                    "Choose working directory",
+                    "Choose root folder",
                     move |this, dir, cx| {
                         this.dispatch(ClientRequest::SetWorkspaceWorkingDir {
                             workspace_id,
@@ -444,140 +478,8 @@ impl HhApp {
             }
             WorkspaceConnection::SystemSsh { .. } => {
                 self.editor.modal = Modal::DirEditor(DirEditor {
-                    target: DirEditorTarget::WorkspaceDefault(workspace_id),
+                    target: DirEditorTarget::WorkspaceRoot(workspace_id),
                     value: working_dir.unwrap_or_else(|| "/".to_owned()),
-                    replace_on_type: true,
-                    suggestions: Vec::new(),
-                });
-                cx.notify();
-            }
-        }
-    }
-
-    pub(crate) fn begin_project_creation(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        let workspace = self.session.snapshot.as_ref().and_then(|snapshot| {
-            snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == workspace_id)
-                .map(|workspace| (workspace.connection.clone(), workspace.working_dir.clone()))
-        });
-        let Some((connection, working_dir)) = workspace else {
-            self.editor.modal = Modal::None;
-            cx.notify();
-            return;
-        };
-        match connection {
-            WorkspaceConnection::Local => {
-                self.editor.modal = Modal::None;
-                self.prompt_local_directory(
-                    "Choose project folder",
-                    move |this, dir, cx| {
-                        let project_dir = dir.clone();
-                        this.dispatch_with(
-                            ClientRequest::CreateWorkspaceProject {
-                                workspace_id,
-                                working_dir: dir,
-                                title: None,
-                            },
-                            Box::new(move |this, cx, result| {
-                                match result {
-                                    Ok(ServiceResponse::PaneCreated { pane_id }) => {
-                                        this.focus_created_pane(workspace_id, pane_id, cx);
-                                        let tab_id =
-                                            this.session.snapshot.as_ref().and_then(|snapshot| {
-                                                snapshot
-                                                    .workspaces
-                                                    .iter()
-                                                    .find(|workspace| workspace.id == workspace_id)
-                                                    .and_then(|workspace| {
-                                                        workspace
-                                                            .tabs
-                                                            .iter()
-                                                            .find(|tab| {
-                                                                find_pane(&tab.layout, pane_id)
-                                                                    .is_some()
-                                                            })
-                                                            .map(|tab| tab.id)
-                                                    })
-                                            });
-                                        if let Some(tab_id) = tab_id {
-                                            this.detect_and_set_project_icon(
-                                                tab_id,
-                                                project_dir,
-                                                cx,
-                                            );
-                                        }
-                                    }
-                                    Ok(response) => this.report_unexpected(&response),
-                                    Err(error) => this.report(&error),
-                                }
-                                cx.notify();
-                            }),
-                        );
-                        this.layout.last_sizes.clear();
-                        cx.notify();
-                    },
-                    cx,
-                );
-            }
-            WorkspaceConnection::SystemSsh { .. } => {
-                self.editor.modal = Modal::DirEditor(DirEditor {
-                    target: DirEditorTarget::NewProject(workspace_id),
-                    value: working_dir.unwrap_or_else(|| "/".to_owned()),
-                    replace_on_type: true,
-                    suggestions: Vec::new(),
-                });
-                cx.notify();
-            }
-        }
-    }
-
-    pub(crate) fn begin_project_dir_edit(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        let project = self.workspace_id_for_tab(tab_id).and_then(|workspace_id| {
-            self.session.snapshot.as_ref().and_then(|snapshot| {
-                snapshot
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.id == workspace_id)
-                    .and_then(|workspace| {
-                        workspace
-                            .tabs
-                            .iter()
-                            .find(|tab| tab.id == tab_id)
-                            .map(|tab| {
-                                (
-                                    workspace.connection.clone(),
-                                    tab.project_dir.clone().unwrap_or_else(|| "/".to_owned()),
-                                )
-                            })
-                    })
-            })
-        });
-        let Some((connection, value)) = project else {
-            self.editor.modal = Modal::None;
-            cx.notify();
-            return;
-        };
-        match connection {
-            WorkspaceConnection::Local => {
-                self.editor.modal = Modal::None;
-                self.prompt_local_directory(
-                    "Choose project directory",
-                    move |this, dir, cx| {
-                        this.dispatch(ClientRequest::SetTabWorkingDir {
-                            tab_id,
-                            working_dir: dir,
-                        });
-                        cx.notify();
-                    },
-                    cx,
-                );
-            }
-            WorkspaceConnection::SystemSsh { .. } => {
-                self.editor.modal = Modal::DirEditor(DirEditor {
-                    target: DirEditorTarget::ProjectDir(tab_id),
-                    value,
                     replace_on_type: true,
                     suggestions: Vec::new(),
                 });
@@ -600,32 +502,10 @@ impl HhApp {
             return;
         }
         match editor.target {
-            DirEditorTarget::WorkspaceDefault(workspace_id) => {
+            DirEditorTarget::WorkspaceRoot(workspace_id) => {
                 self.dispatch(ClientRequest::SetWorkspaceWorkingDir {
                     workspace_id,
                     working_dir: Some(editor.value),
-                });
-            }
-            DirEditorTarget::NewProject(workspace_id) => {
-                self.dispatch_with(
-                    ClientRequest::CreateWorkspaceProject {
-                        workspace_id,
-                        working_dir: editor.value,
-                        title: None,
-                    },
-                    Box::new(move |this, cx, result| match result {
-                        Ok(ServiceResponse::PaneCreated { pane_id }) => {
-                            this.focus_created_pane(workspace_id, pane_id, cx);
-                        }
-                        Ok(response) => this.report_unexpected(&response),
-                        Err(error) => this.report(&error),
-                    }),
-                );
-            }
-            DirEditorTarget::ProjectDir(tab_id) => {
-                self.dispatch(ClientRequest::SetTabWorkingDir {
-                    tab_id,
-                    working_dir: editor.value,
                 });
             }
         }
@@ -692,15 +572,13 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) {
         if keystroke.key == "tab" {
-            let workspace_id =
-                self.editor
-                    .modal
-                    .dir_editor()
-                    .and_then(|editor| match editor.target {
-                        DirEditorTarget::WorkspaceDefault(workspace_id)
-                        | DirEditorTarget::NewProject(workspace_id) => Some(workspace_id),
-                        DirEditorTarget::ProjectDir(tab_id) => self.workspace_id_for_tab(tab_id),
-                    });
+            let workspace_id = self
+                .editor
+                .modal
+                .dir_editor()
+                .map(|editor| match editor.target {
+                    DirEditorTarget::WorkspaceRoot(workspace_id) => workspace_id,
+                });
             let ssh_workspace = workspace_id.filter(|workspace_id| {
                 self.session.snapshot.as_ref().is_some_and(|snapshot| {
                     snapshot.workspaces.iter().any(|workspace| {
@@ -807,30 +685,52 @@ impl HhApp {
         cx.notify();
     }
 
-    pub(crate) fn move_tab_to_project(
+    /// Whether a tab dragged out of `source` may move into `target`: another
+    /// non-bot workstation on the same machine.
+    pub(crate) fn accepts_tab_move(&self, source: Uuid, target: Uuid) -> bool {
+        if source == target {
+            return false;
+        }
+        let Some(snapshot) = self.session.snapshot.as_ref() else {
+            return false;
+        };
+        let find = |id: Uuid| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == id && !workspace.is_bot())
+        };
+        find(source)
+            .zip(find(target))
+            .is_some_and(|(source, target)| same_machine(&source.connection, &target.connection))
+    }
+
+    pub(crate) fn move_tab_to_workstation(
         &mut self,
         tab_id: Uuid,
-        project_tab: Uuid,
+        workspace_id: Uuid,
         cx: &mut Context<Self>,
     ) {
-        self.dispatch(ClientRequest::MoveTabToProject {
+        self.dispatch(ClientRequest::MoveTabToWorkstation {
             tab_id,
-            project_tab,
+            workspace_id,
         });
+        self.reveal_workspace(workspace_id);
         self.sidebar.tab_drop_preview = None;
+        self.sidebar.tab_drop_workspace = None;
         self.sidebar.suppress_tab_click_until =
             Some(Instant::now() + Duration::from_millis(DRAG_CLICK_SUPPRESSION_MS));
         cx.notify();
     }
 
-    pub(crate) fn move_sidebar_pane_to_group(
+    pub(crate) fn move_sidebar_pane_into_tab(
         &mut self,
         source_pane: Uuid,
         target_tab: Uuid,
         cx: &mut Context<Self>,
     ) {
         self.dispatch_with(
-            ClientRequest::MovePaneToGroup {
+            ClientRequest::MovePaneIntoTab {
                 source_pane,
                 target_tab,
             },
@@ -857,7 +757,6 @@ impl HhApp {
         source_pane: Uuid,
         target_tab: Uuid,
         after: bool,
-        parent_tab: Option<Uuid>,
         cx: &mut Context<Self>,
     ) {
         self.dispatch_with(
@@ -865,7 +764,6 @@ impl HhApp {
                 source_pane,
                 target_tab,
                 after,
-                parent_tab,
             },
             Box::new(move |this, cx, result| {
                 match result {
@@ -984,11 +882,21 @@ impl HhApp {
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
         });
-        if let Some(workspace) = workspace {
+        if let Some((workspace, snapshot)) = workspace.zip(self.session.snapshot.as_ref())
+            && !workspace.home
+        {
+            let nested = workstation_descendants(&snapshot.workspaces, workspace_id);
+            let active_terminal_count = snapshot
+                .workspaces
+                .iter()
+                .filter(|candidate| candidate.id == workspace_id || nested.contains(&candidate.id))
+                .map(|candidate| candidate.active_terminal_count)
+                .sum();
             self.editor.modal = Modal::WorkspaceDelete(WorkspaceDeleteConfirmation {
                 workspace_id,
                 title: workspace.title.clone(),
-                active_terminal_count: workspace.active_terminal_count,
+                active_terminal_count,
+                nested_count: nested.len(),
                 bot: workspace.is_bot(),
             });
             cx.notify();

@@ -1,9 +1,9 @@
 use super::{
-    ClientRequest, CloseConfirmation, CloseConfirmationKind, DialogTextEditor, DragDestination,
-    DragHoverState, DropPlacement, HashSet, MAX_BOT_INSTRUCTIONS_CHARS, MAX_SSH_INPUT_LEN,
-    MAX_WORKSPACE_DIR_BYTES, MouseButton, Pane, SidebarResizeLifecycle, SidebarResizeMove,
-    TmuxScanScope, TmuxSession, TmuxSessionId, TmuxSessionPicker, Uuid, WorkspaceCreationDialog,
-    WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
+    ClientRequest, CloseConfirmation, CloseConfirmationKind, CreationParent, DialogTextEditor,
+    DragDestination, DragHoverState, DropPlacement, HashSet, MAX_BOT_INSTRUCTIONS_CHARS,
+    MAX_SSH_INPUT_LEN, MAX_WORKSPACE_DIR_BYTES, MouseButton, Pane, SidebarResizeLifecycle,
+    SidebarResizeMove, TmuxScanScope, TmuxSession, TmuxSessionId, TmuxSessionPicker, Uuid,
+    WorkspaceCreationDialog, WorkspaceCreationField, WorkspaceCreationKind, WorkspaceCreationStep,
     route_workspace_creation_paste,
 };
 use hh_protocol::TerminalProfile;
@@ -52,6 +52,69 @@ fn ssh_workspace_cannot_create_a_network_action_before_review_and_confirmation()
             title: None,
             destination: "prod-east".to_owned(),
         })
+    );
+}
+#[test]
+fn local_workstation_request_carries_its_parent_and_root_folder() {
+    let expanded_root = std::env::var("HOME")
+        .map_or_else(|_| "~/src/app".to_owned(), |home| format!("{home}/src/app"));
+    let mut dialog = WorkspaceCreationDialog::new();
+    assert_eq!(
+        dialog.approved_request(),
+        Some(ClientRequest::CreateWorkspace {
+            title: None,
+            parent_workstation: None,
+            working_dir: None,
+        }),
+        "an empty dialog creates a top-level workstation at the home folder"
+    );
+    dialog.name = DialogTextEditor::with_text("  App  ");
+    dialog.working_dir = DialogTextEditor::with_text("  ~/src/app ");
+    assert_eq!(
+        dialog.approved_request(),
+        Some(ClientRequest::CreateWorkspace {
+            title: Some("App".to_owned()),
+            parent_workstation: None,
+            working_dir: Some(expanded_root.clone()),
+        })
+    );
+
+    let parent_id = Uuid::new_v4();
+    let parent = |remote| CreationParent {
+        workspace_id: parent_id,
+        title: "Parent".to_owned(),
+        remote,
+    };
+    let mut nested = WorkspaceCreationDialog::nested(parent(false));
+    nested.working_dir = DialogTextEditor::with_text("~/src/app");
+    assert_eq!(
+        nested.approved_request(),
+        Some(ClientRequest::CreateWorkspace {
+            title: None,
+            parent_workstation: Some(parent_id),
+            working_dir: Some(expanded_root),
+        })
+    );
+
+    let mut remote = WorkspaceCreationDialog::nested(parent(true));
+    remote.name = DialogTextEditor::with_text("api");
+    remote.working_dir = DialogTextEditor::with_text("~/src/app");
+    assert_eq!(
+        remote.approved_request(),
+        Some(ClientRequest::CreateWorkspace {
+            title: Some("api".to_owned()),
+            parent_workstation: Some(parent_id),
+            working_dir: None,
+        }),
+        "a remote child inherits its parent's root; local paths never reach it"
+    );
+    remote.kind = WorkspaceCreationKind::SystemSsh;
+    remote.destination = DialogTextEditor::with_text("prod-east");
+    remote.review();
+    assert_eq!(
+        remote.approved_request(),
+        None,
+        "SSH workstations are top-level only"
     );
 }
 #[test]

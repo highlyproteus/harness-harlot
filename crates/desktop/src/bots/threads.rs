@@ -12,9 +12,7 @@ use uuid::Uuid;
 
 use crate::HhApp;
 use crate::THEME;
-use crate::helpers::{
-    WorkspaceTabScope, find_pane, identity_label, visible_panes, workspace_tab_standalone_pane,
-};
+use crate::helpers::{find_pane, identity_label, visible_panes, workspace_tab_standalone_pane};
 use crate::view_models::{
     BotThreadDeleteConfirmation, BotThreadMenu, DialogAction, DialogSpec, DialogTone, Modal,
     SidebarMode,
@@ -220,7 +218,6 @@ impl HhApp {
                         this.bot_threads.activated = Some(pane_id);
                         this.editor.modal = Modal::None;
                         this.sidebar.dismissed_workspace_tabs.remove(&tab_id);
-                        this.sidebar.workspace_tab_scope = WorkspaceTabScope::Workstation;
                         this.layout.last_sizes.clear();
                         this.focus_created_pane(bot_id, pane_id, cx);
                         this.mark_pane_viewed(pane_id);

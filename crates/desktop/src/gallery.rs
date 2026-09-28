@@ -61,9 +61,9 @@ impl HhApp {
     }
 
     pub(crate) fn new_gallery_tab_in(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        let request = self.browser_group_target(workspace_id).map_or(
+        let request = self.browser_tab_target(workspace_id).map_or(
             ClientRequest::CreateGalleryTab { workspace_id },
-            |target_pane| ClientRequest::CreateGroupGallery { target_pane },
+            |target_pane| ClientRequest::CreateTabGallery { target_pane },
         );
         self.create_gallery(workspace_id, request, cx);
     }
@@ -75,20 +75,6 @@ impl HhApp {
             cx,
         );
     }
-    pub(crate) fn add_gallery_to_context(
-        &mut self,
-        workspace_id: Uuid,
-        target_tab: Option<Uuid>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tab_id) = target_tab.filter(|tab_id| self.tab_is_navigation_container(*tab_id))
-        {
-            self.new_group_gallery(tab_id, cx);
-        } else {
-            self.new_workspace_gallery(workspace_id, cx);
-        }
-    }
-
     pub(crate) fn create_gallery(
         &mut self,
         workspace_id: Uuid,
@@ -101,7 +87,7 @@ impl HhApp {
                 match result {
                     Ok(ServiceResponse::PaneCreated { pane_id }) => {
                         this.sidebar.active_workspace = Some(workspace_id);
-                        this.sidebar.expanded_workspaces.insert(workspace_id);
+                        this.reveal_workspace(workspace_id);
                         this.focus_pane_with_snapshot(pane_id, cx);
                     }
                     Ok(response) => this.report_unexpected(&response),

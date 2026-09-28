@@ -370,10 +370,8 @@ impl SessionRegistry {
                 id: Uuid::new_v4(),
                 title: tmux_session.name.clone(),
                 custom_title: None,
-                project_dir: None,
                 color: None,
                 custom_icon: None,
-                parent_tab: None,
                 pinned: false,
                 owner_bot: None,
                 layout: PaneLayout::Leaf {
@@ -460,10 +458,11 @@ mod tests {
     fn a_live_remote_tmux_attach_connects_an_offline_workstation() {
         let registry = SessionRegistry::new().unwrap();
         let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
-        registry.state.write().snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
-            destination: "build-node".to_owned(),
-            status: WorkspaceConnectionStatus::Offline,
-        };
+        crate::registry::make_first_workstation_remote(
+            &mut registry.state.write(),
+            "build-node",
+            WorkspaceConnectionStatus::Offline,
+        );
         let pane_id = Uuid::new_v4();
         let session = PtySession::spawn_command(
             pane_id,
@@ -570,7 +569,7 @@ mod tests {
             )
             .unwrap();
 
-        let plain_pane_id = registry.create_group_terminal(tmux_pane_id).unwrap();
+        let plain_pane_id = registry.create_tab_terminal(tmux_pane_id).unwrap();
         let live_snapshot = registry.snapshot().unwrap();
         let live_tab = live_snapshot.workspaces[0]
             .tabs
@@ -647,10 +646,11 @@ mod tests {
         let pane_id = first_pane_id(&snapshot).unwrap();
         {
             let mut state = registry.state.write();
-            state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
-                destination: "build-node".to_owned(),
-                status: WorkspaceConnectionStatus::Offline,
-            };
+            crate::registry::make_first_workstation_remote(
+                &mut state,
+                "build-node",
+                WorkspaceConnectionStatus::Offline,
+            );
             // Only a tmux attach remains, exactly what survives closing the
             // initial SSH tab.
             state

@@ -190,9 +190,9 @@ fn grouped_browser_panes_round_trip_inside_the_group_stack() {
     let path = directory.join("sessions.json");
     let registry = SessionRegistry::persistent(&path).unwrap();
     let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
-    let group_terminal = registry.create_workspace_group(workspace_id, None).unwrap();
+    let group_terminal = registry.create_workspace_tab(workspace_id).unwrap();
     let browser_id = registry
-        .create_group_browser(group_terminal, Some("https://example.com"))
+        .create_tab_browser(group_terminal, Some("https://example.com"))
         .unwrap();
 
     let snapshot = registry.snapshot().unwrap();
@@ -245,8 +245,8 @@ fn grouped_browser_panes_round_trip_inside_the_group_stack() {
 }
 
 #[test]
-fn projects_and_working_dirs_round_trip() {
-    let directory = test_directory("projects");
+fn nested_workstations_open_terminals_in_inherited_root_folders_and_round_trip() {
+    let directory = test_directory("nested-roots");
     let path = directory.join("sessions.json");
     let workspace_dir = directory.join("workspace");
     let project_dir = directory.join("project");
@@ -255,127 +255,105 @@ fn projects_and_working_dirs_round_trip() {
     fs::create_dir(&project_dir).unwrap();
 
     let registry = SessionRegistry::persistent(&path).unwrap();
-    let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
+    let home = registry.snapshot().unwrap().workspaces[0].id;
     registry
-        .set_workspace_working_dir(
-            workspace_id,
-            Some(workspace_dir.to_string_lossy().into_owned()),
+        .set_workspace_working_dir(home, Some(workspace_dir.to_string_lossy().into_owned()))
+        .unwrap();
+    let home_pane = registry.create_workspace_tab(home).unwrap();
+    wait_for_process_cwd(&registry, home_pane, &workspace_dir);
+
+    let (project, project_pane) = registry
+        .create_workspace(
+            None,
+            Some(home),
+            Some(project_dir.to_string_lossy().into_owned()),
         )
         .unwrap();
-    let workspace_pane = registry.create_workspace_tab(workspace_id).unwrap();
-    wait_for_process_cwd(&registry, workspace_pane, &workspace_dir);
-
-    let project_pane = registry
-        .create_workspace_project(workspace_id, &project_dir.to_string_lossy(), None)
-        .unwrap();
     wait_for_process_cwd(&registry, project_pane, &project_dir);
-    let snapshot = registry.snapshot().unwrap();
-    let project_tab = snapshot.workspaces[0]
-        .tabs
-        .iter()
-        .find(|tab| matches!(&tab.layout, PaneLayout::Leaf { pane } if pane.id == project_pane))
+    let (inner, inner_pane) = registry
+        .create_workspace(None, Some(project), None)
         .unwrap();
-    assert_eq!(project_tab.custom_title.as_deref(), Some("project"));
-    assert_eq!(
-        project_tab.project_dir.as_deref(),
-        Some(project_dir.to_string_lossy().as_ref())
-    );
+    wait_for_process_cwd(&registry, inner_pane, &project_dir);
+    let inner_tab_pane = registry.create_workspace_tab(inner).unwrap();
+    wait_for_process_cwd(&registry, inner_tab_pane, &project_dir);
 
-    let grouped_pane = registry.create_group_terminal(project_pane).unwrap();
-    wait_for_process_cwd(&registry, grouped_pane, &project_dir);
-    let plain_tab = registry.snapshot().unwrap().workspaces[0].tabs[0].id;
-    let error = registry
-        .set_tab_working_dir(plain_tab, project_dir.to_string_lossy().into_owned())
-        .unwrap_err();
-    assert!(error.to_string().contains("not a project"));
+    let snapshot = registry.snapshot().unwrap();
+    let find = |id| {
+        snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(find(project).title, "project");
+    assert_eq!(find(project).parent_workstation, Some(home));
+    assert_eq!(find(inner).parent_workstation, Some(project));
+    assert_eq!(find(inner).working_dir, None);
 
     registry.persist().unwrap();
     drop(registry);
 
     let recovered = SessionRegistry::persistent(&path).unwrap();
-    let workspace = &recovered.snapshot().unwrap().workspaces[0];
+    let snapshot = recovered.snapshot().unwrap();
+    let recovered_project = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == project)
+        .unwrap();
+    assert_eq!(recovered_project.parent_workstation, Some(home));
     assert_eq!(
-        workspace.working_dir.as_deref(),
-        Some(workspace_dir.to_string_lossy().as_ref())
+        recovered_project.working_dir.as_deref(),
+        Some(project_dir.to_string_lossy().as_ref())
     );
     assert!(
-        workspace.tabs.iter().any(|tab| {
-            tab.project_dir.as_deref() == Some(project_dir.to_string_lossy().as_ref())
-        })
+        snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == inner && workspace.parent_workstation == Some(project))
     );
-
     drop(recovered);
 }
 
 #[test]
-fn project_group_inherits_project_directory() {
-    let directory = test_directory("project-group");
+fn deleting_a_workstation_removes_its_nested_workstations_but_home_is_kept() {
+    let directory = test_directory("delete-nested");
     let path = directory.join("sessions.json");
-    let project_dir = directory.join("project");
-    create_owner_only_directory(&project_dir);
+    create_owner_only_directory(&directory);
     let registry = SessionRegistry::persistent(&path).unwrap();
-    let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
-    let project_pane = registry
-        .create_workspace_project(workspace_id, &project_dir.to_string_lossy(), None)
+    let home = registry.snapshot().unwrap().workspaces[0].id;
+    let (outer, outer_pane) = registry
+        .create_workspace(Some("Outer"), None, None)
         .unwrap();
-    let project_tab = registry.snapshot().unwrap().workspaces[0]
-        .tabs
-        .iter()
-        .find(|tab| matches!(&tab.layout, PaneLayout::Leaf { pane } if pane.id == project_pane))
+    let (middle, middle_pane) = registry.create_workspace(None, Some(outer), None).unwrap();
+    let (inner, inner_pane) = registry.create_workspace(None, Some(middle), None).unwrap();
+    let (sibling, _) = registry.create_workspace(None, Some(home), None).unwrap();
+
+    let error = registry.delete_workspace(home).unwrap_err();
+    assert_eq!(error.to_string(), "the home workstation cannot be deleted");
+
+    registry.delete_workspace(outer).unwrap();
+    let remaining = registry
+        .snapshot()
         .unwrap()
-        .id;
-
-    let child_pane = registry
-        .create_workspace_group(workspace_id, Some(project_tab))
-        .unwrap();
-    wait_for_process_cwd(&registry, child_pane, &project_dir);
-    let snapshot = registry.snapshot().unwrap();
-    let child = snapshot.workspaces[0]
-        .tabs
+        .workspaces
         .iter()
-        .find(|tab| matches!(&tab.layout, PaneLayout::Leaf { pane } if pane.id == child_pane))
-        .unwrap();
-    assert_eq!(child.parent_tab, Some(project_tab));
-
-    let grouped_pane = registry.create_group_terminal(child_pane).unwrap();
-    wait_for_process_cwd(&registry, grouped_pane, &project_dir);
+        .map(|workspace| workspace.id)
+        .collect::<Vec<_>>();
+    assert_eq!(remaining, vec![home, sibling]);
+    for (id, pane) in [
+        (outer, outer_pane),
+        (middle, middle_pane),
+        (inner, inner_pane),
+    ] {
+        assert!(!remaining.contains(&id));
+        assert!(registry.pane_process_id(pane).is_err());
+    }
     drop(registry);
-}
 
-#[test]
-fn close_tab_removes_tab_children_and_sessions() {
-    let directory = test_directory("close-project");
-    let path = directory.join("sessions.json");
-    let project_dir = directory.join("project");
-    create_owner_only_directory(&project_dir);
-    let registry = SessionRegistry::persistent(&path).unwrap();
-    let workspace_id = registry.snapshot().unwrap().workspaces[0].id;
-    let project_pane = registry
-        .create_workspace_project(workspace_id, &project_dir.to_string_lossy(), None)
-        .unwrap();
-    let project_tab = registry.snapshot().unwrap().workspaces[0]
-        .tabs
-        .iter()
-        .find(|tab| matches!(&tab.layout, PaneLayout::Leaf { pane } if pane.id == project_pane))
-        .unwrap()
-        .id;
-    let child_pane = registry
-        .create_workspace_group(workspace_id, Some(project_tab))
-        .unwrap();
-
-    registry.close_tab(project_tab).unwrap();
-    let snapshot = registry.snapshot().unwrap();
-    let workspace = &snapshot.workspaces[0];
-    assert!(
-        !workspace
-            .tabs
-            .iter()
-            .any(|tab| { tab.id == project_tab || tab.parent_tab == Some(project_tab) })
-    );
-    assert_eq!(workspace.active_terminal_count, 1);
-    assert!(registry.pane_process_id(project_pane).is_err());
-    assert!(registry.pane_process_id(child_pane).is_err());
-    drop(registry);
+    let recovered = SessionRegistry::persistent(&path).unwrap();
+    assert_eq!(recovered.snapshot().unwrap().workspaces.len(), 2);
+    drop(recovered);
 }
 
 #[test]

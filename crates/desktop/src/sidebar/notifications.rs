@@ -42,7 +42,7 @@ impl HhApp {
                             workspace_id: entry.workspace.id,
                             tab_id: Some(entry.tab.id),
                             tab_color: entry.tab.color,
-                            from_group: false,
+                            from_pane_map: false,
                             indent: 4.0,
                             activity: Some(ActivityRow {
                                 indicator: notification_indicator(entry.pane.status, entry.exited),

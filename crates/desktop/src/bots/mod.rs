@@ -345,6 +345,7 @@ impl HhApp {
             workspace_id: bot_id,
             title: workspace.title.clone(),
             active_terminal_count: workspace.active_terminal_count,
+            nested_count: 0,
             bot: true,
         });
         cx.notify();

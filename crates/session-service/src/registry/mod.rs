@@ -193,7 +193,6 @@ pub(crate) struct RegistryState {
     notifications: VecDeque<SessionNotification>,
     next_notification_id: u64,
     next_terminal_number: u32,
-    next_group_number: u32,
     last_identity_refresh: Option<Instant>,
 }
 
@@ -714,7 +713,7 @@ fn discover_managed_tmux(state_dir: &Path) -> (Option<TmuxServer>, Option<String
 }
 
 /// The managed tmux session holding the windows of workspace `workspace_id`.
-fn tmux_session_name(workspace_id: Uuid) -> String {
+pub(crate) fn tmux_session_name(workspace_id: Uuid) -> String {
     format!("hh-{workspace_id}")
 }
 
@@ -834,8 +833,8 @@ impl SessionRegistry {
                                 recovered.tmux_by_pane.remove(&pane_id)
                             {
                                 if recovered.legacy_tmux_workspace.contains_key(&pane_id) {
-                                    // A migrated bot thread: its window still
-                                    // lives in the retired Bots session.
+                                    // A migrated bot thread or project tab: its
+                                    // window still lives in the old session.
                                     let _ = client.move_window_to_session(
                                         &window_id,
                                         &tmux_session_name(workspace_id),
@@ -895,14 +894,28 @@ impl SessionRegistry {
                 }
             }
         }
+        // Sessions of retired workspaces (the shared Bots workspace) are gone;
+        // a workstation whose projects moved out keeps its own session.
         let legacy_sessions = recovered
             .legacy_tmux_workspace
             .values()
             .copied()
+            .filter(|workspace_id| {
+                !recovered
+                    .snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == *workspace_id)
+            })
             .collect::<HashSet<_>>();
         if let Some(client) = tmux_clients.values().next() {
             for legacy in legacy_sessions {
                 let _ = client.kill_named_session(&tmux_session_name(legacy));
+            }
+        }
+        for (from, to) in &recovered.gallery_copies {
+            if let Err(error) = crate::gallery::copy_gallery_contents(*from, *to) {
+                eprintln!("failed to copy the gallery of a migrated project: {error:#}");
             }
         }
         let referenced_windows = panes
@@ -944,7 +957,6 @@ impl SessionRegistry {
             notifications: VecDeque::new(),
             next_notification_id: 1,
             next_terminal_number,
-            next_group_number: 1,
             last_identity_refresh: None,
         }));
         {
@@ -1042,7 +1054,6 @@ impl SessionRegistry {
             tmux_clients,
             tmux_sinks,
             next_terminal_number: 2,
-            next_group_number: 1,
             last_identity_refresh: None,
         }));
         {
@@ -1339,6 +1350,31 @@ fn remove_retired_history_archive(state_directory: &Path) {
             "failed to remove retired terminal history archive {}: {error}",
             archive.display()
         );
+    }
+}
+
+/// Turns the first workstation of a test registry into an SSH workstation.
+/// The home workstation must stay local, so an empty local home is appended.
+#[cfg(test)]
+pub(crate) fn make_first_workstation_remote(
+    state: &mut RegistryState,
+    destination: &str,
+    status: hh_protocol::WorkspaceConnectionStatus,
+) {
+    let workspace = &mut state.snapshot.workspaces[0];
+    workspace.connection = WorkspaceConnection::SystemSsh {
+        destination: destination.to_owned(),
+        status,
+    };
+    if std::mem::take(&mut workspace.home) {
+        let mut home = workspace.clone();
+        home.id = Uuid::new_v4();
+        home.connection = WorkspaceConnection::Local;
+        home.home = true;
+        home.tabs.clear();
+        home.active_terminal_count = 0;
+        home.order = home.order.saturating_add(1);
+        state.snapshot.workspaces.push(home);
     }
 }
 

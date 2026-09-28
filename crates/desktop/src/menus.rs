@@ -3,7 +3,7 @@ use crate::browser::{BrowserUrlEditor, browser_command_available, browser_unavai
 use crate::commands::{AppCommand, descriptor, palette_matches};
 use crate::helpers::{element_key, find_pane};
 use crate::view_models::{
-    ColorTarget, CommandPaletteState, CreateMenu, GroupMenu, Modal, TabMenu, TooltipView,
+    ColorTarget, CommandPaletteState, CreateMenu, Modal, TabMenu, TabRowMenu, TooltipView,
     WorkspaceConnectionInfo, WorkspaceMenu,
 };
 use crate::{COMMAND_PALETTE_LIMIT, HhApp, THEME};
@@ -14,7 +14,8 @@ use gpui::{
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled};
 use hh_protocol::{
-    ClientRequest, PaneKind, ServiceResponse, WorkspaceConnection, WorkspaceConnectionStatus,
+    ClientRequest, MAX_WORKSTATION_DEPTH, PaneKind, ServiceResponse, WorkspaceConnection,
+    WorkspaceConnectionStatus, workstation_depth,
 };
 use uuid::Uuid;
 
@@ -84,14 +85,14 @@ impl HhApp {
         cx.notify();
     }
 
-    pub(crate) fn open_group_menu(
+    pub(crate) fn open_tab_row_menu(
         &mut self,
         tab_id: Uuid,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         self.clear_menu_color_picker();
-        self.editor.modal = Modal::GroupMenu(GroupMenu {
+        self.editor.modal = Modal::TabRowMenu(TabRowMenu {
             tab_id,
             position,
             icon_picker_open: false,
@@ -110,14 +111,14 @@ impl HhApp {
         }
     }
 
-    pub(crate) fn new_group_browser(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        let Some(target_pane) = self.group_metadata(tab_id).map(|(_, pane_id)| pane_id) else {
+    pub(crate) fn new_tab_browser(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        let Some(target_pane) = self.tab_metadata(tab_id).map(|(_, pane_id)| pane_id) else {
             self.editor.modal = Modal::None;
             cx.notify();
             return;
         };
         self.dispatch_with(
-            ClientRequest::CreateGroupBrowser {
+            ClientRequest::CreateTabBrowser {
                 target_pane,
                 url: None,
             },
@@ -139,8 +140,8 @@ impl HhApp {
         self.editor.modal = Modal::None;
         cx.notify();
     }
-    pub(crate) fn new_group_gallery(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        let Some(target_pane) = self.group_metadata(tab_id).map(|(_, pane_id)| pane_id) else {
+    pub(crate) fn new_tab_gallery(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        let Some(target_pane) = self.tab_metadata(tab_id).map(|(_, pane_id)| pane_id) else {
             self.editor.modal = Modal::None;
             cx.notify();
             return;
@@ -150,7 +151,7 @@ impl HhApp {
         };
         self.create_gallery(
             workspace_id,
-            ClientRequest::CreateGroupGallery { target_pane },
+            ClientRequest::CreateTabGallery { target_pane },
             cx,
         );
     }
@@ -165,8 +166,8 @@ impl HhApp {
         }
     }
 
-    pub(crate) fn toggle_group_icon_picker(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        if let Modal::GroupMenu(menu) = &mut self.editor.modal
+    pub(crate) fn toggle_tab_icon_picker(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        if let Modal::TabRowMenu(menu) = &mut self.editor.modal
             && menu.tab_id == tab_id
         {
             menu.icon_picker_open = !menu.icon_picker_open;
@@ -235,7 +236,6 @@ impl HhApp {
                 .iter()
                 .flat_map(|workspace| workspace.tabs.iter())
                 .find(|tab| find_pane(&tab.layout, pane_id).is_some())
-                .filter(|tab| tab.parent_tab.is_none())
                 .map(|tab| (tab.id, tab.pinned))
         });
         // Bot threads get no generic browser/gallery siblings.
@@ -464,23 +464,16 @@ impl HhApp {
         let CreateMenu {
             position,
             workspace_id,
-            target_tab,
         } = menu;
         let items = [
-            self.create_menu_item("strip-add-project", "Add Project", cx, move |this, cx| {
-                this.begin_project_creation(workspace_id, cx);
-            }),
             self.create_menu_item("strip-add-terminal", "Add Terminal", cx, move |this, cx| {
-                this.add_terminal_to_context(workspace_id, target_tab, cx);
+                this.new_workspace_tab(workspace_id, cx);
             }),
             self.create_menu_item("strip-add-browser", "Add Browser", cx, move |this, cx| {
-                this.add_browser_to_context(workspace_id, target_tab, cx);
+                this.new_workspace_browser(workspace_id, cx);
             }),
             self.create_menu_item("strip-add-gallery", "Add Gallery", cx, move |this, cx| {
-                this.add_gallery_to_context(workspace_id, target_tab, cx);
-            }),
-            self.create_menu_item("strip-add-group", "Add Group", cx, move |this, cx| {
-                this.add_group_to_context(workspace_id, target_tab, cx);
+                this.new_workspace_gallery(workspace_id, cx);
             }),
         ];
         anchored_menu(
@@ -498,30 +491,24 @@ impl HhApp {
         )
     }
 
-    pub(crate) fn render_group_menu(
+    pub(crate) fn render_tab_row_menu(
         &self,
-        menu: GroupMenu,
+        menu: TabRowMenu,
         menu_max_height: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab_id = menu.tab_id;
         let metadata = self.session.snapshot.as_ref().and_then(|snapshot| {
             snapshot.workspaces.iter().find_map(|workspace| {
-                workspace.tabs.iter().find_map(|tab| {
-                    (tab.id == tab_id).then_some((
-                        workspace.id,
-                        tab.project_dir.is_some(),
-                        tab.parent_tab.is_some(),
-                        tab.pinned,
-                    ))
-                })
+                workspace
+                    .tabs
+                    .iter()
+                    .find_map(|tab| (tab.id == tab_id).then_some((workspace.id, tab.pinned)))
             })
         });
         let workspace_id = metadata.map(|metadata| metadata.0);
-        let is_project = metadata.is_some_and(|metadata| metadata.1);
-        let has_parent = metadata.is_some_and(|metadata| metadata.2);
-        let pinned = metadata.is_some_and(|metadata| metadata.3);
-        // A bot's tabs hold threads only: no generic panes or groups.
+        let pinned = metadata.is_some_and(|metadata| metadata.1);
+        // A bot's tabs hold threads only: no generic panes.
         let creatable =
             workspace_id.is_none_or(|workspace_id| !self.workspace_is_bot(workspace_id));
         let inline_color_picker = self
@@ -532,7 +519,7 @@ impl HhApp {
         anchored_menu(
             menu.position,
             div()
-                .id(("group-context-menu", element_key(tab_id)))
+                .id(("tab-row-context-menu", element_key(tab_id)))
                 .w(px(252.0))
                 .h_auto()
                 .max_h(menu_max_height)
@@ -546,75 +533,15 @@ impl HhApp {
                 .occlude()
                 .when(creatable, |element| {
                     element.child(self.create_menu_item(
-                        ("new-group-terminal", element_key(tab_id)),
-                        "New terminal in group",
+                        ("new-terminal-in-tab", element_key(tab_id)),
+                        "New terminal in this tab",
                         cx,
-                        move |this, cx| this.new_group_terminal(tab_id, cx),
+                        move |this, cx| this.new_tab_terminal(tab_id, cx),
                     ))
                 })
-                .when(!has_parent, |element| {
-                    element.child(
-                        div()
-                            .id(("toggle-tab-pin", element_key(tab_id)))
-                            .mx(px(5.0))
-                            .px(px(9.0))
-                            .py(px(7.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.foreground))
-                            .hover(|element| element.bg(rgb(THEME.accent_soft)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_tab_pinned(tab_id, !pinned, cx)
-                            }))
-                            .child(if pinned { "Unpin" } else { "Pin to top" }),
-                    )
-                })
-                .when(creatable && browser_command_available(), |element| {
-                    element.child(self.create_menu_item(
-                        ("new-browser-in-group", element_key(tab_id)),
-                        "New Browser",
-                        cx,
-                        move |this, cx| this.new_group_browser(tab_id, cx),
-                    ))
-                })
-                .when(creatable, |element| {
-                    element.child(self.create_menu_item(
-                        ("new-gallery-in-group", element_key(tab_id)),
-                        "New Gallery",
-                        cx,
-                        move |this, cx| this.new_group_gallery(tab_id, cx),
-                    ))
-                })
-                .when_some(
-                    workspace_id.filter(|_| is_project && !has_parent),
-                    |element, workspace_id| {
-                        element.child(self.create_menu_item(
-                            ("new-project-group", element_key(tab_id)),
-                            "New Group",
-                            cx,
-                            move |this, cx| this.new_project_group(workspace_id, tab_id, cx),
-                        ))
-                    },
-                )
-                .when(is_project, |element| {
-                    element.child(self.create_menu_item(
-                        ("change-project-dir-menu", element_key(tab_id)),
-                        "Change Directory…",
-                        cx,
-                        move |this, cx| this.begin_project_dir_edit(tab_id, cx),
-                    ))
-                })
-                .child(self.create_menu_item(
-                    ("rename-group-menu", element_key(tab_id)),
-                    "Rename group…",
-                    cx,
-                    move |this, cx| this.begin_group_rename(tab_id, cx),
-                ))
                 .child(
                     div()
-                        .id(("select-group-icon", element_key(tab_id)))
+                        .id(("toggle-tab-pin", element_key(tab_id)))
                         .mx(px(5.0))
                         .px(px(9.0))
                         .py(px(7.0))
@@ -625,7 +552,46 @@ impl HhApp {
                         .text_color(rgb(THEME.foreground))
                         .hover(|element| element.bg(rgb(THEME.accent_soft)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_group_icon_picker(tab_id, cx)
+                            this.set_tab_pinned(tab_id, !pinned, cx)
+                        }))
+                        .child(if pinned { "Unpin" } else { "Pin to top" }),
+                )
+                .when(creatable && browser_command_available(), |element| {
+                    element.child(self.create_menu_item(
+                        ("new-browser-in-tab", element_key(tab_id)),
+                        "New browser in this tab",
+                        cx,
+                        move |this, cx| this.new_tab_browser(tab_id, cx),
+                    ))
+                })
+                .when(creatable, |element| {
+                    element.child(self.create_menu_item(
+                        ("new-gallery-in-tab", element_key(tab_id)),
+                        "New gallery in this tab",
+                        cx,
+                        move |this, cx| this.new_tab_gallery(tab_id, cx),
+                    ))
+                })
+                .child(self.create_menu_item(
+                    ("rename-tab-row-menu", element_key(tab_id)),
+                    "Rename tab…",
+                    cx,
+                    move |this, cx| this.begin_tab_rename(tab_id, cx),
+                ))
+                .child(
+                    div()
+                        .id(("select-tab-icon", element_key(tab_id)))
+                        .mx(px(5.0))
+                        .px(px(9.0))
+                        .py(px(7.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .font_family(".SystemUIFont")
+                        .text_sm()
+                        .text_color(rgb(THEME.foreground))
+                        .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_tab_icon_picker(tab_id, cx)
                         }))
                         .flex()
                         .items_center()
@@ -634,11 +600,11 @@ impl HhApp {
                         .child(if menu.icon_picker_open { "⌄" } else { "›" }),
                 )
                 .when(menu.icon_picker_open, |element| {
-                    element.child(self.render_group_icon_choices(tab_id, cx))
+                    element.child(self.render_tab_icon_choices(tab_id, cx))
                 })
                 .child(
                     div()
-                        .id(("pick-group-color", element_key(tab_id)))
+                        .id(("pick-tab-color", element_key(tab_id)))
                         .mx(px(5.0))
                         .px(px(9.0))
                         .py(px(7.0))
@@ -653,7 +619,7 @@ impl HhApp {
                         }))
                         .flex()
                         .items_center()
-                        .child(div().flex_1().child("Pick color…"))
+                        .child(div().flex_1().child("Pick tab color…"))
                         .child(if inline_color_picker.is_some() {
                             "⌄"
                         } else {
@@ -661,11 +627,11 @@ impl HhApp {
                         }),
                 )
                 .when_some(inline_color_picker, |element, picker| {
-                    element.child(self.render_inline_color_picker(picker, "inline-group-color", cx))
+                    element.child(self.render_inline_color_picker(picker, "inline-tab-color", cx))
                 })
                 .child(
                     div()
-                        .id(("delete-group-menu", element_key(tab_id)))
+                        .id(("delete-tab-row-menu", element_key(tab_id)))
                         .mx(px(5.0))
                         .px(px(9.0))
                         .py(px(7.0))
@@ -678,11 +644,7 @@ impl HhApp {
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.begin_tab_close(tab_id, cx)),
                         )
-                        .child(if is_project {
-                            "Delete project…"
-                        } else {
-                            "Delete group…"
-                        }),
+                        .child("Delete tab…"),
                 ),
         )
     }
@@ -695,14 +657,20 @@ impl HhApp {
     ) -> AnyElement {
         let workspace_id = menu.workspace_id;
         let key = element_key(workspace_id);
-        let workspace = self.session.snapshot.as_ref().and_then(|snapshot| {
-            snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == workspace_id)
-        });
+        let workspaces = self
+            .session
+            .snapshot
+            .as_ref()
+            .map_or(&[][..], |snapshot| snapshot.workspaces.as_slice());
+        let workspace = workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id);
         let pinned = workspace.is_some_and(|workspace| workspace.pinned);
+        let home = workspace.is_some_and(|workspace| workspace.home);
+        let nested = workspace.is_some_and(|workspace| workspace.parent_workstation.is_some());
         let has_working_dir = workspace.is_some_and(|workspace| workspace.working_dir.is_some());
+        let can_nest = workstation_depth(workspaces, workspace_id)
+            .is_some_and(|depth| depth < MAX_WORKSTATION_DEPTH);
         let can_scan_tmux =
             workspace.is_some_and(|workspace| tmux_scan_available(&workspace.connection));
         let offline = workspace.is_some_and(|workspace| {
@@ -728,6 +696,12 @@ impl HhApp {
                 .border_color(rgb(THEME.border_strong))
                 .shadow_lg()
                 .occlude()
+                .child(self.create_menu_item(
+                    ("new-workspace-terminal-menu", key),
+                    "New Terminal",
+                    cx,
+                    move |this, cx| this.new_workspace_terminal(workspace_id, cx),
+                ))
                 .child(
                     div()
                         .id(("new-workspace-browser-menu", key))
@@ -760,36 +734,29 @@ impl HhApp {
                     cx,
                     move |this, cx| this.new_workspace_gallery(workspace_id, cx),
                 ))
-                .child(self.create_menu_item(
-                    ("new-workspace-terminal-menu", key),
-                    "New Terminal",
-                    cx,
-                    move |this, cx| this.new_workspace_terminal(workspace_id, cx),
-                ))
+                .when(can_nest, |element| {
+                    element.child(menu_separator()).child(self.create_menu_item(
+                        ("new-nested-workstation-menu", key),
+                        "New Workstation Inside…",
+                        cx,
+                        move |this, cx| this.begin_nested_workspace_creation(workspace_id, cx),
+                    ))
+                })
                 .child(menu_separator())
                 .child(self.create_menu_item(
-                    ("new-project-menu", key),
-                    "New Project…",
-                    cx,
-                    move |this, cx| this.begin_project_creation(workspace_id, cx),
-                ))
-                .child(self.create_menu_item(
-                    ("new-workspace-group-menu", key),
-                    "New Group",
-                    cx,
-                    move |this, cx| this.new_workspace_group(workspace_id, cx),
-                ))
-                .child(menu_separator())
-                .child(self.create_menu_item(
-                    ("set-workdir-menu", key),
-                    "Set Working Directory…",
+                    ("set-root-folder-menu", key),
+                    "Set Root Folder…",
                     cx,
                     move |this, cx| this.begin_workspace_dir_edit(workspace_id, cx),
                 ))
                 .when(has_working_dir, |element| {
                     element.child(self.create_menu_item(
-                        ("clear-workdir-menu", key),
-                        "Use Default Directory",
+                        ("clear-root-folder-menu", key),
+                        if nested {
+                            "Use Parent Folder"
+                        } else {
+                            "Use Home Folder"
+                        },
                         cx,
                         move |this, cx| {
                             this.dispatch(ClientRequest::SetWorkspaceWorkingDir {
@@ -829,24 +796,26 @@ impl HhApp {
                         move |this, cx| this.reconnect_workspace(workspace_id, cx),
                     ))
                 })
-                .child(
-                    div()
-                        .id(("delete-workspace-menu", key))
-                        .mx(px(5.0))
-                        .mt(px(4.0))
-                        .px(px(9.0))
-                        .py(px(7.0))
-                        .rounded(px(4.0))
-                        .cursor_pointer()
-                        .font_family(".SystemUIFont")
-                        .text_sm()
-                        .text_color(rgb(THEME.danger))
-                        .hover(|element| element.bg(rgb(THEME.accent_soft)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.begin_workspace_delete(workspace_id, cx)
-                        }))
-                        .child("Delete workstation…"),
-                ),
+                .when(!home, |element| {
+                    element.child(
+                        div()
+                            .id(("delete-workspace-menu", key))
+                            .mx(px(5.0))
+                            .mt(px(4.0))
+                            .px(px(9.0))
+                            .py(px(7.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .font_family(".SystemUIFont")
+                            .text_sm()
+                            .text_color(rgb(THEME.danger))
+                            .hover(|element| element.bg(rgb(THEME.accent_soft)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.begin_workspace_delete(workspace_id, cx)
+                            }))
+                            .child("Delete workstation…"),
+                    )
+                }),
         )
     }
 

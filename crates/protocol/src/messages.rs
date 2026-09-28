@@ -128,7 +128,8 @@ pub enum ClientRequest {
         target_pane: Uuid,
         axis: SplitAxis,
     },
-    CreateGroupTerminal {
+    /// Adds a terminal to the tab holding `target_pane`.
+    CreateTabTerminal {
         target_pane: Uuid,
     },
     CreateWorkspaceTerminal {
@@ -141,14 +142,16 @@ pub enum ClientRequest {
         workspace_id: Uuid,
         url: Option<String>,
     },
-    CreateGroupBrowser {
+    /// Adds a browser to the tab holding `target_pane`.
+    CreateTabBrowser {
         target_pane: Uuid,
         url: Option<String>,
     },
     CreateGalleryTab {
         workspace_id: Uuid,
     },
-    CreateGroupGallery {
+    /// Adds a gallery to the tab holding `target_pane`.
+    CreateTabGallery {
         target_pane: Uuid,
     },
     AddGalleryImage {
@@ -164,40 +167,11 @@ pub enum ClientRequest {
         request_id: u64,
         outcome: BrowserCommandOutcome,
     },
-    CreateWorkspaceGroup {
-        workspace_id: Uuid,
-        #[serde(default)]
-        parent_tab: Option<Uuid>,
-    },
+    /// Sets a workstation's root folder. `None` inherits the parent workstation's root,
+    /// or the home folder for a top-level workstation.
     SetWorkspaceWorkingDir {
         workspace_id: Uuid,
         working_dir: Option<String>,
-    },
-    CreateWorkspaceProject {
-        workspace_id: Uuid,
-        working_dir: String,
-        title: Option<String>,
-    },
-    /// Creates a project only after the service resolves the consumed path and
-    /// verifies canonical containment at the operation edge.
-    CreateAuthorizedWorkspaceProject {
-        workspace_id: Uuid,
-        working_dir: String,
-        authorized_root: String,
-        title: Option<String>,
-    },
-    /// Creates a Git worktree and project tab under the same service-side
-    /// canonical-root authority operation.
-    CreateAuthorizedWorktreeProject {
-        workspace_id: Uuid,
-        repo_dir: String,
-        authorized_root: String,
-        branch: String,
-        base: Option<String>,
-    },
-    SetTabWorkingDir {
-        tab_id: Uuid,
-        working_dir: String,
     },
     SetTabColor {
         tab_id: Uuid,
@@ -218,7 +192,7 @@ pub enum ClientRequest {
         target_pane: Uuid,
         host: String,
     },
-    /// Explicitly reads bounded tmux session metadata for one workstation.
+    /// Explicitly reads bounded tmux session metadata for one workstation's machine.
     ScanTmuxSessions {
         workspace_id: Uuid,
     },
@@ -243,7 +217,7 @@ pub enum ClientRequest {
         source_pane: Uuid,
         target_pane: Uuid,
     },
-    MovePaneToGroup {
+    MovePaneIntoTab {
         source_pane: Uuid,
         target_tab: Uuid,
     },
@@ -251,17 +225,17 @@ pub enum ClientRequest {
         source_pane: Uuid,
         target_tab: Uuid,
         after: bool,
-        #[serde(default)]
-        parent_tab: Option<Uuid>,
     },
     ReorderTab {
         tab_id: Uuid,
         target_tab_id: Uuid,
         after: bool,
     },
-    MoveTabToProject {
+    /// Moves a tab, with its panes, to the end of another workstation on the same
+    /// machine.
+    MoveTabToWorkstation {
         tab_id: Uuid,
-        project_tab: Uuid,
+        workspace_id: Uuid,
     },
     SetTabPinned {
         tab_id: Uuid,
@@ -317,16 +291,23 @@ pub enum ClientRequest {
         workspace_id: Uuid,
         icon: Option<String>,
     },
+    /// Creates a workstation. With `parent_workstation` it is nested there
+    /// and runs on the parent's machine; otherwise it is a top-level local
+    /// workstation.
     CreateWorkspace {
         title: Option<String>,
+        parent_workstation: Option<Uuid>,
+        working_dir: Option<String>,
     },
-    /// Creates a workspace and applies its directory only after service-side
-    /// canonical-root containment succeeds at the mutation edge.
+    /// Creates a top-level local workstation and applies its directory only
+    /// after service-side canonical-root containment succeeds at the
+    /// mutation edge.
     CreateAuthorizedWorkspace {
         title: Option<String>,
         working_dir: String,
         authorized_root: String,
     },
+    /// Creates a top-level remote workstation reached through system OpenSSH.
     CreateSshWorkspace {
         title: Option<String>,
         destination: String,
@@ -348,12 +329,16 @@ pub enum ClientRequest {
         target_workspace_id: Uuid,
         after: bool,
     },
+    /// Disconnects a remote workstation and every workstation nested in it.
     DisconnectWorkspace {
         workspace_id: Uuid,
     },
+    /// Reconnects a remote workstation and every workstation nested in it.
     ReconnectWorkspace {
         workspace_id: Uuid,
     },
+    /// Deletes a workstation and every workstation nested in it. The home workstation is
+    /// refused.
     DeleteWorkspace {
         workspace_id: Uuid,
     },
@@ -549,14 +534,14 @@ mod tests {
                 }),
             ),
             (
-                ClientRequest::CreateGroupBrowser {
+                ClientRequest::CreateTabBrowser {
                     target_pane: pane_id,
-                    url: Some("https://example.com/group".to_owned()),
+                    url: Some("https://example.com/tab".to_owned()),
                 },
                 serde_json::json!({
-                    "type": "create_group_browser",
+                    "type": "create_tab_browser",
                     "target_pane": pane_id,
-                    "url": "https://example.com/group",
+                    "url": "https://example.com/tab",
                 }),
             ),
             (
@@ -567,11 +552,20 @@ mod tests {
                 }),
             ),
             (
-                ClientRequest::CreateGroupGallery {
+                ClientRequest::CreateTabGallery {
                     target_pane: pane_id,
                 },
                 serde_json::json!({
-                    "type": "create_group_gallery",
+                    "type": "create_tab_gallery",
+                    "target_pane": pane_id,
+                }),
+            ),
+            (
+                ClientRequest::CreateTabTerminal {
+                    target_pane: pane_id,
+                },
+                serde_json::json!({
+                    "type": "create_tab_terminal",
                     "target_pane": pane_id,
                 }),
             ),
@@ -679,12 +673,12 @@ mod tests {
                 }),
             ),
             (
-                ClientRequest::MovePaneToGroup {
+                ClientRequest::MovePaneIntoTab {
                     source_pane: pane_id,
                     target_tab: tab_id,
                 },
                 serde_json::json!({
-                    "type": "move_pane_to_group",
+                    "type": "move_pane_into_tab",
                     "source_pane": pane_id,
                     "target_tab": tab_id,
                 }),
@@ -694,25 +688,23 @@ mod tests {
                     source_pane: pane_id,
                     target_tab: tab_id,
                     after: true,
-                    parent_tab: None,
                 },
                 serde_json::json!({
                     "type": "move_pane_to_new_tab",
                     "source_pane": pane_id,
                     "target_tab": tab_id,
                     "after": true,
-                    "parent_tab": null,
                 }),
             ),
             (
-                ClientRequest::MoveTabToProject {
+                ClientRequest::MoveTabToWorkstation {
                     tab_id,
-                    project_tab: workspace_id,
+                    workspace_id,
                 },
                 serde_json::json!({
-                    "type": "move_tab_to_project",
+                    "type": "move_tab_to_workstation",
                     "tab_id": tab_id,
-                    "project_tab": workspace_id,
+                    "workspace_id": workspace_id,
                 }),
             ),
             (
@@ -761,27 +753,16 @@ mod tests {
                 }),
             ),
             (
-                ClientRequest::CreateWorkspaceProject {
-                    workspace_id,
-                    working_dir: "/srv/project".to_owned(),
+                ClientRequest::CreateWorkspace {
                     title: None,
+                    parent_workstation: Some(workspace_id),
+                    working_dir: Some("/srv/app/api".to_owned()),
                 },
                 serde_json::json!({
-                    "type": "create_workspace_project",
-                    "workspace_id": workspace_id,
-                    "working_dir": "/srv/project",
+                    "type": "create_workspace",
                     "title": null,
-                }),
-            ),
-            (
-                ClientRequest::SetTabWorkingDir {
-                    tab_id,
-                    working_dir: "/srv/project".to_owned(),
-                },
-                serde_json::json!({
-                    "type": "set_tab_working_dir",
-                    "tab_id": tab_id,
-                    "working_dir": "/srv/project",
+                    "parent_workstation": workspace_id,
+                    "working_dir": "/srv/app/api",
                 }),
             ),
             (

@@ -174,10 +174,8 @@ pub(crate) fn thread_tab(tab_id: Uuid, pane: Pane) -> Tab {
         id: tab_id,
         title: THREAD_TAB_TITLE.to_owned(),
         custom_title: None,
-        project_dir: None,
         color: None,
         custom_icon: None,
-        parent_tab: None,
         pinned: false,
         owner_bot: None,
         owner_thread: None,
@@ -530,13 +528,18 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-            let workspace = state
+            let connection = state
                 .snapshot
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
+                .map(|workspace| workspace.connection.clone())
                 .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-            (workspace.connection.clone(), workspace.working_dir.clone())
+            (
+                connection,
+                hh_protocol::effective_working_dir(&state.snapshot.workspaces, workspace_id)
+                    .map(str::to_owned),
+            )
         };
         let (cwd, remote_dir) = match connection {
             WorkspaceConnection::Local => match working_dir {
@@ -578,10 +581,8 @@ impl SessionRegistry {
                 id: tab_id,
                 title: pane.title.clone(),
                 custom_title: title.map(str::to_owned),
-                project_dir: None,
                 color: None,
                 custom_icon: None,
-                parent_tab: None,
                 pinned: false,
                 owner_bot,
                 layout: PaneLayout::Leaf { pane },
@@ -829,6 +830,8 @@ fn empty_local_workspace(id: Uuid, title: String, order: u32, kind: WorkspaceKin
         connection: WorkspaceConnection::Local,
         working_dir: None,
         kind,
+        parent_workstation: None,
+        home: false,
         instructions: None,
         owner_bot: None,
         custom_icon: None,

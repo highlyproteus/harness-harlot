@@ -127,9 +127,6 @@ pub(crate) fn reconcile_updates(
             .flat_map(|workspace| workspace.tabs.iter().map(|tab| tab.id))
             .collect::<HashSet<_>>();
         sidebar
-            .collapsed_groups
-            .retain(|tab_id| live_tab_ids.contains(tab_id));
-        sidebar
             .dismissed_workspace_tabs
             .retain(|tab_id| live_tab_ids.contains(tab_id));
         session.snapshot = Some(snapshot);
@@ -241,17 +238,15 @@ mod tests {
     fn sidebar() -> SidebarUi {
         SidebarUi {
             active_workspace: None,
-            workspace_tab_scope: crate::helpers::WorkspaceTabScope::Workstation,
             expanded_workspaces: HashSet::new(),
-            collapsed_groups: HashSet::new(),
             collapsed_pinned_sections: HashSet::new(),
-            collapsed_project_sections: HashSet::new(),
             dismissed_workspace_tabs: HashSet::new(),
             workstation_tab_scroll: ScrollHandle::new(),
             dragging_workspace: None,
             workspace_drop_preview: None,
             suppress_workspace_click_until: None,
             tab_drop_preview: None,
+            tab_drop_workspace: None,
             suppress_tab_click_until: None,
             sidebar_resize: SidebarResizeLifecycle::default(),
             preferred_sidebar_width: 200.0,

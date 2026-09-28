@@ -6,7 +6,7 @@
 
 <p align="center">
   A lightweight native terminal workstation for local and SSH work,
-  with tabs, splits, groups, tmux integration, and embedded browser tabs.
+  with tabs, splits, nested workstations, tmux integration, and embedded browser tabs.
 </p>
 
 <p align="center">
@@ -89,11 +89,16 @@ Linux packages target a glibc 2.35 baseline. Details: [Linux releases](docs/linu
 
 ## Workstations
 
-A workstation is a machine — your local computer or an SSH host.
+A workstation is where your terminals live: a folder of tabs on your own
+computer or on an SSH host. The hammer in the sidebar toolbar shows them.
 
-- Each workstation has its own working directory. Change it from the workstation menu and every new terminal in that workstation opens there from then on.
-- Rename workstations, give them their own colors, and pin the ones you use most.
-- SSH workstations launch your installed OpenSSH client, so your `~/.ssh/config`, keys, agents, and host verification are always the authority. Saved SSH workstations reconnect into their saved layout; credentials are never stored.
+- **This Mac** (**This Computer** on Linux) is your home workstation. You can rename, recolor, and pin it or give it a root folder, but it can never be deleted.
+- Add more local workstations whenever you like. Each has a root folder, set from the workstation menu (**Set Root Folder…**); new tabs, the first terminal of a new workstation, and the first terminal after all its tabs close open there. Split panes keep following the directory of the pane they split from.
+- Workstations nest up to four levels deep: choose **New Workstation Inside…** on a workstation's menu. A nested workstation runs on the same machine as its parent and uses its parent's root folder until you give it its own. A collapsed workstation shows one status dot for itself and everything inside it (needs you, then running, then done). Deleting a workstation also removes the workstations nested inside it.
+- Drag a tab onto another workstation on the same machine to move it there.
+- Rename workstations, give them their own colors, and pin the ones you use most; drag to reorder them among their siblings.
+- SSH workstations launch your installed OpenSSH client, so your `~/.ssh/config`, keys, agents, and host verification are always the authority. Saved SSH workstations reconnect into their saved layout, together with the workstations nested inside them; credentials are never stored.
+- Projects from earlier versions become nested workstations on upgrade, keeping their folder, title, color, icon, tabs, and running terminals.
 
 ## Terminals
 
@@ -104,9 +109,9 @@ A workstation is a machine — your local computer or an SSH host.
 - Your terminals keep running if the app closes, crashes, or updates. They live in a small local session service, so reopening the app puts you right back where you were. Ending a session is always explicit: close its tab or exit the shell.
 - On macOS, programs in your terminals get Harness Harlot's Screen Recording and Accessibility permissions, even after the window closes. **Settings → Permissions** shows and requests them.
 
-## Groups
+## Tabs and splits
 
-A group displays several terminals together in one view — and can include a browser pane alongside them — so one glance covers a whole task.
+A tab can hold several terminals side by side — and a browser pane alongside them — so one glance covers a whole task. Drag panes between tabs to rearrange them.
 
 ## Browser tabs
 

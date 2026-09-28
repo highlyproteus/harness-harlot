@@ -80,7 +80,6 @@ fn status_state(profile: TerminalProfile) -> (RegistryState, Uuid) {
             notifications: VecDeque::new(),
             next_notification_id: 1,
             next_terminal_number: 2,
-            next_group_number: 1,
             last_identity_refresh: None,
         },
         pane_id,
@@ -212,10 +211,11 @@ fn local_runtime_replacement_inside_ssh_workstation_projects_local_transport() {
     let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
     {
         let mut state = registry.state.write();
-        state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
-            destination: "developer@build-node".to_owned(),
-            status: WorkspaceConnectionStatus::Connected,
-        };
+        crate::registry::make_first_workstation_remote(
+            &mut state,
+            "developer@build-node",
+            WorkspaceConnectionStatus::Connected,
+        );
     }
 
     registry

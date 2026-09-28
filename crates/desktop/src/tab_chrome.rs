@@ -7,7 +7,7 @@ use gpui::{
     AnyElement, AppContext, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
     ParentElement, StatefulInteractiveElement, Styled, div, px, rgb, rgba,
 };
-use hh_protocol::{Pane, PaneStatus};
+use hh_protocol::{Pane, PaneStatus, Workspace, workstation_descendants};
 use uuid::Uuid;
 
 use crate::notifications::{ActivitySection, activity_section};
@@ -64,6 +64,28 @@ pub(crate) const fn pane_indicator(
         PaneIndicator::Done if !unread => PaneIndicator::None,
         indicator => indicator,
     }
+}
+
+/// A collapsed workstation card's one status dot: the most urgent indicator
+/// across its own panes and those of every workstation nested in it.
+pub(crate) fn workstation_rollup_indicator(
+    workspaces: &[Workspace],
+    workstation_id: Uuid,
+    indicator: impl Fn(&Pane) -> PaneIndicator,
+) -> PaneIndicator {
+    let nested = workstation_descendants(workspaces, workstation_id);
+    workspaces
+        .iter()
+        .filter(|workspace| workspace.id == workstation_id || nested.contains(&workspace.id))
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| {
+            let mut panes = Vec::new();
+            crate::helpers::collect_terminal_tabs(&tab.layout, &mut panes);
+            panes
+        })
+        .map(indicator)
+        .max()
+        .unwrap_or_default()
 }
 
 /// A Notifications row's indicator: like [`pane_indicator`], but a finished
@@ -230,9 +252,54 @@ impl HhApp {
 mod tests {
     use super::{
         PULSE_MIN_OPACITY, PULSE_STEPS, PaneIndicator, notification_indicator, pane_indicator,
-        pulse_opacity_at_step,
+        pulse_opacity_at_step, workstation_rollup_indicator,
     };
-    use hh_protocol::PaneStatus;
+    use hh_protocol::{PaneLayout, PaneStatus, SessionSnapshot, Workspace};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_collapsed_workstation_rolls_up_its_nested_workstations() {
+        fn workstation(id: u128, parent: Option<u128>, status: PaneStatus) -> Workspace {
+            let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
+            workspace.id = Uuid::from_u128(id);
+            workspace.home = false;
+            workspace.parent_workstation = parent.map(Uuid::from_u128);
+            let PaneLayout::Leaf { pane } = &mut workspace.tabs[0].layout else {
+                unreachable!("seeded tabs are single panes");
+            };
+            pane.id = Uuid::from_u128(id * 10);
+            pane.status = status;
+            workspace
+        }
+        let workspaces = vec![
+            workstation(1, None, PaneStatus::Done),
+            workstation(11, Some(1), PaneStatus::Working),
+            workstation(111, Some(11), PaneStatus::NeedsInput),
+            workstation(2, None, PaneStatus::Working),
+        ];
+        let rollup = |id: u128| {
+            workstation_rollup_indicator(&workspaces, Uuid::from_u128(id), |pane| {
+                pane_indicator(pane.status, false, true)
+            })
+        };
+
+        assert_eq!(rollup(1), PaneIndicator::NeedsYou, "grandchild needs you");
+        assert_eq!(rollup(11), PaneIndicator::NeedsYou);
+        assert_eq!(rollup(111), PaneIndicator::NeedsYou);
+        assert_eq!(
+            rollup(2),
+            PaneIndicator::Running,
+            "siblings never leak into a rollup"
+        );
+        let mut done_only = workspaces.clone();
+        done_only.truncate(1);
+        assert_eq!(
+            workstation_rollup_indicator(&done_only, Uuid::from_u128(1), |pane| {
+                pane_indicator(pane.status, false, true)
+            }),
+            PaneIndicator::Done
+        );
+    }
 
     #[test]
     fn pane_indicator_maps_every_status_and_exit() {

@@ -34,7 +34,7 @@ pub(crate) struct SidebarPaneRowContext {
     pub(crate) workspace_id: Uuid,
     pub(crate) tab_id: Option<Uuid>,
     pub(crate) tab_color: Option<AppearanceColor>,
-    pub(crate) from_group: bool,
+    pub(crate) from_pane_map: bool,
     pub(crate) indent: f32,
     /// Set on Notifications rows, which never drag-reorder.
     pub(crate) activity: Option<ActivityRow>,

@@ -150,10 +150,10 @@ fn visit_panes(layout: &PaneLayout, visitor: &mut impl FnMut(&Pane)) {
     }
 }
 
-fn browser_open(context: &AgentContext, url: Option<String>, force_group: bool) -> Result<Value> {
+fn browser_open(context: &AgentContext, url: Option<String>, split: bool) -> Result<Value> {
     let mut client = client()?;
-    let request = if force_group || context.pane_id.is_some() {
-        ClientRequest::CreateGroupBrowser {
+    let request = if split || context.pane_id.is_some() {
+        ClientRequest::CreateTabBrowser {
             target_pane: required_pane(context)?,
             url,
         }

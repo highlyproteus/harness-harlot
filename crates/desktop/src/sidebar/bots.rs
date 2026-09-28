@@ -26,8 +26,7 @@ impl HhApp {
         let cards = self
             .bot_workspaces()
             .into_iter()
-            .enumerate()
-            .map(|(index, workspace)| self.render_workspace_section(index, workspace, cx))
+            .map(|workspace| self.render_workspace_section(None, 1, workspace, cx))
             .collect::<Vec<_>>();
         let empty = cards.is_empty();
         div()

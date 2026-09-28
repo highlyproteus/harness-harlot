@@ -433,15 +433,15 @@ fn thread_panes_split_side_by_side_stay_threads_but_generic_creation_is_refused(
 
     // Moving a thread back out into its own tab works too.
     registry
-        .move_pane_to_new_tab(second, first_tab, true, None)
+        .move_pane_to_new_tab(second, first_tab, true)
         .unwrap();
     assert_eq!(thread_tabs(registry, bot_id).len(), 2);
 
     let workstation = registry.snapshot().unwrap().workspaces[0].id;
     let plain = crate::layout::first_pane_id(&registry.snapshot().unwrap()).unwrap();
     assert!(registry.create_pane(first, SplitAxis::Vertical).is_err());
-    assert!(registry.create_group_terminal(first).is_err());
-    assert!(registry.create_group_browser(first, None).is_err());
+    assert!(registry.create_tab_terminal(first).is_err());
+    assert!(registry.create_tab_browser(first, None).is_err());
     assert!(registry.create_workspace_tab(bot_id).is_err());
     assert!(registry.create_browser_tab(bot_id, None).is_err());
     assert!(
@@ -458,7 +458,7 @@ fn thread_panes_split_side_by_side_stay_threads_but_generic_creation_is_refused(
     );
     assert!(
         registry
-            .move_pane_to_group(first, registry.snapshot().unwrap().workspaces[0].tabs[0].id)
+            .move_pane_into_tab(first, registry.snapshot().unwrap().workspaces[0].tabs[0].id)
             .is_err()
     );
     assert_eq!(live(registry, bot_id).0.len(), 2);

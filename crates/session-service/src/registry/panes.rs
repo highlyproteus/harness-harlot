@@ -22,7 +22,8 @@ use hh_protocol::{
     AppearanceColor, MAX_PANES, Pane, PaneKind, PaneLayout, PaneStatus, SplitAxis, Tab,
     TerminalIdentity, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
     TerminalProfile, TerminalSelectionKind, WorkspaceConnection, WorkspaceConnectionStatus,
-    normalize_browser_url, normalize_browser_url_or_default, validate_ssh_host,
+    effective_working_dir, normalize_browser_url, normalize_browser_url_or_default,
+    validate_ssh_host,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,42 +122,26 @@ impl SessionRegistry {
         result
     }
 
-    pub fn create_group_terminal(&self, target_pane: Uuid) -> Result<Uuid> {
-        let (workspace_id, project_dir) = {
+    /// Adds a terminal to the tab holding `target_pane`, opened in that
+    /// pane's working directory like a split.
+    pub fn create_tab_terminal(&self, target_pane: Uuid) -> Result<Uuid> {
+        {
             let state = self.state.read();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
             state.require_terminal_layout_pane(target_pane)?;
             state.refuse_bot_pane(target_pane)?;
-            let (workspace, tab) = state
-                .snapshot
-                .workspaces
-                .iter()
-                .find_map(|workspace| {
-                    workspace.tabs.iter().find_map(|tab| {
-                        layout_contains(&tab.layout, target_pane).then_some((workspace, tab))
-                    })
-                })
-                .with_context(|| format!("target pane {target_pane} does not exist"))?;
-            let project_dir = tab.project_dir.clone().or_else(|| {
-                tab.parent_tab.and_then(|parent_id| {
-                    workspace
-                        .tabs
-                        .iter()
-                        .find(|parent| parent.id == parent_id)
-                        .and_then(|parent| parent.project_dir.clone())
-                })
-            });
-            (workspace.id, project_dir)
-        };
+        }
         let new_id = Uuid::new_v4();
-        let cwd = match project_dir.as_deref() {
-            Some(dir) => local_spawn_dir(Some(dir))?,
-            None => self.cwd_for_pane(target_pane)?,
+        let cwd = self.cwd_for_pane(target_pane)?;
+        let workspace_id = self.workspace_for_pane(target_pane)?;
+        let remote_dir = {
+            let state = self.state.read();
+            effective_working_dir(&state.snapshot.workspaces, workspace_id).map(str::to_owned)
         };
         let (session, kind) =
-            self.spawn_pane_for_workspace(new_id, workspace_id, &cwd, project_dir.as_deref())?;
+            self.spawn_pane_for_workspace(new_id, workspace_id, &cwd, remote_dir.as_deref())?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -198,7 +183,7 @@ impl SessionRegistry {
         result
     }
 
-    pub fn create_group_browser(&self, target_pane: Uuid, url: Option<&str>) -> Result<Uuid> {
+    pub fn create_tab_browser(&self, target_pane: Uuid, url: Option<&str>) -> Result<Uuid> {
         let url = normalize_browser_url_or_default(url)?;
         let title = browser_title(&url, None);
         let pane_id = Uuid::new_v4();
@@ -247,7 +232,7 @@ impl SessionRegistry {
         Ok(pane_id)
     }
 
-    pub fn create_group_gallery(&self, target_pane: Uuid, activate: bool) -> Result<Uuid> {
+    pub fn create_tab_gallery(&self, target_pane: Uuid, activate: bool) -> Result<Uuid> {
         let pane_id = Uuid::new_v4();
         let mut state = self.state.write();
         state.refuse_bot_pane(target_pane)?;
@@ -337,7 +322,10 @@ impl SessionRegistry {
             if !workspace.tabs.is_empty() {
                 bail!("workstation {workspace_id} already has a terminal layout");
             }
-            (workspace.connection.clone(), workspace.working_dir.clone())
+            (
+                workspace.connection.clone(),
+                effective_working_dir(&state.snapshot.workspaces, workspace_id).map(str::to_owned),
+            )
         };
 
         let pane_id = Uuid::new_v4();
@@ -388,10 +376,8 @@ impl SessionRegistry {
                 id: Uuid::new_v4(),
                 title: tab_title,
                 custom_title: None,
-                project_dir: None,
                 color: None,
                 custom_icon: None,
-                parent_tab: None,
                 pinned: false,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
@@ -532,10 +518,8 @@ impl SessionRegistry {
             id: Uuid::new_v4(),
             title: title.clone(),
             custom_title: None,
-            project_dir: None,
             color: None,
             custom_icon: None,
-            parent_tab: None,
             pinned: false,
             owner_bot: None,
             layout: PaneLayout::Leaf {
@@ -588,10 +572,8 @@ impl SessionRegistry {
             id: Uuid::new_v4(),
             title: "Gallery".to_owned(),
             custom_title: None,
-            project_dir: None,
             color: None,
             custom_icon: None,
-            parent_tab: None,
             pinned: false,
             owner_bot: None,
             layout: PaneLayout::Leaf {
@@ -656,7 +638,7 @@ impl SessionRegistry {
         };
         let pane_id = match (gallery_pane, group_origin) {
             (Some(pane_id), _) => pane_id,
-            (None, Some(origin_pane)) => self.create_group_gallery(origin_pane, false)?,
+            (None, Some(origin_pane)) => self.create_tab_gallery(origin_pane, false)?,
             (None, None) => self.create_gallery_tab(workspace_id)?,
         };
         Ok((path, pane_id))
@@ -854,12 +836,7 @@ impl SessionRegistry {
             if let Some(remaining) = remaining {
                 workspace.tabs[tab_index].layout = remaining;
             } else {
-                let removed_tab = workspace.tabs.remove(tab_index);
-                for tab in &mut workspace.tabs {
-                    if tab.parent_tab == Some(removed_tab.id) {
-                        tab.parent_tab = None;
-                    }
-                }
+                workspace.tabs.remove(tab_index);
             }
             prune_bot_threads(workspace);
             if was_terminal {

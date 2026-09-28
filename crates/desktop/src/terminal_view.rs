@@ -95,7 +95,7 @@ impl HhApp {
                     active,
                     "new-browser-tab",
                     PaneControlIcon::Web,
-                    "New browser in this group",
+                    "New browser in this tab",
                     cx,
                     |this, _pane_id, cx| this.new_browser_tab(cx),
                 ))
@@ -106,7 +106,7 @@ impl HhApp {
                         active,
                         "new-tab",
                         PaneControlIcon::Add,
-                        "New terminal in this group",
+                        "New terminal in this tab",
                         cx,
                         HhApp::new_tab_at,
                     ))

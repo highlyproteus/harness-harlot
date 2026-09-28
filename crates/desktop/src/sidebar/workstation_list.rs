@@ -1,13 +1,13 @@
-//! The scrollable workstation list and one workstation's card.
+//! The scrollable workstation tree and one workstation's card.
 use crate::elements::SidebarPaneRowContext;
 use crate::helpers::{
-    HeaderDropZone, SidebarSection, WorkstationTabEntry, abbreviate_home, click_suppression_active,
-    element_key, header_drop_zone, identity_detail, partition_workstation_entries,
-    readable_text_color, render_terminal_profile_icon, split_control_id, terminal_tab_count_label,
-    workspace_tab_entries, workspace_terminal_tabs,
+    HeaderDropZone, WorkstationTabEntry, abbreviate_home, click_suppression_active, element_key,
+    header_drop_zone, identity_detail, partition_workstation_entries, readable_text_color,
+    render_terminal_profile_icon, split_control_id, terminal_tab_count_label,
+    visible_workstation_tree, workspace_tab_entries, workspace_terminal_tabs,
 };
 use crate::notifications::{activity_badge, activity_section};
-use crate::tab_chrome::{PaneIndicator, render_pane_indicator};
+use crate::tab_chrome::{PaneIndicator, render_pane_indicator, workstation_rollup_indicator};
 use crate::view_models::{
     TabDrag, TabDropPreview, TooltipView, WorkspaceDrag, WorkspaceDropPreview,
 };
@@ -20,79 +20,70 @@ use gpui::{
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{
     AppearanceColor, Pane, PaneLayout, SplitAxis, TerminalProfile, Workspace, WorkspaceConnection,
-    WorkspaceConnectionStatus,
+    WorkspaceConnectionStatus, effective_working_dir,
 };
 use std::time::Instant;
 use uuid::Uuid;
 
+/// Horizontal step, in pixels, between a workstation and the ones nested in it.
+const NESTING_INDENT: f32 = 13.0;
+/// Left margin of a top-level workstation card.
+const CARD_MARGIN: f32 = 7.0;
+
 struct TabRowEntry<'a> {
     tab_id: Uuid,
-    group_label: Option<&'a str>,
-    project_dir: Option<&'a str>,
+    label: Option<&'a str>,
     tab_color: Option<AppearanceColor>,
-    custom_icon: Option<&'a str>,
-    parent_tab: Option<Uuid>,
     panes: Vec<&'a Pane>,
-    section: Option<(SidebarSection, bool)>,
+    /// `Some(is_first)` for tabs in the Pinned section.
+    pinned_section: Option<bool>,
 }
 
-struct WorkspaceGroupRow<'a> {
+#[derive(Clone, Copy)]
+struct WorkspaceTabRow<'a> {
     tab_id: Uuid,
     label: &'a str,
     tab_color: Option<AppearanceColor>,
-    custom_icon: Option<&'a str>,
-    panes: Vec<&'a Pane>,
-    group_indent: f32,
-    pane_indent: f32,
+    tab_indent: f32,
     tab_active: bool,
     tab_focus_target: Option<Uuid>,
-    is_project: bool,
 }
 
-fn flatten_entries(
+fn tab_row_entries(
     entries: Vec<WorkstationTabEntry<'_>>,
-    section: Option<SidebarSection>,
-) -> Vec<TabRowEntry<'_>> {
+    pinned: bool,
+) -> impl Iterator<Item = TabRowEntry<'_>> {
     entries
         .into_iter()
         .enumerate()
-        .flat_map(move |(entry_index, entry)| {
-            let parent_id = entry.tab_id;
-            let mut flattened = vec![TabRowEntry {
-                tab_id: entry.tab_id,
-                group_label: entry.group_label,
-                project_dir: entry.project_dir,
-                tab_color: entry.color,
-                custom_icon: entry.custom_icon,
-                parent_tab: None,
-                panes: entry.panes,
-                section: section.map(|section| (section, entry_index == 0)),
-            }];
-            flattened.extend(entry.children.into_iter().map(|child| TabRowEntry {
-                tab_id: child.tab_id,
-                group_label: child.group_label,
-                project_dir: child.project_dir,
-                tab_color: child.color,
-                custom_icon: child.custom_icon,
-                parent_tab: Some(parent_id),
-                panes: child.panes,
-                section: section.map(|section| (section, false)),
-            }));
-            flattened
+        .map(move |(entry_index, entry)| TabRowEntry {
+            tab_id: entry.tab_id,
+            label: entry.label,
+            tab_color: entry.color,
+            panes: entry.panes,
+            pinned_section: pinned.then_some(entry_index == 0),
         })
-        .collect()
 }
 
 #[allow(clippy::struct_excessive_bools)]
 struct WorkspaceSectionCtx {
     workspace_id: Uuid,
-    index: usize,
+    /// Sidebar position shown before a top-level workstation's title
+    /// (the ⌘ number); `None` for nested workstations and bots.
+    number: Option<usize>,
+    parent: Option<Uuid>,
+    /// Left offset of this card from its nesting depth.
+    card_indent: f32,
     pinned: bool,
+    home: bool,
     active: bool,
     offline: bool,
     connected: bool,
     expanded: bool,
     terminal_count: usize,
+    /// Status dot a collapsed card shows for itself and its nested
+    /// workstations.
+    rollup: PaneIndicator,
     card_color: u32,
     active_text: u32,
     workspace_title: String,
@@ -100,28 +91,35 @@ struct WorkspaceSectionCtx {
     custom_icon: Option<String>,
     drop_above: bool,
     drop_below: bool,
+    /// A tab dragged from another workstation on the same machine hovers
+    /// this card and would move here on drop.
+    tab_drop_into: bool,
     /// A bot card: its agent replaces the workstation number.
     bot: Option<TerminalProfile>,
 }
 
 impl HhApp {
     /// The Workstations view: its header, then the scrollable workstation
-    /// list or the empty-state hint.
+    /// tree or the empty-state hint.
     pub(crate) fn render_workstation_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut workspaces = self
+        let workspaces = self
             .session
             .snapshot
             .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .workspaces
-                    .iter()
-                    .filter(|workspace| !workspace.is_bot())
-                    .collect::<Vec<_>>()
+            .map_or(&[][..], |snapshot| snapshot.workspaces.as_slice());
+        let rows = visible_workstation_tree(workspaces, &self.sidebar.expanded_workspaces);
+        let has_workspaces = !rows.is_empty();
+        let mut top_level_index = 0;
+        let sections = rows
+            .into_iter()
+            .map(|(workspace, depth)| {
+                let number = (depth == 1).then(|| {
+                    top_level_index += 1;
+                    top_level_index - 1
+                });
+                self.render_workspace_section(number, depth, workspace, cx)
             })
-            .unwrap_or_default();
-        workspaces.sort_by_key(|workspace| (!workspace.pinned, workspace.order));
-        let has_workspaces = !workspaces.is_empty();
+            .collect::<Vec<_>>();
         div()
             .min_h(px(0.0))
             .flex_1()
@@ -140,14 +138,7 @@ impl HhApp {
                     .min_h(px(0.0))
                     .flex_1()
                     .overflow_y_scroll()
-                    .children(
-                        workspaces
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, workspace)| {
-                                self.render_workspace_section(index, workspace, cx)
-                            }),
-                    )
+                    .children(sections)
                     .when(!has_workspaces, |element| {
                         element.child(
                             div()
@@ -163,10 +154,12 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// One workstation card with its tabs, groups, and terminal rows.
+    /// One workstation (or bot) card at nesting `depth` (1 for top level),
+    /// with its tab and terminal rows when expanded.
     pub(crate) fn render_workspace_section(
         &self,
-        index: usize,
+        number: Option<usize>,
+        depth: usize,
         workspace: &Workspace,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -187,18 +180,32 @@ impl HhApp {
                 ..
             }
         );
+        let workspaces = self
+            .session
+            .snapshot
+            .as_ref()
+            .map_or(&[][..], |snapshot| snapshot.workspaces.as_slice());
         let workspace_title = workspace.title.clone();
-        let workspace_dir = workspace.working_dir.as_deref().map(abbreviate_home);
-        let (pinned_entries, project_entries, floating_entries) =
+        let workspace_dir = if workspace.is_bot() {
+            workspace.working_dir.as_deref().map(abbreviate_home)
+        } else {
+            Some(
+                effective_working_dir(workspaces, workspace_id)
+                    .map_or_else(|| "~".to_owned(), abbreviate_home),
+            )
+        };
+        let (pinned_entries, other_entries) =
             partition_workstation_entries(workspace_tab_entries(workspace));
-        let mut tab_entries = flatten_entries(pinned_entries, Some(SidebarSection::Pinned));
-        tab_entries.extend(flatten_entries(
-            project_entries,
-            Some(SidebarSection::Projects),
-        ));
-        tab_entries.extend(flatten_entries(floating_entries, None));
+        let tab_entries = tab_row_entries(pinned_entries, true)
+            .chain(tab_row_entries(other_entries, false))
+            .collect::<Vec<_>>();
         let terminal_count = workspace_terminal_tabs(workspace).len();
         let expanded = self.sidebar.expanded_workspaces.contains(&workspace_id);
+        let rollup = if expanded || workspace.is_bot() {
+            PaneIndicator::None
+        } else {
+            workstation_rollup_indicator(workspaces, workspace_id, |pane| self.pane_indicator(pane))
+        };
         let workspace_color = self.workspace_color(workspace_id).as_rgb();
         let card_color = workspace_color;
         let active_text = readable_text_color(card_color);
@@ -209,19 +216,26 @@ impl HhApp {
             .is_some_and(|preview| preview.target_workspace_id == workspace_id && preview.after);
         let drag = WorkspaceDrag {
             workspace_id,
+            parent: workspace.parent_workstation,
             pinned,
             title: workspace_title.clone(),
             position: Point::default(),
         };
+        #[allow(clippy::cast_precision_loss)]
+        let card_indent = depth.saturating_sub(1) as f32 * NESTING_INDENT;
         let ctx = WorkspaceSectionCtx {
             workspace_id,
-            index,
+            number,
+            parent: workspace.parent_workstation,
+            card_indent,
             pinned,
+            home: workspace.home,
             active,
             offline,
             connected,
             expanded,
             terminal_count,
+            rollup,
             card_color,
             active_text,
             workspace_title,
@@ -229,6 +243,7 @@ impl HhApp {
             custom_icon: workspace.custom_icon.clone(),
             drop_above,
             drop_below,
+            tab_drop_into: self.sidebar.tab_drop_workspace == Some(workspace_id),
             bot: workspace.bot.as_ref().map(|bot| bot.agent),
         };
         let saved_threads = ctx
@@ -239,7 +254,8 @@ impl HhApp {
             .child(
                 div()
                     .id(("workspace-section", element_key(workspace.id)))
-                    .mx(px(7.0))
+                    .ml(px(CARD_MARGIN + card_indent))
+                    .mr(px(CARD_MARGIN))
                     .mb(px(3.0))
                     .flex()
                     .flex_col()
@@ -275,46 +291,30 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let workspace_id = ctx.workspace_id;
+        let pinned_collapsed = self
+            .sidebar
+            .collapsed_pinned_sections
+            .contains(&workspace_id);
         tab_entries
             .into_iter()
             .flat_map(
                 |TabRowEntry {
                      tab_id,
-                     group_label,
-                     project_dir,
+                     label,
                      tab_color,
-                     custom_icon,
-                     parent_tab,
                      panes,
-                     section,
+                     pinned_section,
                  }| {
-                    let is_project = project_dir.is_some();
                     let mut rows = Vec::new();
-                    if let Some((section, is_section_header)) = section {
-                        let collapsed = match section {
-                            SidebarSection::Pinned => self
-                                .sidebar
-                                .collapsed_pinned_sections
-                                .contains(&workspace_id),
-                            SidebarSection::Projects => self
-                                .sidebar
-                                .collapsed_project_sections
-                                .contains(&workspace_id),
-                        };
-                        if is_section_header {
-                            rows.push(self.render_sidebar_section_row(ctx, section, collapsed, cx));
+                    if let Some(is_first) = pinned_section {
+                        if is_first {
+                            rows.push(self.render_pinned_section_row(ctx, pinned_collapsed, cx));
                         }
-                        if collapsed {
+                        if pinned_collapsed {
                             return rows;
                         }
                     }
-                    if parent_tab
-                        .is_some_and(|parent_id| self.sidebar.collapsed_groups.contains(&parent_id))
-                    {
-                        return rows;
-                    }
-                    let group_indent = if parent_tab.is_some() { 48.0 } else { 20.0 };
-                    let pane_indent = if parent_tab.is_some() { 62.0 } else { 34.0 };
+                    let tab_indent = 20.0;
                     let tab_active = self
                         .layout
                         .focused_pane
@@ -324,7 +324,7 @@ impl HhApp {
                         .focused_pane
                         .filter(|focused| panes.iter().any(|pane| pane.id == *focused))
                         .or_else(|| panes.first().map(|pane| pane.id));
-                    match group_label {
+                    match label {
                         None => {
                             if let Some(pane) = panes.into_iter().next() {
                                 rows.push(self.render_workspace_terminal_row(
@@ -333,27 +333,23 @@ impl HhApp {
                                         workspace_id,
                                         tab_id: Some(tab_id),
                                         tab_color,
-                                        from_group: false,
-                                        indent: group_indent,
+                                        from_pane_map: false,
+                                        indent: tab_indent,
                                         activity: None,
                                     },
                                     cx,
                                 ));
                             }
                         }
-                        Some(label) => rows.extend(self.render_workspace_group_rows(
+                        Some(label) => rows.push(self.render_workspace_tab_window(
                             ctx,
-                            WorkspaceGroupRow {
+                            WorkspaceTabRow {
                                 tab_id,
                                 label,
                                 tab_color,
-                                custom_icon,
-                                panes,
-                                group_indent,
-                                pane_indent,
+                                tab_indent,
                                 tab_active,
                                 tab_focus_target,
-                                is_project,
                             },
                             cx,
                         )),
@@ -364,298 +360,173 @@ impl HhApp {
             .collect()
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn render_workspace_group_rows(
+    /// A multi-pane or named tab: the ring of its pane chips laid out like
+    /// the tab itself. Click focuses it, dragging reorders it, and dropping
+    /// a chip from another tab onto it moves that pane in.
+    fn render_workspace_tab_window(
         &self,
         ctx: &WorkspaceSectionCtx,
-        row: WorkspaceGroupRow<'_>,
+        row: WorkspaceTabRow<'_>,
         cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    ) -> AnyElement {
         let workspace_id = ctx.workspace_id;
-        let WorkspaceGroupRow {
+        let WorkspaceTabRow {
             tab_id,
             label,
             tab_color,
-            custom_icon,
-            panes,
-            group_indent,
-            pane_indent,
+            tab_indent,
             tab_active,
             tab_focus_target,
-            is_project,
         } = row;
-        let mut rows = Vec::new();
-        let collapsed = self.sidebar.collapsed_groups.contains(&tab_id);
-        let count_label = terminal_tab_count_label(panes.len());
         let drop_preview = self.sidebar.tab_drop_preview;
-        let drop_into = drop_preview
-            .is_some_and(|preview| preview.target_tab_id == tab_id && preview.into_group);
+        let drop_into =
+            drop_preview.is_some_and(|preview| preview.target_tab_id == tab_id && preview.into_tab);
         let drop_above = drop_preview.is_some_and(|preview| {
-            preview.target_tab_id == tab_id && !preview.into_group && !preview.after
+            preview.target_tab_id == tab_id && !preview.into_tab && !preview.after
         });
         let drop_below = drop_preview.is_some_and(|preview| {
-            preview.target_tab_id == tab_id && !preview.into_group && preview.after
+            preview.target_tab_id == tab_id && !preview.into_tab && preview.after
         });
         let drag = TabDrag {
             workspace_id,
             tab_id,
             pane_id: None,
-            from_group: false,
+            from_pane_map: false,
             title: label.to_owned(),
             position: Point::default(),
         };
-        let custom_icon_path = custom_icon.and_then(|icon| self.custom_icon_path(icon));
-        let group_text = tab_color.map_or(THEME.foreground, |color| {
-            readable_text_color(color.as_rgb())
+        let content = self.tab_layout(workspace_id, tab_id).map(|layout| {
+            self.render_pane_map(
+                workspace_id,
+                tab_id,
+                layout,
+                tab_indent + ctx.card_indent,
+                cx,
+            )
         });
-        let group_detail_text =
-            tab_color.map_or(THEME.dim, |color| readable_text_color(color.as_rgb()));
-        // A window is its ring of terminal chips, with no header row. Project
-        // folders keep a collapsible header because they hold other tabs.
-        let window_ring = !is_project;
-        let content: Vec<AnyElement> = if window_ring {
-            self.tab_layout(workspace_id, tab_id)
-                .map(|layout| self.render_pane_map(workspace_id, tab_id, layout, group_indent, cx))
-                .into_iter()
-                .collect()
-        } else {
-            let mut parts = vec![
-                div()
-                    .id(("toggle-workspace-group", element_key(tab_id)))
-                    .flex_none()
-                    .w(px(12.0))
-                    .font_family(".SystemUIFont")
-                    .text_xs()
-                    .text_color(rgb(group_detail_text))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_group_collapsed(tab_id, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(if collapsed { "▸" } else { "▾" })
-                    .into_any_element(),
-            ];
-            parts.push(match custom_icon_path {
-                Some(path) => img(path)
-                    .flex_none()
-                    .w(px(11.0))
-                    .h(px(11.0))
-                    .object_fit(gpui::ObjectFit::Contain)
-                    .rounded(px(2.0))
-                    .into_any_element(),
-                None => div()
-                    .relative()
-                    .flex_none()
-                    .w(px(11.0))
-                    .h(px(8.0))
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(0.0))
-                            .top(px(2.0))
-                            .w(px(11.0))
-                            .h(px(6.0))
-                            .rounded(px(1.5))
-                            .border_1()
-                            .border_color(rgb(THEME.muted)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(0.0))
-                            .top(px(0.0))
-                            .w(px(5.0))
-                            .h(px(3.0))
-                            .rounded(px(1.0))
-                            .bg(rgb(THEME.muted)),
-                    )
-                    .into_any_element(),
-            });
-            parts.push(
-                div()
-                    .min_w(px(0.0))
-                    .flex_1()
-                    .truncate()
-                    .font_family(".SystemUIFont")
-                    .text_xs()
-                    .text_color(rgb(group_text))
-                    .child(label.to_owned())
-                    .into_any_element(),
-            );
-            parts.push(
-                div()
-                    .flex_none()
-                    .font_family(".SystemUIFont")
-                    .text_xs()
-                    .text_color(rgb(group_detail_text))
-                    .child(count_label)
-                    .into_any_element(),
-            );
-            parts.push(self.render_workspace_group_menu_button(tab_id, cx));
-            parts
-        };
-        rows.push(
-            div()
-                .id(("workspace-group", element_key(tab_id)))
-                .ml(px(group_indent))
-                .mr(px(4.0))
-                .when(window_ring, |element| {
-                    element.p(px(3.0)).my(px(2.0)).rounded(px(6.0)).border_1()
+        div()
+            .id(("workspace-tab-window", element_key(tab_id)))
+            .ml(px(tab_indent))
+            .mr(px(4.0))
+            .p(px(3.0))
+            .my(px(2.0))
+            .rounded(px(6.0))
+            .border_1()
+            .when(drop_above, |element| element.border_t(px(2.0)))
+            .when(drop_below, |element| element.border_b(px(2.0)))
+            .border_color(rgb(if drop_into || drop_above || drop_below {
+                THEME.accent
+            } else {
+                THEME.border_strong
+            }))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .when_some(tab_color, |element, color| element.bg(rgb(color.as_rgb())))
+            .when(tab_active && tab_color.is_none(), |element| {
+                element.bg(rgb(THEME.accent_soft))
+            })
+            .when(tab_color.is_none(), |element| {
+                element.hover(|element| element.bg(rgb(THEME.elevated)))
+            })
+            .when(tab_color.is_some(), |element| {
+                element.hover(|element| {
+                    element.border_1().border_color(rgb(readable_text_color(
+                        tab_color.map_or(THEME.foreground, |color| color.as_rgb()),
+                    )))
                 })
-                .when(!window_ring, |element| {
-                    element.px(px(7.0)).h(px(27.0)).rounded(px(4.0))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if click_suppression_active(
+                    &mut this.sidebar.suppress_tab_click_until,
+                    Instant::now(),
+                ) {
+                    cx.notify();
+                    return;
+                }
+                if let Some(pane_id) = tab_focus_target {
+                    this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+                }
+                cx.stop_propagation();
+            }))
+            .on_drag(drag, |info: &TabDrag, position, _, cx| {
+                cx.new(|_| TabDrag {
+                    position,
+                    ..info.clone()
                 })
-                .when(drop_above, |element| element.border_t(px(2.0)))
-                .when(drop_below, |element| element.border_b(px(2.0)))
-                .when(drop_into, |element| element.border_1())
-                .border_color(rgb(if drop_into || drop_above || drop_below {
-                    THEME.accent
-                } else if window_ring {
-                    THEME.border_strong
-                } else {
-                    THEME.border
-                }))
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .when_some(tab_color, |element, color| element.bg(rgb(color.as_rgb())))
-                .when(tab_active && tab_color.is_none(), |element| {
-                    element.bg(rgb(THEME.accent_soft))
-                })
-                .when(tab_color.is_none(), |element| {
-                    element.hover(|element| element.bg(rgb(THEME.elevated)))
-                })
-                .when(tab_color.is_some(), |element| {
-                    element.hover(|element| {
-                        element.border_1().border_color(rgb(readable_text_color(
-                            tab_color.map_or(THEME.foreground, |color| color.as_rgb()),
-                        )))
-                    })
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if click_suppression_active(
-                        &mut this.sidebar.suppress_tab_click_until,
-                        Instant::now(),
-                    ) {
-                        cx.notify();
-                        return;
-                    }
-                    this.sidebar.collapsed_groups.remove(&tab_id);
-                    if let Some(pane_id) = tab_focus_target {
-                        this.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
-                    }
-                    cx.stop_propagation();
-                }))
-                .on_drag(drag, |info: &TabDrag, position, _, cx| {
-                    cx.new(|_| TabDrag {
-                        position,
-                        ..info.clone()
-                    })
-                })
-                .on_drag_move::<TabDrag>(cx.listener(
-                    move |this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
-                        let drag = event.drag(cx);
-                        let previews_this_tab = this
-                            .sidebar
-                            .tab_drop_preview
-                            .is_some_and(|preview| preview.target_tab_id == tab_id);
-                        if drag.workspace_id != workspace_id
-                            || (drag.tab_id == tab_id && drag.pane_id.is_none())
-                        {
-                            if previews_this_tab {
-                                this.sidebar.tab_drop_preview = None;
-                                cx.notify();
-                            }
-                            return;
-                        }
-                        if event.bounds.contains(&event.event.position) {
-                            let zone = header_drop_zone(
-                                f32::from(event.event.position.y),
-                                f32::from(event.bounds.origin.y),
-                                f32::from(event.bounds.origin.y + event.bounds.size.height),
-                            );
-                            let next = Some(TabDropPreview {
-                                target_tab_id: tab_id,
-                                after: zone == HeaderDropZone::After,
-                                into_group: zone == HeaderDropZone::Into
-                                    && (is_project
-                                        || (drag.pane_id.is_some() && drag.tab_id != tab_id)),
-                            });
-                            cx.stop_propagation();
-                            if this.sidebar.tab_drop_preview != next {
-                                this.sidebar.tab_drop_preview = next;
-                                cx.notify();
-                            }
-                        } else if previews_this_tab {
+            })
+            .on_drag_move::<TabDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                    let drag = event.drag(cx);
+                    let previews_this_tab = this
+                        .sidebar
+                        .tab_drop_preview
+                        .is_some_and(|preview| preview.target_tab_id == tab_id);
+                    if drag.workspace_id != workspace_id
+                        || (drag.tab_id == tab_id && drag.pane_id.is_none())
+                    {
+                        if previews_this_tab {
                             this.sidebar.tab_drop_preview = None;
                             cx.notify();
                         }
-                    },
-                ))
-                .on_drop(cx.listener(move |this, info: &TabDrag, _, cx| {
-                    if info.workspace_id == workspace_id {
-                        let preview = this
-                            .sidebar
-                            .tab_drop_preview
-                            .filter(|preview| preview.target_tab_id == tab_id);
-                        let into_group = preview.is_some_and(|preview| preview.into_group);
-                        let after = preview.is_some_and(|preview| preview.after);
-                        if into_group && is_project {
-                            if let Some(source_pane) = info.pane_id.filter(|_| info.from_group) {
-                                this.move_sidebar_pane_to_new_tab(
-                                    source_pane,
-                                    tab_id,
-                                    false,
-                                    Some(tab_id),
-                                    cx,
-                                );
-                            } else if info.tab_id != tab_id {
-                                this.move_tab_to_project(info.tab_id, tab_id, cx);
-                            }
-                        } else if into_group {
-                            if let Some(source_pane) = info.pane_id {
-                                this.move_sidebar_pane_to_group(source_pane, tab_id, cx);
-                            }
-                        } else if let Some(source_pane) = info.pane_id.filter(|_| info.from_group) {
-                            this.move_sidebar_pane_to_new_tab(source_pane, tab_id, after, None, cx);
-                        } else if info.tab_id != tab_id {
-                            this.reorder_workspace_tab(info.tab_id, tab_id, after, cx);
-                        }
+                        return;
                     }
-                    this.sidebar.tab_drop_preview = None;
-                    cx.notify();
-                    cx.stop_propagation();
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        this.open_group_menu(tab_id, event.position, cx);
+                    if event.bounds.contains(&event.event.position) {
+                        let zone = header_drop_zone(
+                            f32::from(event.event.position.y),
+                            f32::from(event.bounds.origin.y),
+                            f32::from(event.bounds.origin.y + event.bounds.size.height),
+                        );
+                        let next = Some(TabDropPreview {
+                            target_tab_id: tab_id,
+                            after: zone == HeaderDropZone::After,
+                            into_tab: zone == HeaderDropZone::Into
+                                && drag.pane_id.is_some()
+                                && drag.tab_id != tab_id,
+                        });
                         cx.stop_propagation();
-                    }),
-                )
-                .children(content)
-                .into_any_element(),
-        );
-        if is_project
-            && !collapsed
-            && let Some(layout) = self.tab_layout(workspace_id, tab_id)
-        {
-            rows.push(
-                div()
-                    .ml(px(pane_indent))
-                    .mr(px(4.0))
-                    .mt(px(1.0))
-                    .mb(px(3.0))
-                    .p(px(3.0))
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(rgb(THEME.border_strong))
-                    .flex()
-                    .child(self.render_pane_map(workspace_id, tab_id, layout, pane_indent, cx))
-                    .into_any_element(),
-            );
-        }
-        rows
+                        if this.sidebar.tab_drop_preview != next {
+                            this.sidebar.tab_drop_preview = next;
+                            cx.notify();
+                        }
+                    } else if previews_this_tab {
+                        this.sidebar.tab_drop_preview = None;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(move |this, info: &TabDrag, _, cx| {
+                if info.workspace_id == workspace_id {
+                    let preview = this
+                        .sidebar
+                        .tab_drop_preview
+                        .filter(|preview| preview.target_tab_id == tab_id);
+                    let into_tab = preview.is_some_and(|preview| preview.into_tab);
+                    let after = preview.is_some_and(|preview| preview.after);
+                    if into_tab {
+                        if let Some(source_pane) = info.pane_id {
+                            this.move_sidebar_pane_into_tab(source_pane, tab_id, cx);
+                        }
+                    } else if let Some(source_pane) = info.pane_id.filter(|_| info.from_pane_map) {
+                        this.move_sidebar_pane_to_new_tab(source_pane, tab_id, after, cx);
+                    } else if info.tab_id != tab_id {
+                        this.reorder_workspace_tab(info.tab_id, tab_id, after, cx);
+                    }
+                }
+                this.sidebar.tab_drop_preview = None;
+                cx.notify();
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_tab_row_menu(tab_id, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .children(content)
+            .into_any_element()
     }
 
     fn tab_layout(&self, workspace_id: Uuid, tab_id: Uuid) -> Option<&PaneLayout> {
@@ -714,7 +585,7 @@ impl HhApp {
         match layout {
             PaneLayout::Leaf { pane } => cell()
                 .size_full()
-                .child(self.render_group_pane_chip(workspace_id, tab_id, pane, cx))
+                .child(self.render_tab_pane_chip(workspace_id, tab_id, pane, cx))
                 .into_any_element(),
             PaneLayout::Stack { panes, .. } => cell()
                 .size_full()
@@ -722,7 +593,7 @@ impl HhApp {
                     panes
                         .iter()
                         .map(|pane| {
-                            cell().flex_1().h_full().child(self.render_group_pane_chip(
+                            cell().flex_1().h_full().child(self.render_tab_pane_chip(
                                 workspace_id,
                                 tab_id,
                                 pane,
@@ -777,7 +648,7 @@ impl HhApp {
     /// One terminal of a window, tmux-style: a compact chip with its icon,
     /// name, and status. Click focuses it, dragging moves it out to its own
     /// tab, and right-click opens its tab menu.
-    fn render_group_pane_chip(
+    fn render_tab_pane_chip(
         &self,
         workspace_id: Uuid,
         tab_id: Uuid,
@@ -816,12 +687,12 @@ impl HhApp {
             workspace_id,
             tab_id,
             pane_id: Some(pane_id),
-            from_group: true,
+            from_pane_map: true,
             title: title.clone(),
             position: Point::default(),
         };
         div()
-            .id(("group-pane-chip", element_key(pane_id)))
+            .id(("tab-pane-chip", element_key(pane_id)))
             .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
@@ -883,7 +754,7 @@ impl HhApp {
             )
             .child(render_pane_indicator(indicator))
             .child(self.render_close_button(
-                ("close-group-pane-chip", element_key(pane_id)),
+                ("close-tab-pane-chip", element_key(pane_id)),
                 THEME.foreground,
                 close_tooltip,
                 move |this, cx| match close_thread.clone() {
@@ -897,45 +768,15 @@ impl HhApp {
             .into_any_element()
     }
 
-    fn render_workspace_group_menu_button(
-        &self,
-        tab_id: Uuid,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .id(("group-row-menu", element_key(tab_id)))
-            .flex_none()
-            .w(px(16.0))
-            .h(px(18.0))
-            .rounded(px(4.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .font_family(".SystemUIFont")
-            .text_sm()
-            .text_color(rgb(THEME.dim))
-            .hover(|element| element.text_color(rgb(THEME.foreground)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.open_group_menu(tab_id, event.position, cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child("⋮")
-            .into_any_element()
-    }
-
-    fn render_sidebar_section_row(
+    fn render_pinned_section_row(
         &self,
         ctx: &WorkspaceSectionCtx,
-        section: SidebarSection,
         collapsed: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let workspace_id = ctx.workspace_id;
         div()
-            .id((section.element_id(), element_key(workspace_id)))
+            .id(("sidebar-pinned-section", element_key(workspace_id)))
             .ml(px(20.0))
             .py(px(3.0))
             .cursor_pointer()
@@ -947,11 +788,11 @@ impl HhApp {
             .text_color(rgb(THEME.dim))
             .hover(|element| element.text_color(rgb(THEME.muted)))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_sidebar_section(workspace_id, section, cx);
+                this.toggle_pinned_section(workspace_id, cx);
                 cx.stop_propagation();
             }))
             .child(div().flex_none().child(if collapsed { "›" } else { "⌄" }))
-            .child(section.label())
+            .child("Pinned")
             .into_any_element()
     }
 
@@ -973,6 +814,8 @@ impl HhApp {
         let workspace_dir = ctx.workspace_dir.clone();
         let drop_above = ctx.drop_above;
         let drop_below = ctx.drop_below;
+        let tab_drop_into = ctx.tab_drop_into;
+        let parent = ctx.parent;
         let bot = ctx.bot.is_some();
         div()
             .id(("workspace", element_key(workspace_id)))
@@ -981,7 +824,8 @@ impl HhApp {
             .rounded(px(6.0))
             .border_t(if drop_above { px(2.0) } else { px(0.0) })
             .border_b(if drop_below { px(2.0) } else { px(0.0) })
-            .border_color(rgb(if drop_above || drop_below {
+            .when(tab_drop_into, |element| element.border_1())
+            .border_color(rgb(if drop_above || drop_below || tab_drop_into {
                 THEME.accent
             } else {
                 THEME.border
@@ -1025,6 +869,7 @@ impl HhApp {
                     let drag = event.drag(cx);
                     if drag.workspace_id != workspace_id
                         && drag.pinned == pinned
+                        && drag.parent == parent
                         && event.bounds.contains(&event.event.position)
                     {
                         let next_dragging = Some(drag.workspace_id);
@@ -1051,8 +896,46 @@ impl HhApp {
                     }
                 },
             ))
+            .when(!bot, |element| {
+                element
+                    .on_drag_move::<TabDrag>(cx.listener(
+                        move |this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                            let drag = event.drag(cx);
+                            let accepts = !drag.from_pane_map
+                                && event.bounds.contains(&event.event.position)
+                                && this.accepts_tab_move(drag.workspace_id, workspace_id);
+                            let next = if accepts {
+                                Some(workspace_id)
+                            } else if this.sidebar.tab_drop_workspace == Some(workspace_id) {
+                                None
+                            } else {
+                                return;
+                            };
+                            if accepts {
+                                cx.stop_propagation();
+                            }
+                            if this.sidebar.tab_drop_workspace != next {
+                                this.sidebar.tab_drop_workspace = next;
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, info: &TabDrag, _, cx| {
+                        if !info.from_pane_map
+                            && this.accepts_tab_move(info.workspace_id, workspace_id)
+                        {
+                            this.move_tab_to_workstation(info.tab_id, workspace_id, cx);
+                        }
+                        this.sidebar.tab_drop_workspace = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }))
+            })
             .on_drop(cx.listener(move |this, info: &WorkspaceDrag, _, cx| {
-                if info.workspace_id != workspace_id && info.pinned == pinned {
+                if info.workspace_id != workspace_id
+                    && info.pinned == pinned
+                    && info.parent == parent
+                {
                     let after = this.sidebar.workspace_drop_preview.is_some_and(|preview| {
                         preview.target_workspace_id == workspace_id && preview.after
                     });
@@ -1093,9 +976,9 @@ impl HhApp {
                     .tooltip(move |_, cx| {
                         cx.new(|_| TooltipView {
                             text: if expanded {
-                                "Collapse workstation terminals".to_owned()
+                                "Collapse workstation".to_owned()
                             } else {
-                                "Expand workstation terminals".to_owned()
+                                "Expand workstation".to_owned()
                             },
                         })
                         .into()
@@ -1107,6 +990,9 @@ impl HhApp {
                     .child(if expanded { "⌄" } else { "›" }),
             )
             .child(self.render_workspace_card_title(ctx))
+            .when(ctx.rollup != PaneIndicator::None, |element| {
+                element.child(render_pane_indicator(ctx.rollup))
+            })
             .when(!bot, |element| {
                 element.child(self.render_workspace_tab_count(ctx))
             })
@@ -1114,119 +1000,126 @@ impl HhApp {
                 element.child(self.render_new_thread_button(workspace_id, cx))
             })
             .child(self.render_workspace_menu_button(ctx, cx))
-            .when(connected, |element| {
-                element
-                    .child(
-                        div()
-                            .id(("workspace-connection-info", element_key(workspace_id)))
-                            .flex_none()
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .rounded_full()
-                            .cursor_pointer()
-                            .font_family(".SystemUIFont")
-                            .text_xs()
-                            .text_color(rgb(active_text))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|element| element.bg(rgba(0xffffff20)))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "Connection details".to_owned(),
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                this.open_workspace_connection_info(
-                                    workspace_id,
-                                    event.position(),
-                                    cx,
-                                );
-                                cx.stop_propagation();
-                            }))
-                            .child("ⓘ"),
-                    )
-                    .child(
-                        div()
-                            .id(("workspace-connected-indicator", element_key(workspace_id)))
-                            .flex_none()
-                            .w(px(8.0))
-                            .h(px(8.0))
-                            .rounded_full()
-                            .bg(rgb(THEME.ansi[2]))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "Connected".to_owned(),
-                                })
-                                .into()
-                            }),
-                    )
-            })
-            .when(offline, |element| {
-                element
-                    .child(
-                        div()
-                            .id(("reconnect-workspace", element_key(workspace_id)))
-                            .flex_none()
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .font_family(".SystemUIFont")
-                            .text_sm()
-                            .text_color(rgb(THEME.ansi[2]))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|element| element.bg(rgba(0xffffff20)))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "Reconnect with system OpenSSH".to_owned(),
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.reconnect_workspace(workspace_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child("↻"),
-                    )
-                    .child(
-                        div()
-                            .id(("delete-offline-workspace", element_key(workspace_id)))
-                            .flex_none()
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .font_family(".SystemUIFont")
-                            .text_xs()
-                            .text_color(rgb(THEME.danger))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|element| element.bg(rgba(0xffffff20)))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| TooltipView {
-                                    text: "Delete saved workstation…".to_owned(),
-                                })
-                                .into()
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.begin_workspace_delete(workspace_id, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child("⌫"),
-                    )
-            })
+            .children(self.render_remote_card_controls(ctx, cx))
             .into_any_element()
     }
 
+    /// The connected SSH card's info button and green dot, or the offline
+    /// card's reconnect and delete buttons.
+    fn render_remote_card_controls(
+        &self,
+        ctx: &WorkspaceSectionCtx,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let workspace_id = ctx.workspace_id;
+        let active_text = ctx.active_text;
+        if ctx.connected {
+            vec![
+                div()
+                    .id(("workspace-connection-info", element_key(workspace_id)))
+                    .flex_none()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(active_text))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|element| element.bg(rgba(0xffffff20)))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: "Connection details".to_owned(),
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        this.open_workspace_connection_info(workspace_id, event.position(), cx);
+                        cx.stop_propagation();
+                    }))
+                    .child("ⓘ")
+                    .into_any_element(),
+                div()
+                    .id(("workspace-connected-indicator", element_key(workspace_id)))
+                    .flex_none()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded_full()
+                    .bg(rgb(THEME.ansi[2]))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: "Connected".to_owned(),
+                        })
+                        .into()
+                    })
+                    .into_any_element(),
+            ]
+        } else if ctx.offline {
+            vec![
+                div()
+                    .id(("reconnect-workspace", element_key(workspace_id)))
+                    .flex_none()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_sm()
+                    .text_color(rgb(THEME.ansi[2]))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|element| element.bg(rgba(0xffffff20)))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: "Reconnect with system OpenSSH".to_owned(),
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.reconnect_workspace(workspace_id, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child("↻")
+                    .into_any_element(),
+                div()
+                    .id(("delete-offline-workspace", element_key(workspace_id)))
+                    .flex_none()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .font_family(".SystemUIFont")
+                    .text_xs()
+                    .text_color(rgb(THEME.danger))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|element| element.bg(rgba(0xffffff20)))
+                    .tooltip(|_, cx| {
+                        cx.new(|_| TooltipView {
+                            text: "Delete saved workstation…".to_owned(),
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.begin_workspace_delete(workspace_id, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child("⌫")
+                    .into_any_element(),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn render_workspace_card_title(&self, ctx: &WorkspaceSectionCtx) -> AnyElement {
-        let title = match ctx.bot {
-            Some(_) => ctx.workspace_title.clone(),
-            None => format!("{}  {}", ctx.index + 1, ctx.workspace_title),
+        let title = match ctx.number.filter(|_| ctx.bot.is_none()) {
+            Some(index) => format!("{}  {}", index + 1, ctx.workspace_title),
+            None => ctx.workspace_title.clone(),
         };
         let text_color = if ctx.active || ctx.connected || ctx.offline {
             ctx.active_text
@@ -1251,6 +1144,9 @@ impl HhApp {
                     .gap(px(6.0))
                     .when_some(ctx.bot, |element, agent| {
                         element.child(render_terminal_profile_icon(agent, text_color, 14.0))
+                    })
+                    .when(ctx.home, |element| {
+                        element.child(render_this_machine_mark(ctx.workspace_id, text_color))
                     })
                     .when_some(icon_path, |element, path| {
                         element.child(
@@ -1352,6 +1248,36 @@ impl HhApp {
             .child("⋮")
             .into_any_element()
     }
+}
+
+/// The home workstation's small monitor glyph, marking the card that stands
+/// for this machine.
+fn render_this_machine_mark(workspace_id: Uuid, color: u32) -> AnyElement {
+    div()
+        .id(("this-machine-mark", element_key(workspace_id)))
+        .flex_none()
+        .w(px(13.0))
+        .h(px(11.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .tooltip(|_, cx| {
+            cx.new(|_| TooltipView {
+                text: hh_protocol::this_machine_title().to_owned(),
+            })
+            .into()
+        })
+        .child(
+            div()
+                .w(px(13.0))
+                .h(px(8.0))
+                .rounded(px(1.5))
+                .border_1()
+                .border_color(rgb(color)),
+        )
+        .child(div().w(px(1.5)).h(px(1.5)).bg(rgb(color)))
+        .child(div().w(px(6.0)).h(px(1.0)).rounded(px(0.5)).bg(rgb(color)))
+        .into_any_element()
 }
 
 /// How many terminal rows a window stacks vertically, so the sidebar map is

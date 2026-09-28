@@ -83,8 +83,8 @@ use browser::{BrowserUrlEditor, prepare_cef_process};
 use commands::{AppConfig, ROOT_KEY_CONTEXT, ResolvedKeymap};
 use gallery::GalleryUi;
 use helpers::{
-    WorkspaceTabScope, default_sidebar_width, gpui_binding, migrated_sidebar_width,
-    next_terminal_poll_delay_ms, product_name,
+    default_sidebar_width, gpui_binding, migrated_sidebar_width, next_terminal_poll_delay_ms,
+    product_name,
 };
 use session::session_call;
 use theme::{AppTheme, BuiltInTheme};
@@ -286,17 +286,16 @@ impl SessionState {
 
 struct SidebarUi {
     active_workspace: Option<Uuid>,
-    workspace_tab_scope: WorkspaceTabScope,
     expanded_workspaces: HashSet<Uuid>,
-    collapsed_groups: HashSet<Uuid>,
     collapsed_pinned_sections: HashSet<Uuid>,
-    collapsed_project_sections: HashSet<Uuid>,
     dismissed_workspace_tabs: HashSet<Uuid>,
     workstation_tab_scroll: ScrollHandle,
     dragging_workspace: Option<Uuid>,
     workspace_drop_preview: Option<WorkspaceDropPreview>,
     suppress_workspace_click_until: Option<Instant>,
     tab_drop_preview: Option<TabDropPreview>,
+    /// Workstation card a dragged tab would move into on drop.
+    tab_drop_workspace: Option<Uuid>,
     suppress_tab_click_until: Option<Instant>,
     sidebar_resize: SidebarResizeLifecycle,
     preferred_sidebar_width: f32,
@@ -319,17 +318,15 @@ impl SidebarUi {
     ) -> Self {
         Self {
             active_workspace: None,
-            workspace_tab_scope: WorkspaceTabScope::Workstation,
             expanded_workspaces: HashSet::new(),
-            collapsed_groups: HashSet::new(),
             collapsed_pinned_sections: HashSet::new(),
-            collapsed_project_sections: HashSet::new(),
             dismissed_workspace_tabs: HashSet::new(),
             workstation_tab_scroll: ScrollHandle::new(),
             dragging_workspace: None,
             workspace_drop_preview: None,
             suppress_workspace_click_until: None,
             tab_drop_preview: None,
+            tab_drop_workspace: None,
             suppress_tab_click_until: None,
             sidebar_resize: SidebarResizeLifecycle::default(),
             preferred_sidebar_width,

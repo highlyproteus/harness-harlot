@@ -124,7 +124,7 @@ pub(crate) fn color_picker_hosted(target: ColorTarget, modal: &Modal) -> bool {
         ColorTarget::Workspace(id) => {
             matches!(modal, Modal::WorkspaceMenu(menu) if menu.workspace_id == id)
         }
-        ColorTarget::Tab(id) => matches!(modal, Modal::GroupMenu(menu) if menu.tab_id == id),
+        ColorTarget::Tab(id) => matches!(modal, Modal::TabRowMenu(menu) if menu.tab_id == id),
         ColorTarget::DefaultTerminal | ColorTarget::DefaultWorkspace => true,
     }
 }
@@ -252,7 +252,7 @@ impl HhApp {
         self.dispatch(request);
         if matches!(
             self.editor.modal,
-            Modal::TabMenu(_) | Modal::WorkspaceMenu(_) | Modal::GroupMenu(_)
+            Modal::TabMenu(_) | Modal::WorkspaceMenu(_) | Modal::TabRowMenu(_)
         ) {
             self.editor.modal = Modal::None;
         }
@@ -295,7 +295,7 @@ impl HhApp {
         if let Modal::TabMenu(menu) = &mut self.editor.modal {
             menu.identity_picker_open = false;
         }
-        if let Modal::GroupMenu(menu) = &mut self.editor.modal {
+        if let Modal::TabRowMenu(menu) = &mut self.editor.modal {
             menu.icon_picker_open = false;
         }
         if let Modal::WorkspaceMenu(menu) = &mut self.editor.modal {
@@ -1195,7 +1195,7 @@ impl HhApp {
             ColorTarget::DefaultWorkspace => ("Pick default workstation color", false),
             ColorTarget::Pane(_) => ("Pick terminal color", true),
             ColorTarget::Workspace(_) => ("Pick workstation color", true),
-            ColorTarget::Tab(_) => ("Pick group or project color", true),
+            ColorTarget::Tab(_) => ("Pick tab color", true),
         };
         div()
             .absolute()

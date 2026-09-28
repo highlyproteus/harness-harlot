@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Workstations are now the sidebar's only way to organize terminals. Projects
+  and tab groups are gone; everything they did is covered by workstations and
+  tabs.
+- **This Mac** (**This Computer** on Linux) is your home workstation. It can be
+  renamed, recolored, pinned, and given a root folder, but never deleted. On
+  upgrade, your first local workstation becomes This Mac (it keeps a custom
+  title; a default "Workstation N" title becomes "This Mac"), or an empty This
+  Mac is added if you had none.
+- Workstations nest up to four levels deep: **New Workstation Inside…** on a
+  workstation's menu replaces **New Project…**. A nested workstation runs on
+  its parent's machine and uses its parent's root folder until you set its own
+  with **Set Root Folder…**. A collapsed workstation shows one status dot for
+  itself and everything inside it. Deleting a workstation also removes the
+  workstations nested inside it (the confirmation says how many), and
+  disconnecting or reconnecting an SSH workstation includes them too.
+- Projects become nested workstations on upgrade, keeping their folder, title,
+  color, icon, pin, tabs, and running terminals.
+- A tab-level group is now simply a tab: **New Group** and **Add Group** are
+  removed, and its menu reads **Rename tab…**, **Delete tab…**, **New terminal
+  in this tab**, **New browser in this tab**, and **Pick tab color**. Tabs with
+  a default "Group N" title show their terminal's title again.
+- Dragging a tab onto another workstation on the same machine moves it there.
+- `hh terminal list` (and MCP `terminal_list`) adds `parent_workstation` to each
+  workstation, and a tab's `cwd` is its workstation's effective root folder.
+  CLI, MCP, and omp plugin command names are unchanged.
+- Bumped the desktop/service wire protocol from 47 to 48 for nested and home
+  workstations and the removed project and tab-group requests; desktop and
+  service must be upgraded together, so the update restarts the terminal
+  service. Session snapshots move to schema 16.
+
+### Fixed
+
+- A workstation created with `hh workstation new --cwd DIR` starts its first
+  terminal in `DIR` instead of the home folder.
+
 ## [0.1.26] - 2026-09-26
 
 ### Added

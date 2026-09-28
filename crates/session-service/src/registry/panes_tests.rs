@@ -249,7 +249,7 @@ fn resize_bounds_reject_oom_dimensions_without_killing_sessions() {
 fn terminals_receive_human_names_and_can_be_renamed() {
     let registry = SessionRegistry::new().unwrap();
     let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
-    let second = registry.create_group_terminal(first).unwrap();
+    let second = registry.create_tab_terminal(first).unwrap();
     registry.rename_pane(second, "Build logs").unwrap();
 
     // Panes spawn at the fallback cwd ($HOME), so their default titles
@@ -271,7 +271,7 @@ fn terminals_receive_human_names_and_can_be_renamed() {
 fn moving_a_live_tab_to_a_directional_split_preserves_its_process() {
     let registry = SessionRegistry::new().unwrap();
     let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
-    let second = registry.create_group_terminal(first).unwrap();
+    let second = registry.create_tab_terminal(first).unwrap();
     let first_pid = registry.pane_process_id(first).unwrap();
     let second_pid = registry.pane_process_id(second).unwrap();
 

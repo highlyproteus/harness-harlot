@@ -214,10 +214,8 @@ mod tests {
             id: Uuid::from_u128(0x88),
             title: "buzz".to_owned(),
             custom_title: None,
-            project_dir: None,
             color: None,
             custom_icon: None,
-            parent_tab: None,
             pinned: false,
             layout: PaneLayout::Leaf {
                 pane: Pane {

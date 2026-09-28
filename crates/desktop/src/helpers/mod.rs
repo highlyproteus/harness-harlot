@@ -43,11 +43,11 @@ pub(crate) use polling::{
 };
 pub(crate) use scroll::{LiveScrollTarget, live_scroll_target, wheel_delta_lines};
 pub(crate) use tabs::{
-    FocusResync, SidebarSection, WorkspaceTabScope, WorkstationTabEntry, focus_resync_for,
-    partition_workstation_entries, terminal_tab_count_label, terminal_tab_secondary_label,
-    workspace_scope_for_tab, workspace_strip_active_tab, workspace_tab_click_target,
-    workspace_tab_entries, workspace_tab_focus_target, workspace_tab_set,
-    workspace_tab_standalone_pane,
+    FocusResync, WorkstationTabEntry, child_workstations, focus_resync_for,
+    partition_workstation_entries, same_machine, terminal_tab_count_label,
+    terminal_tab_secondary_label, top_level_workstation, visible_workstation_tree,
+    workspace_strip_active_tab, workspace_tab_click_target, workspace_tab_entries,
+    workspace_tab_focus_target, workspace_tab_set, workspace_tab_standalone_pane,
 };
 pub(crate) use terminal_io::{
     TerminalPointerAction, TerminalUrlOpenTarget, prepare_paste, selection_span,
