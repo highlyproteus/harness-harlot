@@ -140,6 +140,13 @@ impl HhApp {
         })
     }
 
+    /// Whether any bot wears the ring; rings the toolbar's Bots button.
+    pub(crate) fn any_bot_wants_you(&self) -> bool {
+        self.session.snapshot.as_ref().is_some_and(|snapshot| {
+            crate::notifications::any_bot_wants_you(snapshot, &self.session.pane_states)
+        })
+    }
+
     /// The hammer, robot, and bell toolbar buttons; see `next_sidebar_mode`.
     pub(crate) fn toggle_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
         let settings_open = matches!(self.editor.modal, Modal::AppearanceSettings);

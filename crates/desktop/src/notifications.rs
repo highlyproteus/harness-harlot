@@ -141,6 +141,59 @@ pub(crate) fn bots_needing_you(
         .count()
 }
 
+/// Whether a bot thread pane should ring its bot's icon: it is waiting on the
+/// user (input, approval, or a bell) or it finished and the user has not
+/// opened it since. Opening the thread clears `unseen` (the blue-dot rule);
+/// a waiting pane rings until it is answered.
+pub(crate) fn pane_wants_you(pane: &Pane, exited: bool) -> bool {
+    pane.unseen
+        || (!exited
+            && matches!(
+                pane.status,
+                PaneStatus::NeedsInput | PaneStatus::NeedsApproval | PaneStatus::Attention
+            ))
+}
+
+fn layout_wants_you(layout: &PaneLayout, pane_states: &HashMap<Uuid, PaneStreamState>) -> bool {
+    let wants = |pane: &Pane| {
+        pane_wants_you(
+            pane,
+            pane_states.get(&pane.id).is_some_and(|state| state.exited),
+        )
+    };
+    match layout {
+        PaneLayout::Leaf { pane } => wants(pane),
+        PaneLayout::Stack { panes, .. } => panes.iter().any(wants),
+        PaneLayout::Split { first, second, .. } => {
+            layout_wants_you(first, pane_states) || layout_wants_you(second, pane_states)
+        }
+    }
+}
+
+/// Whether bot workspace `workspace` should wear the orange ring: any of its
+/// threads wants the user. Always false for workstations.
+pub(crate) fn bot_wants_you(
+    workspace: &Workspace,
+    pane_states: &HashMap<Uuid, PaneStreamState>,
+) -> bool {
+    workspace.is_bot()
+        && workspace
+            .tabs
+            .iter()
+            .any(|tab| layout_wants_you(&tab.layout, pane_states))
+}
+
+/// Whether any bot wants the user; rings the toolbar's Bots button.
+pub(crate) fn any_bot_wants_you(
+    snapshot: &SessionSnapshot,
+    pane_states: &HashMap<Uuid, PaneStreamState>,
+) -> bool {
+    snapshot
+        .workspaces
+        .iter()
+        .any(|workspace| bot_wants_you(workspace, pane_states))
+}
+
 /// The unread count shared by the in-app bell and the Dock, and whether any
 /// unread item asks for the user. Only the in-app bell is tinted (orange for
 /// asks, blue for reports); macOS always draws the Dock number in red.
@@ -442,8 +495,8 @@ impl HhApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivitySection, UnreadBadge, activity_badge, activity_entries, bots_needing_you,
-        pane_has_unseen, panes_shown_with, unread_badge,
+        ActivitySection, UnreadBadge, activity_badge, activity_entries, any_bot_wants_you,
+        bot_wants_you, bots_needing_you, pane_has_unseen, panes_shown_with, unread_badge,
     };
     use hh_protocol::{
         NotificationKind, PaneLayout, PaneStatus, PaneStreamState, SessionNotification,
@@ -551,6 +604,97 @@ mod tests {
             bot(&workstation, vec![exited_tab]),
         ]);
         assert_eq!(bots_needing_you(&snapshot, &exited(exited_pane)), 1);
+    }
+
+    fn unseen(mut tab: Tab) -> Tab {
+        let PaneLayout::Leaf { pane } = &mut tab.layout else {
+            unreachable!("seeded tabs are single panes");
+        };
+        pane.unseen = true;
+        tab
+    }
+
+    /// A bot's icon rings while any thread needs the user or finished unseen,
+    /// including an exited thread nobody opened and a thread hidden in a
+    /// stack; working, idle, and seen threads never ring it.
+    #[test]
+    fn a_bot_rings_when_any_thread_wants_the_user_and_the_toolbar_when_any_bot_does() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let workstation = snapshot.workspaces[0].clone();
+        let template = workstation.tabs[0].clone();
+        let quiet = |status| tab_with(&template, status).0;
+        let (exited_tab, exited_pane) = tab_with(&template, PaneStatus::NeedsInput);
+        let exited_unseen = unseen(tab_with(&template, PaneStatus::Done).0);
+        let exited_unseen_id = match &exited_unseen.layout {
+            PaneLayout::Leaf { pane } => pane.id,
+            _ => unreachable!(),
+        };
+        let mut stacked = quiet(PaneStatus::Idle);
+        let PaneLayout::Leaf { pane: front } = stacked.layout.clone() else {
+            unreachable!();
+        };
+        let mut hidden = front.clone();
+        hidden.id = Uuid::new_v4();
+        hidden.status = PaneStatus::Attention;
+        stacked.layout = PaneLayout::Stack {
+            active: front.id,
+            panes: vec![front, hidden],
+        };
+
+        let cases = [
+            (vec![quiet(PaneStatus::NeedsInput)], true),
+            (vec![quiet(PaneStatus::NeedsApproval)], true),
+            (vec![quiet(PaneStatus::Attention)], true),
+            (vec![unseen(quiet(PaneStatus::Done))], true),
+            (vec![stacked], true),
+            (vec![exited_unseen], true),
+            (vec![quiet(PaneStatus::Done)], false),
+            (
+                vec![quiet(PaneStatus::Working), quiet(PaneStatus::Idle)],
+                false,
+            ),
+            (vec![exited_tab], false),
+        ];
+        let mut states = exited(exited_pane);
+        states.extend(exited(exited_unseen_id));
+        for (index, (tabs, rings)) in cases.into_iter().enumerate() {
+            let one = bot(&workstation, tabs);
+            assert_eq!(bot_wants_you(&one, &states), rings, "case {index}");
+        }
+
+        // A workstation's panes never ring a bot, and the toolbar rings when
+        // any single bot does.
+        snapshot.workspaces[0].tabs = vec![quiet(PaneStatus::NeedsInput)];
+        assert!(!bot_wants_you(&snapshot.workspaces[0], &states));
+        snapshot
+            .workspaces
+            .push(bot(&workstation, vec![quiet(PaneStatus::Working)]));
+        assert!(!any_bot_wants_you(&snapshot, &states));
+        snapshot
+            .workspaces
+            .push(bot(&workstation, vec![unseen(quiet(PaneStatus::Done))]));
+        assert!(any_bot_wants_you(&snapshot, &states));
+    }
+
+    /// Opening a finished thread (the blue-dot seen rule clears `unseen`)
+    /// takes the ring off its bot and off the toolbar.
+    #[test]
+    fn viewing_the_finished_thread_clears_the_bot_ring() {
+        let mut snapshot = SessionSnapshot::seeded();
+        let workstation = snapshot.workspaces[0].clone();
+        let template = workstation.tabs[0].clone();
+        let finished = unseen(tab_with(&template, PaneStatus::Done).0);
+        snapshot.workspaces.push(bot(&workstation, vec![finished]));
+        let states = HashMap::new();
+        assert!(any_bot_wants_you(&snapshot, &states));
+
+        let bot_index = snapshot.workspaces.len() - 1;
+        let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[bot_index].tabs[0].layout else {
+            unreachable!();
+        };
+        pane.unseen = false;
+        assert!(!bot_wants_you(&snapshot.workspaces[bot_index], &states));
+        assert!(!any_bot_wants_you(&snapshot, &states));
     }
 
     #[test]

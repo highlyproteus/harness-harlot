@@ -345,6 +345,7 @@ impl HhApp {
                 render_hammer_icon,
                 0,
                 THEME.danger,
+                false,
                 cx,
             ))
             .child(self.render_sidebar_mode_button(
@@ -353,6 +354,7 @@ impl HhApp {
                 render_robot_icon,
                 self.bots_needing_you(),
                 THEME.danger,
+                self.any_bot_wants_you(),
                 cx,
             ))
             .child(
@@ -363,6 +365,7 @@ impl HhApp {
                     self.unread_badge().map_or(0, |badge| badge.count),
                     self.unread_badge()
                         .map_or(THEME.accent, |badge| badge.color()),
+                    false,
                     cx,
                 ),
             )
@@ -434,7 +437,9 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// A toolbar button for one sidebar mode, with a count badge.
+    /// A toolbar button for one sidebar mode, with a count badge and, when
+    /// `ring`, the orange needs-you ring (the needs-input border).
+    #[allow(clippy::too_many_arguments)]
     fn render_sidebar_mode_button(
         &self,
         mode: SidebarMode,
@@ -442,6 +447,7 @@ impl HhApp {
         icon: fn(u32) -> AnyElement,
         count: usize,
         badge_color: u32,
+        ring: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.sidebar.sidebar_mode == mode
@@ -454,7 +460,7 @@ impl HhApp {
         } else {
             count.to_string()
         };
-        div()
+        let button = div()
             .id(label)
             .relative()
             .flex_none()
@@ -483,7 +489,9 @@ impl HhApp {
                 THEME.foreground
             } else {
                 THEME.muted
-            }))
+            }));
+        // The ring goes under the count badge so the number stays readable.
+        self.with_needs_input_border(button, ring, 5.0)
             .when(count > 0, |element| {
                 element.child(
                     div()

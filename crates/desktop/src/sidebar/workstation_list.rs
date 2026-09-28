@@ -29,6 +29,8 @@ use uuid::Uuid;
 const NESTING_INDENT: f32 = 13.0;
 /// Left margin of a top-level workstation card.
 const CARD_MARGIN: f32 = 7.0;
+/// Side of the circle around a bot card's agent icon that carries its ring.
+const BOT_ICON_RING_SIZE: f32 = 20.0;
 
 struct TabRowEntry<'a> {
     tab_id: Uuid,
@@ -98,6 +100,9 @@ struct WorkspaceSectionCtx {
     tab_drop_into: bool,
     /// A bot card: its agent replaces the workstation number.
     bot: Option<TerminalProfile>,
+    /// A bot card whose thread needs the user or finished unseen: the agent
+    /// icon wears the orange ring.
+    bot_ring: bool,
 }
 
 impl HhApp {
@@ -247,6 +252,7 @@ impl HhApp {
             drop_below,
             tab_drop_into: self.sidebar.tab_drop_workspace == Some(workspace_id),
             bot: workspace.bot.as_ref().map(|bot| bot.agent),
+            bot_ring: crate::notifications::bot_wants_you(workspace, &self.session.pane_states),
         };
         let saved_threads = ctx
             .bot
@@ -1156,7 +1162,20 @@ impl HhApp {
                     .items_center()
                     .gap(px(6.0))
                     .when_some(ctx.bot, |element, agent| {
-                        element.child(render_terminal_profile_icon(agent, text_color, 14.0))
+                        let icon = div()
+                            .flex_none()
+                            .w(px(BOT_ICON_RING_SIZE))
+                            .h(px(BOT_ICON_RING_SIZE))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(render_terminal_profile_icon(agent, text_color, 14.0));
+                        element.child(self.with_needs_input_border(
+                            icon,
+                            ctx.bot_ring,
+                            BOT_ICON_RING_SIZE / 2.0,
+                        ))
                     })
                     .when(ctx.home, |element| {
                         element.child(render_this_machine_mark(ctx.workspace_id, text_color))

@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A bot's icon on its sidebar card, and the toolbar's Bots button when any bot
+  qualifies, wear the same orange ring as the needs-input border while one of
+  its threads needs your input, approval, or attention, or has finished and
+  you haven't opened it yet. Opening that thread (or answering it) clears the
+  ring. It stays still with **Reduce motion**.
 - Tabs whose agent waits for your input or approval get an orange border with
   a bright segment running around it, in the tab strip, the sidebar, pane
   headers, and the sidebar's pane chips. It animates only while visible and
