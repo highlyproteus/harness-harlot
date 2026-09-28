@@ -68,10 +68,12 @@ fn workspace_tab_rank(tab: &hh_protocol::Tab) -> u8 {
 }
 
 /// One sidebar entry per tab. `label` is `Some` exactly when the tab renders
-/// as a window of pane chips: it holds several panes, or the user named it.
+/// as a window of pane chips because it holds several panes; a single-pane
+/// tab is a compact row titled `title` (its name) or its pane's label.
 pub(crate) struct WorkstationTabEntry<'a> {
     pub(crate) tab_id: Uuid,
     pub(crate) label: Option<&'a str>,
+    pub(crate) title: Option<&'a str>,
     pub(crate) color: Option<AppearanceColor>,
     pub(crate) pinned: bool,
     pub(crate) panes: Vec<&'a Pane>,
@@ -83,11 +85,12 @@ pub(crate) fn workspace_tab_entries(workspace: &Workspace) -> Vec<WorkstationTab
         .map(|tab| {
             let mut panes = Vec::new();
             collect_terminal_tabs(&tab.layout, &mut panes);
-            let label = (panes.len() >= 2 || tab.custom_title.is_some())
+            let label = (panes.len() >= 2)
                 .then(|| tab.custom_title.as_deref().unwrap_or(tab.title.as_str()));
             WorkstationTabEntry {
                 tab_id: tab.id,
                 label,
+                title: tab.custom_title.as_deref(),
                 color: tab.color,
                 pinned: tab.pinned,
                 panes,
@@ -303,6 +306,7 @@ mod tests {
             WorkstationTabEntry {
                 tab_id: Uuid::from_u128(tab_id),
                 label: None,
+                title: None,
                 color: None,
                 pinned,
                 panes: Vec::new(),
@@ -326,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn named_and_multi_pane_tabs_precede_single_panes() {
+    fn only_multi_pane_tabs_render_as_windows_and_named_tabs_keep_their_name() {
         let mut workspace = SessionSnapshot::seeded().workspaces.remove(0);
         workspace.tabs = vec![
             make_tab(10, None, leaf(1)),
@@ -354,9 +358,15 @@ mod tests {
         let expected = [20, 30, 40, 10, 50].map(Uuid::from_u128).to_vec();
 
         let entries = workspace_tab_entries(&workspace);
+        // A named single-pane tab (a bot's worker) is a compact row, not a
+        // window of one chip, and it keeps its name for that row.
         assert_eq!(
             entries.iter().map(|entry| entry.label).collect::<Vec<_>>(),
-            vec![Some("Named"), Some("Tab 30"), Some("Tab 40"), None, None]
+            vec![None, Some("Tab 30"), Some("Tab 40"), None, None]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.title).collect::<Vec<_>>(),
+            vec![Some("Named"), None, None, None, None]
         );
         assert_eq!(
             entries

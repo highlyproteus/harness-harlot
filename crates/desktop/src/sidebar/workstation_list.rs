@@ -33,6 +33,7 @@ const CARD_MARGIN: f32 = 7.0;
 struct TabRowEntry<'a> {
     tab_id: Uuid,
     label: Option<&'a str>,
+    title: Option<&'a str>,
     tab_color: Option<AppearanceColor>,
     panes: Vec<&'a Pane>,
     /// `Some(is_first)` for tabs in the Pinned section.
@@ -59,6 +60,7 @@ fn tab_row_entries(
         .map(move |(entry_index, entry)| TabRowEntry {
             tab_id: entry.tab_id,
             label: entry.label,
+            title: entry.title,
             tab_color: entry.color,
             panes: entry.panes,
             pinned_section: pinned.then_some(entry_index == 0),
@@ -301,6 +303,7 @@ impl HhApp {
                 |TabRowEntry {
                      tab_id,
                      label,
+                     title,
                      tab_color,
                      panes,
                      pinned_section,
@@ -335,6 +338,9 @@ impl HhApp {
                                         tab_color,
                                         from_pane_map: false,
                                         indent: tab_indent,
+                                        // Bot thread rows keep their thread names.
+                                        title:
+                                            title.filter(|_| ctx.bot.is_none()).map(str::to_owned),
                                         activity: None,
                                     },
                                     cx,

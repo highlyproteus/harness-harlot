@@ -575,6 +575,7 @@ impl HhApp {
             tab_color,
             from_pane_map,
             indent,
+            title,
             activity,
         } = row;
         let pane_id = pane.id;
@@ -589,7 +590,7 @@ impl HhApp {
         let drag_tab_id = tab_id.filter(|_| activity.is_none());
         let selected = self.layout.focused_pane == Some(pane_id);
         let input = cx.entity();
-        let label = self.pane_label(pane);
+        let label = title.unwrap_or_else(|| self.pane_label(pane));
         let drag_title = label.clone();
         let drop_above = !from_pane_map
             && tab_id.is_some_and(|tab_id| {

@@ -36,6 +36,8 @@ pub(crate) struct SidebarPaneRowContext {
     pub(crate) tab_color: Option<AppearanceColor>,
     pub(crate) from_pane_map: bool,
     pub(crate) indent: f32,
+    /// Row title in place of the pane's own label: a named tab's name.
+    pub(crate) title: Option<String>,
     /// Set on Notifications rows, which never drag-reorder.
     pub(crate) activity: Option<ActivityRow>,
 }

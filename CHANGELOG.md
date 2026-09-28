@@ -73,6 +73,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - A workstation created with `hh workstation new --cwd DIR` starts its first
   terminal in `DIR` instead of the home folder.
+- Named single-terminal tabs, such as a bot's worker tabs, are compact
+  sidebar rows showing their name, like every other tab, instead of a tall box
+  holding one terminal chip. Only tabs with several panes show the pane map.
 - The blue "done" dot stays until you look at the pane: clicking it or its
   tab, switching to its tab or workstation, clicking its notification, or
   typing into it. Merely focusing the window no longer clears it, it is set

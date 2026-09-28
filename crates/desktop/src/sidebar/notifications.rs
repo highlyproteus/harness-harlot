@@ -83,6 +83,7 @@ impl HhApp {
                             tab_color: entry.tab.color,
                             from_pane_map: false,
                             indent: 4.0,
+                            title: None,
                             activity: Some(ActivityRow {
                                 indicator: self.pane_indicator(entry.pane),
                                 unread: entry.pane.unseen,
