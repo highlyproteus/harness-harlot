@@ -6,8 +6,8 @@ use crate::helpers::{
     render_terminal_profile_icon, split_control_id, terminal_tab_count_label,
     visible_workstation_tree, workspace_tab_entries, workspace_terminal_tabs,
 };
-use crate::notifications::{activity_badge, activity_section};
-use crate::tab_chrome::{PaneIndicator, render_pane_indicator, workstation_rollup_indicator};
+use crate::notifications::activity_badge;
+use crate::tab_chrome::{PaneIndicator, workstation_rollup_indicator};
 use crate::view_models::{
     TabDrag, TabDropPreview, TooltipView, WorkspaceDrag, WorkspaceDropPreview,
 };
@@ -19,8 +19,8 @@ use gpui::{
 };
 use gpui::{AppContext, ParentElement, StatefulInteractiveElement, Styled, StyledImage};
 use hh_protocol::{
-    AppearanceColor, Pane, PaneLayout, SplitAxis, TerminalProfile, Workspace, WorkspaceConnection,
-    WorkspaceConnectionStatus, effective_working_dir,
+    AppearanceColor, Pane, PaneLayout, PaneStatus, SplitAxis, TerminalProfile, Workspace,
+    WorkspaceConnection, WorkspaceConnectionStatus, effective_working_dir,
 };
 use std::time::Instant;
 use uuid::Uuid;
@@ -659,6 +659,8 @@ impl HhApp {
         let title = self.pane_label(pane);
         let exited = self.pane_exited(pane_id);
         let indicator = self.pane_indicator(pane);
+        let indicator_tooltip = self.pane_indicator_tooltip(pane);
+        let awaits_input = self.pane_awaits_input(pane);
         let focused = self.layout.focused_pane == Some(pane_id);
         let border = if focused {
             THEME.accent
@@ -675,13 +677,14 @@ impl HhApp {
             ),
             None => (format!("Close {title}…"), None),
         };
-        let tooltip = match activity_section(pane.status, exited) {
-            Some(_) => format!(
+        let tooltip = if exited || pane.status != PaneStatus::Idle {
+            format!(
                 "{} — {}",
                 identity_detail(pane),
                 activity_badge(pane.status, exited)
-            ),
-            None => identity_detail(pane),
+            )
+        } else {
+            identity_detail(pane)
         };
         let drag = TabDrag {
             workspace_id,
@@ -691,7 +694,7 @@ impl HhApp {
             title: title.clone(),
             position: Point::default(),
         };
-        div()
+        let chip = div()
             .id(("tab-pane-chip", element_key(pane_id)))
             .size_full()
             .min_w(px(0.0))
@@ -752,7 +755,11 @@ impl HhApp {
                     .text_color(rgb(if exited { THEME.dim } else { THEME.foreground }))
                     .child(title),
             )
-            .child(render_pane_indicator(indicator))
+            .child(self.render_pane_indicator_with_tooltip(
+                indicator,
+                ("tab-pane-chip-status", element_key(pane_id)),
+                indicator_tooltip,
+            ))
             .child(self.render_close_button(
                 ("close-tab-pane-chip", element_key(pane_id)),
                 THEME.foreground,
@@ -764,7 +771,8 @@ impl HhApp {
                     None => this.begin_close(pane_id, cx),
                 },
                 cx,
-            ))
+            ));
+        self.with_needs_input_border(chip, awaits_input, 4.0)
             .into_any_element()
     }
 
@@ -991,7 +999,11 @@ impl HhApp {
             )
             .child(self.render_workspace_card_title(ctx))
             .when(ctx.rollup != PaneIndicator::None, |element| {
-                element.child(render_pane_indicator(ctx.rollup))
+                element.child(self.render_pane_indicator_with_tooltip(
+                    ctx.rollup,
+                    ("workstation-rollup-status", element_key(ctx.workspace_id)),
+                    ctx.rollup.tooltip(),
+                ))
             })
             .when(!bot, |element| {
                 element.child(self.render_workspace_tab_count(ctx))

@@ -160,12 +160,49 @@ one-time MCP setup for the tools; **Settings → Bots** shows the exact command.
 Claude Code and Codex may ask once to trust the bot's folder. See
 [Bots privacy and data handling](PRIVACY.md).
 
-## Notifications
+## Status and notifications
 
-The bell switches the sidebar to Notifications, which lists terminal tabs and
-bots by live status: **Needs you** (waiting for input or approval), then
-**Running**, then **Done**, newest first within each group. Click a row to jump
-to it. The bell and Dock badges count what needs you.
+Every terminal tab shows what its agent is doing:
+
+- **Orange border** — the agent waits for your input or approval. A bright
+  segment runs around the tab (in the tab strip, the sidebar, and pane
+  headers) so it catches your eye; with **Reduce motion** on (macOS
+  Accessibility, or GNOME's animations switched off) the border stays solid.
+- **Progress ring** — the agent is working. Agents that keep a task list fill
+  the ring as tasks complete, shading from red through amber to green; hover
+  it for "3 of 7 done" and the current task. Other running agents show a
+  spinning blue ring.
+- **Blue dot** — the agent finished (or needed you) while you were elsewhere.
+  It stays until you look: click the tab or pane, switch to its tab or
+  workstation, click its notification, or type into it. Merely having the
+  window in front does not clear it, and it survives restarts.
+
+The bell switches the sidebar to Notifications: **Needs you** and **Running**
+list live terminal tabs and bots, and **Recent** keeps the last 200 finished
+and attention notifications across restarts, newest first, unread ones marked
+with a blue dot. **Mark all read** clears them; clicking any row jumps to its
+pane and marks it seen. The bell and Dock badges count unread notifications:
+orange when one of them needs you, blue otherwise.
+
+### Task progress from agents
+
+The progress ring is opt-in per agent. Enable it in **Settings → Bots → Agent
+task progress**, or from a terminal:
+
+```bash
+hh progress install omp      # omp extension in ~/.omp/agent/extensions (or $PI_CODING_AGENT_DIR)
+hh progress install claude   # TodoWrite hook in ~/.claude/settings.json
+hh progress install codex    # update_plan hook in ~/.codex/hooks.json
+hh progress status           # add --json for machine-readable output
+hh progress uninstall claude
+```
+
+Installing keeps every other setting and hook and never replaces an omp
+extension file you edited. Codex asks you to trust the new hook the next time
+it starts. omp and Claude Code bots report progress without any setup. The
+integrations call `hh progress report --done N --total M [--current T]
+[--phase T] --source omp|claude|codex` and `hh progress clear` for the pane in
+`HH_PANE_ID` (or `--pane`); tasks an agent abandons do not count.
 
 ## Browser automation and Galleries
 

@@ -19,6 +19,8 @@ fn per_tab_close_requires_an_explicit_confirmation_for_the_exact_terminal() {
         identity: hh_protocol::TerminalIdentity::default(),
         status: hh_protocol::PaneStatus::default(),
         status_changed_at_ms: 0,
+        unseen: false,
+        progress: None,
         custom_title: Some("build".to_owned()),
         profile_override: None,
         custom_icon: None,

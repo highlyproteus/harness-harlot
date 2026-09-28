@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use hh_protocol::{PaneProgress, ProgressSource};
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::agent_progress::ProgressAgent;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AgentContext {
@@ -27,6 +30,7 @@ pub(crate) enum AgentAction {
     Workstation(WorkstationCommand),
     Mcp,
     Skill(SkillCommand),
+    Progress(ProgressCommand),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,6 +215,17 @@ pub(crate) enum SkillCommand {
     Path,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProgressCommand {
+    Report(PaneProgress),
+    Clear,
+    /// Reads a Claude Code or Codex `PostToolUse` hook payload on stdin.
+    Hook(ProgressAgent),
+    Install(ProgressAgent),
+    Uninstall(ProgressAgent),
+    Status,
+}
+
 pub(crate) fn parse_agent_command(arguments: &[String]) -> Result<AgentCommand> {
     let (context, arguments) = parse_context(arguments)?;
     let Some((surface, arguments)) = arguments.split_first() else {
@@ -227,6 +242,7 @@ pub(crate) fn parse_agent_command(arguments: &[String]) -> Result<AgentCommand> 
             AgentAction::Mcp
         }
         "skill" => AgentAction::Skill(parse_skill(arguments)?),
+        "progress" => AgentAction::Progress(parse_progress(arguments)?),
         _ => bail!("unknown agent command {surface}"),
     };
     Ok(AgentCommand { context, action })
@@ -609,6 +625,65 @@ fn parse_skill(arguments: &[String]) -> Result<SkillCommand> {
     }
 }
 
+const PROGRESS_USAGE: &str = "usage: hh progress report --done N --total M [--current T] [--phase T] --source omp|claude|codex | clear | hook claude|codex | install|uninstall omp|claude|codex | status";
+
+fn parse_progress(arguments: &[String]) -> Result<ProgressCommand> {
+    let Some((command, arguments)) = arguments.split_first() else {
+        bail!("{PROGRESS_USAGE}");
+    };
+    let agent = |allowed: &[ProgressAgent]| -> Result<ProgressAgent> {
+        let name = one_argument(arguments, "agent (omp, claude or codex)")?;
+        ProgressAgent::parse(name)
+            .filter(|agent| allowed.contains(agent))
+            .with_context(|| format!("unsupported agent {name}"))
+    };
+    match command.as_str() {
+        "report" => {
+            let options = Options::scan(
+                arguments,
+                &["--done", "--total", "--current", "--phase", "--source"],
+                &[],
+            )?;
+            options.positionals::<0>(PROGRESS_USAGE)?;
+            let count = |flag: &str| -> Result<u32> {
+                options
+                    .single(flag)?
+                    .with_context(|| format!("progress report requires {flag} N"))?
+                    .parse()
+                    .with_context(|| format!("{flag} must be a non-negative integer"))
+            };
+            let source = match options
+                .single("--source")?
+                .context("progress report requires --source omp|claude|codex")?
+            {
+                "omp" => ProgressSource::Omp,
+                "claude" => ProgressSource::Claude,
+                "codex" => ProgressSource::Codex,
+                other => bail!("unsupported progress source {other}"),
+            };
+            let progress = PaneProgress {
+                done: count("--done")?,
+                total: count("--total")?,
+                current: options
+                    .single("--current")?
+                    .and_then(super::progress::clean_text),
+                phase: options
+                    .single("--phase")?
+                    .and_then(super::progress::clean_text),
+                source,
+            };
+            progress.validate().map_err(|error| anyhow!(error))?;
+            Ok(ProgressCommand::Report(progress))
+        }
+        "clear" => no_arguments(arguments, ProgressCommand::Clear),
+        "hook" => agent(&[ProgressAgent::Claude, ProgressAgent::Codex]).map(ProgressCommand::Hook),
+        "install" => agent(&ProgressAgent::ALL).map(ProgressCommand::Install),
+        "uninstall" => agent(&ProgressAgent::ALL).map(ProgressCommand::Uninstall),
+        "status" => no_arguments(arguments, ProgressCommand::Status),
+        _ => bail!("{PROGRESS_USAGE}"),
+    }
+}
+
 fn no_arguments<T>(arguments: &[String], value: T) -> Result<T> {
     ensure!(arguments.is_empty(), "unexpected command arguments");
     Ok(value)
@@ -800,5 +875,94 @@ mod tests {
         );
         assert!(parse(&["terminal", "list", "--all"]).is_err());
         assert!(parse(&["terminal", "focus"]).is_err());
+    }
+
+    #[test]
+    fn progress_commands_parse_reports_and_agents() {
+        assert_eq!(
+            parse(&[
+                "progress",
+                "report",
+                "--done",
+                "3",
+                "--total",
+                "7",
+                "--current",
+                "Write\ttests\n",
+                "--phase",
+                "",
+                "--source",
+                "claude",
+            ])
+            .unwrap(),
+            AgentAction::Progress(ProgressCommand::Report(PaneProgress {
+                done: 3,
+                total: 7,
+                current: Some("Write tests".into()),
+                phase: None,
+                source: ProgressSource::Claude,
+            }))
+        );
+        let long = "é".repeat(500);
+        let AgentAction::Progress(ProgressCommand::Report(progress)) = parse(&[
+            "progress",
+            "report",
+            "--done",
+            "0",
+            "--total",
+            "1",
+            "--current",
+            &long,
+            "--source",
+            "omp",
+        ])
+        .unwrap() else {
+            panic!("expected a report");
+        };
+        assert_eq!(
+            progress.current.unwrap().chars().count(),
+            hh_protocol::MAX_PROGRESS_TEXT_CHARS
+        );
+        assert!(
+            parse(&[
+                "progress", "report", "--done", "8", "--total", "7", "--source", "omp"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "progress", "report", "--done", "-1", "--total", "7", "--source", "omp"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["progress", "report", "--done", "1", "--total", "7"]).is_err());
+        assert!(
+            parse(&[
+                "progress", "report", "--done", "1", "--total", "7", "--source", "vim"
+            ])
+            .is_err()
+        );
+        assert_eq!(
+            parse(&["progress", "clear"]).unwrap(),
+            AgentAction::Progress(ProgressCommand::Clear)
+        );
+        assert_eq!(
+            parse(&["progress", "hook", "codex"]).unwrap(),
+            AgentAction::Progress(ProgressCommand::Hook(ProgressAgent::Codex))
+        );
+        assert!(parse(&["progress", "hook", "omp"]).is_err());
+        assert_eq!(
+            parse(&["progress", "install", "omp"]).unwrap(),
+            AgentAction::Progress(ProgressCommand::Install(ProgressAgent::Omp))
+        );
+        assert_eq!(
+            parse(&["progress", "uninstall", "claude"]).unwrap(),
+            AgentAction::Progress(ProgressCommand::Uninstall(ProgressAgent::Claude))
+        );
+        assert!(parse(&["progress", "install"]).is_err());
+        assert_eq!(
+            parse(&["progress", "status", "--json"]).unwrap(),
+            AgentAction::Progress(ProgressCommand::Status)
+        );
     }
 }

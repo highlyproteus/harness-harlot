@@ -1,6 +1,7 @@
 mod agent;
 mod args;
 pub(crate) mod mcp;
+mod progress;
 pub(crate) mod skill;
 mod terminal;
 
@@ -27,6 +28,8 @@ pub(crate) enum CliAction {
     Doctor,
     InstallCli,
     Agent(AgentCommand),
+    /// `hh progress hook claude|codex`: an agent hook that must never fail.
+    ProgressHook(crate::agent_progress::ProgressAgent),
     /// Internal: the long-lived parent of the session service (macOS).
     #[cfg(target_os = "macos")]
     SessionHost,
@@ -55,13 +58,31 @@ where
         }
         #[cfg(target_os = "macos")]
         [argument] if argument == crate::privacy::STATUS_COMMAND => Ok(CliAction::PrivacyStatus),
+        [command, subcommand, agent] if command == "progress" && subcommand == "hook" => {
+            // Parsed apart from agent commands so a malformed environment
+            // (e.g. a stale HH_PANE_ID) cannot make the hook fail.
+            match crate::agent_progress::ProgressAgent::parse(agent) {
+                Some(
+                    agent @ (crate::agent_progress::ProgressAgent::Claude
+                    | crate::agent_progress::ProgressAgent::Codex),
+                ) => Ok(CliAction::ProgressHook(agent)),
+                _ => bail!("usage: hh progress hook claude|codex"),
+            }
+        }
         [command, arguments @ ..] if command == "update" => {
             parse_update_options(arguments).map(CliAction::Update)
         }
         [command, arguments @ ..]
             if matches!(
                 command.as_str(),
-                "bot" | "browser" | "gallery" | "terminal" | "workstation" | "mcp" | "skill"
+                "bot"
+                    | "browser"
+                    | "gallery"
+                    | "terminal"
+                    | "workstation"
+                    | "mcp"
+                    | "skill"
+                    | "progress"
             ) =>
         {
             let mut agent_arguments = Vec::with_capacity(arguments.len() + 1);
@@ -271,6 +292,12 @@ pub(crate) fn run_cli_or_request_desktop() -> Result<bool> {
             AgentAction::Skill(SkillCommand::Path) => {
                 println!("{}", skill::source_path().display());
             }
+            AgentAction::Progress(progress_command) => {
+                let result = progress::execute(&command.context, progress_command)?;
+                if !result.is_null() {
+                    agent::print_result(&result, command.context.json)?;
+                }
+            }
             AgentAction::Bot(_)
             | AgentAction::Browser(_)
             | AgentAction::Gallery(_)
@@ -280,6 +307,7 @@ pub(crate) fn run_cli_or_request_desktop() -> Result<bool> {
                 agent::print_result(&result, command.context.json)?;
             }
         },
+        CliAction::ProgressHook(agent) => progress::run_hook(agent),
         #[cfg(target_os = "macos")]
         CliAction::SessionHost => {
             crate::privacy::run_session_host(&bundled_executable("hh-service")?)?;
@@ -358,6 +386,19 @@ mod tests {
         assert!(parse_cli_action(["version", "extra"]).is_err());
         assert!(parse_cli_action(["update", "--unknown"]).is_err());
         assert!(parse_cli_action(["update", "--check", "--restart-service"]).is_err());
+        assert!(parse_cli_action(["progress", "hook", "omp"]).is_err());
+    }
+
+    #[test]
+    fn progress_hooks_bypass_agent_context_parsing() {
+        assert_eq!(
+            parse_cli_action(["progress", "hook", "claude"]).unwrap(),
+            CliAction::ProgressHook(crate::agent_progress::ProgressAgent::Claude)
+        );
+        assert!(matches!(
+            parse_cli_action(["progress", "status"]).unwrap(),
+            CliAction::Agent(_)
+        ));
     }
 
     #[test]

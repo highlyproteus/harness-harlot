@@ -1,6 +1,6 @@
 # Bots privacy and data handling
 
-Effective: September 24, 2026
+Effective: September 28, 2026
 
 This document describes the data behavior of Bots in Harness Harlot. The agent
 CLIs you choose for bots and workers (for example omp, Hermes, Claude Code, or
@@ -69,6 +69,37 @@ Earlier releases stored Assistant conversation files and Voice settings under
 the application state directory. This release no longer reads them and does not
 delete them automatically; remove the `assistant` directory in the application
 state directory if you no longer need it.
+
+The notifications list keeps its last 200 entries (the pane and workstation
+titles, the kind of event and its time, any message text a terminal program
+sent, and whether you read it) in an owner-only `notifications.json` in the
+application state directory, so it survives restarts. **Clear** in
+Notifications empties it.
+
+## Agent task progress
+
+Task progress is opt-in. Nothing is written until you click **Install** in
+**Settings → Bots → Agent task progress** or run `hh progress install`:
+
+- **omp**: copies the bundled progress extension to
+  `~/.omp/agent/extensions/harness-harlot-progress.ts` (or the `extensions`
+  folder of `$PI_CODING_AGENT_DIR`).
+- **Claude Code**: adds one `PostToolUse` hook for `TodoWrite` to
+  `~/.claude/settings.json`.
+- **Codex**: adds one `PostToolUse` hook for `update_plan` to
+  `~/.codex/hooks.json`.
+
+The hooks run the local `hh` executable (by its absolute path). Existing
+settings and other hooks are kept; uninstalling removes only the Harness
+Harlot entry, and an omp extension file you edited is never replaced or
+removed. omp and Claude Code bots get the same reporting at launch without
+changing your settings.
+
+Inside a Harness Harlot terminal, the integrations send the pane's task counts
+(done and total), the title of the task in progress, and its phase name to the
+local session service over the owner-only socket; outside one they do
+nothing. The service keeps that progress only while the agent runs, in the
+session snapshot, and sends it nowhere else.
 
 ## Terminal and browser boundary
 

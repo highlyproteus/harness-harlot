@@ -220,7 +220,6 @@ impl HhApp {
                         this.sidebar.dismissed_workspace_tabs.remove(&tab_id);
                         this.layout.last_sizes.clear();
                         this.focus_created_pane(bot_id, pane_id, cx);
-                        this.mark_pane_viewed(pane_id);
                         this.refresh_bot_threads(bot_id);
                     }
                     Ok(response) => this.report_unexpected(&response),

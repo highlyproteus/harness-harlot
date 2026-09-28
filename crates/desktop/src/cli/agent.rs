@@ -30,7 +30,7 @@ pub(crate) fn execute(command: &AgentCommand) -> Result<Value> {
             terminal::execute_terminal(&command.context, terminal_command)
         }
         AgentAction::Workstation(workstation) => terminal::execute_workstation(workstation),
-        AgentAction::Mcp | AgentAction::Skill(_) => {
+        AgentAction::Mcp | AgentAction::Skill(_) | AgentAction::Progress(_) => {
             bail!("agent action must be dispatched directly")
         }
     }

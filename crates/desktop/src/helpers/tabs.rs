@@ -252,6 +252,8 @@ mod tests {
     fn make_pane(id: u128) -> Pane {
         Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,
             title: format!("Terminal {id}"),
@@ -563,6 +565,8 @@ mod tests {
     fn focused_workspace_tab_layout_is_rendered_instead_of_the_first_tab() {
         let pane = |id, title: &str| Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(id),
             kind: hh_protocol::PaneKind::Terminal,

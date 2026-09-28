@@ -19,7 +19,7 @@
 /// bump. Because the
 /// handshake is strict equality, a bump orphans every live service until
 /// the desktop relaunches them.
-pub const PROTOCOL_VERSION: u16 = 48;
+pub const PROTOCOL_VERSION: u16 = 49;
 
 /// Deepest nesting of workstations: a top-level workstation is level 1.
 pub const MAX_WORKSTATION_DEPTH: usize = 4;

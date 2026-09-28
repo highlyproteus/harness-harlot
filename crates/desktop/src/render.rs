@@ -113,10 +113,11 @@ impl Render for HhApp {
             // views cannot consume replacement typing.
             self.focus_handle.focus(window);
         }
+        self.motion.begin_frame();
         let menu_max_height = window.viewport_size().height - px(16.0);
         let modal_element = self.render_modal(menu_max_height, cx);
 
-        div()
+        let root = div()
             .key_context(if self.editor.modal.command_palette().is_some() {
                 "HhPalette"
             } else {
@@ -314,6 +315,8 @@ impl Render for HhApp {
                     )
                 }),
                 |element, picker| element.child(self.render_color_picker(picker, cx)),
-            )
+            );
+        self.ensure_animation_tick(cx);
+        root
     }
 }

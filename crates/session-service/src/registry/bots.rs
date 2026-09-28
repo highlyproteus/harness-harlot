@@ -745,6 +745,7 @@ impl SessionRegistry {
         );
         set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, &shell_title());
         state.set_pane_status(pane_id, PaneStatus::Idle);
+        state.clear_pane_progress(pane_id);
         refresh_workspace_activity(&mut state);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;

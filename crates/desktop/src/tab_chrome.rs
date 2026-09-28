@@ -1,16 +1,20 @@
 //! Chrome shared by every place a tab or terminal appears (top bar, pane
 //! headers, sidebar rows, window ring chips, bot threads): one status
-//! indicator slot and an always-visible close button.
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+//! indicator slot, the needs-input border, and an always-visible close button.
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AppContext, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, StatefulInteractiveElement, Styled, div, px, rgb, rgba,
+    AnyElement, AppContext, BoxShadow, Context, Div, ElementId, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, StatefulInteractiveElement, Styled, canvas, div,
+    point, px, rgb, rgba,
 };
-use hh_protocol::{Pane, PaneStatus, Workspace, workstation_descendants};
+use hh_protocol::{Pane, PaneLayout, PaneProgress, PaneStatus, Workspace, workstation_descendants};
+use std::time::Instant;
 use uuid::Uuid;
 
-use crate::notifications::{ActivitySection, activity_section};
+use crate::status_art::{
+    ANIMATION_FRAME, BorderMotion, border_motion, paint_needs_input_border, paint_progress_ring,
+    paint_spinner_ring, spinner_rotation,
+};
 use crate::view_models::TooltipView;
 use crate::{HhApp, THEME};
 
@@ -18,117 +22,200 @@ use crate::{HhApp, THEME};
 const INDICATOR_SIZE: f32 = 10.0;
 const STATUS_DOT_SIZE: f32 = 7.0;
 const UNREAD_DOT_SIZE: f32 = 6.0;
-/// The running dot fades in coarse steps: a frame-driven animation redraws the
-/// whole app every frame (measured ~44% CPU in a debug build) for as long as
-/// any agent works, while stepping costs a few redraws per second.
-pub(crate) const PULSE_STEP: Duration = Duration::from_millis(250);
-/// Steps in one fade out and back in: a slow two-second breath.
-const PULSE_STEPS: u128 = 8;
-/// The dimmest point of the fade, so a running dot never vanishes.
-const PULSE_MIN_OPACITY: f32 = 0.25;
 const CLOSE_BUTTON_SIZE: f32 = 16.0;
 
-/// What a status slot shows. Ordered by urgency so aggregates over several
-/// panes take the maximum.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum PaneIndicator {
-    /// Idle, or a finished pane already viewed: the slot stays empty.
-    #[default]
-    None,
-    /// Finished (done or exited); on a tab only until the user views it.
-    Done,
-    Running,
-    NeedsYou,
+/// Completed and total tasks, for one pane or summed over several.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TaskCount {
+    pub(crate) done: u32,
+    pub(crate) total: u32,
 }
 
-impl PaneIndicator {
-    /// Symbol color: needs-you orange, running and done blue, else dim.
-    pub(crate) const fn color(self) -> u32 {
-        match self {
-            Self::None => THEME.dim,
-            Self::Done | Self::Running => THEME.accent,
-            Self::NeedsYou => THEME.warning,
+impl TaskCount {
+    pub(crate) const fn of(progress: &PaneProgress) -> Self {
+        Self {
+            done: progress.done,
+            total: progress.total,
+        }
+    }
+
+    /// Completed share in `0..=1`; an empty list counts as complete.
+    pub(crate) fn fraction(self) -> f32 {
+        PaneProgress {
+            done: self.done,
+            total: self.total,
+            current: None,
+            phase: None,
+            source: hh_protocol::ProgressSource::Omp,
+        }
+        .fraction()
+    }
+
+    const fn plus(self, other: Self) -> Self {
+        Self {
+            done: self.done.saturating_add(other.done),
+            total: self.total.saturating_add(other.total),
         }
     }
 }
 
-/// The one mapping from pane activity to a tab's indicator. An exited pane is
-/// finished whatever its last status said; a finished pane keeps its blue dot
-/// until the user views it (`unread`), then shows nothing.
-pub(crate) const fn pane_indicator(
-    status: PaneStatus,
-    exited: bool,
-    unread: bool,
-) -> PaneIndicator {
-    match notification_indicator(status, exited) {
-        PaneIndicator::Done if !unread => PaneIndicator::None,
-        indicator => indicator,
+/// What a status slot shows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PaneIndicator {
+    /// Idle, or a finished pane the user has opened since: the slot stays empty.
+    #[default]
+    None,
+    /// Finished (done or exited) and not opened since (`Pane.unseen`).
+    Done,
+    /// Working, with the agent's task counts when it reports them.
+    Running(Option<TaskCount>),
+    NeedsYou,
+}
+
+impl PaneIndicator {
+    /// Urgency, which decides what an aggregate over several panes shows.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Done => 1,
+            Self::Running(_) => 2,
+            Self::NeedsYou => 3,
+        }
+    }
+
+    /// Symbol color: needs-you orange, running and done blue, else dim.
+    pub(crate) const fn color(self) -> u32 {
+        match self {
+            Self::None => THEME.dim,
+            Self::Done | Self::Running(_) => THEME.accent,
+            Self::NeedsYou => THEME.warning,
+        }
+    }
+
+    /// Hover text for a slot that summarizes task counts.
+    pub(crate) fn tooltip(self) -> Option<String> {
+        match self {
+            Self::Running(Some(count)) => Some(count_tooltip(count)),
+            _ => None,
+        }
     }
 }
 
-/// A collapsed workstation card's one status dot: the most urgent indicator
-/// across its own panes and those of every workstation nested in it.
+/// The one mapping from pane state to its indicator, by precedence: needs
+/// you, then running, then finished-and-unseen. An exited pane is finished
+/// whatever its last status said.
+pub(crate) fn pane_indicator(
+    status: PaneStatus,
+    exited: bool,
+    unseen: bool,
+    progress: Option<&PaneProgress>,
+) -> PaneIndicator {
+    let finished = if unseen {
+        PaneIndicator::Done
+    } else {
+        PaneIndicator::None
+    };
+    if exited {
+        return finished;
+    }
+    match status {
+        PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention => {
+            PaneIndicator::NeedsYou
+        }
+        PaneStatus::Working => PaneIndicator::Running(progress.map(TaskCount::of)),
+        PaneStatus::Done | PaneStatus::Idle => finished,
+    }
+}
+
+/// Whether a pane is blocked on an answer, which frames its tabs with the
+/// travelling needs-input border. Bells (`Attention`) only get the dot.
+pub(crate) const fn awaits_input(status: PaneStatus, exited: bool) -> bool {
+    !exited && matches!(status, PaneStatus::NeedsInput | PaneStatus::NeedsApproval)
+}
+
+/// Several panes in one slot: the most urgent indicator wins; running
+/// progress sums the task counts of every running pane that reports them,
+/// and stays indeterminate when none does.
+pub(crate) fn aggregate_indicators(
+    indicators: impl IntoIterator<Item = PaneIndicator>,
+) -> PaneIndicator {
+    let mut most_urgent = PaneIndicator::None;
+    let mut tasks: Option<TaskCount> = None;
+    for indicator in indicators {
+        if let PaneIndicator::Running(Some(count)) = indicator {
+            tasks = Some(tasks.map_or(count, |sum| sum.plus(count)));
+        }
+        if indicator.rank() > most_urgent.rank() {
+            most_urgent = indicator;
+        }
+    }
+    match most_urgent {
+        PaneIndicator::Running(_) => PaneIndicator::Running(tasks),
+        other => other,
+    }
+}
+
+/// A collapsed workstation card's one status slot, aggregated across its own
+/// panes and those of every workstation nested in it.
 pub(crate) fn workstation_rollup_indicator(
     workspaces: &[Workspace],
     workstation_id: Uuid,
     indicator: impl Fn(&Pane) -> PaneIndicator,
 ) -> PaneIndicator {
     let nested = workstation_descendants(workspaces, workstation_id);
-    workspaces
-        .iter()
-        .filter(|workspace| workspace.id == workstation_id || nested.contains(&workspace.id))
-        .flat_map(|workspace| &workspace.tabs)
-        .flat_map(|tab| {
-            let mut panes = Vec::new();
-            crate::helpers::collect_terminal_tabs(&tab.layout, &mut panes);
-            panes
-        })
-        .map(indicator)
-        .max()
-        .unwrap_or_default()
+    aggregate_indicators(
+        workspaces
+            .iter()
+            .filter(|workspace| workspace.id == workstation_id || nested.contains(&workspace.id))
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| {
+                let mut panes = Vec::new();
+                crate::helpers::collect_terminal_tabs(&tab.layout, &mut panes);
+                panes
+            })
+            .map(indicator),
+    )
 }
 
-/// A Notifications row's indicator: like [`pane_indicator`], but a finished
-/// pane keeps its Done dot, since the row itself carries the unread mark.
-pub(crate) const fn notification_indicator(status: PaneStatus, exited: bool) -> PaneIndicator {
-    match activity_section(status, exited) {
-        Some(ActivitySection::NeedsYou) => PaneIndicator::NeedsYou,
-        Some(ActivitySection::Running) => PaneIndicator::Running,
-        Some(ActivitySection::Done) => PaneIndicator::Done,
-        None => PaneIndicator::None,
+/// "3 of 7 done · Phase — current task" for one pane's progress.
+pub(crate) fn progress_tooltip(progress: &PaneProgress) -> String {
+    let mut text = count_tooltip(TaskCount::of(progress));
+    let phase = progress.phase.as_deref().filter(|text| !text.is_empty());
+    let current = progress.current.as_deref().filter(|text| !text.is_empty());
+    match (phase, current) {
+        (Some(phase), Some(current)) => {
+            text = format!("{text} · {phase} — {current}");
+        }
+        (Some(detail), None) | (None, Some(detail)) => {
+            text = format!("{text} · {detail}");
+        }
+        (None, None) => {}
     }
+    text
 }
 
-/// The fixed-size status slot: a slowly pulsing blue dot while running, a
-/// solid blue dot when done, an orange dot when the pane needs the user,
-/// otherwise empty space.
-pub(crate) fn render_pane_indicator(indicator: PaneIndicator) -> AnyElement {
-    let slot = div()
-        .flex_none()
-        .w(px(INDICATOR_SIZE))
-        .h(px(INDICATOR_SIZE))
-        .flex()
-        .items_center()
-        .justify_center();
+pub(crate) fn count_tooltip(count: TaskCount) -> String {
+    format!("{} of {} done", count.done, count.total)
+}
+
+/// What the status slot draws this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum IndicatorArt {
+    Empty,
+    Dot(u32),
+    /// A ring filled to this fraction.
+    Progress(f32),
+    /// The indeterminate running ring at this rotation; `None` is still.
+    Spinner(Option<f32>),
+}
+
+pub(crate) fn indicator_art(indicator: PaneIndicator, reduced: bool, elapsed: f32) -> IndicatorArt {
     match indicator {
-        PaneIndicator::None => slot,
-        PaneIndicator::Running => slot.child(
-            div()
-                .w(px(STATUS_DOT_SIZE))
-                .h(px(STATUS_DOT_SIZE))
-                .rounded_full()
-                .bg(rgb(indicator.color()))
-                .opacity(pulse_opacity()),
-        ),
-        PaneIndicator::NeedsYou | PaneIndicator::Done => slot.child(
-            div()
-                .w(px(STATUS_DOT_SIZE))
-                .h(px(STATUS_DOT_SIZE))
-                .rounded_full()
-                .bg(rgb(indicator.color())),
-        ),
+        PaneIndicator::None => IndicatorArt::Empty,
+        PaneIndicator::Done | PaneIndicator::NeedsYou => IndicatorArt::Dot(indicator.color()),
+        PaneIndicator::Running(Some(count)) => IndicatorArt::Progress(count.fraction()),
+        PaneIndicator::Running(None) => IndicatorArt::Spinner(spinner_rotation(reduced, elapsed)),
     }
-    .into_any_element()
 }
 
 /// The blue unread dot beside a Notifications row's status symbol; an empty
@@ -146,43 +233,32 @@ pub(crate) fn render_unread_dot(unread: bool) -> AnyElement {
     }
 }
 
-/// The running dot's opacity now, taken from the wall clock so every running
-/// indicator pulses together without per-view state.
-fn pulse_opacity() -> f32 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    pulse_opacity_at_step(elapsed / PULSE_STEP.as_millis())
-}
-
-/// Fades linearly from full to [`PULSE_MIN_OPACITY`] and back over
-/// [`PULSE_STEPS`] steps.
-fn pulse_opacity_at_step(step: u128) -> f32 {
-    // Both values are below 8, so the conversions are exact.
-    let phase = f32::from(u8::try_from(step % PULSE_STEPS).unwrap_or(0));
-    let half = f32::from(u8::try_from(PULSE_STEPS / 2).unwrap_or(1));
-    let brightness = (phase - half).abs() / half;
-    PULSE_MIN_OPACITY + (1.0 - PULSE_MIN_OPACITY) * brightness
-}
-
 impl HhApp {
-    /// Whether any live terminal is working, which is when the pulse ticker
-    /// has to redraw.
-    pub(crate) fn any_pane_running(&self) -> bool {
-        self.session.snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .workspaces
-                .iter()
-                .flat_map(|workspace| &workspace.tabs)
-                .any(|tab| {
-                    let mut panes = Vec::new();
-                    crate::helpers::collect_terminal_tabs(&tab.layout, &mut panes);
-                    panes
-                        .iter()
-                        .any(|pane| self.pane_indicator(pane) == PaneIndicator::Running)
-                })
+    /// Keeps frames coming at ~30 fps while the last frame drew something
+    /// animated (a comet border or a spinning ring), and stops as soon as a
+    /// frame draws none: no timer runs while nothing moves.
+    pub(crate) fn ensure_animation_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.motion.wants_frames() || self.motion.tick_running {
+            return;
+        }
+        self.motion.tick_running = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                gpui::Timer::after(ANIMATION_FRAME).await;
+                let Ok(true) = this.update(cx, |this, cx| {
+                    if !this.motion.wants_frames() {
+                        this.motion.tick_running = false;
+                        return false;
+                    }
+                    this.motion.refresh_reduced(Instant::now());
+                    cx.notify();
+                    true
+                }) else {
+                    break;
+                };
+            }
         })
+        .detach();
     }
 
     pub(crate) fn pane_exited(&self, pane_id: Uuid) -> bool {
@@ -196,8 +272,132 @@ impl HhApp {
         pane_indicator(
             pane.status,
             self.pane_exited(pane.id),
-            self.session.pane_views.is_unread(pane),
+            pane.unseen,
+            pane.progress.as_ref(),
         )
+    }
+
+    /// Hover text for one pane's slot: its task progress while running.
+    pub(crate) fn pane_indicator_tooltip(&self, pane: &Pane) -> Option<String> {
+        match self.pane_indicator(pane) {
+            PaneIndicator::Running(Some(_)) => pane.progress.as_ref().map(progress_tooltip),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pane_awaits_input(&self, pane: &Pane) -> bool {
+        awaits_input(pane.status, self.pane_exited(pane.id))
+    }
+
+    /// Whether any terminal of a tab is blocked on an answer.
+    pub(crate) fn layout_awaits_input(&self, layout: &PaneLayout) -> bool {
+        let mut panes = Vec::new();
+        crate::helpers::collect_terminal_tabs(layout, &mut panes);
+        panes.iter().any(|pane| self.pane_awaits_input(pane))
+    }
+
+    fn indicator_slot(&self, indicator: PaneIndicator) -> Div {
+        let slot = div()
+            .flex_none()
+            .w(px(INDICATOR_SIZE))
+            .h(px(INDICATOR_SIZE))
+            .flex()
+            .items_center()
+            .justify_center();
+        let art = indicator_art(indicator, self.motion.reduced(), self.motion.elapsed_secs());
+        match art {
+            IndicatorArt::Empty => slot,
+            IndicatorArt::Dot(color) => slot.child(
+                div()
+                    .w(px(STATUS_DOT_SIZE))
+                    .h(px(STATUS_DOT_SIZE))
+                    .rounded_full()
+                    .bg(rgb(color)),
+            ),
+            IndicatorArt::Progress(fraction) => slot.child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, (), window, _| paint_progress_ring(bounds, window, fraction),
+                )
+                .size_full(),
+            ),
+            IndicatorArt::Spinner(rotation) => {
+                if rotation.is_some() {
+                    self.motion.request_frames();
+                }
+                slot.child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, (), window, _| paint_spinner_ring(bounds, window, rotation),
+                    )
+                    .size_full(),
+                )
+            }
+        }
+    }
+
+    /// The fixed-size status slot: an orange dot when the pane needs the
+    /// user, a progress ring (or the indeterminate blue ring) while it runs,
+    /// a blue dot when it finished unseen, otherwise empty space.
+    pub(crate) fn render_pane_indicator(&self, indicator: PaneIndicator) -> AnyElement {
+        self.indicator_slot(indicator).into_any_element()
+    }
+
+    /// [`Self::render_pane_indicator`] with hover text, e.g. task progress.
+    pub(crate) fn render_pane_indicator_with_tooltip(
+        &self,
+        indicator: PaneIndicator,
+        id: impl Into<ElementId>,
+        tooltip: Option<String>,
+    ) -> AnyElement {
+        let slot = self.indicator_slot(indicator);
+        match tooltip {
+            Some(text) => slot
+                .id(id)
+                .tooltip(move |_, cx| cx.new(|_| TooltipView { text: text.clone() }).into())
+                .into_any_element(),
+            None => slot.into_any_element(),
+        }
+    }
+
+    /// Frames `element` with the needs-input border when `awaits`: orange
+    /// with a comet running clockwise, or a steady glow under reduced motion.
+    /// `radius` is the element's corner radius.
+    pub(crate) fn with_needs_input_border<E>(&self, element: E, awaits: bool, radius: f32) -> E
+    where
+        E: Styled + ParentElement + FluentBuilder,
+    {
+        if !awaits {
+            return element;
+        }
+        let motion = border_motion(self.motion.reduced(), self.motion.elapsed_secs());
+        if matches!(motion, BorderMotion::Comet { .. }) {
+            self.motion.request_frames();
+        }
+        let mut glow = Hsla::from(rgb(THEME.warning));
+        glow.a = 0.45;
+        element
+            .relative()
+            .when(motion == BorderMotion::Glow, |element| {
+                element.shadow(vec![BoxShadow {
+                    color: glow,
+                    offset: point(px(0.0), px(0.0)),
+                    blur_radius: px(6.0),
+                    spread_radius: px(0.0),
+                }])
+            })
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, (), window, _| {
+                        paint_needs_input_border(bounds, window, radius, motion);
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
     }
 
     /// The always-visible ×: dim until hovered. It swallows its own mouse
@@ -251,11 +451,27 @@ impl HhApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        PULSE_MIN_OPACITY, PULSE_STEPS, PaneIndicator, notification_indicator, pane_indicator,
-        pulse_opacity_at_step, workstation_rollup_indicator,
+        IndicatorArt, PaneIndicator, TaskCount, aggregate_indicators, awaits_input, indicator_art,
+        pane_indicator, progress_tooltip, workstation_rollup_indicator,
     };
-    use hh_protocol::{PaneLayout, PaneStatus, SessionSnapshot, Workspace};
+    use hh_protocol::{
+        PaneLayout, PaneProgress, PaneStatus, ProgressSource, SessionSnapshot, Workspace,
+    };
     use uuid::Uuid;
+
+    fn progress(done: u32, total: u32) -> PaneProgress {
+        PaneProgress {
+            done,
+            total,
+            current: None,
+            phase: None,
+            source: ProgressSource::Claude,
+        }
+    }
+
+    const fn running(done: u32, total: u32) -> PaneIndicator {
+        PaneIndicator::Running(Some(TaskCount { done, total }))
+    }
 
     #[test]
     fn a_collapsed_workstation_rolls_up_its_nested_workstations() {
@@ -269,6 +485,8 @@ mod tests {
             };
             pane.id = Uuid::from_u128(id * 10);
             pane.status = status;
+            pane.unseen = true;
+            pane.progress = Some(progress(1, 4));
             workspace
         }
         let workspaces = vec![
@@ -276,126 +494,165 @@ mod tests {
             workstation(11, Some(1), PaneStatus::Working),
             workstation(111, Some(11), PaneStatus::NeedsInput),
             workstation(2, None, PaneStatus::Working),
+            workstation(21, Some(2), PaneStatus::Working),
         ];
-        let rollup = |id: u128| {
-            workstation_rollup_indicator(&workspaces, Uuid::from_u128(id), |pane| {
-                pane_indicator(pane.status, false, true)
+        let rollup = |id: u128, workspaces: &[Workspace]| {
+            workstation_rollup_indicator(workspaces, Uuid::from_u128(id), |pane| {
+                pane_indicator(pane.status, false, pane.unseen, pane.progress.as_ref())
             })
         };
 
-        assert_eq!(rollup(1), PaneIndicator::NeedsYou, "grandchild needs you");
-        assert_eq!(rollup(11), PaneIndicator::NeedsYou);
-        assert_eq!(rollup(111), PaneIndicator::NeedsYou);
         assert_eq!(
-            rollup(2),
-            PaneIndicator::Running,
-            "siblings never leak into a rollup"
+            rollup(1, &workspaces),
+            PaneIndicator::NeedsYou,
+            "grandchild needs you"
         );
-        let mut done_only = workspaces.clone();
-        done_only.truncate(1);
+        assert_eq!(rollup(11, &workspaces), PaneIndicator::NeedsYou);
+        assert_eq!(rollup(111, &workspaces), PaneIndicator::NeedsYou);
         assert_eq!(
-            workstation_rollup_indicator(&done_only, Uuid::from_u128(1), |pane| {
-                pane_indicator(pane.status, false, true)
-            }),
-            PaneIndicator::Done
+            rollup(2, &workspaces),
+            running(2, 8),
+            "running progress sums over nested workstations, never siblings"
         );
+        assert_eq!(rollup(1, &workspaces[..1]), PaneIndicator::Done);
     }
 
     #[test]
-    fn pane_indicator_maps_every_status_and_exit() {
-        let expected = [
-            (PaneStatus::Idle, PaneIndicator::None),
-            (PaneStatus::Working, PaneIndicator::Running),
-            (PaneStatus::NeedsApproval, PaneIndicator::NeedsYou),
-            (PaneStatus::NeedsInput, PaneIndicator::NeedsYou),
-            (PaneStatus::Attention, PaneIndicator::NeedsYou),
-        ];
-        for (status, indicator) in expected {
-            for unread in [false, true] {
+    fn needs_you_beats_running_beats_unseen_done() {
+        let with = Some(progress(3, 7));
+        for status in [
+            PaneStatus::NeedsApproval,
+            PaneStatus::NeedsInput,
+            PaneStatus::Attention,
+        ] {
+            for unseen in [false, true] {
                 assert_eq!(
-                    pane_indicator(status, false, unread),
-                    indicator,
-                    "{status:?}"
+                    pane_indicator(status, false, unseen, with.as_ref()),
+                    PaneIndicator::NeedsYou,
+                    "{status:?} unseen={unseen}"
                 );
             }
         }
+        for unseen in [false, true] {
+            assert_eq!(
+                pane_indicator(PaneStatus::Working, false, unseen, with.as_ref()),
+                running(3, 7),
+                "running ignores unseen"
+            );
+            assert_eq!(
+                pane_indicator(PaneStatus::Working, false, unseen, None),
+                PaneIndicator::Running(None)
+            );
+        }
+        for status in [PaneStatus::Done, PaneStatus::Idle] {
+            assert_eq!(
+                pane_indicator(status, false, true, None),
+                PaneIndicator::Done
+            );
+            assert_eq!(
+                pane_indicator(status, false, false, None),
+                PaneIndicator::None
+            );
+        }
     }
 
     #[test]
-    fn a_finished_tab_stays_blue_until_viewed() {
-        // A finished turn, or a pane whose process exited whatever its last
-        // status said, shows the Done dot while unread and nothing once seen.
-        for (status, exited) in [
-            (PaneStatus::Done, false),
-            (PaneStatus::Working, true),
-            (PaneStatus::NeedsInput, true),
+    fn an_exited_pane_is_finished_whatever_its_last_status_said() {
+        for status in [
+            PaneStatus::Working,
+            PaneStatus::NeedsInput,
+            PaneStatus::Done,
         ] {
             assert_eq!(
-                pane_indicator(status, exited, true),
+                pane_indicator(status, true, true, Some(&progress(1, 2))),
                 PaneIndicator::Done,
-                "{status:?} exited={exited}"
+                "{status:?}"
             );
             assert_eq!(
-                pane_indicator(status, exited, false),
-                PaneIndicator::None,
-                "{status:?} exited={exited}"
-            );
-        }
-        assert_eq!(PaneIndicator::Done.color(), PaneIndicator::Running.color());
-        assert_ne!(PaneIndicator::Done.color(), PaneIndicator::NeedsYou.color());
-    }
-
-    #[test]
-    fn notifications_keep_done_rows_after_they_are_read() {
-        let expected = [
-            (PaneStatus::Idle, false, PaneIndicator::None),
-            (PaneStatus::Done, false, PaneIndicator::Done),
-            (PaneStatus::Working, false, PaneIndicator::Running),
-            (PaneStatus::NeedsApproval, false, PaneIndicator::NeedsYou),
-            (PaneStatus::NeedsInput, false, PaneIndicator::NeedsYou),
-            (PaneStatus::Attention, false, PaneIndicator::NeedsYou),
-            (PaneStatus::Working, true, PaneIndicator::Done),
-            (PaneStatus::NeedsInput, true, PaneIndicator::Done),
-            (PaneStatus::Idle, true, PaneIndicator::Done),
-        ];
-        for (status, exited, indicator) in expected {
-            assert_eq!(
-                notification_indicator(status, exited),
-                indicator,
-                "{status:?} exited={exited}"
+                pane_indicator(status, true, false, None),
+                PaneIndicator::None
             );
         }
     }
 
     #[test]
-    fn aggregates_surface_the_most_urgent_indicator() {
-        let tab = [
-            pane_indicator(PaneStatus::Done, false, true),
-            pane_indicator(PaneStatus::Working, false, false),
-            pane_indicator(PaneStatus::NeedsInput, true, false),
-        ];
-        assert_eq!(tab.into_iter().max(), Some(PaneIndicator::Running));
-        let tab = [
-            pane_indicator(PaneStatus::Done, false, true),
-            pane_indicator(PaneStatus::Idle, false, false),
-        ];
-        assert_eq!(tab.into_iter().max(), Some(PaneIndicator::Done));
-        let tab = [
-            pane_indicator(PaneStatus::Working, false, false),
-            pane_indicator(PaneStatus::Attention, false, false),
-        ];
-        assert_eq!(tab.into_iter().max(), Some(PaneIndicator::NeedsYou));
+    fn only_questions_and_approvals_get_the_needs_input_border() {
+        assert!(awaits_input(PaneStatus::NeedsInput, false));
+        assert!(awaits_input(PaneStatus::NeedsApproval, false));
+        assert!(
+            !awaits_input(PaneStatus::Attention, false),
+            "bells keep the dot"
+        );
+        assert!(!awaits_input(PaneStatus::Working, false));
+        assert!(!awaits_input(PaneStatus::NeedsInput, true), "exited");
     }
 
     #[test]
-    fn the_running_dot_fades_out_and_back_without_vanishing() {
-        let cycle = (0..PULSE_STEPS)
-            .map(pulse_opacity_at_step)
-            .collect::<Vec<_>>();
-        assert!((cycle[0] - 1.0).abs() < f32::EPSILON);
-        assert!((cycle[4] - PULSE_MIN_OPACITY).abs() < f32::EPSILON);
-        assert!(cycle[..=4].windows(2).all(|pair| pair[1] < pair[0]));
-        assert!(cycle[4..].windows(2).all(|pair| pair[1] > pair[0]));
-        assert!((pulse_opacity_at_step(PULSE_STEPS) - cycle[0]).abs() < f32::EPSILON);
+    fn aggregation_takes_the_most_urgent_and_sums_reported_progress() {
+        assert_eq!(
+            aggregate_indicators([
+                PaneIndicator::Done,
+                running(1, 3),
+                PaneIndicator::Running(None),
+                running(2, 5),
+            ]),
+            running(3, 8),
+            "panes without progress do not dilute the sum"
+        );
+        assert_eq!(
+            aggregate_indicators([PaneIndicator::Running(None), PaneIndicator::Done]),
+            PaneIndicator::Running(None),
+            "indeterminate when no running pane reports progress"
+        );
+        assert_eq!(
+            aggregate_indicators([running(1, 2), PaneIndicator::NeedsYou]),
+            PaneIndicator::NeedsYou
+        );
+        assert_eq!(
+            aggregate_indicators([PaneIndicator::None, PaneIndicator::Done]),
+            PaneIndicator::Done
+        );
+        assert_eq!(aggregate_indicators([]), PaneIndicator::None);
+    }
+
+    #[test]
+    fn running_draws_a_ring_that_holds_still_under_reduced_motion() {
+        assert_eq!(
+            indicator_art(running(1, 4), false, 0.3),
+            IndicatorArt::Progress(0.25)
+        );
+        assert_eq!(
+            indicator_art(running(1, 4), true, 0.3),
+            IndicatorArt::Progress(0.25)
+        );
+        assert_eq!(
+            indicator_art(PaneIndicator::Running(None), true, 0.3),
+            IndicatorArt::Spinner(None)
+        );
+        assert!(matches!(
+            indicator_art(PaneIndicator::Running(None), false, 0.3),
+            IndicatorArt::Spinner(Some(_))
+        ));
+        assert_eq!(
+            indicator_art(PaneIndicator::NeedsYou, false, 0.0),
+            IndicatorArt::Dot(PaneIndicator::NeedsYou.color())
+        );
+        assert_eq!(
+            indicator_art(PaneIndicator::None, false, 0.0),
+            IndicatorArt::Empty
+        );
+    }
+
+    #[test]
+    fn progress_tooltip_names_the_phase_and_current_task() {
+        let mut report = progress(3, 7);
+        assert_eq!(progress_tooltip(&report), "3 of 7 done");
+        report.current = Some("Write tests".to_owned());
+        assert_eq!(progress_tooltip(&report), "3 of 7 done · Write tests");
+        report.phase = Some("Build".to_owned());
+        assert_eq!(
+            progress_tooltip(&report),
+            "3 of 7 done · Build — Write tests"
+        );
     }
 }

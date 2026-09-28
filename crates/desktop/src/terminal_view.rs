@@ -16,7 +16,6 @@ use crate::helpers::{
     split_target_for_drag, split_target_for_drag_ids, terminal_tab_secondary_label,
     workspace_layout_for_focused_pane, workspace_tab_standalone_pane, zoom_projection,
 };
-use crate::tab_chrome::render_pane_indicator;
 use crate::view_models::{
     DragDestination, Modal, PaneControlIcon, PaneDrag, ResizeDrag, SearchEditor, SplitControlId,
     TabDrag, TooltipView, WorkspaceDrag,
@@ -149,6 +148,8 @@ impl HhApp {
                 let secondary_label = terminal_tab_secondary_label(pane).map(str::to_owned);
                 let selected = pane_id == active;
                 let indicator = self.pane_indicator(pane);
+                let indicator_tooltip = self.pane_indicator_tooltip(pane);
+                let awaits_input = self.pane_awaits_input(pane);
                 let pane_accent = pane
                     .color
                     .unwrap_or_else(|| self.terminal_accent(pane_id))
@@ -159,7 +160,7 @@ impl HhApp {
                     title: label.clone(),
                     position: Point::default(),
                 };
-                div()
+                let tab = div()
                     .id(("pane-tab", element_key(pane_id)))
                     .h_full()
                     .min_w(px(54.0))
@@ -257,14 +258,19 @@ impl HhApp {
                                 .child(label),
                         )
                     })
-                    .child(render_pane_indicator(indicator))
+                    .child(self.render_pane_indicator_with_tooltip(
+                        indicator,
+                        ("pane-tab-status", element_key(pane_id)),
+                        indicator_tooltip,
+                    ))
                     .child(self.render_close_button(
                         ("close-tab", element_key(pane_id)),
                         THEME.foreground,
                         close_tooltip,
                         move |this, cx| this.begin_close(pane_id, cx),
                         cx,
-                    ))
+                    ));
+                self.with_needs_input_border(tab, awaits_input, 0.0)
                     .into_any_element()
             })
             .collect()
@@ -427,6 +433,7 @@ impl HhApp {
             .flex()
             .flex_col()
             .on_click(cx.listener(move |this, _, window, cx| {
+                this.mark_pane_seen(active);
                 this.focus_pane_with_snapshot(active, cx);
                 this.focus_handle.focus(window);
                 cx.notify();

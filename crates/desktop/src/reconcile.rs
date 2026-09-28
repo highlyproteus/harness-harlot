@@ -9,9 +9,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
 
-use hh_protocol::{
-    NotificationKind, PaneStreamState, SessionNotification, SessionSnapshot, TerminalScreen,
-};
+use hh_protocol::{PaneStreamState, SessionNotification, SessionSnapshot, TerminalScreen};
 use uuid::Uuid;
 
 use crate::helpers::{
@@ -32,7 +30,8 @@ pub(crate) struct ReconcileOutcome {
     /// Focus moved to a pane the desktop has not focused yet; resync its
     /// snapshot.
     pub focus_resync: Option<Uuid>,
-    /// The notification ring was reset by a stale id; refetch the full list.
+    /// The notification mirror is stale (new ring, or new items that may
+    /// replace or re-read older ones); refetch the full list.
     pub notifications_need_refresh: bool,
 }
 
@@ -43,6 +42,7 @@ pub(crate) struct UpdatePayload {
     pub screens: Vec<TerminalScreen>,
     pub pane_states: Vec<PaneStreamState>,
     pub notification_deltas: Vec<SessionNotification>,
+    pub notifications_epoch: Uuid,
 }
 
 const NOTIFICATION_RING_CAPACITY: usize = 200;
@@ -62,6 +62,7 @@ pub(crate) fn reconcile_updates(
         screens,
         pane_states,
         notification_deltas,
+        notifications_epoch,
     } = payload;
     let mut outcome = ReconcileOutcome::default();
     let current_session_revision = session.snapshot.as_ref().map(|snapshot| snapshot.revision);
@@ -162,42 +163,74 @@ pub(crate) fn reconcile_updates(
             .map(|state| (state.pane_id, state))
             .collect();
     }
-    let notifications_changed = if notification_deltas
-        .iter()
-        .any(|notification| notification.id <= session.notifications_latest_id)
-    {
-        session.notifications.clear();
-        session.notifications_latest_id = 0;
-        outcome.notifications_need_refresh = true;
-        true
-    } else if notification_deltas.is_empty() {
-        false
-    } else {
-        session.notifications_latest_id = notification_deltas
-            .iter()
-            .map(|notification| notification.id)
-            .max()
-            .unwrap_or(session.notifications_latest_id);
-        session.notifications.extend(
-            notification_deltas
-                .into_iter()
-                .filter(|notification| notification.kind == NotificationKind::Message),
-        );
-        let overflow = session
-            .notifications
-            .len()
-            .saturating_sub(NOTIFICATION_RING_CAPACITY);
-        if overflow > 0 {
-            session.notifications.drain(..overflow);
-        }
-        true
-    };
+    let notifications = sync_notifications(
+        &mut session.notifications,
+        &mut session.notifications_latest_id,
+        &mut session.notifications_epoch,
+        notifications_epoch,
+        notification_deltas,
+    );
+    outcome.notifications_need_refresh = notifications.refresh;
+    let notifications_changed = notifications.changed;
     let connection_changed = session.connection_error.take().is_some();
     session.connection_error = None;
     outcome.state_changed = pane_update_requires_repaint(snapshot_changed, screens_applied)
         || connection_changed
         || notifications_changed;
     outcome
+}
+
+/// What one `Updates` payload did to the notification mirror.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct NotificationSync {
+    pub changed: bool,
+    pub refresh: bool,
+}
+
+/// Merges notification deltas into the mirror. A new `epoch` means the
+/// service replaced its ring (restart), so ids from the old ring mean nothing:
+/// the mirror and cursor are dropped and a full refetch is requested. Within
+/// one epoch, deltas at or below the cursor are late duplicates and ignored;
+/// newer ones are appended, and a refetch picks up the older items the
+/// service replaced or marked read meanwhile.
+pub(crate) fn sync_notifications(
+    notifications: &mut Vec<SessionNotification>,
+    latest_id: &mut u64,
+    current_epoch: &mut Option<Uuid>,
+    epoch: Uuid,
+    deltas: Vec<SessionNotification>,
+) -> NotificationSync {
+    if *current_epoch != Some(epoch) {
+        let changed = !notifications.is_empty();
+        notifications.clear();
+        *latest_id = 0;
+        *current_epoch = Some(epoch);
+        return NotificationSync {
+            changed,
+            refresh: true,
+        };
+    }
+    let fresh = deltas
+        .into_iter()
+        .filter(|notification| notification.id > *latest_id)
+        .collect::<Vec<_>>();
+    if fresh.is_empty() {
+        return NotificationSync::default();
+    }
+    *latest_id = fresh
+        .iter()
+        .map(|notification| notification.id)
+        .max()
+        .unwrap_or(*latest_id);
+    notifications.extend(fresh);
+    let overflow = notifications
+        .len()
+        .saturating_sub(NOTIFICATION_RING_CAPACITY);
+    notifications.drain(..overflow);
+    NotificationSync {
+        changed: true,
+        refresh: true,
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -206,6 +239,8 @@ mod tests {
     use crate::view_models::{DragHoverState, SidebarResizeLifecycle};
     use gpui::ScrollHandle;
     use hh_protocol::{NotificationKind, StreamDiagnostics, TerminalModes, TerminalProfile};
+
+    const EPOCH: Uuid = Uuid::from_u128(0xe90c);
     use parking_lot::Mutex;
     use std::sync::Arc;
 
@@ -226,8 +261,8 @@ mod tests {
             pane_states: HashMap::new(),
             notifications: Vec::new(),
             notifications_latest_id: 0,
+            notifications_epoch: Some(EPOCH),
             dock_badge: None,
-            pane_views: crate::notifications::PaneViews::default(),
             last_delivery: HashMap::new(),
             window_active: true,
             stream_diagnostics: StreamDiagnostics::default(),
@@ -341,6 +376,7 @@ mod tests {
                     enhanced_paste: false,
                 }],
                 notification_deltas: Vec::new(),
+                notifications_epoch: EPOCH,
             },
             Instant::now(),
         );
@@ -388,6 +424,7 @@ mod tests {
                     enhanced_paste: false,
                 }],
                 notification_deltas: Vec::new(),
+                notifications_epoch: EPOCH,
             },
             Instant::now(),
         );
@@ -400,13 +437,13 @@ mod tests {
         assert!(!outcome.state_changed, "nothing visible changed");
     }
 
-    #[test]
-    fn stale_notification_delta_resets_the_ring_and_requests_refetch() {
-        let mut session = session_state();
-        session.notifications_latest_id = 30;
-        session.notifications = vec![notification(30)];
-        let outcome = reconcile_updates(
-            &mut session,
+    fn deltas(
+        session: &mut SessionState,
+        epoch: Uuid,
+        deltas: Vec<SessionNotification>,
+    ) -> ReconcileOutcome {
+        reconcile_updates(
+            session,
             &mut sidebar(),
             &mut layout(),
             &mut HashMap::new(),
@@ -415,38 +452,61 @@ mod tests {
                 snapshot: None,
                 screens: Vec::new(),
                 pane_states: Vec::new(),
-                notification_deltas: vec![notification(12)],
+                notification_deltas: deltas,
+                notifications_epoch: epoch,
             },
             Instant::now(),
-        );
-        assert!(session.notifications.is_empty());
-        assert_eq!(session.notifications_latest_id, 0);
-        assert!(outcome.notifications_need_refresh);
-        assert!(outcome.state_changed);
+        )
     }
 
     #[test]
-    fn only_service_messages_are_kept_while_the_cursor_tracks_every_delta() {
+    fn a_new_epoch_drops_the_mirror_and_its_cursor_and_refetches() {
+        let mut session = session_state();
+        session.notifications_latest_id = 30;
+        session.notifications = vec![notification(30)];
+        let restarted = Uuid::from_u128(0xbeef);
+        // The restarted service's ids start over below the old cursor.
+        let outcome = deltas(&mut session, restarted, vec![notification(2)]);
+        assert!(session.notifications.is_empty());
+        assert_eq!(session.notifications_latest_id, 0);
+        assert_eq!(session.notifications_epoch, Some(restarted));
+        assert!(outcome.notifications_need_refresh);
+        assert!(outcome.state_changed);
+
+        let outcome = deltas(&mut session, restarted, vec![notification(3)]);
+        assert_eq!(session.notifications, vec![notification(3)]);
+        assert_eq!(session.notifications_latest_id, 3, "the new ring's cursor");
+        assert!(
+            outcome.notifications_need_refresh,
+            "picks up replaced items"
+        );
+    }
+
+    #[test]
+    fn every_kind_is_kept_and_late_duplicates_are_ignored() {
         let mut session = session_state();
         let mut message = notification(8);
         message.kind = NotificationKind::Message;
-        let outcome = reconcile_updates(
+        let mut attention = notification(9);
+        attention.kind = NotificationKind::Attention;
+        let outcome = deltas(
             &mut session,
-            &mut sidebar(),
-            &mut layout(),
-            &mut HashMap::new(),
-            UpdatePayload {
-                session_revision: 0,
-                snapshot: None,
-                screens: Vec::new(),
-                pane_states: Vec::new(),
-                notification_deltas: vec![notification(7), message.clone(), notification(9)],
-            },
-            Instant::now(),
+            EPOCH,
+            vec![notification(7), message.clone(), attention.clone()],
         );
-        assert_eq!(session.notifications, vec![message]);
+        assert_eq!(
+            session.notifications,
+            vec![notification(7), message, attention]
+        );
         assert_eq!(session.notifications_latest_id, 9);
+        assert!(outcome.state_changed);
+
+        // A response computed with an older cursor repeats items already held.
+        let before = session.notifications.clone();
+        let outcome = deltas(&mut session, EPOCH, vec![notification(8), notification(9)]);
+        assert_eq!(session.notifications, before);
         assert!(!outcome.notifications_need_refresh);
+        assert!(!outcome.state_changed);
     }
 
     #[test]
@@ -471,6 +531,7 @@ mod tests {
                 screens: Vec::new(),
                 pane_states: Vec::new(),
                 notification_deltas: Vec::new(),
+                notifications_epoch: EPOCH,
             },
             Instant::now(),
         );

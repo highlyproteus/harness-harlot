@@ -111,6 +111,8 @@ pub(crate) fn handle_request(
         | ClientRequest::GetNotifications
         | ClientRequest::MarkNotificationsRead { .. }
         | ClientRequest::ClearNotifications
+        | ClientRequest::MarkPaneSeen { .. }
+        | ClientRequest::ReportPaneProgress { .. }
         | ClientRequest::GetPaneSnapshot { .. }
         | ClientRequest::GetAuthorizedPaneSnapshot { .. } => {
             handle_streaming_request(sessions, request)
@@ -235,7 +237,16 @@ fn handle_streaming_request(
         ),
         ClientRequest::GetNotifications => Ok(ServiceResponse::Notifications {
             items: sessions.notifications()?,
+            epoch: sessions.notifications_epoch(),
         }),
+        ClientRequest::MarkPaneSeen { pane_id } => {
+            sessions.mark_pane_seen(pane_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::ReportPaneProgress { pane_id, progress } => {
+            sessions.report_pane_progress(pane_id, progress)?;
+            Ok(ServiceResponse::Ack)
+        }
         ClientRequest::MarkNotificationsRead { ids } => {
             sessions.mark_notifications_read(&ids);
             Ok(ServiceResponse::Ack)
@@ -753,6 +764,7 @@ pub(crate) fn handle_get_updates(
         screens: update.screens,
         pane_states: update.pane_states,
         notifications: update.notifications,
+        notifications_epoch: update.notifications_epoch,
         diagnostics: update.diagnostics,
         browser_commands: update.browser_commands,
     })

@@ -369,7 +369,7 @@ fn schema_v14_shared_bots_workspace_splits_into_one_workspace_per_bot() {
     )
     .unwrap();
     let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(written["schema_version"], 16);
+    assert_eq!(written["schema_version"], 17);
     assert_eq!(written["workspaces"][2]["kind"], "bot");
     assert!(written["workspaces"][2]["tabs"][0].get("bot").is_none());
     store.write_snapshot(&bytes).unwrap();
@@ -524,6 +524,8 @@ fn ssh_workspace_layout_recovers_offline_without_runtime_or_secret_material() {
         custom_title: None,
         profile_override: None,
         custom_icon: None,
+        unseen: false,
+        progress: None,
     };
     let first_id = first.id;
     let second_id = second.id;
@@ -1179,4 +1181,56 @@ fn nesting_rejects_excess_depth_cross_machine_parents_and_nested_homes() {
     second.tabs.clear();
     two_homes.workspaces.push(second);
     assert!(two_homes.validate().is_err());
+}
+
+#[test]
+fn unseen_and_progress_round_trip_and_invalid_progress_is_rejected() {
+    let directory = test_directory("unseen-progress");
+    let store = SnapshotStore::new(directory.join("sessions.json"));
+    let mut snapshot = SessionSnapshot::seeded();
+    let PaneLayout::Leaf { pane } = &mut snapshot.workspaces[0].tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    pane.unseen = true;
+    pane.progress = Some(PaneProgress {
+        done: 2,
+        total: 5,
+        current: Some("Write tests".to_owned()),
+        phase: Some("Verify".to_owned()),
+        source: hh_protocol::ProgressSource::Omp,
+    });
+    let expected = pane.progress.clone();
+    store.save(&snapshot, &cwd_map(&snapshot)).unwrap();
+    let recovered = store.load().unwrap().snapshot;
+    let PaneLayout::Leaf { pane } = &recovered.workspaces[0].tabs[0].layout else {
+        panic!("expected recovered leaf");
+    };
+    assert!(pane.unseen);
+    assert_eq!(pane.progress, expected);
+
+    // A seen pane without progress writes neither field, so the defaults
+    // are what an older snapshot without them loads as.
+    let mut plain = SessionSnapshot::seeded();
+    store.save(&plain, &cwd_map(&plain)).unwrap();
+    let text = fs::read_to_string(directory.join("sessions.json")).unwrap();
+    assert!(!text.contains("unseen") && !text.contains("progress"));
+    let recovered = store.load().unwrap().snapshot;
+    let PaneLayout::Leaf { pane } = &recovered.workspaces[0].tabs[0].layout else {
+        panic!("expected recovered leaf");
+    };
+    assert!(!pane.unseen);
+    assert_eq!(pane.progress, None);
+
+    let PaneLayout::Leaf { pane } = &mut plain.workspaces[0].tabs[0].layout else {
+        panic!("expected leaf");
+    };
+    pane.progress = Some(PaneProgress {
+        done: 6,
+        total: 5,
+        current: None,
+        phase: None,
+        source: hh_protocol::ProgressSource::Claude,
+    });
+    assert!(store.save(&plain, &cwd_map(&plain)).is_err());
+    fs::remove_dir_all(directory).unwrap();
 }

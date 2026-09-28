@@ -33,9 +33,9 @@ pub(crate) use icons::{
     workspace_is_selectable,
 };
 pub(crate) use layout::{
-    apply_layout_control_mutation, collect_terminal_tabs, find_pane, inactive_stack_contains,
-    split_control_id, visible_panes, workspace_layout_for_focused_pane, workspace_terminal_tabs,
-    workspace_visible_panes, zoom_projection,
+    apply_layout_control_mutation, collect_terminal_tabs, find_pane, find_pane_mut,
+    inactive_stack_contains, split_control_id, visible_panes, workspace_layout_for_focused_pane,
+    workspace_terminal_tabs, workspace_visible_panes, zoom_projection,
 };
 pub(crate) use polling::{
     next_terminal_poll_delay_ms, paced_subscriptions, pane_update_requires_repaint,

@@ -1,15 +1,15 @@
-//! Live pane activity (Needs you, Running, Done), the Dock badge, and the
-//! service's message notifications.
+//! Live pane activity (Needs you, Running), the service's stored
+//! notifications (Recent), the unread badges, and marking panes seen.
 use hh_protocol::{
     ClientRequest, NotificationKind, Pane, PaneLayout, PaneStatus, PaneStreamState,
-    ServiceResponse, SessionSnapshot, Tab, Workspace,
+    ServiceResponse, SessionNotification, SessionSnapshot, Tab, Workspace,
 };
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::HhApp;
-use crate::helpers::collect_terminal_tabs;
+use crate::helpers::{collect_terminal_tabs, find_pane, find_pane_mut};
+use crate::{HhApp, THEME};
 
 #[cfg(target_os = "macos")]
 pub(crate) fn set_macos_dock_badge(label: Option<&str>) {
@@ -19,38 +19,35 @@ pub(crate) fn set_macos_dock_badge(label: Option<&str>) {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn set_macos_dock_badge(_: Option<&str>) {}
 
-/// Notifications groups, in display order.
+/// Live Notifications groups, in display order.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ActivitySection {
     NeedsYou,
     Running,
-    Done,
 }
 
 impl ActivitySection {
-    pub(crate) const ALL: [Self; 3] = [Self::NeedsYou, Self::Running, Self::Done];
+    pub(crate) const ALL: [Self; 2] = [Self::NeedsYou, Self::Running];
 
     pub(crate) const fn title(self) -> &'static str {
         match self {
             Self::NeedsYou => "Needs you",
             Self::Running => "Running",
-            Self::Done => "Done",
         }
     }
 }
 
-/// A pane whose process exited is done whatever its last status said.
+/// The live section a pane belongs in; an exited pane is in none.
 pub(crate) const fn activity_section(status: PaneStatus, exited: bool) -> Option<ActivitySection> {
     if exited {
-        return Some(ActivitySection::Done);
+        return None;
     }
     match status {
         PaneStatus::NeedsApproval | PaneStatus::NeedsInput | PaneStatus::Attention => {
             Some(ActivitySection::NeedsYou)
         }
         PaneStatus::Working => Some(ActivitySection::Running),
-        PaneStatus::Done => Some(ActivitySection::Done),
-        PaneStatus::Idle => None,
+        PaneStatus::Done | PaneStatus::Idle => None,
     }
 }
 
@@ -68,18 +65,17 @@ pub(crate) const fn activity_badge(status: PaneStatus, exited: bool) -> &'static
     }
 }
 
-/// One pane shown in Notifications.
+/// One live pane shown in Notifications.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ActivityEntry<'a> {
     pub(crate) section: ActivitySection,
     pub(crate) workspace: &'a Workspace,
     pub(crate) tab: &'a Tab,
     pub(crate) pane: &'a Pane,
-    pub(crate) exited: bool,
 }
 
-/// Every pane with activity across workstation tabs and bots, grouped by
-/// section and newest status change first within each section.
+/// Every pane that needs the user or is running, across workstation tabs
+/// and bots, grouped by section and newest status change first.
 pub(crate) fn activity_entries<'a>(
     snapshot: &'a SessionSnapshot,
     pane_states: &HashMap<Uuid, PaneStreamState>,
@@ -97,7 +93,6 @@ pub(crate) fn activity_entries<'a>(
                         workspace,
                         tab,
                         pane,
-                        exited,
                     });
                 }
             }
@@ -139,70 +134,62 @@ pub(crate) fn bots_needing_you(
         .count()
 }
 
-/// Whether a pane's latest status change is unread: newer than the last time
-/// the user viewed the pane.
-pub(crate) const fn is_unread(status_changed_at_ms: u64, last_viewed_ms: u64) -> bool {
-    status_changed_at_ms > last_viewed_ms
+/// The bell and Dock badge: how many stored notifications are unread, and
+/// whether any of them asks for the user (orange) rather than reports (blue).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UnreadBadge {
+    pub(crate) count: usize,
+    pub(crate) attention: bool,
 }
 
-/// When the user last viewed each pane (focused it, clicked its
-/// Notifications row, or opened its bot thread), in epoch ms. Desktop-local
-/// and not persisted: a pane not viewed since launch counts as viewed at
-/// launch, so a restart does not mark every finished pane unread.
-#[derive(Debug, Default)]
-pub(crate) struct PaneViews {
-    launched_ms: u64,
-    viewed_ms: HashMap<Uuid, u64>,
-}
-
-impl PaneViews {
-    pub(crate) fn new(launched_ms: u64) -> Self {
-        Self {
-            launched_ms,
-            viewed_ms: HashMap::new(),
+impl UnreadBadge {
+    pub(crate) const fn color(self) -> u32 {
+        if self.attention {
+            THEME.warning
+        } else {
+            THEME.accent
         }
     }
+}
 
-    /// Records a view of `pane_id` at `at_ms`; a later view is never undone.
-    pub(crate) fn mark(&mut self, pane_id: Uuid, at_ms: u64) {
-        let viewed = self.viewed_ms.entry(pane_id).or_insert(at_ms);
-        *viewed = (*viewed).max(at_ms);
+/// `None` when everything is read, so the badge hides.
+pub(crate) fn unread_badge(notifications: &[SessionNotification]) -> Option<UnreadBadge> {
+    let mut badge = UnreadBadge {
+        count: 0,
+        attention: false,
+    };
+    for notification in notifications
+        .iter()
+        .filter(|notification| !notification.read)
+    {
+        badge.count += 1;
+        badge.attention |= notification.kind == NotificationKind::Attention;
     }
-
-    pub(crate) fn last_viewed_ms(&self, pane_id: Uuid) -> u64 {
-        self.viewed_ms
-            .get(&pane_id)
-            .copied()
-            .unwrap_or(self.launched_ms)
-    }
-
-    pub(crate) fn is_unread(&self, pane: &Pane) -> bool {
-        is_unread(pane.status_changed_at_ms, self.last_viewed_ms(pane.id))
-    }
+    (badge.count > 0).then_some(badge)
 }
 
 impl HhApp {
+    /// Replaces the notification mirror with the service's full ring.
     pub(crate) fn refresh_notifications(&mut self) {
         self.dispatch_with(
             ClientRequest::GetNotifications,
             Box::new(|this, cx, result| {
                 let previous = this.session.notifications.clone();
                 match result {
-                    Ok(ServiceResponse::Notifications { items }) => {
+                    Ok(ServiceResponse::Notifications { items, epoch }) => {
                         this.session.notifications_latest_id = items
                             .iter()
                             .map(|notification| notification.id)
                             .max()
                             .unwrap_or(0);
-                        this.session.notifications = items
-                            .into_iter()
-                            .filter(|notification| notification.kind == NotificationKind::Message)
-                            .collect();
+                        this.session.notifications = items;
+                        this.session.notifications_epoch = Some(epoch);
                         this.session.connection_error = None;
                     }
                     Ok(response) => this.report_unexpected(&response),
                     Err(error) => this.report(&error),
                 }
+                this.sync_dock_badge();
                 if this.session.notifications != previous {
                     cx.notify();
                 }
@@ -210,50 +197,12 @@ impl HhApp {
         );
     }
 
-    /// Panes waiting on the user; drives the bell and Dock badges.
-    pub(crate) fn needs_you_count(&self) -> usize {
-        self.session.snapshot.as_ref().map_or(0, |snapshot| {
-            snapshot
-                .workspaces
-                .iter()
-                .flat_map(|workspace| &workspace.tabs)
-                .map(|tab| needs_you_in(&tab.layout, &self.session.pane_states))
-                .sum()
-        })
-    }
-
-    /// Records that the user viewed pane `pane_id` now. Its latest status
-    /// change counts as seen even if the service clock runs ahead.
-    pub(crate) fn mark_pane_viewed(&mut self, pane_id: Uuid) {
-        let changed_ms = self
-            .session
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .workspaces
-                    .iter()
-                    .flat_map(|workspace| &workspace.tabs)
-                    .find_map(|tab| crate::helpers::find_pane(&tab.layout, pane_id))
-            })
-            .map_or(0, |pane| pane.status_changed_at_ms);
-        self.session
-            .pane_views
-            .mark(pane_id, crate::bots::now_ms().max(changed_ms));
-    }
-
-    /// The focused pane of an active window is being looked at, so its
-    /// status changes are seen as they arrive.
-    pub(crate) fn mark_focused_pane_viewed(&mut self) {
-        if self.session.window_active
-            && let Some(pane_id) = self.layout.focused_pane
-        {
-            self.mark_pane_viewed(pane_id);
-        }
+    pub(crate) fn unread_badge(&self) -> Option<UnreadBadge> {
+        unread_badge(&self.session.notifications)
     }
 
     pub(crate) fn sync_dock_badge(&mut self) {
-        let count = self.needs_you_count();
+        let count = self.unread_badge().map_or(0, |badge| badge.count);
         if self.session.dock_badge == Some(count) {
             return;
         }
@@ -265,6 +214,151 @@ impl HhApp {
         }
     }
 
+    /// The user opened pane `pane_id` (clicked it, typed into it, or switched
+    /// to its tab): clears its unseen dot and reads its notifications. Sends
+    /// nothing unless the pane is unseen.
+    pub(crate) fn mark_pane_seen(&mut self, pane_id: Uuid) {
+        let Some(pane) = self.session.snapshot.as_mut().and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter_mut()
+                .flat_map(|workspace| workspace.tabs.iter_mut())
+                .find_map(|tab| find_pane_mut(&mut tab.layout, pane_id))
+        }) else {
+            return;
+        };
+        if !pane.unseen {
+            return;
+        }
+        // Optimistic: the next snapshot and notification refresh confirm it.
+        pane.unseen = false;
+        for notification in &mut self.session.notifications {
+            if notification.pane_id == pane_id {
+                notification.read = true;
+            }
+        }
+        self.sync_dock_badge();
+        self.dispatch_with(
+            ClientRequest::MarkPaneSeen { pane_id },
+            Box::new(|this, cx, result| {
+                match result {
+                    Ok(ServiceResponse::Ack) => this.refresh_notifications(),
+                    Ok(response) => this.report_unexpected(&response),
+                    Err(error) => this.report(&error),
+                }
+                cx.notify();
+            }),
+        );
+    }
+
+    /// Switching to a tab shows every pane in it.
+    pub(crate) fn mark_tab_seen(&mut self, pane_id: Uuid) {
+        let panes = self
+            .session
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.tabs)
+                    .find(|tab| find_pane(&tab.layout, pane_id).is_some())
+            })
+            .map(|tab| {
+                let mut panes = Vec::new();
+                collect_terminal_tabs(&tab.layout, &mut panes);
+                panes
+                    .into_iter()
+                    .filter(|pane| pane.unseen)
+                    .map(|pane| pane.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for pane_id in panes {
+            self.mark_pane_seen(pane_id);
+        }
+    }
+
+    /// Marks stored notifications read without touching their panes.
+    pub(crate) fn mark_notifications_read(&mut self, ids: Vec<u64>) {
+        if ids.is_empty() {
+            return;
+        }
+        for notification in &mut self.session.notifications {
+            if ids.contains(&notification.id) {
+                notification.read = true;
+            }
+        }
+        self.sync_dock_badge();
+        self.dispatch_with(
+            ClientRequest::MarkNotificationsRead { ids },
+            Box::new(|this, cx, result| {
+                match result {
+                    Ok(ServiceResponse::Ack) => this.refresh_notifications(),
+                    Ok(response) => this.report_unexpected(&response),
+                    Err(error) => this.report(&error),
+                }
+                cx.notify();
+            }),
+        );
+    }
+
+    /// The Recent header's "Mark all read".
+    pub(crate) fn mark_all_notifications_read(&mut self) {
+        let unread = self
+            .session
+            .notifications
+            .iter()
+            .filter(|notification| !notification.read)
+            .map(|notification| notification.id)
+            .collect();
+        self.mark_notifications_read(unread);
+    }
+
+    /// A Recent row was clicked: show its pane (which marks the pane seen)
+    /// and read the notification itself.
+    pub(crate) fn open_notification(&mut self, id: u64, cx: &mut gpui::Context<Self>) {
+        let Some(notification) = self
+            .session
+            .notifications
+            .iter()
+            .find(|notification| notification.id == id)
+        else {
+            return;
+        };
+        let pane_id = notification.pane_id;
+        let unread = !notification.read;
+        let target = self.session.snapshot.as_ref().and_then(|snapshot| {
+            snapshot.workspaces.iter().find_map(|workspace| {
+                workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| find_pane(&tab.layout, pane_id).is_some())
+                    .map(|tab| (workspace.id, workspace.is_bot(), tab.id))
+            })
+        });
+        match target {
+            Some((workspace_id, true, tab_id)) => {
+                self.open_bot_pane(workspace_id, tab_id, pane_id, cx);
+            }
+            Some((workspace_id, false, tab_id)) => {
+                self.select_sidebar_pane(workspace_id, tab_id, pane_id, cx);
+            }
+            None => {}
+        }
+        self.mark_pane_seen(pane_id);
+        let still_unread = unread
+            && self
+                .session
+                .notifications
+                .iter()
+                .any(|notification| notification.id == id && !notification.read);
+        if still_unread {
+            self.mark_notifications_read(vec![id]);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn clear_notifications(&mut self) {
         self.dispatch_with(
             ClientRequest::ClearNotifications,
@@ -272,6 +366,7 @@ impl HhApp {
                 Ok(ServiceResponse::Ack) => {
                     this.session.notifications.clear();
                     this.session.connection_error = None;
+                    this.sync_dock_badge();
                     cx.notify();
                 }
                 Ok(response) => this.report_unexpected(&response),
@@ -283,9 +378,10 @@ impl HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivitySection, PaneViews, activity_entries, bots_needing_you, is_unread};
+    use super::{ActivitySection, UnreadBadge, activity_entries, bots_needing_you, unread_badge};
     use hh_protocol::{
-        PaneLayout, PaneStatus, PaneStreamState, SessionSnapshot, Tab, Workspace, WorkspaceKind,
+        NotificationKind, PaneLayout, PaneStatus, PaneStreamState, SessionNotification,
+        SessionSnapshot, Tab, TerminalProfile, Workspace, WorkspaceKind,
     };
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -310,26 +406,66 @@ mod tests {
         bot
     }
 
-    #[test]
-    fn a_status_change_is_unread_until_the_pane_is_viewed_after_it() {
-        assert!(is_unread(20, 10));
-        assert!(
-            !is_unread(10, 10),
-            "a change at the viewing instant is seen"
-        );
-        assert!(!is_unread(5, 10));
+    fn exited(pane_id: Uuid) -> HashMap<Uuid, PaneStreamState> {
+        HashMap::from([(
+            pane_id,
+            PaneStreamState {
+                pane_id,
+                revision: 1,
+                subscribed: false,
+                dirty: false,
+                exited: true,
+                enhanced_paste: false,
+            },
+        )])
+    }
 
-        let pane = Uuid::new_v4();
-        let mut views = PaneViews::new(100);
+    fn stored(id: u64, kind: NotificationKind, read: bool) -> SessionNotification {
+        SessionNotification {
+            id,
+            pane_id: Uuid::nil(),
+            workspace_id: Uuid::nil(),
+            kind,
+            message: None,
+            pane_title: "t".to_owned(),
+            workspace_title: "w".to_owned(),
+            profile: TerminalProfile::default(),
+            at_ms: 0,
+            read,
+        }
+    }
+
+    #[test]
+    fn the_badge_counts_unread_and_turns_orange_for_unread_attention() {
+        assert_eq!(unread_badge(&[]), None);
         assert_eq!(
-            views.last_viewed_ms(pane),
-            100,
-            "unviewed panes date from launch"
+            unread_badge(&[
+                stored(1, NotificationKind::Attention, true),
+                stored(2, NotificationKind::Completed, true),
+            ]),
+            None,
+            "hidden when everything is read"
         );
-        views.mark(pane, 300);
-        views.mark(pane, 200);
-        assert_eq!(views.last_viewed_ms(pane), 300, "an older view never wins");
-        assert_eq!(views.last_viewed_ms(Uuid::new_v4()), 100);
+        let blue = unread_badge(&[
+            stored(1, NotificationKind::Attention, true),
+            stored(2, NotificationKind::Completed, false),
+            stored(3, NotificationKind::Message, false),
+        ]);
+        assert_eq!(
+            blue,
+            Some(UnreadBadge {
+                count: 2,
+                attention: false
+            }),
+            "read attention does not tint the badge"
+        );
+        let orange = unread_badge(&[
+            stored(1, NotificationKind::Completed, false),
+            stored(2, NotificationKind::Attention, false),
+        ])
+        .expect("unread");
+        assert_eq!(orange.count, 2);
+        assert_ne!(orange.color(), blue.expect("unread").color());
     }
 
     #[test]
@@ -340,29 +476,18 @@ mod tests {
         let (waiting, _) = tab_with(&template, PaneStatus::NeedsApproval);
         let (also_waiting, _) = tab_with(&template, PaneStatus::NeedsInput);
         let (working, _) = tab_with(&template, PaneStatus::Working);
-        let (exited_tab, exited) = tab_with(&template, PaneStatus::NeedsInput);
+        let (exited_tab, exited_pane) = tab_with(&template, PaneStatus::NeedsInput);
         snapshot.workspaces[0].tabs = vec![tab_with(&template, PaneStatus::NeedsInput).0];
         snapshot.workspaces.extend([
             bot(&workstation, vec![waiting, also_waiting]),
             bot(&workstation, vec![working]),
             bot(&workstation, vec![exited_tab]),
         ]);
-        let pane_states = HashMap::from([(
-            exited,
-            PaneStreamState {
-                pane_id: exited,
-                revision: 1,
-                subscribed: false,
-                dirty: false,
-                exited: true,
-                enhanced_paste: false,
-            },
-        )]);
-        assert_eq!(bots_needing_you(&snapshot, &pane_states), 1);
+        assert_eq!(bots_needing_you(&snapshot, &exited(exited_pane)), 1);
     }
 
     #[test]
-    fn activity_groups_needs_you_running_done_newest_first_and_treats_exited_as_done() {
+    fn live_activity_groups_needs_you_then_running_newest_first() {
         let mut snapshot = SessionSnapshot::seeded();
         let template = snapshot.workspaces[0].tabs[0].clone();
         let statuses = [
@@ -378,32 +503,17 @@ mod tests {
         snapshot.workspaces[0].tabs = statuses
             .iter()
             .map(|(status, changed_at)| {
-                let mut tab = template.clone();
-                tab.id = uuid::Uuid::new_v4();
+                let (mut tab, pane_id) = tab_with(&template, *status);
                 let PaneLayout::Leaf { pane } = &mut tab.layout else {
                     unreachable!("seeded tabs are single panes");
                 };
-                pane.id = uuid::Uuid::new_v4();
-                pane.status = *status;
                 pane.status_changed_at_ms = *changed_at;
-                ids.push(pane.id);
+                ids.push(pane_id);
                 tab
             })
             .collect();
-        let exited = ids[6];
-        let pane_states = HashMap::from([(
-            exited,
-            PaneStreamState {
-                pane_id: exited,
-                revision: 1,
-                subscribed: false,
-                dirty: false,
-                exited: true,
-                enhanced_paste: false,
-            },
-        )]);
 
-        let entries = activity_entries(&snapshot, &pane_states);
+        let entries = activity_entries(&snapshot, &exited(ids[6]));
         let order = entries
             .iter()
             .map(|entry| (entry.section, entry.pane.id))
@@ -416,9 +526,8 @@ mod tests {
                 (ActivitySection::NeedsYou, ids[1]),
                 (ActivitySection::NeedsYou, ids[5]),
                 (ActivitySection::Running, ids[0]),
-                (ActivitySection::Done, exited),
-                (ActivitySection::Done, ids[2]),
-            ]
+            ],
+            "finished, idle, and exited panes live in Recent, not here"
         );
     }
 }

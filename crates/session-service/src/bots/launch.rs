@@ -21,6 +21,8 @@ use super::threads::{prepare_threads_directory, valid_session_id};
 const COORDINATOR_PROMPT: &str = include_str!("../../bundled/bot-prompt.md");
 const OMP_EXTENSION: &[u8] = include_bytes!("../../bundled/hh-omp.ts");
 const OMP_EXTENSION_FILE: &str = "hh-omp.ts";
+const OMP_PROGRESS_EXTENSION: &[u8] = include_bytes!("../../bundled/hh-progress.ts");
+const OMP_PROGRESS_EXTENSION_FILE: &str = "hh-progress.ts";
 const CONTEXT_FILE: &str = "AGENTS.md";
 /// First line of every generated `AGENTS.md`; a file without it belongs to
 /// the user and is never overwritten.
@@ -105,6 +107,9 @@ pub(crate) fn prepare_launch(
             let extension = bots_dir.join(OMP_EXTENSION_FILE);
             write_if_changed(&extension, OMP_EXTENSION)?;
             argv.extend(["-e".to_owned(), utf8_path(&extension)?]);
+            let progress = bots_dir.join(OMP_PROGRESS_EXTENSION_FILE);
+            write_if_changed(&progress, OMP_PROGRESS_EXTENSION)?;
+            argv.extend(["-e".to_owned(), utf8_path(&progress)?]);
             let threads = prepare_threads_directory(bots_dir, bot.bot_id)?;
             argv.extend(["--session-dir".to_owned(), utf8_path(&threads)?]);
             if let Some(session) = bot.resume {
@@ -125,6 +130,23 @@ pub(crate) fn prepare_launch(
                 let bytes = serde_json::to_vec(&json).context("encode bot MCP config")?;
                 write_if_changed(&config, &bytes)?;
                 argv.extend(["--mcp-config".to_owned(), utf8_path(&config)?]);
+                // Task progress: report every TodoWrite to Harness Harlot.
+                let settings = bots_dir.join(format!("{}.settings.json", bot.bot_id));
+                let hook = format!(
+                    "'{}' progress hook claude",
+                    utf8_path(hh_cli)?.replace('\'', "'\\''")
+                );
+                let json = serde_json::json!({
+                    "hooks": {
+                        "PostToolUse": [{
+                            "matcher": "TodoWrite",
+                            "hooks": [{ "type": "command", "command": hook }]
+                        }]
+                    }
+                });
+                let bytes = serde_json::to_vec(&json).context("encode bot Claude settings")?;
+                write_if_changed(&settings, &bytes)?;
+                argv.extend(["--settings".to_owned(), utf8_path(&settings)?]);
             }
         }
         TerminalProfile::Codex => {
@@ -179,7 +201,7 @@ pub(crate) fn remove_bot_files(bots_dir: &Path, bot_id: Uuid) {
         eprintln!("could not keep removing a bot home: {error}");
     }
     // `prompt.md` files were written by earlier versions.
-    for suffix in ["mcp.json", "prompt.md"] {
+    for suffix in ["mcp.json", "settings.json", "prompt.md"] {
         let _ = fs::remove_file(bots_dir.join(format!("{bot_id}.{suffix}")));
     }
 }
@@ -384,16 +406,19 @@ mod tests {
         let directory = bots_dir();
         let command = command_for(TerminalProfile::Omp, &directory, None);
         let extension = directory.join(OMP_EXTENSION_FILE);
+        let progress = directory.join(OMP_PROGRESS_EXTENSION_FILE);
         let threads = home(&directory).join("threads");
         assert_eq!(
             command,
             format!(
-                "/opt/bin/omp -e '{}' --session-dir '{}'",
+                "/opt/bin/omp -e '{}' -e '{}' --session-dir '{}'",
                 extension.display(),
+                progress.display(),
                 threads.display()
             )
         );
         assert_eq!(fs::read(&extension).unwrap(), OMP_EXTENSION);
+        assert_eq!(fs::read(&progress).unwrap(), OMP_PROGRESS_EXTENSION);
         assert_eq!(
             fs::metadata(&threads).unwrap().permissions().mode() & 0o777,
             0o700
@@ -417,8 +442,9 @@ mod tests {
         assert_eq!(
             launch.command,
             format!(
-                "/opt/bin/omp -e '{}' --session-dir '{}' --resume 0193-abc",
+                "/opt/bin/omp -e '{}' -e '{}' --session-dir '{}' --resume 0193-abc",
                 extension.display(),
+                progress.display(),
                 threads.display()
             ),
             "threads stay in the HH-owned bot folder"
@@ -435,14 +461,33 @@ mod tests {
     }
 
     #[test]
-    fn claude_gets_only_the_harness_harlot_mcp_server() {
+    fn claude_gets_only_the_harness_harlot_mcp_server_and_the_progress_hook() {
         let directory = bots_dir();
         let hh = Path::new("/Applications/Harness Harlot.app/Contents/MacOS/hh");
         let command = command_for(TerminalProfile::Claude, &directory, Some(hh));
         let config = directory.join(format!("{}.mcp.json", Uuid::nil()));
+        let settings = directory.join(format!("{}.settings.json", Uuid::nil()));
         assert_eq!(
             command,
-            format!("/opt/bin/claude --mcp-config '{}'", config.display())
+            format!(
+                "/opt/bin/claude --mcp-config '{}' --settings '{}'",
+                config.display(),
+                settings.display()
+            )
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(settings).unwrap()).unwrap();
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "hooks": {"PostToolUse": [{
+                    "matcher": "TodoWrite",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "'/Applications/Harness Harlot.app/Contents/MacOS/hh' progress hook claude",
+                    }],
+                }]}
+            })
         );
         let config: serde_json::Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
         assert_eq!(

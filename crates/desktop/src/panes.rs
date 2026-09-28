@@ -140,6 +140,7 @@ impl HhApp {
     }
 
     pub(crate) fn activate_tab(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        self.mark_pane_seen(pane_id);
         self.dispatch_with(
             ClientRequest::ActivateTab { pane_id },
             Box::new(move |this, cx, result| match result {
@@ -396,6 +397,7 @@ impl HhApp {
         } else {
             index - 1
         };
+        self.mark_pane_seen(panes[next]);
         self.focus_pane_with_snapshot(panes[next], cx);
         if self.layout.zoomed_pane.is_some() {
             self.layout.zoomed_pane = self.layout.focused_pane;
@@ -731,6 +733,7 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) {
         self.layout.scroll_residual.remove(&pane_id);
+        self.mark_pane_seen(pane_id);
         self.focus_pane_with_snapshot(pane_id, cx);
         self.focus_handle.focus(window);
         if matches!(self.editor.modal, Modal::TerminalImageMenu(_)) {

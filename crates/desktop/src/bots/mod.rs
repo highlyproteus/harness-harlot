@@ -16,9 +16,11 @@ use crate::view_models::{
 };
 
 mod menus;
+mod progress_settings;
 mod settings;
 mod threads;
 
+pub(crate) use progress_settings::AgentProgressUi;
 pub(crate) use threads::{BotThreadsState, NEW_THREAD_TITLE, now_ms, relative_time, saved_threads};
 
 /// Installed coding agents reported by the session service.

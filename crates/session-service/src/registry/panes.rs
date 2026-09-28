@@ -215,6 +215,8 @@ impl SessionRegistry {
             custom_title: None,
             profile_override: None,
             custom_icon: None,
+            unseen: false,
+            progress: None,
         };
         if !add_tab(&mut tab.layout, target_pane, pane, true) {
             bail!("target pane {target_pane} does not exist");
@@ -258,6 +260,8 @@ impl SessionRegistry {
             custom_title: None,
             profile_override: None,
             custom_icon: None,
+            unseen: false,
+            progress: None,
         };
         if !add_tab(&mut tab.layout, target_pane, pane, activate) {
             bail!("target pane {target_pane} does not exist");
@@ -370,6 +374,8 @@ impl SessionRegistry {
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
+                unseen: false,
+                progress: None,
             };
             workspace.tabs.push(Tab {
                 owner_thread: None,
@@ -457,6 +463,8 @@ impl SessionRegistry {
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
+                unseen: false,
+                progress: None,
             };
             let did_add = state.snapshot.workspaces.iter_mut().any(|workspace| {
                 workspace
@@ -535,6 +543,8 @@ impl SessionRegistry {
                     custom_title: None,
                     profile_override: None,
                     custom_icon: None,
+                    unseen: false,
+                    progress: None,
                 },
             },
         });
@@ -589,6 +599,8 @@ impl SessionRegistry {
                     custom_title: None,
                     profile_override: None,
                     custom_icon: None,
+                    unseen: false,
+                    progress: None,
                 },
             },
         });
@@ -920,6 +932,7 @@ impl SessionRegistry {
         runtime.exit_status = None;
         runtime.recovered = false;
         runtime.omp_title_status = None;
+        state.clear_pane_progress(pane_id);
         let shell_label = kind.shell_label();
         set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, &shell_label);
         state.set_pane_status(pane_id, PaneStatus::Idle);

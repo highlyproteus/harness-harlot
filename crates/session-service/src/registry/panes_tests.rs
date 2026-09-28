@@ -13,6 +13,61 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Progress belongs to the agent that reported it: once the pane's title and
+/// process say the shell is back, the ring must stop showing it.
+#[test]
+fn agent_progress_clears_when_the_agent_leaves_the_pane() {
+    let registry = SessionRegistry::new().unwrap();
+    let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+    registry
+        .write_input(
+            pane_id,
+            "printf '\\033]0;π ⠋ fixing\\007'; sleep 2; printf '\\033]0;plain shell\\007'; sleep 30\r"
+                .as_bytes(),
+        )
+        .unwrap();
+    let observe = |title: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while registry
+            .state
+            .read()
+            .terminal_pane(pane_id)
+            .unwrap()
+            .session
+            .terminal_title()
+            .as_deref()
+            != Some(title)
+        {
+            assert!(Instant::now() < deadline, "title {title:?} never arrived");
+            thread::sleep(Duration::from_millis(10));
+        }
+        refresh_runtime_metadata(&mut registry.state.write());
+    };
+    let progress = || {
+        find_pane_in_snapshot(&registry.snapshot().unwrap(), pane_id)
+            .unwrap()
+            .progress
+            .clone()
+    };
+
+    observe("π ⠋ fixing");
+    let reported = hh_protocol::PaneProgress {
+        done: 1,
+        total: 3,
+        current: Some("beta".to_owned()),
+        phase: Some("Demo".to_owned()),
+        source: hh_protocol::ProgressSource::Omp,
+    };
+    registry
+        .report_pane_progress(pane_id, Some(reported.clone()))
+        .unwrap();
+    refresh_runtime_metadata(&mut registry.state.write());
+    assert_eq!(progress(), Some(reported), "omp still owns the pane");
+
+    observe("plain shell");
+    assert_eq!(progress(), None);
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn ssh_test_seam_honors_workspace_directory_and_keeps_direct_tabs_offline() {

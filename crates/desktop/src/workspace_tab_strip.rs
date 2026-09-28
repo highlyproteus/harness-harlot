@@ -14,7 +14,7 @@ use crate::helpers::{
     element_key, workspace_strip_active_tab, workspace_tab_focus_target, workspace_tab_set,
     workspace_tab_standalone_pane,
 };
-use crate::tab_chrome::render_pane_indicator;
+use crate::tab_chrome::aggregate_indicators;
 use crate::view_models::{CreateMenu, Modal, TabDrag, TabDropPreview, TooltipView};
 use crate::{HhApp, TAB_COLOR_ALPHA, THEME, WORKSPACE_TAB_STRIP_HEIGHT};
 
@@ -83,13 +83,11 @@ impl HhApp {
                 let (pane_count, indicator) = {
                     let mut panes = Vec::new();
                     collect_terminal_tabs(&tab.layout, &mut panes);
-                    let indicator = panes
-                        .iter()
-                        .map(|pane| self.pane_indicator(pane))
-                        .max()
-                        .unwrap_or_default();
+                    let indicator =
+                        aggregate_indicators(panes.iter().map(|pane| self.pane_indicator(pane)));
                     (panes.len(), indicator)
                 };
+                let awaits_input = self.layout_awaits_input(&tab.layout);
                 let tab_id = tab.id;
                 let close_tooltip = if is_standalone {
                     format!("Close {label}…")
@@ -121,7 +119,7 @@ impl HhApp {
                 let drop_after = self.sidebar.tab_drop_preview.is_some_and(|preview| {
                     preview.target_tab_id == tab_id && !preview.into_tab && preview.after
                 });
-                div()
+                let strip_tab = div()
                     .id(("workspace-strip-tab", element_key(tab_id)))
                     .group("workspace-strip-tab")
                     .h_full()
@@ -245,14 +243,19 @@ impl HhApp {
                                 .child(pane_count.to_string()),
                         )
                     })
-                    .child(render_pane_indicator(indicator))
+                    .child(self.render_pane_indicator_with_tooltip(
+                        indicator,
+                        ("workspace-strip-tab-status", element_key(tab_id)),
+                        indicator.tooltip(),
+                    ))
                     .child(self.render_close_button(
                         ("close-workspace-strip-tab", element_key(tab_id)),
                         THEME.foreground,
                         close_tooltip,
                         move |this, cx| this.dismiss_workspace_tab(tab_id, cx),
                         cx,
-                    ))
+                    ));
+                self.with_needs_input_border(strip_tab, awaits_input, 0.0)
                     .into_any_element()
             });
         div()

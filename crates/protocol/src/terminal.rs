@@ -61,6 +61,74 @@ pub enum PaneStatus {
     Done,
 }
 
+/// Agent that reported a pane's task progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressSource {
+    Omp,
+    Claude,
+    Codex,
+}
+
+/// Largest task count a progress report may carry.
+pub const MAX_PROGRESS_TASKS: u32 = 1_000;
+/// Largest character count of a progress report's `current` or `phase` text.
+pub const MAX_PROGRESS_TEXT_CHARS: usize = 200;
+
+/// Task-list progress an agent reported for its pane: `done` of `total`
+/// tasks complete. Abandoned tasks are excluded from `total`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PaneProgress {
+    pub done: u32,
+    pub total: u32,
+    /// The task in progress, if any.
+    #[serde(default)]
+    pub current: Option<String>,
+    /// The phase holding the current (or first unfinished) task, if the
+    /// agent groups tasks into phases.
+    #[serde(default)]
+    pub phase: Option<String>,
+    pub source: ProgressSource,
+}
+
+impl PaneProgress {
+    /// Completed fraction in `0.0..=1.0`; an empty list counts as complete.
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            1.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let fraction = self.done as f32 / self.total as f32;
+            fraction.clamp(0.0, 1.0)
+        }
+    }
+
+    /// Checks the bounds every progress report must satisfy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first violated bound.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.total > MAX_PROGRESS_TASKS {
+            return Err(format!("progress total exceeds {MAX_PROGRESS_TASKS}"));
+        }
+        if self.done > self.total {
+            return Err("progress done exceeds total".to_owned());
+        }
+        for text in [&self.current, &self.phase].into_iter().flatten() {
+            if text.chars().count() > MAX_PROGRESS_TEXT_CHARS {
+                return Err(format!(
+                    "progress text exceeds {MAX_PROGRESS_TEXT_CHARS} characters"
+                ));
+            }
+            if text.chars().any(char::is_control) {
+                return Err("progress text contains control characters".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalScreen {
     pub pane_id: Uuid,
@@ -293,4 +361,55 @@ pub enum DropPlacement {
     Right,
     Top,
     Bottom,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress(done: u32, total: u32) -> PaneProgress {
+        PaneProgress {
+            done,
+            total,
+            current: None,
+            phase: None,
+            source: ProgressSource::Omp,
+        }
+    }
+
+    #[test]
+    fn progress_fraction_spans_zero_to_one_and_treats_empty_lists_as_complete() {
+        assert!((progress(0, 4).fraction() - 0.0).abs() < f32::EPSILON);
+        assert!((progress(1, 4).fraction() - 0.25).abs() < f32::EPSILON);
+        assert!((progress(4, 4).fraction() - 1.0).abs() < f32::EPSILON);
+        assert!((progress(0, 0).fraction() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn progress_validation_enforces_count_and_text_bounds() {
+        assert!(progress(0, 0).validate().is_ok());
+        assert!(
+            progress(MAX_PROGRESS_TASKS, MAX_PROGRESS_TASKS)
+                .validate()
+                .is_ok()
+        );
+        assert!(progress(0, MAX_PROGRESS_TASKS + 1).validate().is_err());
+        assert!(progress(5, 4).validate().is_err());
+
+        let with_text = |current: &str, phase: &str| PaneProgress {
+            current: Some(current.to_owned()),
+            phase: Some(phase.to_owned()),
+            ..progress(1, 2)
+        };
+        let longest = "é".repeat(MAX_PROGRESS_TEXT_CHARS);
+        assert!(with_text(&longest, "Phase 1").validate().is_ok());
+        assert!(
+            with_text(&format!("{longest}x"), "Phase 1")
+                .validate()
+                .is_err()
+        );
+        assert!(with_text("ok", &format!("{longest}x")).validate().is_err());
+        assert!(with_text("line\nbreak", "Phase 1").validate().is_err());
+        assert!(with_text("ok", "tab\there").validate().is_err());
+    }
 }

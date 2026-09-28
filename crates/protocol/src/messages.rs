@@ -11,8 +11,9 @@ use crate::model::{
 use crate::profile::TerminalProfile;
 use crate::terminal::{
     BrowserAction, BrowserCommandOutcome, BrowserCommandRequest, CodingAgent, DropPlacement,
-    PaneRevisionCursor, PaneStreamState, SessionNotification, StreamDiagnostics, TerminalModifiers,
-    TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen, TerminalSelectionKind,
+    PaneProgress, PaneRevisionCursor, PaneStreamState, SessionNotification, StreamDiagnostics,
+    TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint, TerminalScreen,
+    TerminalSelectionKind,
 };
 
 /// Exact pane identity and transport approved by a trusted caller. The service
@@ -118,6 +119,17 @@ pub enum ClientRequest {
         ids: Vec<u64>,
     },
     ClearNotifications,
+    /// The user opened the pane (clicked, selected, switched to, or typed into
+    /// it): clears its `unseen` flag and marks its notifications read.
+    MarkPaneSeen {
+        pane_id: Uuid,
+    },
+    /// Replaces the pane's task-list progress; `None` clears it. Sent by agent
+    /// integrations running inside the pane.
+    ReportPaneProgress {
+        pane_id: Uuid,
+        progress: Option<PaneProgress>,
+    },
     GetPaneSnapshot {
         pane_id: Uuid,
     },
@@ -421,12 +433,16 @@ pub enum ServiceResponse {
         screens: Vec<TerminalScreen>,
         pane_states: Vec<PaneStreamState>,
         notifications: Vec<SessionNotification>,
+        /// Identifies the service's notification ring. A change means the ring
+        /// was replaced (service restart), so cursors must be discarded.
+        notifications_epoch: Uuid,
         diagnostics: StreamDiagnostics,
         #[serde(default)]
         browser_commands: Vec<BrowserCommandRequest>,
     },
     Notifications {
         items: Vec<SessionNotification>,
+        epoch: Uuid,
     },
     PaneSnapshot {
         screen: TerminalScreen,
@@ -935,5 +951,51 @@ mod tests {
             ClientRequest::ShutdownService,
             serde_json::json!({"type": "shutdown_service"}),
         )]);
+    }
+
+    #[test]
+    fn pane_seen_and_progress_requests_use_stable_snake_case_tags_and_round_trip() {
+        use crate::terminal::ProgressSource;
+        let pane_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        assert_request_json_round_trips([
+            (
+                ClientRequest::MarkPaneSeen { pane_id },
+                serde_json::json!({"type": "mark_pane_seen", "pane_id": pane_id}),
+            ),
+            (
+                ClientRequest::ReportPaneProgress {
+                    pane_id,
+                    progress: Some(PaneProgress {
+                        done: 3,
+                        total: 7,
+                        current: Some("Write tests".to_owned()),
+                        phase: None,
+                        source: ProgressSource::Claude,
+                    }),
+                },
+                serde_json::json!({
+                    "type": "report_pane_progress",
+                    "pane_id": pane_id,
+                    "progress": {
+                        "done": 3,
+                        "total": 7,
+                        "current": "Write tests",
+                        "phase": null,
+                        "source": "claude",
+                    },
+                }),
+            ),
+            (
+                ClientRequest::ReportPaneProgress {
+                    pane_id,
+                    progress: None,
+                },
+                serde_json::json!({
+                    "type": "report_pane_progress",
+                    "pane_id": pane_id,
+                    "progress": null,
+                }),
+            ),
+        ]);
     }
 }

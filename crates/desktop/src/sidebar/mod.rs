@@ -7,7 +7,7 @@ use crate::helpers::{
     render_robot_icon, render_sidebar_toggle_icon, rgba_with_alpha, sidebar_width_for_visibility,
     top_level_workstation, workstation_banner_header_height,
 };
-use crate::tab_chrome::{render_pane_indicator, render_unread_dot};
+use crate::tab_chrome::render_unread_dot;
 use crate::view_models::{
     Modal, SidebarMode, TabDrag, TabDropPreview, TooltipView, UpdateRestartConfirmation,
 };
@@ -343,6 +343,7 @@ impl HhApp {
                 "Workstations",
                 render_hammer_icon,
                 0,
+                THEME.danger,
                 cx,
             ))
             .child(self.render_sidebar_mode_button(
@@ -350,15 +351,20 @@ impl HhApp {
                 "Bots",
                 render_robot_icon,
                 self.bots_needing_you(),
+                THEME.danger,
                 cx,
             ))
-            .child(self.render_sidebar_mode_button(
-                SidebarMode::Notifications,
-                "Notifications",
-                render_bell_icon,
-                self.needs_you_count(),
-                cx,
-            ))
+            .child(
+                self.render_sidebar_mode_button(
+                    SidebarMode::Notifications,
+                    "Notifications",
+                    render_bell_icon,
+                    self.unread_badge().map_or(0, |badge| badge.count),
+                    self.unread_badge()
+                        .map_or(THEME.accent, |badge| badge.color()),
+                    cx,
+                ),
+            )
             .when_some(self.editor.update_available.as_ref(), |toolbar, update| {
                 let label = update.label();
                 toolbar.child(
@@ -427,13 +433,14 @@ impl HhApp {
             .into_any_element()
     }
 
-    /// A toolbar button for one sidebar mode, with a red count badge.
+    /// A toolbar button for one sidebar mode, with a count badge.
     fn render_sidebar_mode_button(
         &self,
         mode: SidebarMode,
         label: &'static str,
         icon: fn(u32) -> AnyElement,
         count: usize,
+        badge_color: u32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.sidebar.sidebar_mode == mode
@@ -486,7 +493,7 @@ impl HhApp {
                         .h(px(14.0))
                         .px(px(3.0))
                         .rounded_full()
-                        .bg(rgb(THEME.danger))
+                        .bg(rgb(badge_color))
                         .font_family(".SystemUIFont")
                         .text_size(px(9.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -613,6 +620,8 @@ impl HhApp {
         let indicator = activity
             .as_ref()
             .map_or_else(|| self.pane_indicator(pane), |activity| activity.indicator);
+        let indicator_tooltip = self.pane_indicator_tooltip(pane);
+        let awaits_input = self.pane_awaits_input(pane);
         let unread = activity.as_ref().map(|activity| activity.unread);
         let (close_tooltip, close_thread) = match bot_thread {
             Some(bot_id) => (
@@ -621,7 +630,7 @@ impl HhApp {
             ),
             None => (format!("Close {label}…"), None),
         };
-        div()
+        let row = div()
             .id(("workspace-tab", element_key(pane_id)))
             .ml(px(indent))
             .mr(px(4.0))
@@ -808,7 +817,11 @@ impl HhApp {
             .when_some(unread, |element, unread| {
                 element.child(render_unread_dot(unread))
             })
-            .child(render_pane_indicator(indicator))
+            .child(self.render_pane_indicator_with_tooltip(
+                indicator,
+                ("workspace-tab-status", element_key(pane_id)),
+                indicator_tooltip,
+            ))
             .child(self.render_close_button(
                 ("close-workspace-tab", element_key(pane_id)),
                 row_text,
@@ -820,7 +833,8 @@ impl HhApp {
                     None => this.begin_close(pane_id, cx),
                 },
                 cx,
-            ))
+            ));
+        self.with_needs_input_border(row, awaits_input, 4.0)
             .into_any_element()
     }
 

@@ -31,6 +31,7 @@ A bot talks with the user and delegates the actual work to worker terminals. Do 
 - `hh terminal rename TAB TITLE`: renames a tab.
 - `hh workstation new --cwd DIR [--title T]`: creates a top-level workstation rooted at an existing directory; its first terminal opens there.
 - `hh bot info`: the calling bot's `bot_id` and `name`, the caller's `tab_id`, the bot's live thread `panes` (each thread tab can be split into several) and its `active_pane`. The omp plugin also calls `hh bot report-session --session ID` to record which omp session a bot thread pane shows.
+- `hh progress report --done N --total M [--current T] [--phase T] --source omp|claude|codex` / `hh progress clear`: sets or clears the task-progress ring of your own pane. The installed omp, Claude Code and Codex integrations (`hh progress install AGENT`) do this from your todo list automatically; call it yourself only without one.
 
 ## Browser
 

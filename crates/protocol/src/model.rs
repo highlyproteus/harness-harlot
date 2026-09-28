@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::profile::{TerminalIdentity, TerminalProfile};
-use crate::terminal::PaneStatus;
+use crate::terminal::{PaneProgress, PaneStatus};
 use crate::validation::ValidationError;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -149,6 +149,8 @@ impl SessionSnapshot {
             identity: TerminalIdentity::default(),
             status: PaneStatus::default(),
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -530,6 +532,15 @@ pub struct Pane {
     /// Ephemeral epoch milliseconds of the last `status` transition; 0 = never.
     #[serde(default)]
     pub status_changed_at_ms: u64,
+    /// The pane reached done, needs input, needs approval, or attention and
+    /// the user has not opened it since (`ClientRequest::MarkPaneSeen`).
+    /// Owned by the session service and kept across restarts.
+    #[serde(default)]
+    pub unseen: bool,
+    /// Task-list progress last reported by the pane's agent; cleared when its
+    /// process exits.
+    #[serde(default)]
+    pub progress: Option<PaneProgress>,
     #[serde(default)]
     pub custom_title: Option<String>,
     #[serde(default)]

@@ -2824,6 +2824,7 @@ dependencies = [
  "hh-updater",
  "image",
  "libc",
+ "objc2-app-kit",
  "parking_lot",
  "raw-window-handle",
  "regex",

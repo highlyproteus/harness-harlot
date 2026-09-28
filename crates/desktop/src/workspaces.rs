@@ -122,6 +122,7 @@ impl HhApp {
                 .and_then(|tab| visible_panes(&tab.layout).first().copied())
         });
         if let Some(pane_id) = first_pane {
+            self.mark_tab_seen(pane_id);
             self.focus_pane_with_snapshot(pane_id, cx);
         }
         self.layout.last_sizes.clear();
@@ -164,6 +165,7 @@ impl HhApp {
                         .map(|tab| tab.id)
                 })
         });
+        self.mark_tab_seen(pane_id);
         self.dispatch_with(
             ClientRequest::ActivateTab { pane_id },
             Box::new(move |this, cx, result| {
@@ -243,7 +245,6 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) {
         self.sidebar.dismissed_workspace_tabs.remove(&tab_id);
-        self.mark_pane_viewed(pane_id);
         self.select_workspace_tab(workspace_id, pane_id, cx);
         cx.notify();
     }

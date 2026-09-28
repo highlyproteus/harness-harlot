@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Tabs whose agent waits for your input or approval get an orange border with
+  a bright segment running around it, in the tab strip, the sidebar, pane
+  headers, and the sidebar's pane chips. It animates only while visible and
+  stays solid with **Reduce motion** (macOS) or GNOME animations off.
+- Task progress: a working agent's status dot becomes a ring that fills as its
+  task list completes, shading from red through amber to green, with "3 of 7
+  done · phase — current task" on hover. Collapsed workstations, tab strip
+  tabs, and Notifications' **Running** rows add up their panes' progress.
+  Agents without a task list show a spinning blue ring (static with reduced
+  motion). Progress disappears once the agent exits back to its shell.
+- `hh progress install|uninstall omp|claude|codex` and `hh progress status
+  [--json]` enable task progress per agent (also under **Settings → Bots →
+  Agent task progress**): an omp extension in the omp agent directory's
+  `extensions` folder, a Claude Code `TodoWrite` hook in
+  `~/.claude/settings.json`, or a Codex `update_plan` hook in
+  `~/.codex/hooks.json`. Installs keep all other settings and hooks, are
+  idempotent, and never replace an omp extension file you edited. omp and
+  Claude Code bots report progress automatically.
+- `hh progress report --done N --total M [--current T] [--phase T] --source
+  omp|claude|codex`, `hh progress clear`, and `hh progress hook claude|codex`
+  (the hook entry point, which never fails and prints nothing) report a pane's
+  progress.
+- Notifications keeps a **Recent** list of the last 200 finished and attention
+  notifications across restarts, with unread ones marked, and a **Mark all
+  read** button.
+
 ### Changed
 
 - Workstations are now the sidebar's only way to organize terminals. Projects
@@ -33,15 +61,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `hh terminal list` (and MCP `terminal_list`) adds `parent_workstation` to each
   workstation, and a tab's `cwd` is its workstation's effective root folder.
   CLI, MCP, and omp plugin command names are unchanged.
-- Bumped the desktop/service wire protocol from 47 to 48 for nested and home
-  workstations and the removed project and tab-group requests; desktop and
-  service must be upgraded together, so the update restarts the terminal
-  service. Session snapshots move to schema 16.
+- Bumped the desktop/service wire protocol from 47 to 49 for nested and home
+  workstations, the removed project and tab-group requests, and pane seen
+  state, notifications, and task progress; desktop and service must be
+  upgraded together, so the update restarts the terminal service. Session
+  snapshots move to schema 17.
+- The bell and Dock badges count unread notifications, orange when one needs
+  you and blue otherwise.
 
 ### Fixed
 
 - A workstation created with `hh workstation new --cwd DIR` starts its first
   terminal in `DIR` instead of the home folder.
+- The blue "done" dot stays until you look at the pane: clicking it or its
+  tab, switching to its tab or workstation, clicking its notification, or
+  typing into it. Merely focusing the window no longer clears it, it is set
+  for every finish or request for attention (including omp title changes,
+  bells, and exits), and it survives restarts.
+- Notifications no longer go blind after the terminal service restarts; the
+  app reloads the list when the service's notification history changes.
+- omp completions and every other finish or request for attention are
+  recorded as notifications, without duplicates for repeated events.
 
 ## [0.1.26] - 2026-09-26
 

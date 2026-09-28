@@ -65,7 +65,7 @@ fn service_shutdown_requires_zero_live_terminals() {
     assert!(registry.shutdown_requested());
 }
 
-fn status_state(profile: TerminalProfile) -> (RegistryState, Uuid) {
+pub(super) fn status_state(profile: TerminalProfile) -> (RegistryState, Uuid) {
     let mut snapshot = SessionSnapshot::seeded();
     let pane_id = first_pane_id(&snapshot).unwrap();
     let pane = find_pane_mut_in_snapshot(&mut snapshot, pane_id).unwrap();
@@ -79,6 +79,8 @@ fn status_state(profile: TerminalProfile) -> (RegistryState, Uuid) {
             tmux_sinks: HashMap::new(),
             notifications: VecDeque::new(),
             next_notification_id: 1,
+            notifications_dirty: false,
+            notifications_epoch: Uuid::new_v4(),
             next_terminal_number: 2,
             last_identity_refresh: None,
         },
@@ -108,7 +110,7 @@ fn contract_event_is_swallowed_and_synthesizes_attention() {
     assert_eq!(state.notifications[0].kind, NotificationKind::Attention);
     assert_eq!(
         state.notifications[0].message.as_deref(),
-        Some("needs approval")
+        Some("Needs approval")
     );
 }
 

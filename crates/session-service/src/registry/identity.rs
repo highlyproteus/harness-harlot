@@ -1,10 +1,10 @@
 //! Runtime identity discovery: process profiles, titles, and workspace activity.
-use super::{PaneLocation, RegistryState, RuntimePane, ssh_pane_title};
+use super::{PaneLocation, RegistryState, RuntimePane, StatusNotice, ssh_pane_title};
 use crate::layout::{find_pane_in_snapshot, find_pane_mut_in_snapshot, pane_ids_for_workspace};
 use crate::process::valid_local_cwd;
 use crate::registry::status::omp_title_status;
 use hh_protocol::{
-    NotificationKind, Pane, PaneStatus, SessionSnapshot, TerminalIdentity, TerminalIdentitySource,
+    Pane, PaneStatus, ProgressSource, SessionSnapshot, TerminalIdentity, TerminalIdentitySource,
     TerminalProfile, WorkspaceConnection, WorkspaceConnectionStatus,
     terminal_profile_for_arguments, terminal_profile_for_command, terminal_profile_for_executable,
     terminal_profile_for_title,
@@ -144,13 +144,13 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
                 &shell_label,
             );
             if status.is_some() {
-                state.append_notification(
+                state.clear_pane_progress(pane_id);
+                state.update_pane_status(
                     pane_id,
-                    NotificationKind::Completed,
-                    None,
+                    PaneStatus::Done,
+                    StatusNotice::Always(None),
                     crate::now_ms(),
                 );
-                state.set_pane_status(pane_id, PaneStatus::Done);
             }
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
@@ -174,15 +174,24 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
         .collect::<Vec<_>>();
     let mut identity_changed = false;
     for (pane_id, title_signal, command_profile, location) in identity_inputs {
-        let resolved = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id).map(|pane| {
-            identity_changed |= resolve_pane_identity(
-                pane,
-                title_signal.as_deref(),
-                command_profile,
-                Some(&location),
-            );
-            (pane.identity.profile, pane.status)
-        });
+        let resolved =
+            find_pane_mut_in_snapshot(&mut state.snapshot, pane_id).map(|pane| {
+                identity_changed |= resolve_pane_identity(
+                    pane,
+                    title_signal.as_deref(),
+                    command_profile,
+                    Some(&location),
+                );
+                // Progress belongs to the agent that reported it; once the pane
+                // runs something else (the agent quit to its shell) it is stale.
+                if pane.progress.as_ref().is_some_and(|progress| {
+                    progress_profile(progress.source) != pane.identity.profile
+                }) {
+                    pane.progress = None;
+                    identity_changed = true;
+                }
+                (pane.identity.profile, pane.status)
+            });
         let resolved_profile = resolved.map(|(profile, _)| profile);
         let current_status = resolved.map(|(_, status)| status);
         let status_update = state
@@ -223,6 +232,15 @@ pub(crate) fn refresh_runtime_metadata(state: &mut RegistryState) {
     }
     if refresh_workspace_activity(state) {
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+    }
+}
+
+/// The terminal profile of the agent that reports progress from `source`.
+fn progress_profile(source: ProgressSource) -> TerminalProfile {
+    match source {
+        ProgressSource::Omp => TerminalProfile::Omp,
+        ProgressSource::Claude => TerminalProfile::Claude,
+        ProgressSource::Codex => TerminalProfile::Codex,
     }
 }
 

@@ -12,11 +12,12 @@ use crate::layout::{
     find_pane_in_snapshot, find_pane_mut_in_snapshot, first_pane_id, pane_ids_in_snapshot,
     retain_persistable_panes, workspace_id_for_pane,
 };
+use crate::notifications::NotificationStore;
 use crate::persistence::{MAX_TITLE_CHARS, SnapshotStore, default_snapshot_path};
 use anyhow::{Context, Result, bail, ensure};
 use hh_protocol::{
     BrowserAction, BrowserCommandOutcome, BrowserCommandRequest, CodingAgent, NotificationKind,
-    Pane, PaneAuthority, PaneKind, PaneRevisionCursor, PaneStatus, PaneStreamState,
+    Pane, PaneAuthority, PaneKind, PaneProgress, PaneRevisionCursor, PaneStatus, PaneStreamState,
     SessionNotification, SessionSnapshot, StreamDiagnostics, TerminalIdentity, TerminalProfile,
     TerminalScreen, TerminalTransport, TmuxSessionId, WorkspaceConnection,
 };
@@ -47,6 +48,9 @@ mod tabs;
 mod workspaces;
 
 pub(crate) const MAX_NOTIFICATIONS: usize = 200;
+/// An unread status notification of the same pane and kind younger than this
+/// is replaced instead of kept next to its successor.
+pub(crate) const NOTIFICATION_DEDUPE_MS: u64 = 5_000;
 pub(crate) const BROWSER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
@@ -192,8 +196,43 @@ pub(crate) struct RegistryState {
     tmux_sinks: HashMap<Uuid, PaneSinks>,
     notifications: VecDeque<SessionNotification>,
     next_notification_id: u64,
+    /// The ring changed since it was last written to disk.
+    notifications_dirty: bool,
+    /// Random per service start; tells clients their cursor is stale.
+    notifications_epoch: Uuid,
     next_terminal_number: u32,
     last_identity_refresh: Option<Instant>,
+}
+
+/// Which stored notification a status change creates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StatusNotice {
+    /// Only an actual transition into a done or needs-you status notifies.
+    OnTransition,
+    /// An explicit signal (bell, OSC status, process exit): notifies even when
+    /// the status is unchanged, with this message or the status default.
+    Always(Option<String>),
+    /// The caller stores its own notification for this event.
+    Suppressed,
+}
+
+/// Stored notification kind for a status that needs the user's eyes.
+fn notification_kind_for(status: PaneStatus) -> Option<NotificationKind> {
+    match status {
+        PaneStatus::Done => Some(NotificationKind::Completed),
+        PaneStatus::NeedsInput | PaneStatus::NeedsApproval | PaneStatus::Attention => {
+            Some(NotificationKind::Attention)
+        }
+        PaneStatus::Idle | PaneStatus::Working => None,
+    }
+}
+
+fn default_status_message(status: PaneStatus) -> Option<String> {
+    match status {
+        PaneStatus::NeedsInput => Some("Needs input".to_owned()),
+        PaneStatus::NeedsApproval => Some("Needs approval".to_owned()),
+        PaneStatus::Idle | PaneStatus::Working | PaneStatus::Attention | PaneStatus::Done => None,
+    }
 }
 
 impl RegistryState {
@@ -256,6 +295,8 @@ impl RegistryState {
             custom_title: None,
             profile_override: None,
             custom_icon: None,
+            unseen: false,
+            progress: None,
         }
     }
 
@@ -277,15 +318,93 @@ impl RegistryState {
     }
 
     pub(crate) fn set_pane_status(&mut self, pane_id: Uuid, status: PaneStatus) {
+        self.update_pane_status(pane_id, status, StatusNotice::OnTransition, crate::now_ms());
+    }
+
+    /// Sets the pane's status. Entering done or a needs-you status marks the
+    /// pane unseen and stores one notification, as `notice` directs.
+    pub(crate) fn update_pane_status(
+        &mut self,
+        pane_id: Uuid,
+        status: PaneStatus,
+        notice: StatusNotice,
+        at_ms: u64,
+    ) {
         let Some(pane) = find_pane_mut_in_snapshot(&mut self.snapshot, pane_id) else {
             return;
         };
-        if pane.status == status {
-            return;
+        let changed = pane.status != status;
+        if changed {
+            pane.status = status;
+            pane.status_changed_at_ms = crate::now_ms();
         }
-        pane.status = status;
-        pane.status_changed_at_ms = crate::now_ms();
-        self.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        let kind = notification_kind_for(status);
+        let signalled = kind.is_some() && (changed || matches!(notice, StatusNotice::Always(_)));
+        let newly_unseen = signalled && !pane.unseen;
+        if newly_unseen {
+            pane.unseen = true;
+        }
+        if changed || newly_unseen {
+            self.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        }
+        let Some(kind) = kind.filter(|_| signalled) else {
+            return;
+        };
+        let message = match notice {
+            StatusNotice::OnTransition => default_status_message(status),
+            StatusNotice::Always(message) => message.or_else(|| default_status_message(status)),
+            StatusNotice::Suppressed => return,
+        };
+        self.append_notification(pane_id, kind, message, at_ms);
+    }
+
+    /// Clears the pane's unseen flag and marks its notifications read.
+    pub(crate) fn mark_pane_seen(&mut self, pane_id: Uuid) -> Result<()> {
+        let pane = find_pane_mut_in_snapshot(&mut self.snapshot, pane_id)
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        if pane.unseen {
+            pane.unseen = false;
+            self.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        }
+        for notification in &mut self.notifications {
+            if notification.pane_id == pane_id && !notification.read {
+                notification.read = true;
+                self.notifications_dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops the pane's task progress: the process that reported it is gone.
+    pub(crate) fn clear_pane_progress(&mut self, pane_id: Uuid) {
+        if let Some(pane) = find_pane_mut_in_snapshot(&mut self.snapshot, pane_id)
+            && pane.progress.take().is_some()
+        {
+            self.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        }
+    }
+
+    /// Replaces the task progress of a live terminal pane.
+    pub(crate) fn set_pane_progress(
+        &mut self,
+        pane_id: Uuid,
+        progress: Option<PaneProgress>,
+    ) -> Result<()> {
+        let terminal = self.terminal_pane(pane_id)?;
+        ensure!(
+            terminal.exit_status.is_none(),
+            "pane {pane_id} has no running process"
+        );
+        if let Some(progress) = &progress {
+            progress.validate().map_err(anyhow::Error::msg)?;
+        }
+        let pane = find_pane_mut_in_snapshot(&mut self.snapshot, pane_id)
+            .with_context(|| format!("pane {pane_id} does not exist"))?;
+        if pane.progress != progress {
+            pane.progress = progress;
+            self.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        }
+        Ok(())
     }
 
     pub(crate) fn terminal_pane(&self, pane_id: Uuid) -> Result<&TerminalRuntimePane> {
@@ -345,32 +464,17 @@ impl RegistryState {
         match (event.kind, event.message) {
             (NotificationKind::Message, Some(message)) => {
                 if let Some(status) = contract_status(&message) {
-                    self.set_pane_status(pane_id, status);
-                    match status {
-                        PaneStatus::NeedsApproval => self.append_notification(
-                            pane_id,
-                            NotificationKind::Attention,
-                            Some("needs approval".to_owned()),
-                            event.at_ms,
-                        ),
-                        PaneStatus::NeedsInput => self.append_notification(
-                            pane_id,
-                            NotificationKind::Attention,
-                            Some("needs input".to_owned()),
-                            event.at_ms,
-                        ),
-                        PaneStatus::Done => self.append_notification(
-                            pane_id,
-                            NotificationKind::Completed,
-                            None,
-                            event.at_ms,
-                        ),
-                        PaneStatus::Idle | PaneStatus::Working | PaneStatus::Attention => {}
-                    }
+                    self.update_pane_status(
+                        pane_id,
+                        status,
+                        StatusNotice::Always(None),
+                        event.at_ms,
+                    );
                     return;
                 }
+                // The message itself is the notification of this event.
                 if let Some(status) = heuristic_status(profile, &message) {
-                    self.set_pane_status(pane_id, status);
+                    self.update_pane_status(pane_id, status, StatusNotice::Suppressed, event.at_ms);
                 }
                 self.append_notification(
                     pane_id,
@@ -383,37 +487,32 @@ impl RegistryState {
                 // Under HH's tmux, omp announces everything with a bare bell. It
                 // needs the user only while its title says so (an ask or an
                 // approval); any other bell is its end-of-turn "Complete".
-                if profile == TerminalProfile::Omp
+                let status = if profile == TerminalProfile::Omp
                     && !matches!(
                         current_status,
                         PaneStatus::NeedsApproval | PaneStatus::NeedsInput
-                    )
-                {
+                    ) {
+                    PaneStatus::Done
+                } else if matches!(profile, TerminalProfile::Terminal | TerminalProfile::Tmux) {
+                    // A plain shell's bell carries no agent status.
                     self.append_notification(
                         pane_id,
-                        NotificationKind::Completed,
+                        NotificationKind::Attention,
                         message,
                         event.at_ms,
                     );
-                    self.set_pane_status(pane_id, PaneStatus::Done);
                     return;
-                }
-                self.append_notification(
+                } else if current_status == PaneStatus::NeedsApproval {
+                    PaneStatus::NeedsInput
+                } else {
+                    PaneStatus::Attention
+                };
+                self.update_pane_status(
                     pane_id,
-                    NotificationKind::Attention,
-                    message,
+                    status,
+                    StatusNotice::Always(message),
                     event.at_ms,
                 );
-                if !matches!(profile, TerminalProfile::Terminal | TerminalProfile::Tmux) {
-                    self.set_pane_status(
-                        pane_id,
-                        if current_status == PaneStatus::NeedsApproval {
-                            PaneStatus::NeedsInput
-                        } else {
-                            PaneStatus::Attention
-                        },
-                    );
-                }
             }
             (kind, message) => {
                 self.append_notification(pane_id, kind, message, event.at_ms);
@@ -428,16 +527,6 @@ impl RegistryState {
         message: Option<String>,
         at_ms: u64,
     ) {
-        if kind == NotificationKind::Attention
-            && let Some(existing) = self.notifications.iter_mut().rev().find(|notification| {
-                notification.pane_id == pane_id
-                    && notification.kind == NotificationKind::Attention
-                    && !notification.read
-            })
-        {
-            existing.at_ms = at_ms;
-            return;
-        }
         let Some(workspace_id) = workspace_id_for_pane(&self.snapshot, pane_id) else {
             return;
         };
@@ -465,10 +554,24 @@ impl RegistryState {
             read: false,
         };
         self.next_notification_id = self.next_notification_id.saturating_add(1);
+        // A repeated status signal replaces its recent unread predecessor
+        // with a new id, so it moves to the top instead of piling up.
+        if matches!(
+            kind,
+            NotificationKind::Completed | NotificationKind::Attention
+        ) {
+            self.notifications.retain(|existing| {
+                !(existing.pane_id == pane_id
+                    && existing.kind == kind
+                    && !existing.read
+                    && at_ms.saturating_sub(existing.at_ms) <= NOTIFICATION_DEDUPE_MS)
+            });
+        }
         if self.notifications.len() == MAX_NOTIFICATIONS {
             self.notifications.pop_front();
         }
         self.notifications.push_back(notification);
+        self.notifications_dirty = true;
     }
 }
 
@@ -557,6 +660,9 @@ pub struct SessionRegistry {
     diagnostics_sampler: Arc<Mutex<DiagnosticsSampler>>,
     shutdown_requested: Arc<AtomicBool>,
     store: Option<SnapshotStore>,
+    notification_store: Option<NotificationStore>,
+    /// Serializes notification-file writes so an older ring never lands last.
+    notification_flush: Arc<Mutex<()>>,
     tmux_scan_gate: Arc<Mutex<TmuxScanGate>>,
     remote_ls_gate: Arc<Mutex<RemoteLsGate>>,
     coding_agents: Arc<Mutex<Option<Vec<CodingAgent>>>>,
@@ -570,6 +676,7 @@ pub struct PaneUpdateBatch {
     pub screens: Vec<TerminalScreen>,
     pub pane_states: Vec<PaneStreamState>,
     pub notifications: Vec<SessionNotification>,
+    pub notifications_epoch: Uuid,
     pub diagnostics: StreamDiagnostics,
     pub browser_commands: Vec<BrowserCommandRequest>,
 }
@@ -775,9 +882,14 @@ impl SessionRegistry {
             .to_path_buf();
         remove_retired_history_archive(&state_dir);
         let store = SnapshotStore::new(path);
+        let notification_store = NotificationStore::in_state_directory(&state_dir);
         let (tmux, tmux_unavailable_reason) = discover_managed_tmux(&state_dir);
         let Some(mut recovered) = store.load_or_quarantine()? else {
-            let registry = Self::seeded_with_tmux(Some(store), tmux, tmux_unavailable_reason)?;
+            let registry = Self::seeded_with_tmux(
+                Some((store, notification_store)),
+                tmux,
+                tmux_unavailable_reason,
+            )?;
             registry.persist()?;
             return Ok(registry);
         };
@@ -790,6 +902,7 @@ impl SessionRegistry {
         let mut tmux_sinks = HashMap::new();
         let mut tmux_failures = Vec::new();
         let mut fresh_bot_panes = Vec::new();
+        let mut reattached_panes = HashSet::new();
         for pane_id in pane_ids {
             let pane_kind = find_pane_in_snapshot(&recovered.snapshot, pane_id)
                 .with_context(|| format!("recovered pane {pane_id} is missing"))?
@@ -860,6 +973,9 @@ impl SessionRegistry {
                         })
                 });
             let reattached = reattached && matches!(managed, Some(Ok(_)));
+            if reattached {
+                reattached_panes.insert(pane_id);
+            }
             let session = match managed {
                 Some(Ok(session)) => Ok(session),
                 Some(Err(error)) => {
@@ -939,6 +1055,16 @@ impl SessionRegistry {
         {
             set_pane_runtime_label(&mut recovered.snapshot, pane_id, true, None, &shell_title());
         }
+        // Progress belongs to the process that reported it; only a reattached
+        // tmux pane still runs that process.
+        for pane_id in pane_ids_in_snapshot(&recovered.snapshot) {
+            if !reattached_panes.contains(&pane_id)
+                && let Some(pane) = find_pane_mut_in_snapshot(&mut recovered.snapshot, pane_id)
+            {
+                pane.progress = None;
+            }
+        }
+        let stored_notifications = notification_store.load_or_quarantine();
         let next_terminal_number = u32::try_from(
             panes
                 .values()
@@ -954,8 +1080,10 @@ impl SessionRegistry {
             tmux,
             tmux_clients,
             tmux_sinks,
-            notifications: VecDeque::new(),
-            next_notification_id: 1,
+            notifications: stored_notifications.items,
+            next_notification_id: stored_notifications.next_id,
+            notifications_dirty: false,
+            notifications_epoch: Uuid::new_v4(),
             next_terminal_number,
             last_identity_refresh: None,
         }));
@@ -991,6 +1119,8 @@ impl SessionRegistry {
             remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
             coding_agents: Arc::new(Mutex::new(None)),
             store: Some(store),
+            notification_store: Some(notification_store),
+            notification_flush: Arc::new(Mutex::new(())),
             browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
         };
         registry.persist()?;
@@ -1001,11 +1131,16 @@ impl SessionRegistry {
     }
 
     fn seeded_with_tmux(
-        store: Option<SnapshotStore>,
+        stores: Option<(SnapshotStore, NotificationStore)>,
         tmux: Option<TmuxServer>,
         tmux_unavailable_reason: Option<String>,
     ) -> Result<Self> {
-        let persistent = store.is_some();
+        let persistent = stores.is_some();
+        let (store, notification_store) = stores.unzip();
+        let stored_notifications = notification_store
+            .as_ref()
+            .map(NotificationStore::load_or_quarantine)
+            .unwrap_or_default();
         let mut snapshot = SessionSnapshot::seeded();
         let pane_id = first_pane_id(&snapshot).context("seeded snapshot has no pane")?;
         let workspace_id = snapshot.workspaces[0].id;
@@ -1034,8 +1169,10 @@ impl SessionRegistry {
         let tmux_unavailable = tmux.is_none();
         let state = Arc::new(RwLock::new(RegistryState {
             snapshot,
-            notifications: VecDeque::new(),
-            next_notification_id: 1,
+            notifications: stored_notifications.items,
+            next_notification_id: stored_notifications.next_id.max(1),
+            notifications_dirty: false,
+            notifications_epoch: Uuid::new_v4(),
             panes: HashMap::from([(
                 pane_id,
                 RuntimePane {
@@ -1087,6 +1224,8 @@ impl SessionRegistry {
             tmux_scan_gate: Arc::new(Mutex::new(TmuxScanGate::default())),
             coding_agents: Arc::new(Mutex::new(None)),
             store,
+            notification_store,
+            notification_flush: Arc::new(Mutex::new(())),
             remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
             browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
         })
@@ -1226,7 +1365,53 @@ impl SessionRegistry {
             refresh_runtime_metadata(&mut state);
             encode_desired_state(&state)?
         };
-        self.write_snapshot(&bytes)
+        self.write_snapshot(&bytes)?;
+        self.flush_notifications()
+    }
+
+    /// Writes the notification ring to disk if it changed since the last
+    /// write. In-memory registries keep it in memory only.
+    pub(crate) fn flush_notifications(&self) -> Result<()> {
+        let Some(store) = &self.notification_store else {
+            return Ok(());
+        };
+        let _flush = self.notification_flush.lock();
+        let (items, next_id) = {
+            let mut state = self.state.write();
+            if !state.notifications_dirty {
+                return Ok(());
+            }
+            state.notifications_dirty = false;
+            (state.notifications.clone(), state.next_notification_id)
+        };
+        let written = store.write(&items, next_id);
+        if written.is_err() {
+            self.state.write().notifications_dirty = true;
+        }
+        written
+    }
+
+    pub(crate) fn notifications_epoch(&self) -> Uuid {
+        self.state.read().notifications_epoch
+    }
+
+    /// Handles `ClientRequest::MarkPaneSeen`.
+    pub(crate) fn mark_pane_seen(&self, pane_id: Uuid) -> Result<()> {
+        {
+            let mut state = self.state.write();
+            state.drain_pane_events();
+            state.mark_pane_seen(pane_id)?;
+        }
+        self.flush_notifications()
+    }
+
+    /// Handles `ClientRequest::ReportPaneProgress`.
+    pub(crate) fn report_pane_progress(
+        &self,
+        pane_id: Uuid,
+        progress: Option<PaneProgress>,
+    ) -> Result<()> {
+        self.state.write().set_pane_progress(pane_id, progress)
     }
 
     pub(crate) fn write_snapshot(&self, bytes: &[u8]) -> Result<()> {
@@ -1391,3 +1576,7 @@ pub(crate) fn create_owner_only_directory(path: &Path) {
 #[cfg(test)]
 #[path = "registry_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "status_tests.rs"]
+mod status_tests;

@@ -354,8 +354,11 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) {
         self.editor.settings_section = section;
-        if section == SettingsSection::Bots && !self.coding_agents.loaded {
-            self.refresh_coding_agents(cx);
+        if section == SettingsSection::Bots {
+            if !self.coding_agents.loaded {
+                self.refresh_coding_agents(cx);
+            }
+            self.refresh_agent_progress(cx);
         }
         #[cfg(target_os = "macos")]
         if section == SettingsSection::Permissions {

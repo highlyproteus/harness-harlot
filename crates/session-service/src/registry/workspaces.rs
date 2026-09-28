@@ -454,6 +454,8 @@ impl SessionRegistry {
             custom_title: None,
             profile_override: None,
             custom_icon: None,
+            unseen: false,
+            progress: None,
         };
         state.snapshot.workspaces.push(Workspace {
             id: ids.workspace,
@@ -974,6 +976,8 @@ impl SessionRegistry {
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
+                unseen: false,
+                progress: None,
             };
             workspace.tabs.push(Tab {
                 owner_thread: None,

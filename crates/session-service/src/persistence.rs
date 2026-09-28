@@ -10,15 +10,17 @@ use crate::layout::collect_pane_ids;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     AppearanceColor, AppearanceSettings, BotSettings, BotSpec, MAX_BROWSER_URL_LEN,
-    MAX_WORKSTATION_DEPTH, Pane, PaneKind, PaneLayout, SessionSnapshot, SplitAxis, Tab,
-    TerminalIdentity, TerminalProfile, Workspace, WorkspaceConnection, WorkspaceConnectionStatus,
-    WorkspaceKind, this_machine_title, validate_ssh_host, validate_workspace_dir,
+    MAX_WORKSTATION_DEPTH, Pane, PaneKind, PaneLayout, PaneProgress, SessionSnapshot, SplitAxis,
+    Tab, TerminalIdentity, TerminalProfile, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus, WorkspaceKind, this_machine_title, validate_ssh_host,
+    validate_workspace_dir,
 };
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 16;
+/// Schema 17 added the pane `unseen` flag and task `progress`.
+const SCHEMA_VERSION: u16 = 17;
 /// Snapshots older than this still carry the retired Harbor Blue defaults.
 const DARK_GRAY_DEFAULTS_SCHEMA_VERSION: u16 = 13;
 /// Snapshots older than this still carry project tabs and have no home
@@ -197,37 +199,7 @@ impl SnapshotStore {
     }
 
     fn quarantine(&self) -> Result<PathBuf> {
-        let parent = self.path.parent().context("snapshot path has no parent")?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let quarantined = parent.join(format!(
-            "sessions.corrupt-{timestamp}-{}.json",
-            Uuid::new_v4()
-        ));
-        fs::rename(&self.path, &quarantined).with_context(|| {
-            format!(
-                "quarantine corrupt snapshot {} as {}",
-                self.path.display(),
-                quarantined.display()
-            )
-        })?;
-        let metadata = fs::symlink_metadata(&quarantined)
-            .context("inspect quarantined snapshot without following links")?;
-        if metadata.is_file() {
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&quarantined)
-                .context("open quarantined snapshot without following links")?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .context("restrict opened quarantined snapshot")?;
-        }
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .context("sync quarantine directory")?;
-        Ok(quarantined)
+        quarantine_private_file(&self.path, "sessions")
     }
 
     #[cfg(test)]
@@ -235,6 +207,43 @@ impl SnapshotStore {
         self.fail_before_replace
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Moves an invalid state file aside as `<stem>.corrupt-<ms>-<uuid>.json` in
+/// its directory, restricting the moved file to its owner, so the service can
+/// start fresh while the bytes stay available for inspection.
+pub(crate) fn quarantine_private_file(path: &Path, stem: &str) -> Result<PathBuf> {
+    let parent = path.parent().context("state file path has no parent")?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let quarantined = parent.join(format!(
+        "{stem}.corrupt-{timestamp}-{}.json",
+        Uuid::new_v4()
+    ));
+    fs::rename(path, &quarantined).with_context(|| {
+        format!(
+            "quarantine corrupt state file {} as {}",
+            path.display(),
+            quarantined.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(&quarantined)
+        .context("inspect quarantined state file without following links")?;
+    if metadata.is_file() {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&quarantined)
+            .context("open quarantined state file without following links")?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .context("restrict opened quarantined state file")?;
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("sync quarantine directory")?;
+    Ok(quarantined)
 }
 
 pub(crate) fn default_snapshot_path() -> Result<PathBuf> {
@@ -400,6 +409,11 @@ struct DesiredPane {
     tmux_window: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tmux_pane: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unseen: bool,
+    /// Boxed: rarely present, and it would dominate the layout enum's size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress: Option<Box<PaneProgress>>,
 }
 
 /// Persisted pane kinds, including the removed Assistant kind that
@@ -1304,6 +1318,8 @@ impl DesiredPane {
             local_cwd,
             tmux_window: tmux_by_pane.get(&pane.id).map(|(window, _)| window.clone()),
             tmux_pane: tmux_by_pane.get(&pane.id).map(|(_, pane)| pane.clone()),
+            unseen: pane.unseen,
+            progress: pane.progress.clone().map(Box::new),
         })
     }
 
@@ -1350,6 +1366,8 @@ impl DesiredPane {
             custom_title,
             profile_override: self.profile_override,
             custom_icon: self.custom_icon,
+            unseen: self.unseen,
+            progress: self.progress.map(|progress| *progress),
         }
     }
 
@@ -1378,6 +1396,14 @@ impl DesiredPane {
         };
         if has_tmux && self.kind != DesiredPaneKind::Terminal {
             bail!("only terminal panes may persist tmux targets");
+        }
+        if let Some(progress) = &self.progress {
+            if self.kind != DesiredPaneKind::Terminal {
+                bail!("only terminal panes may persist task progress");
+            }
+            progress
+                .validate()
+                .map_err(|error| anyhow::anyhow!("persisted {error}"))?;
         }
         match &self.kind {
             DesiredPaneKind::Terminal => {}
