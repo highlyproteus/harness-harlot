@@ -24,7 +24,10 @@ impl PtySession {
         else {
             return;
         };
-        match client.pane_user_option(tmux_pane_id, INPUT_MODES_OPTION) {
+        match client
+            .read()
+            .pane_user_option(tmux_pane_id, INPUT_MODES_OPTION)
+        {
             Ok(Some(modes)) => {
                 let mut terminal = self.terminal.lock();
                 terminal.restore_input_modes(&modes);
@@ -49,15 +52,22 @@ impl PtySession {
         let Transport::Tmux {
             client,
             tmux_pane_id,
+            exited,
             ..
         } = &self.transport
         else {
             return Ok(());
         };
+        // A disconnected or closed window cannot take the copy.
+        if exited.lock().is_some() {
+            return Ok(());
+        }
         let current = self.terminal.lock().input_modes();
         let mut saved = self.saved_input_modes.lock();
         if *saved != current {
-            client.set_pane_user_option(tmux_pane_id, INPUT_MODES_OPTION, &current)?;
+            client
+                .read()
+                .set_pane_user_option(tmux_pane_id, INPUT_MODES_OPTION, &current)?;
             *saved = current;
         }
         Ok(())

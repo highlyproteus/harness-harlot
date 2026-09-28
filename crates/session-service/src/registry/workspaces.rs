@@ -40,29 +40,6 @@ struct ReconnectionPlan {
     pane_ids: Vec<Uuid>,
 }
 
-/// Spawns every SSH session a reconnect needs, terminating any already
-/// spawned session when one fails.
-fn spawn_reconnect_sessions(
-    workspace_id: Uuid,
-    destination: &str,
-    working_dir: Option<&str>,
-    pane_ids: &[Uuid],
-) -> Result<Vec<(Uuid, Arc<PtySession>)>> {
-    let mut sessions = Vec::with_capacity(pane_ids.len());
-    for pane_id in pane_ids {
-        match PtySession::spawn_ssh(*pane_id, workspace_id, destination, working_dir) {
-            Ok(session) => sessions.push((*pane_id, session)),
-            Err(error) => {
-                for (_, session) in sessions {
-                    let _ = session.terminate_and_wait();
-                }
-                return Err(error);
-            }
-        }
-    }
-    Ok(sessions)
-}
-
 pub(crate) fn normalize_workspace_title(title: Option<&str>) -> Result<Option<String>> {
     let Some(title) = title else {
         return Ok(None);
@@ -329,7 +306,7 @@ impl SessionRegistry {
         };
         let cwd = fallback_cwd()?;
         self.persist_ssh_workspace_intent(title, destination, ids)?;
-        let session = PtySession::spawn_ssh(ids.pane, ids.workspace, destination, None)?;
+        let session = self.spawn_ssh_transport(ids.pane, ids.workspace, destination, None)?;
         let result = self.attach_ssh_workspace(destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
@@ -652,9 +629,11 @@ impl SessionRegistry {
                 })
                 .collect::<Vec<_>>()
         };
+        // The windows keep running on the host; Reconnect reattaches them.
         for (_, session) in &sessions {
-            let _ = session.terminate_and_wait();
+            let _ = session.detach("disconnected");
         }
+        self.close_remote_clients(workspace_id);
 
         let mut state = self.state.write();
         let workspace = state
@@ -700,7 +679,9 @@ impl SessionRegistry {
         if created_layout {
             pane_ids.push(Uuid::new_v4());
         }
-        let sessions = spawn_reconnect_sessions(
+        // Reattaches every window still running on the host, with its
+        // scrollback; a host that needs a prompt gets a sign-in tab first.
+        let sessions = self.spawn_ssh_sessions(
             workspace_id,
             &plan.destination,
             plan.working_dir.as_deref(),
@@ -715,7 +696,7 @@ impl SessionRegistry {
         );
         if result.is_err() {
             for (_, session) in sessions {
-                let _ = session.terminate_and_wait();
+                let _ = session.detach("reconnect failed");
             }
         }
         result
@@ -853,7 +834,7 @@ impl SessionRegistry {
     }
 
     pub fn delete_workspace(&self, workspace_id: Uuid) -> Result<()> {
-        let (pane_ids, sessions, tmux_client) = {
+        let (pane_ids, sessions, tmux_client, remote_hosts) = {
             let state = self.state.read();
             let workspace = state
                 .snapshot
@@ -876,11 +857,23 @@ impl SessionRegistry {
                 })
                 .collect::<Vec<_>>();
             let tmux_client = state.tmux_clients.get(&workspace_id).cloned();
-            (pane_ids, sessions, tmux_client)
+            let mut remote_hosts = pane_ids
+                .iter()
+                .filter_map(|pane_id| state.panes.get(pane_id)?.terminal())
+                .filter_map(|terminal| match &terminal.kind {
+                    RuntimePaneKind::SystemSsh { host } => Some(host.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            if let WorkspaceConnection::SystemSsh { destination, .. } = &workspace.connection {
+                remote_hosts.insert(destination.clone());
+            }
+            (pane_ids, sessions, tmux_client, remote_hosts)
         };
         for session in &sessions {
             let _ = session.terminate_and_wait();
         }
+        self.kill_remote_sessions(workspace_id, &remote_hosts);
         let mut cleanup_errors: Vec<anyhow::Error> = Vec::new();
         if let Some(directory) = hh_protocol::gallery_directory(workspace_id)
             && let Err(error) = std::fs::remove_dir_all(&directory)

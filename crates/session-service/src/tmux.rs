@@ -92,7 +92,7 @@ fn tmux_local_attach_command_with_binary(
     pane_id: Uuid,
     session_id: &TmuxSessionId,
 ) -> CommandBuilder {
-    command_with_terminal_env(
+    let mut command = command_with_terminal_env(
         [
             binary.into_os_string(),
             OsString::from("attach-session"),
@@ -100,7 +100,13 @@ fn tmux_local_attach_command_with_binary(
             OsString::from(session_id.as_str()),
         ],
         pane_id,
-    )
+    );
+    // Without -L/-S, tmux talks to the server named by $TMUX. A service
+    // started from inside an HH terminal would otherwise attach to HH's own
+    // private server instead of the user's.
+    command.env_remove("TMUX");
+    command.env_remove("TMUX_PANE");
+    command
 }
 
 /// Single-quoting is safe because `TmuxSessionId` is `$` + ASCII digits.
@@ -157,6 +163,8 @@ pub(crate) fn tmux_local_probe_command() -> Result<Command> {
     let mut command = Command::new(system_tmux_binary()?);
     command
         .args(["list-sessions", "-F", TMUX_SESSION_LIST_FORMAT])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

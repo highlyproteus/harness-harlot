@@ -1,9 +1,11 @@
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use crate::MAX_UNIX_SOCKET_PATH_BYTES;
 use rustix::process::{geteuid, getuid};
@@ -30,7 +32,7 @@ pub const DEVELOPMENT_BUILD_ENV: &str = "HH_DEVELOPMENT_BUILD";
 /// Returns an error when no state directory is available or when the selected
 /// path cannot fit in a macOS Unix-domain socket address.
 pub fn socket_path() -> io::Result<PathBuf> {
-    let path = std::env::var_os(SOCKET_ENV).map_or_else(
+    let path = location_env(SOCKET_ENV).map_or_else(
         || {
             runtime_directory()
                 .map(|directory| default_socket_path(&directory, development_build()))
@@ -46,7 +48,7 @@ pub fn socket_path() -> io::Result<PathBuf> {
 /// override is configured. Clients use this only to preserve live PTYs across
 /// the one-time runtime-directory migration.
 pub fn legacy_socket_path() -> Option<PathBuf> {
-    if std::env::var_os(SOCKET_ENV).is_some() {
+    if location_env(SOCKET_ENV).is_some() || test_isolation().is_some() {
         return None;
     }
     let path = std::env::temp_dir().join(socket_filename(development_build()));
@@ -95,9 +97,15 @@ fn default_socket_path(runtime_directory: &Path, development_build: bool) -> Pat
 }
 
 /// Returns the owner-only Harness Harlot state directory.
+///
+/// Cargo test binaries default to a private per-process directory instead of
+/// the app's live one; see [`test_isolation`].
 pub fn state_directory() -> Option<PathBuf> {
-    if let Some(directory) = std::env::var_os(STATE_DIR_ENV) {
+    if let Some(directory) = location_env(STATE_DIR_ENV) {
         return Some(PathBuf::from(directory));
+    }
+    if let Some(directory) = test_isolation() {
+        return Some(directory.to_path_buf());
     }
     let home = PathBuf::from(std::env::var_os("HOME")?);
     let xdg_state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
@@ -134,8 +142,11 @@ fn default_state_directory(
 
 /// Returns the optional Harness Harlot desktop configuration file.
 pub fn config_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(CONFIG_ENV) {
+    if let Some(path) = location_env(CONFIG_ENV) {
         return Some(PathBuf::from(path));
+    }
+    if let Some(directory) = test_isolation() {
+        return Some(directory.join("config.json"));
     }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -198,6 +209,51 @@ fn development_build() -> bool {
     std::env::var(DEVELOPMENT_BUILD_ENV).as_deref() == Ok("1")
 }
 
+/// Private per-process state directory of a cargo test binary, or `None` for
+/// every real binary (installed app, dev bundle, `cargo run`).
+///
+/// Agents run `cargo test` inside live app terminals, which export the live
+/// `HH_SOCKET` (and possibly `HH_STATE_DIR`/`HH_CONFIG`). A test binary must
+/// never reach the live service or state, so it ignores those variables and
+/// uses this owner-only temporary directory instead.
+fn test_isolation() -> Option<&'static Path> {
+    static DIRECTORY: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+        let executable = std::env::current_exe().ok()?;
+        if !is_cargo_test_binary(&executable) {
+            return None;
+        }
+        // Short enough for a socket below macOS's `$TMPDIR`; the random part
+        // keeps a reused pid from inheriting a previous run's state.
+        let random = Uuid::new_v4().simple().to_string();
+        let directory =
+            std::env::temp_dir().join(format!("hh-test-{}-{}", std::process::id(), &random[..8]));
+        // Callers revalidate ownership, so a failure here fails closed later.
+        let _ = ensure_private_directory(&directory);
+        Some(directory)
+    });
+    DIRECTORY.as_deref()
+}
+
+/// Reads one location variable (`HH_SOCKET`, `HH_STATE_DIR`, `HH_CONFIG`);
+/// test binaries never honor them.
+fn location_env(key: &str) -> Option<OsString> {
+    if test_isolation().is_some() {
+        return None;
+    }
+    std::env::var_os(key)
+}
+
+/// Cargo builds unit and integration test harnesses as
+/// `<target>/<profile>/deps/<name>-<hash>` and runs them in place; real
+/// binaries are run from their uplifted copy or an app bundle.
+fn is_cargo_test_binary(executable: &Path) -> bool {
+    executable
+        .parent()
+        .filter(|directory| directory.file_name() == Some(OsStr::new("deps")))
+        .and_then(Path::parent)
+        .is_some_and(|profile| profile.join(".fingerprint").is_dir())
+}
+
 /// Names the private tmux server (`tmux -L <name>`) owned by `state_dir`.
 ///
 /// The default install keeps the readable `hh` (release) or `hh-dev` (debug)
@@ -209,7 +265,8 @@ fn development_build() -> bool {
 #[must_use]
 pub fn managed_tmux_socket_name(state_dir: &Path) -> String {
     let canonical = canonical_state_dir(state_dir);
-    let is_default_install = std::env::var_os(STATE_DIR_ENV).is_none()
+    let is_default_install = test_isolation().is_none()
+        && std::env::var_os(STATE_DIR_ENV).is_none()
         && state_directory().is_some_and(|default| canonical_state_dir(&default) == canonical);
     if is_default_install {
         let name = if cfg!(debug_assertions) {
@@ -463,5 +520,42 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_cargo_deps_executables_are_test_binaries() {
+        let root = temp_path("target");
+        let profile = root.join("debug");
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+
+        assert!(is_cargo_test_binary(
+            &profile.join("deps/hh_protocol-0123abcd")
+        ));
+        assert!(!is_cargo_test_binary(&profile.join("hh-service")));
+        assert!(!is_cargo_test_binary(
+            &profile.join("Harness Harlot Dev.app/Contents/MacOS/hh-service")
+        ));
+        let stray = temp_path("stray");
+        fs::create_dir_all(stray.join("deps")).unwrap();
+        assert!(!is_cargo_test_binary(&stray.join("deps/hh")));
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(stray).unwrap();
+    }
+
+    #[test]
+    fn test_binaries_resolve_only_private_locations() {
+        let directory = test_isolation().expect("cargo test binary is isolated");
+        assert!(directory.starts_with(std::env::temp_dir()));
+        // Inherited location variables (for example a live tab's HH_SOCKET)
+        // are ignored.
+        let state = state_directory().unwrap();
+        assert_eq!(state, directory);
+        assert!(socket_path().unwrap().starts_with(&state));
+        assert!(config_path().unwrap().starts_with(&state));
+        assert_eq!(legacy_socket_path(), None);
+        let tmux = managed_tmux_socket_name(&state);
+        assert!(tmux != "hh" && tmux != "hh-dev");
     }
 }

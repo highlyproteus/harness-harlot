@@ -30,6 +30,10 @@ use crate::registry::bots::{bot_for_pane, bot_spawn_dir};
 use crate::registry::identity::{
     refresh_process_metadata, refresh_runtime_metadata, set_pane_runtime_label,
 };
+use crate::registry::recovery::{
+    LocalPaneRecovery, LocalRecovery, RecoveryLog, clear_offline_custom_titles,
+    heal_local_tmux_clients, release_runtime_panes, sweep_closed_tab_windows,
+};
 use crate::registry::remote::{RemoteLsGate, TmuxScanGate};
 use crate::registry::status::{contract_status, heuristic_status};
 use crate::registry::streaming::DiagnosticsSampler;
@@ -40,7 +44,9 @@ mod bot_threads;
 mod bots;
 mod identity;
 mod panes;
+mod recovery;
 mod remote;
+mod remote_tmux;
 mod status;
 mod streaming;
 mod tabs;
@@ -190,6 +196,14 @@ pub(crate) struct RegistryState {
     tmux: Option<TmuxServer>,
     tmux_clients: HashMap<Uuid, Arc<TmuxControlClient>>,
     tmux_sinks: HashMap<Uuid, PaneSinks>,
+    /// Control connections to HH's tmux on SSH hosts, per workstation and
+    /// destination (a local workstation can hold direct SSH tabs).
+    remote_clients: HashMap<(Uuid, String), Arc<TmuxControlClient>>,
+    /// `hh`, `hh-dev`, or `hh-<hash>`: names HH's tmux server locally and on
+    /// every SSH host, so builds and tests never share remote sessions.
+    tmux_socket_name: String,
+    /// Where `recovery.log` goes; `None` for an in-memory registry.
+    state_dir: Option<PathBuf>,
     notifications: VecDeque<SessionNotification>,
     next_notification_id: u64,
     next_terminal_number: u32,
@@ -483,7 +497,8 @@ pub(crate) struct InitialTerminalSpawn {
 /// How often the background identity worker refreshes runtime metadata.
 const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Owns the background identity-refresh thread. Refreshing runtime metadata
+/// Owns the background identity-refresh thread, which also re-establishes
+/// lost local tmux connections. Refreshing runtime metadata
 /// enumerates processes, which is too expensive to run inline on every
 /// desktop poll; the worker keeps exit/identity staleness bounded to this
 /// interval instead. The thread is stopped and joined when the last
@@ -518,11 +533,13 @@ impl IdentityWorker {
         let handle = thread::Builder::new()
             .name("rmux-identity-refresh".to_owned())
             .spawn(move || {
+                let mut heal_attempts = HashMap::new();
                 while !thread_stop.load(Ordering::Acquire) {
                     thread::sleep(IDENTITY_REFRESH_INTERVAL);
                     if thread_stop.load(Ordering::Acquire) {
                         break;
                     }
+                    heal_local_tmux_clients(&state, &mut heal_attempts);
                     refresh_process_metadata(&state, false);
                 }
             })
@@ -651,13 +668,7 @@ pub(crate) fn encode_desired_state(state: &RegistryState) -> Result<Vec<u8>> {
             RuntimePaneKind::SystemSsh { host } => {
                 offline_panes.insert(*pane_id);
                 if let Some(pane) = find_pane_mut_in_snapshot(&mut snapshot, *pane_id) {
-                    const OFFLINE_SUFFIX: &str = " — Offline; reconnect required";
-                    let host_chars = MAX_TITLE_CHARS
-                        .saturating_sub("SSH ".chars().count() + OFFLINE_SUFFIX.chars().count());
-                    let host: String = host.chars().take(host_chars).collect();
-                    let offline_title = format!("SSH {host}{OFFLINE_SUFFIX}");
-                    pane.title.clone_from(&offline_title);
-                    pane.custom_title = Some(offline_title);
+                    pane.title = offline_ssh_title(host);
                 }
             }
             RuntimePaneKind::Local => {
@@ -667,6 +678,17 @@ pub(crate) fn encode_desired_state(state: &RegistryState) -> Result<Vec<u8>> {
                 }
             }
             RuntimePaneKind::TmuxLocal { .. } | RuntimePaneKind::TmuxSystemSsh { .. } => {}
+        }
+    }
+    // Only a custom title survives on disk for a terminal, so the offline
+    // label rides there; loading moves it back to the automatic title
+    // (`clear_offline_custom_titles`) so a reconnect can replace it.
+    for pane_id in pane_ids_in_snapshot(&snapshot) {
+        if let Some(pane) = find_pane_mut_in_snapshot(&mut snapshot, pane_id)
+            && pane.custom_title.is_none()
+            && is_offline_ssh_title(&pane.title)
+        {
+            pane.custom_title = Some(pane.title.clone());
         }
     }
     SnapshotStore::encode_with_offline(&snapshot, &cwd_by_pane, &tmux_by_pane, &offline_panes)
@@ -692,11 +714,20 @@ pub(crate) fn snapshot_with_runtime_transports(state: &RegistryState) -> Session
     snapshot
 }
 
-pub(crate) fn terminate_runtime_panes(panes: &HashMap<Uuid, RuntimePane>) {
-    for terminal in panes.values().filter_map(RuntimePane::terminal) {
-        let _ = terminal.session.terminate_and_wait();
-    }
+const OFFLINE_SUFFIX: &str = " — Offline; reconnect required";
+
+/// `SSH <host> — Offline; reconnect required`, within the title limit.
+pub(crate) fn offline_ssh_title(host: &str) -> String {
+    let host_chars =
+        MAX_TITLE_CHARS.saturating_sub("SSH ".chars().count() + OFFLINE_SUFFIX.chars().count());
+    let host: String = host.chars().take(host_chars).collect();
+    format!("SSH {host}{OFFLINE_SUFFIX}")
 }
+
+pub(crate) fn is_offline_ssh_title(title: &str) -> bool {
+    title.starts_with("SSH ") && title.ends_with(OFFLINE_SUFFIX)
+}
+
 fn discover_managed_tmux(state_dir: &Path) -> (Option<TmuxServer>, Option<String>) {
     #[cfg(test)]
     {
@@ -758,7 +789,11 @@ fn append_tmux_notification(state: &mut RegistryState, message: String) {
 
 impl SessionRegistry {
     pub fn new() -> Result<Self> {
-        Self::seeded_with_tmux(None, None, None)
+        let tmux_socket_name = hh_protocol::state_directory().map_or_else(
+            || "hh-unavailable".to_owned(),
+            |directory| hh_protocol::managed_tmux_socket_name(&directory),
+        );
+        Self::seeded_with_tmux(None, None, None, tmux_socket_name, None)
     }
 
     pub fn load_default() -> Result<Self> {
@@ -777,19 +812,51 @@ impl SessionRegistry {
         remove_retired_history_archive(&state_dir);
         let store = SnapshotStore::new(path);
         let (tmux, tmux_unavailable_reason) = discover_managed_tmux(&state_dir);
+        let tmux_socket_name = hh_protocol::managed_tmux_socket_name(&state_dir);
         let Some(mut recovered) = store.load_or_quarantine()? else {
-            let registry = Self::seeded_with_tmux(Some(store), tmux, tmux_unavailable_reason)?;
+            let registry = Self::seeded_with_tmux(
+                Some(store),
+                tmux,
+                tmux_unavailable_reason,
+                tmux_socket_name,
+                Some(state_dir),
+            )?;
             registry.persist()?;
             return Ok(registry);
         };
+        clear_offline_custom_titles(&mut recovered.snapshot);
 
+        let started = Instant::now();
+        let mut log = RecoveryLog::default();
+        log.note(format!(
+            "service {} (pid {}) recovering {} saved panes; tmux {}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            pane_ids_in_snapshot(&recovered.snapshot).len(),
+            tmux.as_ref().map_or_else(
+                || format!(
+                    "unavailable ({})",
+                    tmux_unavailable_reason.as_deref().unwrap_or("not found")
+                ),
+                |server| format!("-L {}", server.socket_name),
+            )
+        ));
         let fallback = fallback_cwd()?;
         let bots_dir = crate::bots::bots_directory(&state_dir);
         let pane_ids = pane_ids_in_snapshot(&recovered.snapshot);
+        let existing_panes = pane_ids.iter().copied().collect::<HashSet<_>>();
+        // Every window the saved layout names survives recovery, whether or
+        // not it could be reattached.
+        let mut keep_windows = recovered
+            .tmux_by_pane
+            .values()
+            .map(|(window_id, _)| window_id.clone())
+            .collect::<HashSet<_>>();
         let mut panes = HashMap::new();
         let mut tmux_clients = HashMap::new();
         let mut tmux_sinks = HashMap::new();
         let mut tmux_failures = Vec::new();
+        let mut unattached = Vec::new();
         let mut fresh_bot_panes = Vec::new();
         for pane_id in pane_ids {
             let pane_kind = find_pane_in_snapshot(&recovered.snapshot, pane_id)
@@ -820,57 +887,48 @@ impl SessionRegistry {
             let workspace_id = workspace_id_for_pane(&recovered.snapshot, pane_id)
                 .context("recovered pane has no workspace")?;
             let bot_id = bot_for_pane(&recovered.snapshot, pane_id);
-            let mut reattached = false;
             let saved_cwd = recovered.cwd_by_pane.remove(&pane_id);
             let cwd = bot_id
                 .and_then(|bot| bot_spawn_dir(&recovered.snapshot, Some(&bots_dir), bot))
                 .or_else(|| saved_cwd.filter(|cwd| valid_local_cwd(cwd)))
                 .unwrap_or_else(|| fallback.clone());
-            let managed =
-                tmux.as_ref().map(|server| {
-                    ensure_tmux_client(server, workspace_id, &mut tmux_clients, &mut tmux_sinks)
-                        .and_then(|client| {
-                            if let Some((window_id, tmux_pane_id)) =
-                                recovered.tmux_by_pane.remove(&pane_id)
-                            {
-                                if recovered.legacy_tmux_workspace.contains_key(&pane_id) {
-                                    // A migrated bot thread: its window still
-                                    // lives in the retired Bots session.
-                                    let _ = client.move_window_to_session(
-                                        &window_id,
-                                        &tmux_session_name(workspace_id),
-                                    );
-                                }
-                                let existing = client.list_panes()?.into_iter().find(
-                                    |(window, pane, _, _)| {
-                                        window == &window_id && pane == &tmux_pane_id
-                                    },
-                                );
-                                if let Some((window_id, tmux_pane_id, pane_pid, _)) = existing {
-                                    reattached = true;
-                                    return PtySession::attach_tmux(
-                                        pane_id,
-                                        client,
-                                        window_id,
-                                        tmux_pane_id,
-                                        pane_pid,
-                                    );
-                                }
-                            }
-                            PtySession::spawn_tmux(pane_id, workspace_id, bot_id, &cwd, &client)
-                        })
-                });
-            let reattached = reattached && matches!(managed, Some(Ok(_)));
-            let session = match managed {
-                Some(Ok(session)) => Ok(session),
+            let outcome = tmux.as_ref().map(|server| {
+                LocalPaneRecovery {
+                    server,
+                    workspace_id,
+                    pane_id,
+                    bot_id,
+                    cwd: &cwd,
+                    saved: recovered.tmux_by_pane.remove(&pane_id),
+                    legacy_workspace: recovered.legacy_tmux_workspace.get(&pane_id).copied(),
+                }
+                .run(&mut tmux_clients, &mut tmux_sinks, &mut log)
+            });
+            let (session, reattached) = match outcome {
+                Some(Ok(LocalRecovery::Reattached(session))) => (Ok(session), true),
+                Some(Ok(LocalRecovery::Fresh(session))) => (Ok(session), false),
+                Some(Ok(LocalRecovery::Unattached(session))) => {
+                    unattached.push(pane_id);
+                    (Ok(session), true)
+                }
                 Some(Err(error)) => {
                     tmux_failures.push((pane_id, format!("{error:#}")));
-                    PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)
+                    log.note(format!("pane {pane_id} fell back to a plain shell"));
+                    (
+                        PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd),
+                        false,
+                    )
                 }
-                None => PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd),
+                None => (
+                    PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd),
+                    false,
+                ),
             };
             match session {
                 Ok(session) => {
+                    if let Some((window_id, _)) = session.tmux_ids() {
+                        keep_windows.insert(window_id.to_owned());
+                    }
                     if let Some(bot_id) = bot_id.filter(|_| !reattached) {
                         fresh_bot_panes.push((bot_id, pane_id));
                     }
@@ -890,7 +948,11 @@ impl SessionRegistry {
                     );
                 }
                 Err(error) => {
-                    terminate_runtime_panes(&panes);
+                    log.note(format!(
+                        "recovery stopped: pane {pane_id} could not start a shell: {error:#}; tmux windows were left running"
+                    ));
+                    log.flush(Some(&state_dir));
+                    release_runtime_panes(&panes);
                     return Err(error).context("recreate fresh shell for recovered pane");
                 }
             }
@@ -905,19 +967,23 @@ impl SessionRegistry {
                 let _ = client.kill_named_session(&tmux_session_name(legacy));
             }
         }
-        let referenced_windows = panes
-            .values()
-            .filter_map(RuntimePane::terminal)
-            .filter_map(|terminal| terminal.session.tmux_ids())
-            .map(|(window, _)| window.to_owned())
-            .collect::<HashSet<_>>();
         for client in tmux_clients.values() {
-            if let Ok(listed) = client.list_panes() {
-                for (window_id, _, _, _) in listed {
-                    if !referenced_windows.contains(&window_id) {
-                        let _ = client.kill_window(&window_id);
-                    }
-                }
+            sweep_closed_tab_windows(client, &keep_windows, &existing_panes, &mut log);
+        }
+        // A pane attached before a retry replaced its workspace's connection
+        // still points at the dead one; the shared sink map lets it move over.
+        for (pane_id, runtime) in &panes {
+            let Some(terminal) = runtime.terminal() else {
+                continue;
+            };
+            if let Some(workspace_id) = workspace_id_for_pane(&recovered.snapshot, *pane_id)
+                && let (Some(current), Some(live)) = (
+                    terminal.session.tmux_client(),
+                    tmux_clients.get(&workspace_id),
+                )
+                && !Arc::ptr_eq(&current, live)
+            {
+                terminal.session.replace_tmux_client(live);
             }
         }
         for pane_id in panes
@@ -926,6 +992,13 @@ impl SessionRegistry {
         {
             set_pane_runtime_label(&mut recovered.snapshot, pane_id, true, None, &shell_title());
         }
+        log.note(format!(
+            "recovery finished in {} ms: {} unattached, {} plain-shell fallbacks",
+            started.elapsed().as_millis(),
+            unattached.len(),
+            tmux_failures.len()
+        ));
+        log.flush(Some(&state_dir));
         let next_terminal_number = u32::try_from(
             panes
                 .values()
@@ -941,6 +1014,9 @@ impl SessionRegistry {
             tmux,
             tmux_clients,
             tmux_sinks,
+            remote_clients: HashMap::new(),
+            tmux_socket_name,
+            state_dir: Some(state_dir),
             notifications: VecDeque::new(),
             next_notification_id: 1,
             next_terminal_number,
@@ -969,18 +1045,19 @@ impl SessionRegistry {
                     format!("tmux window could not be created; using a plain shell: {error}"),
                 );
             }
+            for pane_id in unattached {
+                state.append_notification(
+                    pane_id,
+                    NotificationKind::Message,
+                    Some(
+                        "couldn't reattach this terminal; its program is still running. Use Reattach Exited Terminal to try again"
+                            .to_owned(),
+                    ),
+                    crate::now_ms(),
+                );
+            }
         }
-        let registry = Self {
-            state: Arc::clone(&state),
-            _identity_worker: Arc::new(IdentityWorker::spawn(Arc::clone(&state))),
-            diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
-            shutdown_requested: Arc::new(AtomicBool::new(false)),
-            tmux_scan_gate: Arc::new(Mutex::new(TmuxScanGate::default())),
-            remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
-            coding_agents: Arc::new(Mutex::new(None)),
-            store: Some(store),
-            browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
-        };
+        let registry = Self::from_state(state, Some(store));
         registry.persist()?;
         for (bot_id, pane_id) in fresh_bot_panes {
             registry.relaunch_recovered_bot(bot_id, pane_id);
@@ -988,10 +1065,26 @@ impl SessionRegistry {
         Ok(registry)
     }
 
+    fn from_state(state: Arc<RwLock<RegistryState>>, store: Option<SnapshotStore>) -> Self {
+        Self {
+            state: Arc::clone(&state),
+            _identity_worker: Arc::new(IdentityWorker::spawn(state)),
+            diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            tmux_scan_gate: Arc::new(Mutex::new(TmuxScanGate::default())),
+            remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
+            coding_agents: Arc::new(Mutex::new(None)),
+            store,
+            browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
+        }
+    }
+
     fn seeded_with_tmux(
         store: Option<SnapshotStore>,
         tmux: Option<TmuxServer>,
         tmux_unavailable_reason: Option<String>,
+        tmux_socket_name: String,
+        state_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let persistent = store.is_some();
         let mut snapshot = SessionSnapshot::seeded();
@@ -1041,6 +1134,9 @@ impl SessionRegistry {
             tmux,
             tmux_clients,
             tmux_sinks,
+            remote_clients: HashMap::new(),
+            tmux_socket_name,
+            state_dir,
             next_terminal_number: 2,
             next_group_number: 1,
             last_identity_refresh: None,
@@ -1068,17 +1164,7 @@ impl SessionRegistry {
                 );
             }
         }
-        Ok(Self {
-            state: Arc::clone(&state),
-            _identity_worker: Arc::new(IdentityWorker::spawn(state)),
-            diagnostics_sampler: Arc::new(Mutex::new(DiagnosticsSampler::default())),
-            shutdown_requested: Arc::new(AtomicBool::new(false)),
-            tmux_scan_gate: Arc::new(Mutex::new(TmuxScanGate::default())),
-            coding_agents: Arc::new(Mutex::new(None)),
-            store,
-            remote_ls_gate: Arc::new(Mutex::new(RemoteLsGate::default())),
-            browser_commands: Arc::new(Mutex::new(BrowserCommandQueue::default())),
-        })
+        Ok(Self::from_state(state, store))
     }
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
         Ok(snapshot_with_runtime_transports(&self.state.read()))
@@ -1312,7 +1398,7 @@ impl SessionRegistry {
                 self.spawn_local_transport(pane_id, workspace_id, None, cwd)?
             }
             RuntimePaneKind::SystemSsh { host } => {
-                PtySession::spawn_ssh(pane_id, workspace_id, host, remote_dir)?
+                self.spawn_ssh_transport(pane_id, workspace_id, host, remote_dir)?
             }
             RuntimePaneKind::TmuxLocal { .. } | RuntimePaneKind::TmuxSystemSsh { .. } => {
                 unreachable!("workspace connection cannot resolve to a runtime-only tmux pane")

@@ -145,7 +145,16 @@ pub(crate) fn apply_agent_env(
     }
 }
 
+/// Debug builds only: replaces the system `ssh` so tests can run the remote
+/// tmux path against a local fake host. Release builds ignore it.
+#[cfg(debug_assertions)]
+pub(crate) const TEST_SSH_BINARY_ENV: &str = "HH_TEST_SSH_BINARY";
+
 pub(crate) fn system_ssh_binary() -> Result<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os(TEST_SSH_BINARY_ENV) {
+        return Ok(PathBuf::from(path));
+    }
     for path in [Path::new("/usr/bin/ssh"), Path::new("/bin/ssh")] {
         if is_trusted_executable_file(path) {
             return Ok(path.to_path_buf());

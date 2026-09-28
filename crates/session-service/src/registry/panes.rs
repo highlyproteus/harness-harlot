@@ -16,6 +16,7 @@ use crate::registry::bots::{bot_for_pane, bot_spawn_dir, prune_bot_threads};
 use crate::registry::identity::{
     refresh_workspace_activity, resolve_pane_identity, set_pane_runtime_label,
 };
+use crate::registry::recovery::find_window;
 use crate::registry::workspaces::remember_recent_color;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -307,7 +308,12 @@ impl SessionRegistry {
                 tab_title: "Terminals".to_owned(),
             }),
             WorkspaceConnection::SystemSsh { destination, .. } => Ok(InitialTerminalSpawn {
-                session: PtySession::spawn_ssh(pane_id, workspace_id, destination, working_dir)?,
+                session: self.spawn_ssh_transport(
+                    pane_id,
+                    workspace_id,
+                    destination,
+                    working_dir,
+                )?,
                 kind: RuntimePaneKind::SystemSsh {
                     host: destination.clone(),
                 },
@@ -453,7 +459,7 @@ impl SessionRegistry {
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
-        let session = PtySession::spawn_ssh(pane_id, workspace_id, host, None)?;
+        let session = self.spawn_ssh_transport(pane_id, workspace_id, host, None)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -889,7 +895,7 @@ impl SessionRegistry {
     /// session that no longer exists fails here instead of registering a fake
     /// live tab.
     pub fn reattach_pane(&self, pane_id: Uuid) -> Result<()> {
-        let (kind, cwd, workspace_id, managed_tmux, bot_id) = {
+        let (kind, cwd, workspace_id, saved_tmux, bot_id) = {
             let state = self.state.read();
             let runtime = state.terminal_pane(pane_id)?;
             if runtime.exit_status.is_none() {
@@ -908,21 +914,33 @@ impl SessionRegistry {
                 runtime.kind.clone(),
                 cwd,
                 workspace_id,
-                runtime.session.tmux_ids().is_some(),
+                runtime
+                    .session
+                    .tmux_ids()
+                    .map(|(window, pane)| (window.to_owned(), pane.to_owned())),
                 bot_id,
             )
         };
         let session = match &kind {
-            RuntimePaneKind::Local if managed_tmux => PtySession::spawn_tmux(
-                pane_id,
-                workspace_id,
-                bot_id,
-                &cwd,
-                &self.client_for_workspace(workspace_id)?,
-            )?,
+            // A pane left unattached by recovery gets its still-running
+            // window back; one whose program exited gets a new window.
+            RuntimePaneKind::Local if saved_tmux.is_some() => {
+                let client = self.client_for_workspace(workspace_id)?;
+                let listed = client.list_panes()?;
+                match find_window(&listed, saved_tmux.as_ref(), pane_id) {
+                    Some(existing) => PtySession::attach_tmux(
+                        pane_id,
+                        Arc::clone(&client),
+                        existing.window_id.clone(),
+                        existing.pane_id.clone(),
+                        existing.pane_pid,
+                    )?,
+                    None => PtySession::spawn_tmux(pane_id, workspace_id, bot_id, &cwd, &client)?,
+                }
+            }
             RuntimePaneKind::Local => PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)?,
             RuntimePaneKind::SystemSsh { host } => {
-                PtySession::spawn_ssh(pane_id, workspace_id, host, None)?
+                self.spawn_ssh_transport(pane_id, workspace_id, host, None)?
             }
             RuntimePaneKind::TmuxLocal { session_id } => {
                 PtySession::spawn_tmux_local(pane_id, session_id)?
@@ -945,6 +963,11 @@ impl SessionRegistry {
         runtime.omp_title_status = None;
         let shell_label = kind.shell_label();
         set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, &shell_label);
+        if let RuntimePaneKind::SystemSsh { host } = &kind
+            && let Some(pane) = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
+        {
+            pane.title = ssh_pane_title(host);
+        }
         state.set_pane_status(pane_id, PaneStatus::Idle);
         refresh_workspace_activity(&mut state);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
