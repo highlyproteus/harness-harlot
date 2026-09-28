@@ -9,7 +9,7 @@ use gpui::{
     quad, relative, rgb, rgba, size, transparent_black,
 };
 use hh_protocol::{
-    AppearanceColor, TerminalAttributes, TerminalColor, TerminalCursor, TerminalImage, TerminalRun,
+    AppearanceColor, TerminalAttributes, TerminalColor, TerminalCursor, TerminalRun,
     TerminalScreen, TerminalSelection,
 };
 use std::path::Path;
@@ -21,8 +21,8 @@ use crate::helpers::{
 };
 use crate::tab_chrome::PaneIndicator;
 use crate::terminal_images::{
-    ImageLoad, ImageSegment, decode_terminal_image, is_placeholder_run, placeholder_segments,
-    segment_draw_bounds,
+    ImageLoad, ImageSegment, decode_terminal_image, is_placeholder_run, pixel_aligned_bounds,
+    placeholder_segments, resample_terminal_image, segment_draw_bounds,
 };
 use crate::typography::TerminalCellMetrics;
 use crate::view_models::{DialogTextEditor, WorkspaceCreationField, WorkspaceCreationStep};
@@ -907,8 +907,8 @@ pub(crate) struct TerminalGridElement {
 
 pub(crate) struct TerminalGridPrepaintState {
     rows: Rc<Vec<Vec<CachedRun>>>,
-    /// Image stretches whose image has decoded, with their placement.
-    images: Vec<(ImageSegment, TerminalImage, Arc<RenderImage>)>,
+    /// Decoded images with their pixel-aligned draw bounds and segment clip.
+    images: Vec<(Bounds<Pixels>, Bounds<Pixels>, Arc<RenderImage>)>,
     selection: Option<TerminalSelection>,
     cursor: Option<TerminalCursor>,
     columns: u16,
@@ -1050,7 +1050,7 @@ impl Element for TerminalGridElement {
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         (): &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
@@ -1079,8 +1079,13 @@ impl Element for TerminalGridElement {
         drop(cache);
         let mut images = Vec::new();
         let mut to_load = Vec::new();
+        let mut to_resample = Vec::new();
+        let mut loaded = app.terminal_images.borrow_mut();
+        for image in loaded.take_released() {
+            let _ = window.drop_image(image);
+        }
         if !segments.is_empty() {
-            let mut loaded = app.terminal_images.borrow_mut();
+            let scale_factor = window.scale_factor();
             for segment in segments.iter() {
                 let Some(placement) = screen
                     .images
@@ -1089,17 +1094,38 @@ impl Element for TerminalGridElement {
                 else {
                     continue;
                 };
-                match loaded.get(&placement.path) {
-                    Some(ImageLoad::Ready(image)) => {
-                        images.push((*segment, placement.clone(), Arc::clone(image)));
-                    }
-                    Some(ImageLoad::Loading | ImageLoad::Failed) => {}
+                let pixels = match loaded.get(&placement.path) {
+                    Some(ImageLoad::Ready(decoded)) => decoded.size(),
+                    Some(ImageLoad::Loading | ImageLoad::Failed) => continue,
                     None => {
                         if loaded.begin_load(&placement.path) {
                             to_load.push(placement.path.clone());
                         }
+                        continue;
                     }
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let image_size = size(pixels.width.0 as f32, pixels.height.0 as f32);
+                let Some((image_bounds, clip)) = segment_draw_bounds(
+                    *segment,
+                    placement,
+                    image_size,
+                    self.metrics,
+                    bounds.origin,
+                ) else {
+                    continue;
+                };
+                let Some((image_bounds, drawn)) = pixel_aligned_bounds(image_bounds, scale_factor)
+                else {
+                    continue;
+                };
+                let Some(draw) = loaded.draw(&placement.path, drawn) else {
+                    continue;
+                };
+                if let Some(source) = draw.resample {
+                    to_resample.push((placement.path.clone(), drawn, source));
                 }
+                images.push((image_bounds, clip, draw.image));
             }
             loaded.prune(
                 app.session
@@ -1108,6 +1134,7 @@ impl Element for TerminalGridElement {
                     .flat_map(|screen| screen.images.iter().map(|image| image.path.as_str())),
             );
         }
+        drop(loaded);
         let prepaint = TerminalGridPrepaintState {
             rows,
             images,
@@ -1129,6 +1156,21 @@ impl Element for TerminalGridElement {
                     app.terminal_images
                         .borrow_mut()
                         .finish_load(path, image.ok());
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        for (path, drawn, source) in to_resample {
+            let entity = self.input.clone();
+            cx.spawn(async move |cx| {
+                let image = cx
+                    .background_spawn(async move { resample_terminal_image(&source, drawn) })
+                    .await;
+                let _ = entity.update(cx, |app, cx| {
+                    app.terminal_images
+                        .borrow_mut()
+                        .finish_resample(&path, drawn, image);
                     cx.notify();
                 });
             })
@@ -1192,18 +1234,10 @@ impl Element for TerminalGridElement {
                 );
             }
         }
-        for (segment, placement, image) in &state.images {
-            let pixels = image.size(0);
-            #[allow(clippy::cast_precision_loss)]
-            let image_size = size(pixels.width.0 as f32, pixels.height.0 as f32);
-            let Some((image_bounds, clip)) =
-                segment_draw_bounds(*segment, placement, image_size, metrics, bounds.origin)
-            else {
-                continue;
-            };
-            window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+        for (image_bounds, clip, image) in &state.images {
+            window.with_content_mask(Some(ContentMask { bounds: *clip }), |window| {
                 let _ = window.paint_image(
-                    image_bounds,
+                    *image_bounds,
                     Corners::default(),
                     Arc::clone(image),
                     0,
