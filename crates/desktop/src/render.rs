@@ -48,11 +48,11 @@ impl HhApp {
                 DialogAction::RenamePane,
                 cx,
             )),
-            Modal::GroupRename(editor) => Some(self.render_rename_dialog(
-                Some(("group-rename-input", editor.replace_on_type)),
+            Modal::TabRename(editor) => Some(self.render_rename_dialog(
+                Some(("tab-rename-input", editor.replace_on_type)),
                 format!("{}{}", editor.value, self.editor.ime_preedit),
-                "Rename group",
-                "save-group-rename",
+                "Rename tab",
+                "save-tab-rename",
                 DialogAction::RenameTab,
                 cx,
             )),
@@ -73,7 +73,7 @@ impl HhApp {
                 Some(self.render_workspace_menu(*menu, menu_max_height, cx))
             }
             Modal::CreateMenu(menu) => Some(self.render_create_menu(*menu, cx)),
-            Modal::GroupMenu(menu) => Some(self.render_group_menu(*menu, menu_max_height, cx)),
+            Modal::TabRowMenu(menu) => Some(self.render_tab_row_menu(*menu, menu_max_height, cx)),
             Modal::BotMenu(menu) => Some(self.render_bot_menu(*menu, menu_max_height, cx)),
             Modal::BotThreadMenu(menu) => Some(self.render_bot_thread_menu(menu, cx)),
             Modal::TerminalImageMenu(menu) => Some(self.render_terminal_image_menu(menu, cx)),
@@ -106,17 +106,18 @@ impl Render for HhApp {
             self.layout.focused_pane,
         ) || self.editor.modal.pane_rename().is_some()
             || self.editor.modal.workspace_rename().is_some()
-            || self.editor.modal.group_rename().is_some()
+            || self.editor.modal.tab_rename().is_some()
             || self.editor.modal.dir_editor().is_some()
         {
             // Keep custom text editors on the root input route so native child
             // views cannot consume replacement typing.
             self.focus_handle.focus(window);
         }
+        self.motion.begin_frame();
         let menu_max_height = window.viewport_size().height - px(16.0);
         let modal_element = self.render_modal(menu_max_height, cx);
 
-        div()
+        let root = div()
             .key_context(if self.editor.modal.command_palette().is_some() {
                 "HhPalette"
             } else {
@@ -158,7 +159,7 @@ impl Render for HhApp {
                         Modal::TabMenu(_)
                             | Modal::WorkspaceMenu(_)
                             | Modal::CreateMenu(_)
-                            | Modal::GroupMenu(_)
+                            | Modal::TabRowMenu(_)
                             | Modal::BotMenu(_)
                             | Modal::BotThreadMenu(_)
                             | Modal::TerminalImageMenu(_)
@@ -314,6 +315,8 @@ impl Render for HhApp {
                     )
                 }),
                 |element, picker| element.child(self.render_color_picker(picker, cx)),
-            )
+            );
+        self.ensure_animation_tick(cx);
+        root
     }
 }

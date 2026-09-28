@@ -13,6 +13,62 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Progress belongs to the agent that reported it: once the pane's title and
+/// process say the shell is back, the ring must stop showing it.
+#[test]
+fn agent_progress_clears_when_the_agent_leaves_the_pane() {
+    let registry = SessionRegistry::new().unwrap();
+    let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+    registry
+        .write_input(
+            pane_id,
+            "printf '\\033]0;π ⠋ fixing\\007'; sleep 2; printf '\\033]0;plain shell\\007'; sleep 30\r"
+                .as_bytes(),
+        )
+        .unwrap();
+    let observe = |title: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while registry
+            .state
+            .read()
+            .terminal_pane(pane_id)
+            .unwrap()
+            .session
+            .terminal_title()
+            .as_deref()
+            != Some(title)
+        {
+            assert!(Instant::now() < deadline, "title {title:?} never arrived");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The worker's scan, now: the rule reads what runs in the pane.
+        crate::registry::identity::refresh_process_metadata(&registry.state, true);
+    };
+    let progress = || {
+        find_pane_in_snapshot(&registry.snapshot().unwrap(), pane_id)
+            .unwrap()
+            .progress
+            .clone()
+    };
+
+    observe("π ⠋ fixing");
+    let reported = hh_protocol::PaneProgress {
+        done: 1,
+        total: 3,
+        current: Some("beta".to_owned()),
+        phase: Some("Demo".to_owned()),
+        source: hh_protocol::ProgressSource::Omp,
+    };
+    registry
+        .report_pane_progress(pane_id, Some(reported.clone()))
+        .unwrap();
+    refresh_runtime_metadata(&mut registry.state.write());
+    assert_eq!(progress(), Some(reported), "omp still owns the pane");
+
+    observe("plain shell");
+    assert_eq!(progress(), None);
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn ssh_test_seam_honors_workspace_directory_and_keeps_direct_tabs_offline() {
@@ -249,7 +305,7 @@ fn resize_bounds_reject_oom_dimensions_without_killing_sessions() {
 fn terminals_receive_human_names_and_can_be_renamed() {
     let registry = SessionRegistry::new().unwrap();
     let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
-    let second = registry.create_group_terminal(first).unwrap();
+    let second = registry.create_tab_terminal(first).unwrap();
     registry.rename_pane(second, "Build logs").unwrap();
 
     // Panes spawn at the fallback cwd ($HOME), so their default titles
@@ -271,7 +327,7 @@ fn terminals_receive_human_names_and_can_be_renamed() {
 fn moving_a_live_tab_to_a_directional_split_preserves_its_process() {
     let registry = SessionRegistry::new().unwrap();
     let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
-    let second = registry.create_group_terminal(first).unwrap();
+    let second = registry.create_tab_terminal(first).unwrap();
     let first_pid = registry.pane_process_id(first).unwrap();
     let second_pid = registry.pane_process_id(second).unwrap();
 
@@ -546,4 +602,105 @@ fn add_gallery_image_rejects_non_images() {
 
     assert!(error.to_string().contains("not a PNG"));
     fs::remove_file(source).unwrap();
+}
+
+fn claude_progress() -> hh_protocol::PaneProgress {
+    hh_protocol::PaneProgress {
+        done: 1,
+        total: 3,
+        current: Some("Write tests".to_owned()),
+        phase: None,
+        source: hh_protocol::ProgressSource::Claude,
+    }
+}
+
+/// A pinned profile is only the pane's label: progress follows the agent
+/// actually detected in the pane, and nothing detected is no evidence.
+#[test]
+fn progress_follows_the_detected_agent_not_the_pinned_profile() {
+    let registry = SessionRegistry::new().unwrap();
+    let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
+    registry
+        .set_pane_profile(pane_id, Some(TerminalProfile::Codex))
+        .unwrap();
+    registry
+        .report_pane_progress(pane_id, Some(claude_progress()))
+        .unwrap();
+    // Each scan result and its refresh share one lock, so the background
+    // worker's own scan cannot interleave.
+    let refresh_with = |scan: ProcessScan| {
+        let mut state = registry.state.write();
+        state.terminal_pane_mut(pane_id).unwrap().process_scan = scan;
+        refresh_runtime_metadata(&mut state);
+        find_pane_in_snapshot(&state.snapshot, pane_id)
+            .unwrap()
+            .progress
+            .clone()
+    };
+
+    assert_eq!(
+        refresh_with(ProcessScan::Agent(TerminalProfile::Claude)),
+        Some(claude_progress()),
+        "Claude runs under the pinned Codex label"
+    );
+    assert_eq!(
+        refresh_with(ProcessScan::Unknown),
+        Some(claude_progress()),
+        "an inconclusive scan keeps the progress"
+    );
+    assert_eq!(
+        refresh_with(ProcessScan::NoAgent),
+        None,
+        "Claude quit back to its shell"
+    );
+}
+
+#[test]
+fn reattaching_a_running_program_keeps_its_status_and_progress() {
+    let registry = SessionRegistry::new().unwrap();
+    let snapshot = registry.snapshot().unwrap();
+    let pane_id = first_pane_id(&snapshot).unwrap();
+    let workspace_id = snapshot.workspaces[0].id;
+    let reattach = |behind: Reattached| {
+        registry
+            .report_pane_progress(pane_id, Some(claude_progress()))
+            .unwrap();
+        let session =
+            PtySession::spawn_local(pane_id, workspace_id, None, &fallback_cwd().unwrap()).unwrap();
+        let mut state = registry.state.write();
+        state.set_pane_status(pane_id, PaneStatus::NeedsApproval);
+        state.terminal_pane_mut(pane_id).unwrap().exit_status = Some("connection lost".to_owned());
+        let previous = state
+            .install_reattached_session(pane_id, session, behind)
+            .unwrap();
+        let pane = find_pane_in_snapshot(&state.snapshot, pane_id)
+            .unwrap()
+            .clone();
+        let terminal = state.terminal_pane(pane_id).unwrap();
+        let outcome = (
+            pane.status,
+            pane.progress,
+            terminal.exit_status.clone(),
+            terminal.title_baseline_pending,
+        );
+        drop(state);
+        previous.terminate_and_wait().unwrap();
+        outcome
+    };
+
+    assert_eq!(
+        reattach(Reattached::RunningProgram),
+        (
+            PaneStatus::NeedsApproval,
+            Some(claude_progress()),
+            None,
+            true
+        ),
+        "the program never stopped: its status and ring stay, its next title is a baseline"
+    );
+    assert_eq!(
+        reattach(Reattached::FreshShell),
+        (PaneStatus::Idle, None, None, false),
+        "a new shell starts over"
+    );
 }

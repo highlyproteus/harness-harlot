@@ -117,6 +117,8 @@ impl HhApp {
     pub(crate) fn dispatch_control(&mut self, request: ClientRequest) {
         let wake_poll = terminal_poll_wake_requested(&request);
         if let ClientRequest::WriteInput { pane_id, bytes } = request {
+            // Typing or pasting into a pane is looking at it.
+            self.mark_pane_seen(pane_id);
             match self.session.terminal_input_tx.try_send(pane_id, &bytes) {
                 Ok(()) => {
                     let _ = self.session.poll_wake_tx.try_send(());
@@ -232,6 +234,7 @@ impl HhApp {
                 screens,
                 pane_states,
                 notifications: notification_deltas,
+                notifications_epoch,
                 diagnostics,
                 browser_commands,
             }) => {
@@ -247,6 +250,7 @@ impl HhApp {
                         screens,
                         pane_states,
                         notification_deltas,
+                        notifications_epoch,
                     },
                     Instant::now(),
                 );
@@ -269,7 +273,6 @@ impl HhApp {
                 self.sync_dock_badge();
                 let mut state_changed = outcome.state_changed;
                 self.refresh_changed_bot_threads();
-                self.mark_focused_pane_viewed();
                 if let Some(pane_id) = outcome.focus_resync {
                     state_changed |= self.focus_pane_with_snapshot(pane_id, cx);
                 }
@@ -339,7 +342,6 @@ impl HhApp {
             self.dispatch(ClientRequest::ActivateTab { pane_id });
         }
         self.note_bot_pane_focus(pane_id);
-        self.mark_pane_viewed(pane_id);
         if self
             .pane_metadata(pane_id)
             .is_some_and(|pane| !pane.kind.is_terminal())

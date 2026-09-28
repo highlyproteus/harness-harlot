@@ -39,9 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::PANE_HEADER_HEIGHT;
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::helpers::split_placement_at;
-use crate::helpers::{
-    collect_terminal_tabs, element_key, find_pane, workspace_tab_standalone_pane,
-};
+use crate::helpers::{collect_terminal_tabs, element_key, find_pane};
 use crate::input::browser_url_editor_is_active;
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
 use crate::session::session_call;
@@ -186,7 +184,7 @@ impl HhApp {
         self.new_browser_tab_in(workspace_id, cx);
     }
 
-    pub(crate) fn browser_group_target(&self, workspace_id: Uuid) -> Option<Uuid> {
+    pub(crate) fn browser_tab_target(&self, workspace_id: Uuid) -> Option<Uuid> {
         let workspace = self
             .session
             .snapshot
@@ -234,7 +232,7 @@ impl HhApp {
                     Ok(ServiceResponse::PaneCreated { pane_id }) => {
                         this.sidebar.active_workspace = Some(workspace_id);
                         this.focus_pane_with_snapshot(pane_id, cx);
-                        this.sidebar.expanded_workspaces.insert(workspace_id);
+                        this.reveal_workspace(workspace_id);
                         this.editor.browser_url_editor = Some(BrowserUrlEditor {
                             pane_id,
                             text: String::new(),
@@ -267,7 +265,7 @@ impl HhApp {
             return;
         }
         self.dispatch_with(
-            ClientRequest::CreateGroupBrowser {
+            ClientRequest::CreateTabBrowser {
                 target_pane,
                 url: Some(url.to_owned()),
             },
@@ -303,88 +301,17 @@ impl HhApp {
     }
 
     pub(crate) fn new_browser_tab_in(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        let request = self.browser_group_target(workspace_id).map_or(
+        let request = self.browser_tab_target(workspace_id).map_or(
             ClientRequest::CreateBrowserTab {
                 workspace_id,
                 url: None,
             },
-            |target_pane| ClientRequest::CreateGroupBrowser {
+            |target_pane| ClientRequest::CreateTabBrowser {
                 target_pane,
                 url: None,
             },
         );
         self.create_browser(workspace_id, request, cx);
-    }
-
-    pub(crate) fn tab_is_navigation_container(&self, tab_id: Uuid) -> bool {
-        self.session.snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .workspaces
-                .iter()
-                .flat_map(|workspace| workspace.tabs.iter())
-                .find(|tab| tab.id == tab_id)
-                .is_some_and(|tab| workspace_tab_standalone_pane(tab).is_none())
-        })
-    }
-
-    pub(crate) fn project_for_create_target(&self, tab_id: Uuid) -> Option<Uuid> {
-        self.session.snapshot.as_ref().and_then(|snapshot| {
-            snapshot
-                .workspaces
-                .iter()
-                .flat_map(|workspace| workspace.tabs.iter())
-                .find(|tab| tab.id == tab_id)
-                .and_then(|tab| {
-                    if tab.project_dir.is_some() {
-                        Some(tab.id)
-                    } else {
-                        tab.parent_tab
-                    }
-                })
-        })
-    }
-
-    pub(crate) fn add_terminal_to_context(
-        &mut self,
-        workspace_id: Uuid,
-        target_tab: Option<Uuid>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tab_id) = target_tab.filter(|tab_id| self.tab_is_navigation_container(*tab_id))
-        {
-            self.new_group_terminal(tab_id, cx);
-        } else {
-            self.new_workspace_tab(workspace_id, cx);
-        }
-    }
-
-    pub(crate) fn add_browser_to_context(
-        &mut self,
-        workspace_id: Uuid,
-        target_tab: Option<Uuid>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tab_id) = target_tab.filter(|tab_id| self.tab_is_navigation_container(*tab_id))
-        {
-            self.new_group_browser(tab_id, cx);
-        } else {
-            self.new_workspace_browser(workspace_id, cx);
-        }
-    }
-
-    pub(crate) fn add_group_to_context(
-        &mut self,
-        workspace_id: Uuid,
-        target_tab: Option<Uuid>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(project_id) =
-            target_tab.and_then(|tab_id| self.project_for_create_target(tab_id))
-        {
-            self.new_project_group(workspace_id, project_id, cx);
-        } else {
-            self.new_workspace_group(workspace_id, cx);
-        }
     }
 
     pub(crate) fn begin_browser_url_edit(

@@ -146,6 +146,8 @@ impl HhApp {
             settings_card(self.render_default_agent_rows(cx)),
             settings_section_title("Agent integration"),
             settings_card(self.render_agent_integration_rows(cx)),
+            settings_section_title("Agent task progress"),
+            settings_card(self.render_agent_progress_rows(cx)),
             settings_section_title("Terminal agents"),
             self.render_terminal_agents_setting(cx),
         ]

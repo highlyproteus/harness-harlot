@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::profile::{TerminalIdentity, TerminalProfile};
-use crate::terminal::PaneStatus;
+use crate::terminal::{PaneProgress, PaneStatus};
 use crate::validation::ValidationError;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -62,6 +62,18 @@ pub struct BotThreadPane {
     /// Epoch milliseconds the pane was last activated; 0 = never.
     #[serde(default)]
     pub activated_ms: u64,
+    /// The agent launch running in the pane. Its exit hook quotes the id, so
+    /// a hook left over from an earlier launch is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<AgentLaunch>,
+}
+
+/// One launch of a bot pane's agent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentLaunch {
+    pub id: Uuid,
+    /// Epoch milliseconds the launch command was issued.
+    pub started_ms: u64,
 }
 
 /// One thread of a bot: a saved or live agent conversation.
@@ -149,6 +161,8 @@ impl SessionSnapshot {
             identity: TerminalIdentity::default(),
             status: PaneStatus::default(),
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
             custom_title: None,
             profile_override: None,
             custom_icon: None,
@@ -157,10 +171,8 @@ impl SessionSnapshot {
             id: Uuid::new_v4(),
             title: "Shell".to_owned(),
             custom_title: None,
-            project_dir: None,
             color: None,
             custom_icon: None,
-            parent_tab: None,
             pinned: false,
             owner_bot: None,
             owner_thread: None,
@@ -174,7 +186,7 @@ impl SessionSnapshot {
             terminal_transports: HashMap::new(),
             workspaces: vec![Workspace {
                 id: Uuid::new_v4(),
-                title: "Workstation 1".to_owned(),
+                title: this_machine_title().to_owned(),
                 color: None,
                 pinned: false,
                 pin_order: 0,
@@ -183,6 +195,8 @@ impl SessionSnapshot {
                 connection: WorkspaceConnection::Local,
                 working_dir: None,
                 kind: WorkspaceKind::Workstation,
+                parent_workstation: None,
+                home: true,
                 instructions: None,
                 owner_bot: None,
                 custom_icon: None,
@@ -193,6 +207,17 @@ impl SessionSnapshot {
     }
 }
 
+/// Default title of the undeletable workstation representing this machine.
+pub const fn this_machine_title() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "This Mac"
+    } else {
+        "This Computer"
+    }
+}
+
+/// A workstation in the sidebar (or, with `WorkspaceKind::Bot`, a bot). Workstations nest
+/// through `parent_workstation`; a nested workstation always runs on its parent's machine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Uuid,
@@ -203,17 +228,26 @@ pub struct Workspace {
     pub pinned: bool,
     #[serde(default)]
     pub pin_order: u32,
-    /// Explicit manual order within the workspace's current pinned group.
+    /// Explicit manual order among siblings in the same pinned partition.
     #[serde(default)]
     pub order: u32,
     #[serde(default)]
     pub active_terminal_count: u32,
     #[serde(default)]
     pub connection: WorkspaceConnection,
+    /// Root folder new terminals open in. `None` inherits the nearest
+    /// ancestor's root; a top-level workstation without one uses the home folder.
     #[serde(default)]
     pub working_dir: Option<String>,
     #[serde(default)]
     pub kind: WorkspaceKind,
+    /// Enclosing workstation; `None` for top-level workstations and bots.
+    #[serde(default)]
+    pub parent_workstation: Option<Uuid>,
+    /// The single top-level local workstation representing this machine. It can
+    /// be renamed but never deleted or nested.
+    #[serde(default)]
+    pub home: bool,
     #[serde(default)]
     pub instructions: Option<String>,
     /// Bot whose delegated workers default to this workstation.
@@ -232,6 +266,63 @@ impl Workspace {
     pub fn is_bot(&self) -> bool {
         self.kind == WorkspaceKind::Bot
     }
+}
+
+/// Nesting level of workstation `id`: 1 for a top-level workstation. `None` when the
+/// workstation is missing or its parent chain is broken or cyclic.
+pub fn workstation_depth(workspaces: &[Workspace], id: Uuid) -> Option<usize> {
+    let mut depth = 0;
+    let mut current = Some(id);
+    while let Some(workstation_id) = current {
+        depth += 1;
+        if depth > workspaces.len() {
+            return None;
+        }
+        current = workspaces
+            .iter()
+            .find(|workspace| workspace.id == workstation_id)?
+            .parent_workstation;
+    }
+    Some(depth)
+}
+
+/// Root folder new terminals of workstation `id` open in: its own `working_dir` or
+/// the nearest ancestor's. `None` means the machine's home folder.
+pub fn effective_working_dir(workspaces: &[Workspace], id: Uuid) -> Option<&str> {
+    let mut current = Some(id);
+    let mut steps = 0;
+    while let Some(workstation_id) = current {
+        steps += 1;
+        if steps > workspaces.len() {
+            return None;
+        }
+        let workspace = workspaces
+            .iter()
+            .find(|workspace| workspace.id == workstation_id)?;
+        if let Some(dir) = workspace.working_dir.as_deref() {
+            return Some(dir);
+        }
+        current = workspace.parent_workstation;
+    }
+    None
+}
+
+/// Every workstation nested anywhere below `id`, parents before their children.
+pub fn workstation_descendants(workspaces: &[Workspace], id: Uuid) -> Vec<Uuid> {
+    let mut found = Vec::new();
+    let mut frontier = vec![id];
+    while let Some(parent) = frontier.pop() {
+        for workspace in workspaces {
+            if workspace.parent_workstation == Some(parent)
+                && workspace.id != id
+                && !found.contains(&workspace.id)
+            {
+                found.push(workspace.id);
+                frontier.push(workspace.id);
+            }
+        }
+    }
+    found
 }
 
 const MAX_TMUX_ID_LEN: usize = 32;
@@ -355,13 +446,9 @@ pub struct Tab {
     #[serde(default)]
     pub custom_title: Option<String>,
     #[serde(default)]
-    pub project_dir: Option<String>,
-    #[serde(default)]
     pub color: Option<AppearanceColor>,
     #[serde(default)]
     pub custom_icon: Option<String>,
-    #[serde(default)]
-    pub parent_tab: Option<Uuid>,
     #[serde(default)]
     pub pinned: bool,
     /// Bot that created this worker tab through `CreateWorker`.
@@ -457,6 +544,15 @@ pub struct Pane {
     /// Ephemeral epoch milliseconds of the last `status` transition; 0 = never.
     #[serde(default)]
     pub status_changed_at_ms: u64,
+    /// The pane reached done, needs input, needs approval, or attention and
+    /// the user has not opened it since (`ClientRequest::MarkPaneSeen`).
+    /// Owned by the session service and kept across restarts.
+    #[serde(default)]
+    pub unseen: bool,
+    /// Task-list progress last reported by the pane's agent; cleared when its
+    /// process exits.
+    #[serde(default)]
+    pub progress: Option<PaneProgress>,
     #[serde(default)]
     pub custom_title: Option<String>,
     #[serde(default)]
@@ -534,12 +630,16 @@ mod tests {
     }
 
     #[test]
-    fn seeded_snapshot_has_a_visible_pane() {
+    fn seeded_snapshot_is_the_home_workstation_with_a_visible_pane() {
         let snapshot = SessionSnapshot::seeded();
         assert_eq!(snapshot.workspaces.len(), 1);
-        assert_eq!(snapshot.workspaces[0].title, "Workstation 1");
-        assert_eq!(snapshot.workspaces[0].tabs.len(), 1);
-        let PaneLayout::Leaf { pane } = &snapshot.workspaces[0].tabs[0].layout else {
+        let home = &snapshot.workspaces[0];
+        assert_eq!(home.title, this_machine_title());
+        assert!(home.home && home.parent_workstation.is_none());
+        assert_eq!(home.kind, WorkspaceKind::Workstation);
+        assert_eq!(home.connection, WorkspaceConnection::Local);
+        assert_eq!(home.tabs.len(), 1);
+        let PaneLayout::Leaf { pane } = &home.tabs[0].layout else {
             panic!("expected leaf");
         };
         assert_eq!(pane.kind, PaneKind::Terminal);
@@ -582,19 +682,58 @@ mod tests {
         assert_eq!(pane.custom_title, None);
         assert_eq!(pane.profile_override, None);
         assert_eq!(snapshot.workspaces[0].working_dir, None);
-        assert_eq!(snapshot.workspaces[0].tabs[0].project_dir, None);
+        assert_eq!(snapshot.workspaces[0].parent_workstation, None);
+        assert!(!snapshot.workspaces[0].home);
+    }
+
+    fn nested(parent: Option<&Workspace>, working_dir: Option<&str>) -> Workspace {
+        let mut workstation = SessionSnapshot::seeded().workspaces.remove(0);
+        workstation.home = false;
+        workstation.parent_workstation = parent.map(|parent| parent.id);
+        workstation.working_dir = working_dir.map(str::to_owned);
+        workstation
     }
 
     #[test]
-    fn workspace_and_project_directories_round_trip() {
-        let mut snapshot = SessionSnapshot::seeded();
-        snapshot.workspaces[0].working_dir = Some("/srv/workstation".to_owned());
-        snapshot.workspaces[0].tabs[0].project_dir = Some("/srv/project".to_owned());
+    fn nested_workstations_inherit_the_nearest_root_and_report_depth_and_descendants() {
+        let root = nested(None, Some("/srv"));
+        let child = nested(Some(&root), None);
+        let grandchild = nested(Some(&child), Some("/srv/app"));
+        let leaf = nested(Some(&grandchild), None);
+        let other = nested(None, None);
+        let workstations = vec![
+            root.clone(),
+            child.clone(),
+            grandchild.clone(),
+            leaf.clone(),
+            other.clone(),
+        ];
 
-        let restored: SessionSnapshot =
-            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert_eq!(effective_working_dir(&workstations, child.id), Some("/srv"));
+        assert_eq!(
+            effective_working_dir(&workstations, leaf.id),
+            Some("/srv/app")
+        );
+        assert_eq!(effective_working_dir(&workstations, other.id), None);
+        assert_eq!(workstation_depth(&workstations, root.id), Some(1));
+        assert_eq!(workstation_depth(&workstations, leaf.id), Some(4));
+        assert_eq!(workstation_depth(&workstations, Uuid::new_v4()), None);
+        assert_eq!(
+            workstation_descendants(&workstations, root.id),
+            vec![child.id, grandchild.id, leaf.id]
+        );
+        assert!(workstation_descendants(&workstations, other.id).is_empty());
+    }
 
-        assert_eq!(restored, snapshot);
+    #[test]
+    fn cyclic_parent_chains_terminate() {
+        let mut first = nested(None, None);
+        let mut second = nested(Some(&first), None);
+        first.parent_workstation = Some(second.id);
+        second.parent_workstation = Some(first.id);
+        let workstations = vec![first.clone(), second];
+        assert_eq!(workstation_depth(&workstations, first.id), None);
+        assert_eq!(effective_working_dir(&workstations, first.id), None);
     }
 }
 
@@ -619,6 +758,7 @@ mod bot_thread_tests {
                 BotThreadPane {
                     session: Some("0193-abc".to_owned()),
                     activated_ms: 7,
+                    launch: None,
                 },
             )]),
         };
@@ -628,6 +768,20 @@ mod bot_thread_tests {
             serde_json::json!({ pane.to_string(): {"session": "0193-abc", "activated_ms": 7} })
         );
         assert_eq!(serde_json::from_value::<BotSpec>(encoded).unwrap(), spec);
+        let mut launched = spec.clone();
+        launched.thread_panes.get_mut(&pane).unwrap().launch = Some(AgentLaunch {
+            id: pane,
+            started_ms: 9,
+        });
+        let encoded = serde_json::to_value(&launched).unwrap();
+        assert_eq!(
+            encoded["thread_panes"][pane.to_string()]["launch"],
+            serde_json::json!({"id": pane, "started_ms": 9})
+        );
+        assert_eq!(
+            serde_json::from_value::<BotSpec>(encoded).unwrap(),
+            launched
+        );
 
         let mut snapshot = SessionSnapshot::seeded();
         assert_eq!(snapshot.workspaces[0].tabs[0].owner_thread, None);

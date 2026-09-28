@@ -201,9 +201,15 @@ impl HhApp {
             }
             "tab" if step == Some(WorkspaceCreationStep::Details) => {
                 if let Some(dialog) = self.editor.modal.workspace_creation_mut() {
+                    let asks_local_root = dialog.asks_local_root();
                     dialog.field = match (dialog.kind, dialog.field) {
                         (WorkspaceCreationKind::SystemSsh, WorkspaceCreationField::Name) => {
                             WorkspaceCreationField::Destination
+                        }
+                        (WorkspaceCreationKind::Local, WorkspaceCreationField::Name)
+                            if asks_local_root =>
+                        {
+                            WorkspaceCreationField::WorkingDir
                         }
                         (WorkspaceCreationKind::Bot, WorkspaceCreationField::Name) => {
                             WorkspaceCreationField::WorkingDir
@@ -302,7 +308,7 @@ impl HhApp {
             (Modal::PaneRename(editor), RenameTarget::Pane) => {
                 (&mut editor.value, &mut editor.replace_on_type)
             }
-            (Modal::GroupRename(editor), RenameTarget::Group) => {
+            (Modal::TabRename(editor), RenameTarget::Tab) => {
                 (&mut editor.value, &mut editor.replace_on_type)
             }
             _ => return,
@@ -316,7 +322,7 @@ impl HhApp {
             "enter" => match target {
                 RenameTarget::Pane => self.submit_rename(cx),
                 RenameTarget::Workspace => self.submit_workspace_rename(cx),
-                RenameTarget::Group => self.submit_group_rename(cx),
+                RenameTarget::Tab => self.submit_tab_rename(cx),
             },
             "escape" => {
                 self.editor.modal = Modal::None;
@@ -576,8 +582,8 @@ impl HhApp {
                 cx.stop_propagation();
                 return;
             }
-            Modal::GroupRename(_) => {
-                self.handle_rename_key(keystroke, RenameTarget::Group, cx);
+            Modal::TabRename(_) => {
+                self.handle_rename_key(keystroke, RenameTarget::Tab, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -673,7 +679,7 @@ impl HhApp {
             Modal::TabMenu(_)
             | Modal::WorkspaceMenu(_)
             | Modal::CreateMenu(_)
-            | Modal::GroupMenu(_)
+            | Modal::TabRowMenu(_)
             | Modal::BotMenu(_)
             | Modal::BotThreadMenu(_)
             | Modal::TerminalImageMenu(_)

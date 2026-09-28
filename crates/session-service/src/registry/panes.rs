@@ -1,7 +1,7 @@
 //! Pane lifecycle: creation, input, identity overrides, and close/reattach.
 use super::{
-    InitialTerminalSpawn, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
-    TerminalRuntimePane, encode_desired_state, ssh_pane_title,
+    InitialTerminalSpawn, ProcessScan, RegistryState, RuntimePane, RuntimePaneBackend,
+    RuntimePaneKind, SessionRegistry, TerminalRuntimePane, encode_desired_state, ssh_pane_title,
 };
 use crate::gallery::import_gallery_image;
 use crate::layout::{
@@ -16,13 +16,15 @@ use crate::registry::bots::{bot_for_pane, bot_spawn_dir, prune_bot_threads};
 use crate::registry::identity::{
     refresh_workspace_activity, resolve_pane_identity, set_pane_runtime_label,
 };
+use crate::registry::recovery::find_window;
 use crate::registry::workspaces::remember_recent_color;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
     AppearanceColor, MAX_PANES, Pane, PaneKind, PaneLayout, PaneStatus, SplitAxis, Tab,
     TerminalIdentity, TerminalModifiers, TerminalMouseAction, TerminalMouseButton, TerminalPoint,
     TerminalProfile, TerminalSelectionKind, WorkspaceConnection, WorkspaceConnectionStatus,
-    normalize_browser_url, normalize_browser_url_or_default, validate_ssh_host,
+    effective_working_dir, normalize_browser_url, normalize_browser_url_or_default,
+    validate_ssh_host,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -104,8 +106,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -121,42 +124,26 @@ impl SessionRegistry {
         result
     }
 
-    pub fn create_group_terminal(&self, target_pane: Uuid) -> Result<Uuid> {
-        let (workspace_id, project_dir) = {
+    /// Adds a terminal to the tab holding `target_pane`, opened in that
+    /// pane's working directory like a split.
+    pub fn create_tab_terminal(&self, target_pane: Uuid) -> Result<Uuid> {
+        {
             let state = self.state.read();
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
             state.require_terminal_layout_pane(target_pane)?;
             state.refuse_bot_pane(target_pane)?;
-            let (workspace, tab) = state
-                .snapshot
-                .workspaces
-                .iter()
-                .find_map(|workspace| {
-                    workspace.tabs.iter().find_map(|tab| {
-                        layout_contains(&tab.layout, target_pane).then_some((workspace, tab))
-                    })
-                })
-                .with_context(|| format!("target pane {target_pane} does not exist"))?;
-            let project_dir = tab.project_dir.clone().or_else(|| {
-                tab.parent_tab.and_then(|parent_id| {
-                    workspace
-                        .tabs
-                        .iter()
-                        .find(|parent| parent.id == parent_id)
-                        .and_then(|parent| parent.project_dir.clone())
-                })
-            });
-            (workspace.id, project_dir)
-        };
+        }
         let new_id = Uuid::new_v4();
-        let cwd = match project_dir.as_deref() {
-            Some(dir) => local_spawn_dir(Some(dir))?,
-            None => self.cwd_for_pane(target_pane)?,
+        let cwd = self.cwd_for_pane(target_pane)?;
+        let workspace_id = self.workspace_for_pane(target_pane)?;
+        let remote_dir = {
+            let state = self.state.read();
+            effective_working_dir(&state.snapshot.workspaces, workspace_id).map(str::to_owned)
         };
         let (session, kind) =
-            self.spawn_pane_for_workspace(new_id, workspace_id, &cwd, project_dir.as_deref())?;
+            self.spawn_pane_for_workspace(new_id, workspace_id, &cwd, remote_dir.as_deref())?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -181,8 +168,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -198,7 +186,7 @@ impl SessionRegistry {
         result
     }
 
-    pub fn create_group_browser(&self, target_pane: Uuid, url: Option<&str>) -> Result<Uuid> {
+    pub fn create_tab_browser(&self, target_pane: Uuid, url: Option<&str>) -> Result<Uuid> {
         let url = normalize_browser_url_or_default(url)?;
         let title = browser_title(&url, None);
         let pane_id = Uuid::new_v4();
@@ -230,6 +218,8 @@ impl SessionRegistry {
             custom_title: None,
             profile_override: None,
             custom_icon: None,
+            unseen: false,
+            progress: None,
         };
         if !add_tab(&mut tab.layout, target_pane, pane, true) {
             bail!("target pane {target_pane} does not exist");
@@ -247,7 +237,7 @@ impl SessionRegistry {
         Ok(pane_id)
     }
 
-    pub fn create_group_gallery(&self, target_pane: Uuid, activate: bool) -> Result<Uuid> {
+    pub fn create_tab_gallery(&self, target_pane: Uuid, activate: bool) -> Result<Uuid> {
         let pane_id = Uuid::new_v4();
         let mut state = self.state.write();
         state.refuse_bot_pane(target_pane)?;
@@ -273,6 +263,8 @@ impl SessionRegistry {
             custom_title: None,
             profile_override: None,
             custom_icon: None,
+            unseen: false,
+            progress: None,
         };
         if !add_tab(&mut tab.layout, target_pane, pane, activate) {
             bail!("target pane {target_pane} does not exist");
@@ -307,7 +299,12 @@ impl SessionRegistry {
                 tab_title: "Terminals".to_owned(),
             }),
             WorkspaceConnection::SystemSsh { destination, .. } => Ok(InitialTerminalSpawn {
-                session: PtySession::spawn_ssh(pane_id, workspace_id, destination, working_dir)?,
+                session: self.spawn_ssh_transport(
+                    pane_id,
+                    workspace_id,
+                    destination,
+                    working_dir,
+                )?,
                 kind: RuntimePaneKind::SystemSsh {
                     host: destination.clone(),
                 },
@@ -337,7 +334,10 @@ impl SessionRegistry {
             if !workspace.tabs.is_empty() {
                 bail!("workstation {workspace_id} already has a terminal layout");
             }
-            (workspace.connection.clone(), workspace.working_dir.clone())
+            (
+                workspace.connection.clone(),
+                effective_working_dir(&state.snapshot.workspaces, workspace_id).map(str::to_owned),
+            )
         };
 
         let pane_id = Uuid::new_v4();
@@ -382,16 +382,16 @@ impl SessionRegistry {
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
+                unseen: false,
+                progress: None,
             };
             workspace.tabs.push(Tab {
                 owner_thread: None,
                 id: Uuid::new_v4(),
                 title: tab_title,
                 custom_title: None,
-                project_dir: None,
                 color: None,
                 custom_icon: None,
-                parent_tab: None,
                 pinned: false,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
@@ -409,8 +409,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -453,7 +454,7 @@ impl SessionRegistry {
         let pane_id = Uuid::new_v4();
         let cwd = fallback_cwd()?;
         let workspace_id = self.workspace_for_pane(target_pane)?;
-        let session = PtySession::spawn_ssh(pane_id, workspace_id, host, None)?;
+        let session = self.spawn_ssh_transport(pane_id, workspace_id, host, None)?;
         let result = (|| {
             let mut state = self.state.write();
             if state.panes.len() >= MAX_PANES {
@@ -471,6 +472,8 @@ impl SessionRegistry {
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
+                unseen: false,
+                progress: None,
             };
             let did_add = state.snapshot.workspaces.iter_mut().any(|workspace| {
                 workspace
@@ -492,8 +495,9 @@ impl SessionRegistry {
                         },
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -532,10 +536,8 @@ impl SessionRegistry {
             id: Uuid::new_v4(),
             title: title.clone(),
             custom_title: None,
-            project_dir: None,
             color: None,
             custom_icon: None,
-            parent_tab: None,
             pinned: false,
             owner_bot: None,
             layout: PaneLayout::Leaf {
@@ -551,6 +553,8 @@ impl SessionRegistry {
                     custom_title: None,
                     profile_override: None,
                     custom_icon: None,
+                    unseen: false,
+                    progress: None,
                 },
             },
         });
@@ -588,10 +592,8 @@ impl SessionRegistry {
             id: Uuid::new_v4(),
             title: "Gallery".to_owned(),
             custom_title: None,
-            project_dir: None,
             color: None,
             custom_icon: None,
-            parent_tab: None,
             pinned: false,
             owner_bot: None,
             layout: PaneLayout::Leaf {
@@ -607,6 +609,8 @@ impl SessionRegistry {
                     custom_title: None,
                     profile_override: None,
                     custom_icon: None,
+                    unseen: false,
+                    progress: None,
                 },
             },
         });
@@ -656,7 +660,7 @@ impl SessionRegistry {
         };
         let pane_id = match (gallery_pane, group_origin) {
             (Some(pane_id), _) => pane_id,
-            (None, Some(origin_pane)) => self.create_group_gallery(origin_pane, false)?,
+            (None, Some(origin_pane)) => self.create_tab_gallery(origin_pane, false)?,
             (None, None) => self.create_gallery_tab(workspace_id)?,
         };
         Ok((path, pane_id))
@@ -721,7 +725,7 @@ impl SessionRegistry {
             Some(runtime) => runtime.terminal().map(|terminal| {
                 (
                     terminal.session.terminal_title(),
-                    terminal.detected_command_profile,
+                    terminal.process_scan.agent(),
                     terminal.location(),
                 )
             }),
@@ -775,7 +779,7 @@ impl SessionRegistry {
             Some(runtime) => runtime.terminal().map(|terminal| {
                 (
                     terminal.session.terminal_title(),
-                    terminal.detected_command_profile,
+                    terminal.process_scan.agent(),
                     terminal.location(),
                 )
             }),
@@ -814,6 +818,7 @@ impl SessionRegistry {
             }
             let was_terminal = find_pane_in_snapshot(&state.snapshot, pane_id)
                 .is_some_and(|pane| matches!(pane.kind, PaneKind::Terminal));
+            state.forget_bot_launch(pane_id);
             let runtime = state.panes.get(&pane_id);
             let session = runtime
                 .and_then(RuntimePane::terminal)
@@ -854,12 +859,7 @@ impl SessionRegistry {
             if let Some(remaining) = remaining {
                 workspace.tabs[tab_index].layout = remaining;
             } else {
-                let removed_tab = workspace.tabs.remove(tab_index);
-                for tab in &mut workspace.tabs {
-                    if tab.parent_tab == Some(removed_tab.id) {
-                        tab.parent_tab = None;
-                    }
-                }
+                workspace.tabs.remove(tab_index);
             }
             prune_bot_threads(workspace);
             if was_terminal {
@@ -889,7 +889,7 @@ impl SessionRegistry {
     /// session that no longer exists fails here instead of registering a fake
     /// live tab.
     pub fn reattach_pane(&self, pane_id: Uuid) -> Result<()> {
-        let (kind, cwd, workspace_id, managed_tmux, bot_id) = {
+        let (kind, cwd, workspace_id, saved_tmux, bot_id) = {
             let state = self.state.read();
             let runtime = state.terminal_pane(pane_id)?;
             if runtime.exit_status.is_none() {
@@ -908,28 +908,57 @@ impl SessionRegistry {
                 runtime.kind.clone(),
                 cwd,
                 workspace_id,
-                runtime.session.tmux_ids().is_some(),
+                runtime
+                    .session
+                    .tmux_ids()
+                    .map(|(window, pane)| (window.to_owned(), pane.to_owned())),
                 bot_id,
             )
         };
-        let session = match &kind {
-            RuntimePaneKind::Local if managed_tmux => PtySession::spawn_tmux(
-                pane_id,
-                workspace_id,
-                bot_id,
-                &cwd,
-                &self.client_for_workspace(workspace_id)?,
-            )?,
-            RuntimePaneKind::Local => PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)?,
-            RuntimePaneKind::SystemSsh { host } => {
-                PtySession::spawn_ssh(pane_id, workspace_id, host, None)?
+        // A managed tmux pane gets its still-running window back (one left
+        // unattached by recovery) or, if its program exited, a new window.
+        // Plain PTY panes get a new shell; SSH panes reattach their remote
+        // window when it still runs; a user tmux session is attached again
+        // with its programs still running.
+        let (session, behind) = match &kind {
+            RuntimePaneKind::Local if saved_tmux.is_some() => {
+                let client = self.client_for_workspace(workspace_id)?;
+                let listed = client.list_panes()?;
+                match find_window(&listed, saved_tmux.as_ref(), pane_id) {
+                    Some(existing) => (
+                        PtySession::attach_tmux(
+                            pane_id,
+                            Arc::clone(&client),
+                            existing.window_id.clone(),
+                            existing.pane_id.clone(),
+                            existing.pane_pid,
+                        )?,
+                        Reattached::RunningProgram,
+                    ),
+                    None => (
+                        PtySession::spawn_tmux(pane_id, workspace_id, bot_id, &cwd, &client)?,
+                        Reattached::FreshShell,
+                    ),
+                }
             }
-            RuntimePaneKind::TmuxLocal { session_id } => {
-                PtySession::spawn_tmux_local(pane_id, session_id)?
-            }
-            RuntimePaneKind::TmuxSystemSsh { host, session_id } => {
-                PtySession::spawn_tmux_ssh(pane_id, host, session_id)?
-            }
+            RuntimePaneKind::Local => (
+                PtySession::spawn_local(pane_id, workspace_id, bot_id, &cwd)?,
+                Reattached::FreshShell,
+            ),
+            RuntimePaneKind::SystemSsh { host } => self
+                .spawn_ssh_sessions(workspace_id, host, None, &[pane_id])?
+                .into_iter()
+                .next()
+                .map(|(_, session, behind)| (session, behind))
+                .context("no SSH terminal was started")?,
+            RuntimePaneKind::TmuxLocal { session_id } => (
+                PtySession::spawn_tmux_local(pane_id, session_id)?,
+                Reattached::RunningProgram,
+            ),
+            RuntimePaneKind::TmuxSystemSsh { host, session_id } => (
+                PtySession::spawn_tmux_ssh(pane_id, host, session_id)?,
+                Reattached::RunningProgram,
+            ),
         };
         if kind.is_runtime_only()
             && let Err(error) = session.confirm_live_for_tmux_attach()
@@ -938,21 +967,20 @@ impl SessionRegistry {
             return Err(error);
         }
         let mut state = self.state.write();
-        let runtime = state.terminal_pane_mut(pane_id)?;
-        let previous = std::mem::replace(&mut runtime.session, session);
-        runtime.exit_status = None;
-        runtime.recovered = false;
-        runtime.omp_title_status = None;
-        let shell_label = kind.shell_label();
-        set_pane_runtime_label(&mut state.snapshot, pane_id, false, None, &shell_label);
-        state.set_pane_status(pane_id, PaneStatus::Idle);
+        let previous = state.install_reattached_session(pane_id, session, behind)?;
+        if let RuntimePaneKind::SystemSsh { host } = &kind
+            && let Some(pane) = find_pane_mut_in_snapshot(&mut state.snapshot, pane_id)
+        {
+            pane.title = ssh_pane_title(host);
+        }
         refresh_workspace_activity(&mut state);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
         let _ = previous.terminate_and_wait();
         drop(previous);
-        if let Some(bot_id) = bot_id {
+        // Only a fresh shell needs the bot's agent typed into it again.
+        if let Some(bot_id) = bot_id.filter(|_| behind == Reattached::FreshShell) {
             self.relaunch_recovered_bot(bot_id, pane_id);
         }
         self.write_snapshot(&bytes)
@@ -1118,6 +1146,42 @@ impl SessionRegistry {
 
     pub fn pane_process_id(&self, pane_id: Uuid) -> Result<Option<u32>> {
         Ok(self.pane(pane_id)?.process_id())
+    }
+}
+
+/// What a reattach put behind a pane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Reattached {
+    /// A new shell: the old program, its status and its progress are gone.
+    FreshShell,
+    /// The program that was running all along, attached again.
+    RunningProgram,
+}
+
+impl RegistryState {
+    /// Puts `session` behind terminal pane `pane_id` after a reattach and
+    /// returns the session it replaces. A fresh shell starts Idle without
+    /// progress; a still-running program keeps both, and its next omp title
+    /// is a baseline rather than news.
+    pub(crate) fn install_reattached_session(
+        &mut self,
+        pane_id: Uuid,
+        session: Arc<PtySession>,
+        behind: Reattached,
+    ) -> Result<Arc<PtySession>> {
+        let runtime = self.terminal_pane_mut(pane_id)?;
+        let previous = std::mem::replace(&mut runtime.session, session);
+        runtime.exit_status = None;
+        runtime.recovered = false;
+        runtime.omp_title_status = None;
+        runtime.title_baseline_pending = behind == Reattached::RunningProgram;
+        let shell_label = runtime.kind.shell_label();
+        set_pane_runtime_label(&mut self.snapshot, pane_id, false, None, &shell_label);
+        if behind == Reattached::FreshShell {
+            self.clear_pane_progress(pane_id);
+            self.set_pane_status(pane_id, PaneStatus::Idle);
+        }
+        Ok(previous)
     }
 }
 

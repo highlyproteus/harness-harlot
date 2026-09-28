@@ -365,6 +365,8 @@ mod tests {
     fn renamed_tab_hides_shell_metadata_that_would_displace_its_name() {
         let mut pane = Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::new_v4(),
             kind: hh_protocol::PaneKind::Terminal,

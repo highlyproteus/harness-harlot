@@ -19,7 +19,16 @@
 /// bump. Because the
 /// handshake is strict equality, a bump orphans every live service until
 /// the desktop relaunches them.
-pub const PROTOCOL_VERSION: u16 = 47;
+pub const PROTOCOL_VERSION: u16 = 51;
+
+/// Claude Code `PostToolUse` matcher of the task-progress hook: the task
+/// tools of current versions plus `TodoWrite` for older ones.
+pub const CLAUDE_PROGRESS_HOOK_MATCHER: &str = "TodoWrite|TaskCreate|TaskUpdate";
+/// Codex `PostToolUse` matcher of the task-progress hook.
+pub const CODEX_PROGRESS_HOOK_MATCHER: &str = "^update_plan$";
+
+/// Deepest nesting of workstations: a top-level workstation is level 1.
+pub const MAX_WORKSTATION_DEPTH: usize = 4;
 
 pub const MAX_SSH_HOST_LEN: usize = 253;
 pub const MAX_SSH_INPUT_LEN: usize = MAX_SSH_HOST_LEN + 16;

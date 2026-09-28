@@ -30,13 +30,17 @@ pub(crate) fn execute(command: &AgentCommand) -> Result<Value> {
             terminal::execute_terminal(&command.context, terminal_command)
         }
         AgentAction::Workstation(workstation) => terminal::execute_workstation(workstation),
-        AgentAction::Mcp | AgentAction::Skill(_) => {
+        AgentAction::Mcp | AgentAction::Skill(_) | AgentAction::Progress(_) => {
             bail!("agent action must be dispatched directly")
         }
     }
 }
 
+/// Prints a command's result; a `null` result prints nothing.
 pub(crate) fn print_result(result: &Value, json_output: bool) -> Result<()> {
+    if result.is_null() {
+        return Ok(());
+    }
     if json_output {
         println!("{}", serde_json::to_string_pretty(result)?);
     } else if let Some(text) = result.as_str() {
@@ -150,10 +154,10 @@ fn visit_panes(layout: &PaneLayout, visitor: &mut impl FnMut(&Pane)) {
     }
 }
 
-fn browser_open(context: &AgentContext, url: Option<String>, force_group: bool) -> Result<Value> {
+fn browser_open(context: &AgentContext, url: Option<String>, split: bool) -> Result<Value> {
     let mut client = client()?;
-    let request = if force_group || context.pane_id.is_some() {
-        ClientRequest::CreateGroupBrowser {
+    let request = if split || context.pane_id.is_some() {
+        ClientRequest::CreateTabBrowser {
             target_pane: required_pane(context)?,
             url,
         }

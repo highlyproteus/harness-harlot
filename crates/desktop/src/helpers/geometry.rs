@@ -430,6 +430,8 @@ mod tests {
     fn pane_geometry_tracks_narrow_medium_and_wide_windows_without_fixed_columns() {
         let pane = Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(10),
             kind: hh_protocol::PaneKind::Terminal,
@@ -597,6 +599,8 @@ mod tests {
     fn split_geometry_accounts_for_the_divider_and_each_panes_chrome() {
         let first = Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(21),
             kind: hh_protocol::PaneKind::Terminal,
@@ -611,6 +615,8 @@ mod tests {
         };
         let second = Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(22),
             kind: hh_protocol::PaneKind::Terminal,
@@ -663,6 +669,8 @@ mod tests {
     fn mixed_pane_sizes_include_only_active_terminals() {
         let pane = |id, kind| Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(id),
             kind,
@@ -738,6 +746,8 @@ mod tests {
     fn pane_size_projection_uses_each_active_terminal_zoom() {
         let first = Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(21),
             kind: hh_protocol::PaneKind::Terminal,
@@ -752,6 +762,8 @@ mod tests {
         };
         let second = Pane {
             status_changed_at_ms: 0,
+            unseen: false,
+            progress: None,
 
             id: Uuid::from_u128(22),
             kind: hh_protocol::PaneKind::Terminal,

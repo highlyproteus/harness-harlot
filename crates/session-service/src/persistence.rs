@@ -9,21 +9,29 @@ use crate::bots::valid_session_id;
 use crate::layout::collect_pane_ids;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    AppearanceColor, AppearanceSettings, BotSettings, BotSpec, MAX_BROWSER_URL_LEN, Pane, PaneKind,
-    PaneLayout, SessionSnapshot, SplitAxis, Tab, TerminalIdentity, TerminalProfile, Workspace,
-    WorkspaceConnection, WorkspaceConnectionStatus, WorkspaceKind, validate_ssh_host,
+    AppearanceColor, AppearanceSettings, BotSettings, BotSpec, MAX_BROWSER_URL_LEN,
+    MAX_WORKSTATION_DEPTH, Pane, PaneKind, PaneLayout, PaneProgress, SessionSnapshot, SplitAxis,
+    Tab, TerminalIdentity, TerminalProfile, Workspace, WorkspaceConnection,
+    WorkspaceConnectionStatus, WorkspaceKind, this_machine_title, validate_ssh_host,
     validate_workspace_dir,
 };
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u16 = 15;
+/// Schema 17 added the pane `unseen` flag and task `progress`.
+const SCHEMA_VERSION: u16 = 17;
 /// Snapshots older than this still carry the retired Harbor Blue defaults.
 const DARK_GRAY_DEFAULTS_SCHEMA_VERSION: u16 = 13;
+/// Snapshots older than this still carry project tabs and have no home
+/// workstation; `migrate_projects_and_home` converts them.
+const NESTED_WORKSTATIONS_SCHEMA_VERSION: u16 = 16;
 const MIN_SUPPORTED_SCHEMA_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024;
-pub(crate) const MAX_WORKSPACES: usize = 16;
+/// Most workstations, nested ones included. Every migrated project becomes a
+/// nested workstation and holds at least one pane, so the pane limit plus the
+/// former workstation limit always fits.
+pub(crate) const MAX_WORKSPACES: usize = 64;
 pub(crate) const MAX_TABS_PER_WORKSPACE: usize = 32;
 pub(crate) const MAX_BOTS: usize = 32;
 /// Title of a thread tab created by the per-bot workspace migration.
@@ -41,9 +49,13 @@ pub(crate) struct RecoveredState {
     pub cwd_by_pane: HashMap<Uuid, PathBuf>,
     pub tmux_by_pane: HashMap<Uuid, (String, String)>,
     pub offline_panes: HashSet<Uuid>,
-    /// Panes migrated out of the retired shared Bots workspace, mapped to
-    /// that workspace's id: their tmux windows still live in its session.
+    /// Panes whose tmux windows still live in another workstation's session,
+    /// mapped to that workstation's id: panes of the retired shared Bots
+    /// workspace and panes of projects migrated into nested workstations.
     pub legacy_tmux_workspace: HashMap<Uuid, Uuid>,
+    /// `(from, to)` workstation pairs whose gallery directory contents must be
+    /// copied because migrated project tabs moved gallery panes into `to`.
+    pub gallery_copies: Vec<(Uuid, Uuid)>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,11 +72,6 @@ impl SnapshotStore {
             #[cfg(test)]
             fail_before_replace: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
-    }
-
-    /// The directory holding the snapshot: the service's state directory.
-    pub(crate) fn directory(&self) -> Option<&Path> {
-        self.path.parent()
     }
 
     pub(crate) fn load_or_quarantine(&self) -> Result<Option<RecoveredState>> {
@@ -101,8 +108,7 @@ impl SnapshotStore {
             .with_context(|| format!("read snapshot {}", self.path.display()))?;
         let mut desired: DesiredState =
             serde_json::from_slice(&bytes).context("decode recovery snapshot")?;
-        desired.drop_legacy_assistants();
-        desired.split_legacy_bots();
+        desired.migrate();
         desired.validate()?;
         Ok(desired.into_runtime())
     }
@@ -188,37 +194,7 @@ impl SnapshotStore {
     }
 
     fn quarantine(&self) -> Result<PathBuf> {
-        let parent = self.path.parent().context("snapshot path has no parent")?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let quarantined = parent.join(format!(
-            "sessions.corrupt-{timestamp}-{}.json",
-            Uuid::new_v4()
-        ));
-        fs::rename(&self.path, &quarantined).with_context(|| {
-            format!(
-                "quarantine corrupt snapshot {} as {}",
-                self.path.display(),
-                quarantined.display()
-            )
-        })?;
-        let metadata = fs::symlink_metadata(&quarantined)
-            .context("inspect quarantined snapshot without following links")?;
-        if metadata.is_file() {
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&quarantined)
-                .context("open quarantined snapshot without following links")?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .context("restrict opened quarantined snapshot")?;
-        }
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .context("sync quarantine directory")?;
-        Ok(quarantined)
+        quarantine_private_file(&self.path, "sessions")
     }
 
     #[cfg(test)]
@@ -226,6 +202,43 @@ impl SnapshotStore {
         self.fail_before_replace
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Moves an invalid state file aside as `<stem>.corrupt-<ms>-<uuid>.json` in
+/// its directory, restricting the moved file to its owner, so the service can
+/// start fresh while the bytes stay available for inspection.
+pub(crate) fn quarantine_private_file(path: &Path, stem: &str) -> Result<PathBuf> {
+    let parent = path.parent().context("state file path has no parent")?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let quarantined = parent.join(format!(
+        "{stem}.corrupt-{timestamp}-{}.json",
+        Uuid::new_v4()
+    ));
+    fs::rename(path, &quarantined).with_context(|| {
+        format!(
+            "quarantine corrupt state file {} as {}",
+            path.display(),
+            quarantined.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(&quarantined)
+        .context("inspect quarantined state file without following links")?;
+    if metadata.is_file() {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&quarantined)
+            .context("open quarantined state file without following links")?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .context("restrict opened quarantined state file")?;
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("sync quarantine directory")?;
+    Ok(quarantined)
 }
 
 pub(crate) fn default_snapshot_path() -> Result<PathBuf> {
@@ -263,9 +276,13 @@ struct DesiredState {
     #[expect(dead_code, reason = "parsed only so pre-removal snapshots still load")]
     tmux: RetiredTmuxSettings,
     workspaces: Vec<DesiredWorkspace>,
-    /// Filled by `split_legacy_bots`; see `RecoveredState::legacy_tmux_workspace`.
+    /// Filled by `split_legacy_bots` and `migrate_projects`; see
+    /// `RecoveredState::legacy_tmux_workspace`.
     #[serde(skip)]
     legacy_tmux_workspace: HashMap<Uuid, Uuid>,
+    /// Filled by `migrate_projects`; see `RecoveredState::gallery_copies`.
+    #[serde(skip)]
+    gallery_copies: Vec<(Uuid, Uuid)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -287,6 +304,10 @@ struct DesiredWorkspace {
     working_dir: Option<String>,
     #[serde(default)]
     kind: DesiredWorkspaceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_workstation: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    home: bool,
     #[serde(default)]
     instructions: Option<String>,
     #[serde(default)]
@@ -319,13 +340,16 @@ struct DesiredTab {
     title: String,
     #[serde(default)]
     custom_title: Option<String>,
-    #[serde(default)]
+    /// Project directory of a schema-15 project tab, turned into a nested
+    /// workstation by `migrate_projects`. Never written back.
+    #[serde(default, skip_serializing)]
     project_dir: Option<String>,
     #[serde(default)]
     color: Option<AppearanceColor>,
     #[serde(default)]
     custom_icon: Option<String>,
-    #[serde(default)]
+    /// Project owning a schema-15 child tab. Never written back.
+    #[serde(default, skip_serializing)]
     parent_tab: Option<Uuid>,
     #[serde(default)]
     pinned: bool,
@@ -380,6 +404,11 @@ struct DesiredPane {
     tmux_window: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tmux_pane: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unseen: bool,
+    /// Boxed: rarely present, and it would dominate the layout enum's size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress: Option<Box<PaneProgress>>,
 }
 
 /// Persisted pane kinds, including the removed Assistant kind that
@@ -418,13 +447,36 @@ impl DesiredPaneKind {
 }
 
 impl DesiredState {
+    /// Upgrades an older snapshot to the current schema in memory.
+    fn migrate(&mut self) {
+        self.drop_legacy_assistants();
+        self.split_legacy_bots();
+        if self.schema_version < NESTED_WORKSTATIONS_SCHEMA_VERSION {
+            self.migrate_projects();
+            self.choose_home();
+            for tab in self
+                .workspaces
+                .iter_mut()
+                .flat_map(|workspace| &mut workspace.tabs)
+            {
+                if tab
+                    .custom_title
+                    .as_deref()
+                    .is_some_and(|title| numbered_title(title, "Group"))
+                {
+                    tab.custom_title = None;
+                }
+            }
+        }
+    }
+
     /// Removes the retired pi Assistant from a schema-13 snapshot: its
     /// workspaces, its panes (collapsing their layouts) and tabs left empty.
+    /// A snapshot left without workstations gains an empty home later, in
+    /// `choose_home`.
     fn drop_legacy_assistants(&mut self) {
-        let before = self.workspaces.len();
         self.workspaces
             .retain(|workspace| workspace.kind != DesiredWorkspaceKind::Assistant);
-        let dropped_workspaces = self.workspaces.len() != before;
         for workspace in &mut self.workspaces {
             workspace.tabs = std::mem::take(&mut workspace.tabs)
                 .into_iter()
@@ -433,42 +485,183 @@ impl DesiredState {
                     Some(tab)
                 })
                 .collect();
-            let tab_ids = workspace
-                .tabs
-                .iter()
-                .map(|tab| tab.id)
-                .collect::<HashSet<_>>();
-            for tab in &mut workspace.tabs {
-                if tab
-                    .parent_tab
-                    .is_some_and(|parent| !tab_ids.contains(&parent))
-                {
-                    tab.parent_tab = None;
-                }
-            }
         }
-        let has_workstation = self
+    }
+
+    /// Turns every schema-15 project tab of a workstation into a nested
+    /// workstation holding the project tab and its child tabs, rooted at the
+    /// project directory and running on the parent's machine.
+    fn migrate_projects(&mut self) {
+        let mut next_order = self
             .workspaces
             .iter()
-            .any(|workspace| workspace.kind == DesiredWorkspaceKind::Workstation);
-        if dropped_workspaces && !has_workstation {
-            self.workspaces.push(DesiredWorkspace {
-                id: Uuid::new_v4(),
-                title: "Workstation 1".to_owned(),
-                color: None,
-                pinned: false,
-                pin_order: 0,
-                order: 1,
-                connection: WorkspaceConnection::Local,
-                working_dir: None,
-                kind: DesiredWorkspaceKind::Workstation,
-                instructions: None,
-                owner_bot: None,
-                custom_icon: None,
-                bot: None,
-                tabs: Vec::new(),
-            });
+            .filter(|workspace| !workspace.pinned)
+            .map(|workspace| workspace.order)
+            .max()
+            .unwrap_or(0);
+        let mut next_pin_order = self
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.pinned)
+            .map(|workspace| workspace.pin_order)
+            .max()
+            .unwrap_or(0);
+        let mut nested = Vec::new();
+        for workspace in &mut self.workspaces {
+            let tabs = std::mem::take(&mut workspace.tabs);
+            if workspace.kind != DesiredWorkspaceKind::Workstation {
+                workspace.tabs = tabs
+                    .into_iter()
+                    .map(|mut tab| {
+                        tab.project_dir = None;
+                        tab.parent_tab = None;
+                        tab
+                    })
+                    .collect();
+                continue;
+            }
+            let project_ids = tabs
+                .iter()
+                .filter(|tab| tab.parent_tab.is_none() && tab.project_dir.is_some())
+                .map(|tab| tab.id)
+                .collect::<HashSet<_>>();
+            let mut projects = Vec::new();
+            let mut children: HashMap<Uuid, Vec<DesiredTab>> = HashMap::new();
+            for mut tab in tabs {
+                let parent = tab.parent_tab.take();
+                if parent.is_none() && tab.project_dir.is_some() {
+                    projects.push(tab);
+                } else if let Some(parent) = parent.filter(|parent| project_ids.contains(parent)) {
+                    tab.project_dir = None;
+                    children.entry(parent).or_default().push(tab);
+                } else {
+                    tab.project_dir = None;
+                    workspace.tabs.push(tab);
+                }
+            }
+            for mut root in projects {
+                let working_dir = root.project_dir.take();
+                let title = root
+                    .custom_title
+                    .take()
+                    .unwrap_or_else(|| root.title.clone());
+                let pinned = std::mem::take(&mut root.pinned);
+                let (order, pin_order) = if pinned {
+                    next_pin_order = next_pin_order.saturating_add(1);
+                    (0, next_pin_order)
+                } else {
+                    next_order = next_order.saturating_add(1);
+                    (next_order, 0)
+                };
+                let mut child = DesiredWorkspace {
+                    id: Uuid::new_v4(),
+                    title,
+                    color: root.color.take(),
+                    pinned,
+                    pin_order,
+                    order,
+                    connection: match &workspace.connection {
+                        WorkspaceConnection::Local => WorkspaceConnection::Local,
+                        WorkspaceConnection::SystemSsh { destination, .. } => {
+                            WorkspaceConnection::SystemSsh {
+                                destination: destination.clone(),
+                                status: WorkspaceConnectionStatus::Offline,
+                            }
+                        }
+                    },
+                    working_dir,
+                    kind: DesiredWorkspaceKind::Workstation,
+                    parent_workstation: Some(workspace.id),
+                    home: false,
+                    instructions: None,
+                    owner_bot: None,
+                    custom_icon: root.custom_icon.take(),
+                    bot: None,
+                    tabs: Vec::new(),
+                };
+                let root_children = children.remove(&root.id).unwrap_or_default();
+                child.tabs.push(root);
+                child.tabs.extend(root_children);
+                let mut moves_gallery = false;
+                for tab in &child.tabs {
+                    tab.layout.visit_panes(&mut |pane| {
+                        if pane.tmux_window.is_some() {
+                            self.legacy_tmux_workspace.insert(pane.id, workspace.id);
+                        }
+                        moves_gallery |= pane.kind == DesiredPaneKind::Gallery;
+                    });
+                }
+                if moves_gallery {
+                    self.gallery_copies.push((workspace.id, child.id));
+                }
+                nested.push(child);
+            }
         }
+        self.workspaces.extend(nested);
+    }
+
+    /// Marks the first local top-level workstation in display order as this
+    /// machine's home, or appends an empty one when there is none.
+    fn choose_home(&mut self) {
+        if self.workspaces.iter().any(|workspace| workspace.home) {
+            return;
+        }
+        let home = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| {
+                workspace.kind == DesiredWorkspaceKind::Workstation
+                    && workspace.connection == WorkspaceConnection::Local
+                    && workspace.parent_workstation.is_none()
+                    && workspace.owner_bot.is_none()
+            })
+            .min_by_key(|(index, workspace)| {
+                (
+                    !workspace.pinned,
+                    if workspace.pinned {
+                        workspace.pin_order
+                    } else {
+                        workspace.order
+                    },
+                    *index,
+                )
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = home {
+            let workspace = &mut self.workspaces[index];
+            workspace.home = true;
+            if numbered_title(&workspace.title, "Workstation") {
+                this_machine_title().clone_into(&mut workspace.title);
+            }
+            return;
+        }
+        let order = self
+            .workspaces
+            .iter()
+            .filter(|workspace| !workspace.pinned)
+            .map(|workspace| workspace.order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.workspaces.push(DesiredWorkspace {
+            id: Uuid::new_v4(),
+            title: this_machine_title().to_owned(),
+            color: None,
+            pinned: false,
+            pin_order: 0,
+            order,
+            connection: WorkspaceConnection::Local,
+            working_dir: None,
+            kind: DesiredWorkspaceKind::Workstation,
+            parent_workstation: None,
+            home: true,
+            instructions: None,
+            owner_bot: None,
+            custom_icon: None,
+            bot: None,
+            tabs: Vec::new(),
+        });
     }
 
     /// Splits the retired shared Bots workspace of a schema-14 snapshot into
@@ -534,6 +727,8 @@ impl DesiredState {
                     connection: WorkspaceConnection::Local,
                     working_dir: tab.project_dir,
                     kind: DesiredWorkspaceKind::Bot,
+                    parent_workstation: None,
+                    home: false,
                     instructions: None,
                     owner_bot: None,
                     custom_icon: tab.custom_icon,
@@ -577,6 +772,8 @@ impl DesiredState {
                         WorkspaceKind::Workstation => DesiredWorkspaceKind::Workstation,
                         WorkspaceKind::Bot => DesiredWorkspaceKind::Bot,
                     },
+                    parent_workstation: workspace.parent_workstation,
+                    home: workspace.home,
                     instructions: workspace.instructions.clone(),
                     owner_bot: workspace.owner_bot,
                     custom_icon: workspace.custom_icon.clone(),
@@ -589,10 +786,10 @@ impl DesiredState {
                                 id: tab.id,
                                 title: tab.title.clone(),
                                 custom_title: tab.custom_title.clone(),
-                                project_dir: tab.project_dir.clone(),
+                                project_dir: None,
                                 color: tab.color,
                                 custom_icon: tab.custom_icon.clone(),
-                                parent_tab: tab.parent_tab,
+                                parent_tab: None,
                                 pinned: tab.pinned,
                                 bot: None,
                                 owner_bot: tab.owner_bot,
@@ -619,6 +816,7 @@ impl DesiredState {
             tmux: RetiredTmuxSettings::default(),
             workspaces,
             legacy_tmux_workspace: HashMap::new(),
+            gallery_copies: Vec::new(),
         })
     }
 
@@ -651,10 +849,8 @@ impl DesiredState {
                         id: tab.id,
                         title: tab.title,
                         custom_title: tab.custom_title,
-                        project_dir: tab.project_dir,
                         color: tab.color,
                         custom_icon: tab.custom_icon,
-                        parent_tab: tab.parent_tab,
                         pinned: tab.pinned,
                         owner_bot: tab.owner_bot,
                         owner_thread: tab.owner_thread,
@@ -695,6 +891,8 @@ impl DesiredState {
                             unreachable!("legacy workspaces are migrated before recovery")
                         }
                     },
+                    parent_workstation: workspace.parent_workstation,
+                    home: workspace.home,
                     instructions: workspace.instructions,
                     owner_bot: workspace.owner_bot,
                     custom_icon: workspace.custom_icon,
@@ -715,6 +913,7 @@ impl DesiredState {
             tmux_by_pane,
             offline_panes,
             legacy_tmux_workspace: self.legacy_tmux_workspace,
+            gallery_copies: self.gallery_copies,
         }
     }
 
@@ -738,6 +937,7 @@ impl DesiredState {
         if workstations == 0 || workstations > MAX_WORKSPACES {
             bail!("snapshot must contain 1 to {MAX_WORKSPACES} workstations");
         }
+        self.validate_nesting()?;
         if count_kind(DesiredWorkspaceKind::Bots) > 0 {
             bail!("the legacy Bots workspace must be split before validation");
         }
@@ -783,19 +983,14 @@ impl DesiredState {
             if let Some(bot) = &workspace.bot {
                 validate_bot(bot)?;
             }
-            let tabs_by_id = workspace
-                .tabs
-                .iter()
-                .map(|tab| (tab.id, tab))
-                .collect::<HashMap<_, _>>();
             for tab in &workspace.tabs {
                 validate_id(tab.id, &mut ids)?;
                 validate_title(&tab.title, "tab")?;
                 if let Some(name) = &tab.custom_title {
-                    validate_title(name, "group")?;
+                    validate_title(name, "tab")?;
                 }
-                if let Some(project_dir) = &tab.project_dir {
-                    validate_workspace_dir(project_dir).map_err(anyhow::Error::from)?;
+                if tab.project_dir.is_some() || tab.parent_tab.is_some() {
+                    bail!("project tab {} must be migrated before validation", tab.id);
                 }
                 if let Some(icon) = &tab.custom_icon {
                     validate_custom_icon_id(icon)?;
@@ -806,16 +1001,6 @@ impl DesiredState {
                         tab.id
                     );
                 }
-                if let Some(parent_id) = tab.parent_tab {
-                    let valid_parent = parent_id != tab.id
-                        && tab.project_dir.is_none()
-                        && tabs_by_id.get(&parent_id).is_some_and(|parent| {
-                            parent.parent_tab.is_none() && parent.project_dir.is_some()
-                        });
-                    if !valid_parent {
-                        bail!("tab {} has an invalid parent tab", tab.id);
-                    }
-                }
                 tab.layout.validate(1, &mut ids, &mut panes)?;
             }
         }
@@ -824,6 +1009,83 @@ impl DesiredState {
         }
         Ok(())
     }
+
+    /// Checks the home workstation and the nesting tree: exactly one home
+    /// (local, top-level, not a bot); every parent exists and is a
+    /// workstation on the same machine; no cycles; depth within the limit.
+    fn validate_nesting(&self) -> Result<()> {
+        let by_id = self
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id, workspace))
+            .collect::<HashMap<_, _>>();
+        let mut homes = 0;
+        for workspace in &self.workspaces {
+            let is_workstation = workspace.kind == DesiredWorkspaceKind::Workstation;
+            if workspace.home {
+                homes += 1;
+                if !is_workstation
+                    || workspace.connection != WorkspaceConnection::Local
+                    || workspace.parent_workstation.is_some()
+                {
+                    bail!("the home workstation must be a local top-level workstation");
+                }
+            }
+            let Some(parent_id) = workspace.parent_workstation else {
+                continue;
+            };
+            if !is_workstation || workspace.owner_bot.is_some() {
+                bail!("workspace {} cannot be nested", workspace.id);
+            }
+            let parent = by_id
+                .get(&parent_id)
+                .filter(|parent| parent.kind == DesiredWorkspaceKind::Workstation)
+                .with_context(|| format!("workstation {} has an invalid parent", workspace.id))?;
+            let same_machine = match (&parent.connection, &workspace.connection) {
+                (WorkspaceConnection::Local, WorkspaceConnection::Local) => true,
+                (
+                    WorkspaceConnection::SystemSsh {
+                        destination: parent_destination,
+                        ..
+                    },
+                    WorkspaceConnection::SystemSsh { destination, .. },
+                ) => parent_destination == destination,
+                _ => false,
+            };
+            if !same_machine {
+                bail!(
+                    "workstation {} must run on its parent's machine",
+                    workspace.id
+                );
+            }
+            let mut depth = 1;
+            let mut current = Some(parent_id);
+            while let Some(id) = current {
+                depth += 1;
+                if id == workspace.id || depth > MAX_WORKSTATION_DEPTH {
+                    bail!(
+                        "workstation {} nests deeper than {MAX_WORKSTATION_DEPTH} levels",
+                        workspace.id
+                    );
+                }
+                current = by_id.get(&id).and_then(|parent| parent.parent_workstation);
+            }
+        }
+        if homes != 1 {
+            bail!("snapshot must contain exactly one home workstation");
+        }
+        Ok(())
+    }
+}
+
+/// Whether `title` is `<prefix> <number>`, e.g. a generated "Workstation 2".
+fn numbered_title(title: &str, prefix: &str) -> bool {
+    title
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix(' '))
+        .is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 impl DesiredLayout {
@@ -911,6 +1173,18 @@ impl DesiredLayout {
                 first: Box::new(first.into_runtime(cwd_by_pane, tmux_by_pane, offline_panes)),
                 second: Box::new(second.into_runtime(cwd_by_pane, tmux_by_pane, offline_panes)),
             },
+        }
+    }
+
+    /// Calls `visit` for every pane of this layout, in layout order.
+    fn visit_panes(&self, visit: &mut impl FnMut(&DesiredPane)) {
+        match self {
+            Self::Leaf { pane } => visit(pane),
+            Self::Stack { panes, .. } => panes.iter().for_each(visit),
+            Self::Split { first, second, .. } => {
+                first.visit_panes(visit);
+                second.visit_panes(visit);
+            }
         }
     }
 
@@ -1039,6 +1313,8 @@ impl DesiredPane {
             local_cwd,
             tmux_window: tmux_by_pane.get(&pane.id).map(|(window, _)| window.clone()),
             tmux_pane: tmux_by_pane.get(&pane.id).map(|(_, pane)| pane.clone()),
+            unseen: pane.unseen,
+            progress: pane.progress.clone().map(Box::new),
         })
     }
 
@@ -1085,6 +1361,8 @@ impl DesiredPane {
             custom_title,
             profile_override: self.profile_override,
             custom_icon: self.custom_icon,
+            unseen: self.unseen,
+            progress: self.progress.map(|progress| *progress),
         }
     }
 
@@ -1113,6 +1391,14 @@ impl DesiredPane {
         };
         if has_tmux && self.kind != DesiredPaneKind::Terminal {
             bail!("only terminal panes may persist tmux targets");
+        }
+        if let Some(progress) = &self.progress {
+            if self.kind != DesiredPaneKind::Terminal {
+                bail!("only terminal panes may persist task progress");
+            }
+            progress
+                .validate()
+                .map_err(|error| anyhow::anyhow!("persisted {error}"))?;
         }
         match &self.kind {
             DesiredPaneKind::Terminal => {}

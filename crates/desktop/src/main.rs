@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod agent_icons;
+mod agent_progress;
 mod appearance;
 mod bots;
 mod browser;
@@ -57,6 +58,7 @@ mod reconcile;
 mod render;
 mod session;
 mod sidebar;
+mod status_art;
 mod tab_chrome;
 mod terminal_image_menu;
 mod terminal_images;
@@ -83,8 +85,8 @@ use browser::{BrowserUrlEditor, prepare_cef_process};
 use commands::{AppConfig, ROOT_KEY_CONTEXT, ResolvedKeymap};
 use gallery::GalleryUi;
 use helpers::{
-    WorkspaceTabScope, default_sidebar_width, gpui_binding, migrated_sidebar_width,
-    next_terminal_poll_delay_ms, product_name,
+    default_sidebar_width, gpui_binding, migrated_sidebar_width, next_terminal_poll_delay_ms,
+    product_name,
 };
 use session::session_call;
 use theme::{AppTheme, BuiltInTheme};
@@ -229,14 +231,18 @@ struct SessionState {
     snapshot: Option<SessionSnapshot>,
     screens: HashMap<Uuid, TerminalScreen>,
     pane_states: HashMap<Uuid, PaneStreamState>,
-    /// Service `Message` notifications only; pane activity is read live
-    /// from `Pane.status`.
+    /// The service's stored notifications (completions, needs-you, and
+    /// messages), oldest first, mirrored from `GetNotifications` plus deltas.
     notifications: Vec<SessionNotification>,
     notifications_latest_id: u64,
-    /// Last Needs-you count sent to the Dock, so polling never re-sends it.
+    /// The service's notification ring identity; a new one means the ring
+    /// was replaced and the mirror must be refetched.
+    notifications_epoch: Option<Uuid>,
+    /// A full notification reload was requested for a replaced ring or a
+    /// gap and has not answered yet, so polls do not request another.
+    notifications_reloading: bool,
+    /// Last unread count sent to the Dock, so polling never re-sends it.
     dock_badge: Option<usize>,
-    /// When the user last viewed each pane, for the Notifications unread dot.
-    pane_views: notifications::PaneViews,
     /// When each pane's screen was last applied, used to pace on-screen panes
     /// other than the focused one.
     last_delivery: HashMap<Uuid, Instant>,
@@ -274,8 +280,9 @@ impl SessionState {
             pane_states: HashMap::new(),
             notifications: Vec::new(),
             notifications_latest_id: 0,
+            notifications_epoch: None,
+            notifications_reloading: false,
             dock_badge: None,
-            pane_views: notifications::PaneViews::new(bots::now_ms()),
             last_delivery: HashMap::new(),
             window_active,
             stream_diagnostics: StreamDiagnostics::default(),
@@ -286,17 +293,16 @@ impl SessionState {
 
 struct SidebarUi {
     active_workspace: Option<Uuid>,
-    workspace_tab_scope: WorkspaceTabScope,
     expanded_workspaces: HashSet<Uuid>,
-    collapsed_groups: HashSet<Uuid>,
     collapsed_pinned_sections: HashSet<Uuid>,
-    collapsed_project_sections: HashSet<Uuid>,
     dismissed_workspace_tabs: HashSet<Uuid>,
     workstation_tab_scroll: ScrollHandle,
     dragging_workspace: Option<Uuid>,
     workspace_drop_preview: Option<WorkspaceDropPreview>,
     suppress_workspace_click_until: Option<Instant>,
     tab_drop_preview: Option<TabDropPreview>,
+    /// Workstation card a dragged tab would move into on drop.
+    tab_drop_workspace: Option<Uuid>,
     suppress_tab_click_until: Option<Instant>,
     sidebar_resize: SidebarResizeLifecycle,
     preferred_sidebar_width: f32,
@@ -319,17 +325,15 @@ impl SidebarUi {
     ) -> Self {
         Self {
             active_workspace: None,
-            workspace_tab_scope: WorkspaceTabScope::Workstation,
             expanded_workspaces: HashSet::new(),
-            collapsed_groups: HashSet::new(),
             collapsed_pinned_sections: HashSet::new(),
-            collapsed_project_sections: HashSet::new(),
             dismissed_workspace_tabs: HashSet::new(),
             workstation_tab_scroll: ScrollHandle::new(),
             dragging_workspace: None,
             workspace_drop_preview: None,
             suppress_workspace_click_until: None,
             tab_drop_preview: None,
+            tab_drop_workspace: None,
             suppress_tab_click_until: None,
             sidebar_resize: SidebarResizeLifecycle::default(),
             preferred_sidebar_width,
@@ -386,6 +390,7 @@ struct EditorUi {
     color_picker: Option<ColorPickerState>,
     browser_url_editor: Option<BrowserUrlEditor>,
     agent_skill_status: Option<String>,
+    agent_progress: bots::AgentProgressUi,
     ime_preedit: String,
     workspace_input_focus: [FocusHandle; 4],
     workspace_input_layouts: [Option<ShapedLine>; 4],
@@ -404,6 +409,7 @@ impl EditorUi {
             color_picker: None,
             browser_url_editor: None,
             agent_skill_status: None,
+            agent_progress: bots::AgentProgressUi::default(),
             ime_preedit: String::new(),
             workspace_input_focus,
             workspace_input_layouts: [None, None, None, None],
@@ -474,6 +480,7 @@ struct HhApp {
     gallery: GalleryUi,
     coding_agents: bots::CodingAgentsState,
     bot_threads: bots::BotThreadsState,
+    motion: status_art::Motion,
     #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
     browser: BrowserUi,
 }
@@ -592,6 +599,7 @@ impl HhApp {
             gallery: GalleryUi::new(),
             coding_agents: bots::CodingAgentsState::default(),
             bot_threads: bots::BotThreadsState::default(),
+            motion: status_art::Motion::new(),
             #[cfg(all(target_os = "macos", feature = "browser"))]
             browser: BrowserUi::new(browser_parent_view),
             #[cfg(all(target_os = "linux", feature = "browser"))]
@@ -629,10 +637,14 @@ impl HhApp {
         cx.observe_window_activation(window, |this, window, cx| {
             this.session.window_active = window.is_window_active();
             if this.session.window_active {
-                this.mark_focused_pane_viewed();
+                if this.motion.refresh_reduced(Instant::now()) {
+                    cx.notify();
+                }
                 // Returning from System Settings is the usual moment a grant changes.
                 #[cfg(target_os = "macos")]
-                this.refresh_privacy_status(cx);
+                if this.permissions_panel_visible() {
+                    this.refresh_privacy_status(cx);
+                }
                 cx.notify();
                 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "browser"))]
                 {
@@ -660,19 +672,6 @@ impl HhApp {
                     break;
                 };
                 poll_delay_ms = next_terminal_poll_delay_ms(poll_delay_ms, state_changed);
-            }
-        })
-        .detach();
-        cx.spawn(async move |this, cx| {
-            loop {
-                gpui::Timer::after(tab_chrome::PULSE_STEP).await;
-                let Ok(()) = this.update(cx, |this, cx| {
-                    if this.any_pane_running() {
-                        cx.notify();
-                    }
-                }) else {
-                    break;
-                };
             }
         })
         .detach();

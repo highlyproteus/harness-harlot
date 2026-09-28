@@ -6,7 +6,7 @@
 
 <p align="center">
   A lightweight native terminal workstation for local and SSH work,
-  with tabs, splits, groups, tmux integration, and embedded browser tabs.
+  with tabs, splits, nested workstations, tmux integration, and embedded browser tabs.
 </p>
 
 <p align="center">
@@ -89,11 +89,16 @@ Linux packages target a glibc 2.35 baseline. Details: [Linux releases](docs/linu
 
 ## Workstations
 
-A workstation is a machine — your local computer or an SSH host.
+A workstation is where your terminals live: a folder of tabs on your own
+computer or on an SSH host. The hammer in the sidebar toolbar shows them.
 
-- Each workstation has its own working directory. Change it from the workstation menu and every new terminal in that workstation opens there from then on.
-- Rename workstations, give them their own colors, and pin the ones you use most.
-- SSH workstations launch your installed OpenSSH client, so your `~/.ssh/config`, keys, agents, and host verification are always the authority. Saved SSH workstations reconnect into their saved layout; credentials are never stored.
+- **This Mac** (**This Computer** on Linux) is your home workstation. You can rename, recolor, and pin it or give it a root folder, but it can never be deleted.
+- Add more local workstations whenever you like. Each has a root folder, set from the workstation menu (**Set Root Folder…**); new tabs, the first terminal of a new workstation, and the first terminal after all its tabs close open there. Split panes keep following the directory of the pane they split from.
+- Workstations nest up to four levels deep: choose **New Workstation Inside…** on a workstation's menu. A nested workstation runs on the same machine as its parent and uses its parent's root folder until you give it its own. A collapsed workstation's card wears one status border for itself and everything inside it (needs you, then done, then working). Deleting a workstation also removes the workstations nested inside it.
+- Drag a tab onto another workstation on the same machine to move it there.
+- Rename workstations, give them their own colors, and pin the ones you use most; drag to reorder them among their siblings.
+- SSH workstations launch your installed OpenSSH client, so your `~/.ssh/config`, keys, agents, and host verification are always the authority. Saved SSH workstations reconnect into their saved layout, together with the workstations nested inside them; credentials are never stored.
+- Projects from earlier versions become nested workstations on upgrade, keeping their folder, title, color, icon, tabs, and running terminals.
 
 ## Terminals
 
@@ -104,9 +109,9 @@ A workstation is a machine — your local computer or an SSH host.
 - Your terminals keep running if the app closes, crashes, or updates. They live in a small local session service, so reopening the app puts you right back where you were. Ending a session is always explicit: close its tab or exit the shell.
 - On macOS, programs in your terminals get Harness Harlot's Screen Recording and Accessibility permissions, even after the window closes. **Settings → Permissions** shows and requests them.
 
-## Groups
+## Tabs and splits
 
-A group displays several terminals together in one view — and can include a browser pane alongside them — so one glance covers a whole task.
+A tab can hold several terminals side by side — and a browser pane alongside them — so one glance covers a whole task. Drag panes between tabs to rearrange them.
 
 ## Browser tabs
 
@@ -148,6 +153,14 @@ right-click it to pin it. Up to five threads stay open; older idle ones close
 and stay saved. Starting `/new` or `/resume` inside omp shows up as that tab's
 thread, and each thread hears only about the workers it opened.
 
+Quitting a bot's agent starts a fresh conversation in the same tab, like
+`/new`: press Ctrl+C twice, or quit it any other way, such as `/exit`. The old
+conversation ends and stays saved (omp lists it with the bot's saved threads;
+Claude Code and Codex keep it in their own history), and workers it opened
+report to the new one. A single Ctrl+C still clears the prompt or interrupts a
+turn. If the agent exits with an error, or quits within a few seconds of
+starting, its shell is left open and a notification says so.
+
 omp bots load the bundled Harness Harlot plugin automatically, which also
 reports worker status changes into the bot's conversation. Claude Code and
 Codex bots get the `hh mcp` server attached at launch. Other agents need a
@@ -155,12 +168,59 @@ one-time MCP setup for the tools; **Settings → Bots** shows the exact command.
 Claude Code and Codex may ask once to trust the bot's folder. See
 [Bots privacy and data handling](PRIVACY.md).
 
-## Notifications
+## Status and notifications
 
-The bell switches the sidebar to Notifications, which lists terminal tabs and
-bots by live status: **Needs you** (waiting for input or approval), then
-**Running**, then **Done**, newest first within each group. Click a row to jump
-to it. The bell and Dock badges count what needs you.
+Every terminal tab shows what its agent is doing with its border — in the
+sidebar rows, the tab strip, pane headers, and the sidebar's pane chips. A
+bright segment runs clockwise around the border; with **Reduce motion** on
+(macOS Accessibility, or GNOME's animations switched off) the border keeps its
+colour and a steady glow instead.
+
+- **Blue** — the agent is working. Agents that keep a task list fill the
+  border from the top-left corner as tasks complete (a dim blue track shows
+  the rest); hover the tab for "3 of 7 done" and the current task. Claude Code
+  and Codex show the fill while their task list is unfinished.
+- **Magenta** — the agent needs you: it asks for input or approval, or rang
+  the terminal bell.
+- **Green** — the agent finished while you were elsewhere. It stays until you
+  look: click the tab or pane, switch to its tab or workstation, click its
+  notification, or type into it. Merely having the window in front does not
+  clear it, and it survives restarts.
+- No border — idle, or finished and already seen.
+
+Where one border stands for several tabs — a collapsed workstation card, a
+bot's icon on its card, and the toolbar's Bots button — it shows the most
+urgent: magenta, then green, then blue.
+
+The bell switches the sidebar to Notifications: **Needs you** and **Running**
+list live terminal tabs and bots, and **Recent** keeps the last 200 finished
+and attention notifications across restarts, newest first, unread ones marked
+with a blue dot. **Mark all read** clears them; clicking any row jumps to its
+pane and marks it seen, and viewing a pane marks its notifications read. The
+bell counts unread notifications: magenta when one of them needs you, blue
+otherwise. The Dock icon shows the same count in macOS's standard red badge.
+
+### Task progress from agents
+
+Task progress is opt-in per agent. Enable it in **Settings → Bots → Agent
+task progress**, or from a terminal:
+
+```bash
+hh progress install omp      # omp extension in ~/.omp/agent/extensions (or $PI_CODING_AGENT_DIR)
+hh progress install claude   # task tools hook in ~/.claude/settings.json (or $CLAUDE_CONFIG_DIR)
+hh progress install codex    # update_plan hook in ~/.codex/hooks.json (or $CODEX_HOME)
+hh progress status           # add --json for machine-readable output
+hh progress uninstall claude
+```
+
+Installing keeps every other setting and hook, writes through a symlinked
+settings file, and never replaces an omp extension file you edited. The Claude
+Code hook follows `TaskCreate`/`TaskUpdate` (reading the session's task list)
+and the older `TodoWrite`; subagents' lists never replace the pane's. Codex asks you to trust the new hook the next time
+it starts. omp and Claude Code bots report progress without any setup. The
+integrations call `hh progress report --done N --total M [--current T]
+[--phase T] --source omp|claude|codex` and `hh progress clear` for the pane in
+`HH_PANE_ID` (or `--pane`); tasks an agent abandons do not count.
 
 ## Browser automation and Galleries
 
@@ -191,7 +251,13 @@ revealing the selected image in Finder or the platform file manager.
 ## tmux
 
 - Local terminal panes use an HH-owned private tmux server when tmux 3.2 or
-  newer is installed, preserving processes and output across service restarts.
+  newer is installed, preserving processes and output across service restarts
+  and app updates. Only closing a tab ends its program.
+- SSH workstation terminals run in HH's tmux on the remote host, so they
+  survive dropped connections and restarts; Reconnect reattaches them with
+  full scrollback. The login must work without a prompt (known host key, key
+  in ssh-agent or the Keychain); otherwise a **Sign in to** *host* tab asks
+  once. See [session recovery](docs/session-recovery.md#ssh-workstations).
 - The managed server uses a private `hh` (`hh-dev` in development) socket and
   does not alter the user's default tmux server. A custom `HH_STATE_DIR` gets
   its own private server (`hh-<hash of the state directory>`).

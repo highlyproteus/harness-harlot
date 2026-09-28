@@ -41,8 +41,6 @@ const HOST_LINGER_POLL: Duration = Duration::from_secs(10);
 /// Status refresh cadence while the Permissions panel is visible, so a grant
 /// made in System Settings next to the window shows up promptly.
 pub(crate) const VISIBLE_REFRESH: Duration = Duration::from_secs(3);
-/// Background cadence that keeps the sidebar notice current.
-pub(crate) const BACKGROUND_REFRESH: Duration = Duration::from_mins(1);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SCREEN_RECORDING_SETTINGS: &str =
@@ -75,14 +73,6 @@ pub(crate) enum TerminalAttribution {
 pub(crate) struct PrivacyStatus {
     pub(crate) grants: PrivacyGrants,
     pub(crate) terminals: TerminalAttribution,
-}
-
-impl PrivacyStatus {
-    /// Terminals are missing a permission the user already granted.
-    pub(crate) fn needs_terminal_restart(self) -> bool {
-        self.terminals == TerminalAttribution::Stale
-            && (self.grants.screen_recording || self.grants.accessibility)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,13 +133,6 @@ pub(crate) struct PrivacyUi {
     prompted_accessibility: bool,
     restart: RestartPhase,
     error: Option<String>,
-}
-
-impl PrivacyUi {
-    pub(crate) fn needs_terminal_restart(&self) -> bool {
-        self.status
-            .is_some_and(PrivacyStatus::needs_terminal_restart)
-    }
 }
 
 /// `hh privacy-status`: prints this process's grants as JSON.
@@ -290,49 +273,17 @@ impl HhApp {
             && self.editor.settings_section == SettingsSection::Permissions
     }
 
-    /// Toolbar pill shown while terminals lack a permission the user granted.
-    pub(crate) fn render_privacy_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.editor.privacy.needs_terminal_restart() || self.permissions_panel_visible() {
-            return None;
-        }
-        Some(
-            div()
-                .id("privacy-notice")
-                .h(px(26.0))
-                .px(px(8.0))
-                .rounded(px(5.0))
-                .bg(rgb(THEME.surface))
-                .border_1()
-                .border_color(rgb(THEME.warning))
-                .font_family(".SystemUIFont")
-                .text_xs()
-                .text_color(rgb(THEME.foreground))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|button| button.bg(rgb(THEME.elevated)))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.open_settings(SettingsSection::Permissions, cx);
-                }))
-                .child("Permissions")
-                .into_any_element(),
-        )
-    }
-
-    /// Refreshes when due: every [`VISIBLE_REFRESH`] while the Permissions
-    /// panel shows, otherwise every [`BACKGROUND_REFRESH`].
+    /// Refreshes every [`VISIBLE_REFRESH`] while the Permissions panel shows;
+    /// nothing else displays the status.
     pub(crate) fn refresh_privacy_status_if_due(&mut self, cx: &mut Context<Self>) {
-        let interval = if self.permissions_panel_visible() {
-            VISIBLE_REFRESH
-        } else {
-            BACKGROUND_REFRESH
-        };
+        if !self.permissions_panel_visible() {
+            return;
+        }
         if self
             .editor
             .privacy
             .last_refresh
-            .is_none_or(|last| last.elapsed() >= interval)
+            .is_none_or(|last| last.elapsed() >= VISIBLE_REFRESH)
         {
             self.refresh_privacy_status(cx);
         }
@@ -466,8 +417,8 @@ impl HhApp {
                 "Terminal programs use these permissions. Restart a program that was already running after you change them.",
             ),
             Some(TerminalAttribution::Stale) => (
-                Some(false),
-                "Terminals started before this version, or by an app that has since quit, can't use these permissions until they restart.",
+                None,
+                "Programs started before this version keep their earlier permissions until they restart. Closing every terminal, or Restart Terminals below, applies them.",
             ),
             Some(TerminalAttribution::NoService) => (None, "The terminal service isn't running."),
             Some(TerminalAttribution::Unmanaged) => {
@@ -661,39 +612,5 @@ fn button(id: &'static str, label: &'static str, tone: ButtonTone) -> gpui::Stat
             .bg(rgb(THEME.elevated))
             .border_color(rgb(THEME.border))
             .text_color(rgb(THEME.dim)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn status(
-        screen_recording: bool,
-        accessibility: bool,
-        terminals: TerminalAttribution,
-    ) -> PrivacyStatus {
-        PrivacyStatus {
-            grants: PrivacyGrants {
-                screen_recording,
-                accessibility,
-            },
-            terminals,
-        }
-    }
-
-    #[test]
-    fn terminal_restart_is_suggested_only_for_granted_permissions_terminals_lack() {
-        assert!(status(true, false, TerminalAttribution::Stale).needs_terminal_restart());
-        assert!(status(false, true, TerminalAttribution::Stale).needs_terminal_restart());
-        // Nothing granted: restarting would not give terminals anything.
-        assert!(!status(false, false, TerminalAttribution::Stale).needs_terminal_restart());
-        for terminals in [
-            TerminalAttribution::Current,
-            TerminalAttribution::NoService,
-            TerminalAttribution::Unmanaged,
-        ] {
-            assert!(!status(true, true, terminals).needs_terminal_restart());
-        }
     }
 }

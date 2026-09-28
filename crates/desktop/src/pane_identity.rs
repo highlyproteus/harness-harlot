@@ -19,7 +19,7 @@ pub(crate) enum CustomIconTarget {
     Workspace(Uuid),
 }
 
-pub(crate) fn detected_project_icon(project_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn detected_folder_icon(root: &Path) -> Option<PathBuf> {
     const ROOTS: [&str; 4] = ["", "public", "assets", "static"];
     const FILES: [&str; 8] = [
         "icon.png",
@@ -31,9 +31,9 @@ pub(crate) fn detected_project_icon(project_dir: &Path) -> Option<PathBuf> {
         "icon.webp",
         "logo.webp",
     ];
-    for root in ROOTS {
+    for root_dir in ROOTS {
         for file in FILES {
-            let candidate = project_dir.join(root).join(file);
+            let candidate = root.join(root_dir).join(file);
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -172,16 +172,18 @@ impl HhApp {
         self.import_custom_icon_for(CustomIconTarget::Workspace(workspace_id), cx);
     }
 
-    pub(crate) fn detect_and_set_project_icon(
+    /// Gives a new workstation the icon its root folder ships (a logo or
+    /// favicon), if any.
+    pub(crate) fn detect_and_set_workstation_icon(
         &mut self,
-        tab_id: Uuid,
-        project_dir: String,
+        workspace_id: Uuid,
+        root: String,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    detected_project_icon(Path::new(&project_dir))
+                    detected_folder_icon(Path::new(&root))
                         .map(|path| import_custom_icon(&path))
                         .transpose()
                 })
@@ -192,8 +194,8 @@ impl HhApp {
                     if !this.custom_icons.iter().any(|saved| saved.id == icon_id) {
                         this.custom_icons.push(icon);
                     }
-                    this.dispatch(ClientRequest::SetTabCustomIcon {
-                        tab_id,
+                    this.dispatch(ClientRequest::SetWorkspaceCustomIcon {
+                        workspace_id,
                         icon: Some(icon_id),
                     });
                     cx.notify();
@@ -422,7 +424,7 @@ impl HhApp {
             .into_any_element()
     }
 
-    pub(crate) fn render_group_icon_choices(
+    pub(crate) fn render_tab_icon_choices(
         &self,
         tab_id: Uuid,
         cx: &mut Context<Self>,
@@ -443,7 +445,7 @@ impl HhApp {
             .gap(px(6.0))
             .child(
                 div()
-                    .id(("automatic-group-icon", element_key(tab_id)))
+                    .id(("automatic-tab-icon", element_key(tab_id)))
                     .w(px(30.0))
                     .h(px(28.0))
                     .rounded(px(5.0))
@@ -469,7 +471,7 @@ impl HhApp {
                     )
                     .tooltip(|_, cx| {
                         cx.new(|_| TooltipView {
-                            text: "Automatic project or group icon".to_owned(),
+                            text: "Automatic tab icon".to_owned(),
                         })
                         .into()
                     })
@@ -480,7 +482,7 @@ impl HhApp {
                 let icon_id = icon.id.clone();
                 let path = icon.path.clone();
                 div()
-                    .id(("group-custom-icon", index))
+                    .id(("tab-custom-icon", index))
                     .w(px(30.0))
                     .h(px(28.0))
                     .p(px(3.0))
@@ -510,7 +512,7 @@ impl HhApp {
             }))
             .child(
                 div()
-                    .id(("upload-group-icon", element_key(tab_id)))
+                    .id(("upload-tab-icon", element_key(tab_id)))
                     .h(px(28.0))
                     .px(px(8.0))
                     .rounded(px(5.0))
@@ -643,21 +645,21 @@ impl HhApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{Uuid, detected_project_icon};
+    use super::{Uuid, detected_folder_icon};
 
     #[test]
-    fn project_icon_detection_uses_documented_root_and_name_precedence() {
-        let directory = std::env::temp_dir().join(format!("hh-project-icon-{}", Uuid::new_v4()));
+    fn root_folder_icon_detection_uses_documented_root_and_name_precedence() {
+        let directory = std::env::temp_dir().join(format!("hh-root-icon-{}", Uuid::new_v4()));
         std::fs::create_dir_all(directory.join("public")).unwrap();
         std::fs::write(directory.join("public/icon.png"), b"public icon").unwrap();
         std::fs::write(directory.join("logo.png"), b"root logo").unwrap();
         assert_eq!(
-            detected_project_icon(&directory),
+            detected_folder_icon(&directory),
             Some(directory.join("logo.png"))
         );
         std::fs::write(directory.join("icon.png"), b"root icon").unwrap();
         assert_eq!(
-            detected_project_icon(&directory),
+            detected_folder_icon(&directory),
             Some(directory.join("icon.png"))
         );
         std::fs::remove_dir_all(directory).unwrap();

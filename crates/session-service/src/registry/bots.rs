@@ -1,11 +1,12 @@
 //! Bots: bot workspaces, their thread terminals, and bot-owned workers.
 //! Each bot is its own `WorkspaceKind::Bot` workspace whose id is the bot id.
 use super::{
-    RegistryState, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
-    TerminalRuntimePane, encode_desired_state,
+    ProcessScan, RegistryState, RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry,
+    StateFiles, TerminalRuntimePane, encode_desired_state,
 };
 use crate::bots::{
     BotLaunch, PreparedLaunch, bot_home, bots_directory, prepare_launch, remove_bot_files,
+    with_exit_hook,
 };
 use crate::layout::{collect_pane_ids, find_pane_in_snapshot, find_pane_mut, layout_contains};
 use crate::persistence::{
@@ -13,7 +14,9 @@ use crate::persistence::{
 };
 use crate::process::{fallback_cwd, hh_cli_path, local_spawn_dir, shell_title, valid_local_cwd};
 use crate::pty::{MAX_INPUT_FRAME, PtySession};
-use crate::registry::identity::{refresh_workspace_activity, set_pane_runtime_label};
+use crate::registry::identity::{
+    PANE_RESTARTING, refresh_workspace_activity, set_pane_runtime_label,
+};
 use crate::registry::workspaces::next_workspace_order;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
@@ -174,10 +177,8 @@ pub(crate) fn thread_tab(tab_id: Uuid, pane: Pane) -> Tab {
         id: tab_id,
         title: THREAD_TAB_TITLE.to_owned(),
         custom_title: None,
-        project_dir: None,
         color: None,
         custom_icon: None,
-        parent_tab: None,
         pinned: false,
         owner_bot: None,
         owner_thread: None,
@@ -317,6 +318,7 @@ impl SessionRegistry {
                 BotThreadPane {
                     session: None,
                     activated_ms: crate::now_ms(),
+                    launch: None,
                 },
             )]),
         };
@@ -361,7 +363,7 @@ impl SessionRegistry {
             let _ = session.terminate_and_wait();
             return Err(error);
         }
-        self.start_bot_agent(bot_id, session, launch);
+        self.start_bot_agent(bot_id, pane_id, session, launch);
         Ok((bot_id, tab_id, pane_id))
     }
 
@@ -393,6 +395,7 @@ impl SessionRegistry {
                     BotThreadPane {
                         session: None,
                         activated_ms: crate::now_ms(),
+                        launch: None,
                     },
                 )
             })
@@ -530,13 +533,18 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-            let workspace = state
+            let connection = state
                 .snapshot
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
+                .map(|workspace| workspace.connection.clone())
                 .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-            (workspace.connection.clone(), workspace.working_dir.clone())
+            (
+                connection,
+                hh_protocol::effective_working_dir(&state.snapshot.workspaces, workspace_id)
+                    .map(str::to_owned),
+            )
         };
         let (cwd, remote_dir) = match connection {
             WorkspaceConnection::Local => match working_dir {
@@ -578,10 +586,8 @@ impl SessionRegistry {
                 id: tab_id,
                 title: pane.title.clone(),
                 custom_title: title.map(str::to_owned),
-                project_dir: None,
                 color: None,
                 custom_icon: None,
-                parent_tab: None,
                 pinned: false,
                 owner_bot,
                 layout: PaneLayout::Leaf { pane },
@@ -596,8 +602,9 @@ impl SessionRegistry {
                         kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -633,7 +640,9 @@ impl SessionRegistry {
                     Ok::<_, anyhow::Error>((registry.pane(pane_id)?, launch))
                 })();
                 match launched {
-                    Ok((session, launch)) => registry.start_bot_agent(bot_id, session, launch),
+                    Ok((session, launch)) => {
+                        registry.start_bot_agent(bot_id, pane_id, session, launch);
+                    }
                     Err(error) => registry
                         .notify_bot(bot_id, &format!("could not start its agent: {error:#}")),
                 }
@@ -659,15 +668,28 @@ impl SessionRegistry {
         }
     }
 
-    /// Types the agent's launch command into the bot's fresh shell and tells
-    /// the user when a custom home kept its own `AGENTS.md`.
+    /// Types the agent's launch command into bot pane `pane_id`'s fresh
+    /// shell, followed by an exit hook quoting a new launch id, and tells the
+    /// user when a custom home kept its own `AGENTS.md`.
     pub(super) fn start_bot_agent(
         &self,
         bot_id: Uuid,
+        pane_id: Uuid,
         session: Arc<PtySession>,
         launch: PreparedLaunch,
     ) {
-        type_when_ready(session, launch.command);
+        let hooked = self
+            .record_bot_launch(bot_id, pane_id)
+            .and_then(|id| {
+                hh_cli_path()
+                    .map(|hh| with_exit_hook(&launch.command, &hh, id))
+                    .transpose()
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("bot pane {pane_id} starts without an exit hook: {error:#}");
+                None
+            });
+        type_when_ready(session, hooked.unwrap_or(launch.command));
         if !launch.context_written {
             self.notify_bot(
                 bot_id,
@@ -682,9 +704,9 @@ impl SessionRegistry {
     /// The service's `<state>/bots` directory; bots need a persistent registry.
     pub(crate) fn bots_dir(&self) -> Result<PathBuf> {
         let state_dir = self
-            .store
+            .files
             .as_ref()
-            .and_then(|store| store.directory())
+            .map(StateFiles::directory)
             .context("bots need a persistent session state directory")?;
         Ok(bots_directory(state_dir))
     }
@@ -712,28 +734,57 @@ impl SessionRegistry {
     }
 
     /// Terminates one bot pane's terminal, respawns the same pane in a fresh
-    /// shell in the bot's home and types the launch command into it.
-    fn relaunch_bot(&self, bot_id: Uuid, pane_id: Uuid, launch: PreparedLaunch) -> Result<()> {
+    /// shell in the bot's home and types the launch command into it. The old
+    /// launch is forgotten first, so its exit hook cannot fire into the new one.
+    pub(super) fn relaunch_bot(
+        &self,
+        bot_id: Uuid,
+        pane_id: Uuid,
+        launch: PreparedLaunch,
+    ) -> Result<()> {
+        self.state.write().forget_bot_launch(pane_id);
         let previous = {
-            let state = self.state.read();
+            let mut state = self.state.write();
             let target = state.bot_target(bot_id)?;
             if !target.panes.contains(&pane_id) {
                 bail!("pane {pane_id} is not a thread of bot {bot_id}");
             }
-            state
+            // Marked under the lock before the old shell dies, so the runtime
+            // refresh sees a replacement, never an exit to report as Done.
+            // The old agent's progress goes with it.
+            let previous = state
                 .panes
-                .get(&pane_id)
-                .and_then(RuntimePane::terminal)
-                .map(|terminal| Arc::clone(&terminal.session))
-        };
-        if let Some(previous) = previous {
+                .get_mut(&pane_id)
+                .and_then(RuntimePane::terminal_mut)
+                .map(|terminal| {
+                    terminal.exit_status = Some(PANE_RESTARTING.to_owned());
+                    Arc::clone(&terminal.session)
+                });
+            state.clear_pane_progress(pane_id);
             previous
-                .terminate_and_wait()
-                .context("terminate the bot terminal")?;
-        }
-        let session = self.spawn_local_transport(pane_id, bot_id, Some(bot_id), &launch.home)?;
+        };
+        let session = previous
+            .map_or(Ok(()), |previous| {
+                previous
+                    .terminate_and_wait()
+                    .context("terminate the bot terminal")
+            })
+            .and_then(|()| self.spawn_local_transport(pane_id, bot_id, Some(bot_id), &launch.home));
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                // The restart failed: whatever the old shell does now is its
+                // own exit again.
+                self.state.write().abandon_restart(pane_id);
+                return Err(error);
+            }
+        };
         let mut state = self.state.write();
-        if !state.bot_target(bot_id)?.panes.contains(&pane_id) {
+        if !state
+            .bot_target(bot_id)
+            .is_ok_and(|target| target.panes.contains(&pane_id))
+        {
+            state.abandon_restart(pane_id);
             drop(state);
             let _ = session.terminate_and_wait();
             bail!("bot {bot_id} changed while restarting");
@@ -749,7 +800,7 @@ impl SessionRegistry {
         let bytes = encode_desired_state(&state)?;
         drop(state);
         drop(replaced);
-        self.start_bot_agent(bot_id, session, launch);
+        self.start_bot_agent(bot_id, pane_id, session, launch);
         self.write_snapshot(&bytes)
     }
 
@@ -811,8 +862,9 @@ pub(super) fn local_terminal_runtime(session: Arc<PtySession>, cwd: PathBuf) -> 
             kind: RuntimePaneKind::Local,
             recovered: false,
             exit_status: None,
-            detected_command_profile: None,
+            process_scan: ProcessScan::Unknown,
             omp_title_status: None,
+            title_baseline_pending: false,
         }),
     }
 }
@@ -829,6 +881,8 @@ fn empty_local_workspace(id: Uuid, title: String, order: u32, kind: WorkspaceKin
         connection: WorkspaceConnection::Local,
         working_dir: None,
         kind,
+        parent_workstation: None,
+        home: false,
         instructions: None,
         owner_bot: None,
         custom_icon: None,

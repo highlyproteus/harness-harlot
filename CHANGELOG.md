@@ -6,6 +6,159 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-09-28
+
+### Added
+
+- Every tab shows its agent's state with its border instead of a dot or
+  spinner — in sidebar rows, the tab strip, pane headers, and the sidebar's
+  pane chips: **blue** while working, **magenta** when it needs your input or
+  approval or rang the bell, and **green** when it finished and you haven't
+  looked yet (until you click, switch to, or type into it). A bright segment
+  runs clockwise around the border; with **Reduce motion** (macOS) or GNOME
+  animations off it keeps its colour and a steady glow. Borders animate only
+  while visible: the magenta one at about 30 fps, blue and green at about
+  12 fps.
+- Task progress: while an agent works through a task list, its blue border
+  fills clockwise from the top-left corner as tasks complete, over a dim track,
+  with "3 of 7 done · phase — current task" on hover. Claude Code and Codex,
+  which don't report when they are working, show it while their task list is
+  unfinished. omp's fill also follows `/todo` edits and tasks its subagents
+  complete. Progress disappears once the agent exits back to its shell.
+- One border summarizes several where needed — a collapsed workstation card,
+  a bot's icon on its card, and the toolbar's Bots button — showing magenta,
+  then green, then blue. A bot's icon therefore turns green when one of its
+  threads finished unseen and clears once you open it.
+- `hh progress install|uninstall omp|claude|codex` and `hh progress status
+  [--json]` enable task progress per agent (also under **Settings → Bots →
+  Agent task progress**): an omp extension in the omp agent directory's
+  `extensions` folder, a Claude Code hook for its task tools (`TaskCreate` and
+  `TaskUpdate`, and `TodoWrite` in older versions) in `settings.json` of
+  `$CLAUDE_CONFIG_DIR` or `~/.claude`, or a Codex `update_plan` hook in
+  `hooks.json` of `$CODEX_HOME` or `~/.codex`. Installs keep all other
+  settings and hooks, write through a symlinked settings file, are idempotent,
+  and never replace an omp extension file you edited. omp and Claude Code bots
+  report progress automatically. Subagents' task lists never replace the
+  pane's, and a hook gives up after 2.5 seconds when the terminal service
+  doesn't answer, so the agent never waits on it.
+- `hh progress report --done N --total M [--current T] [--phase T] --source
+  omp|claude|codex`, `hh progress clear`, and `hh progress hook claude|codex`
+  (the hook entry point, which never fails and prints nothing) report a pane's
+  progress. `--current` and `--phase` text may start with `--`.
+- Notifications keeps a **Recent** list of the last 200 finished and attention
+  notifications across restarts, with unread ones marked, and a **Mark all
+  read** button. Rows are marked magenta for attention and green for finished.
+- SSH workstations keep running when the connection drops, the app quits, or
+  it updates. Their terminals are windows of Harness Harlot's own tmux on the
+  remote host (`tmux -L hh`, separate from your own tmux), and Reconnect
+  reattaches each tab with its full scrollback. Direct SSH tabs in a local
+  workstation work the same way. Workstations still stay offline after a
+  restart until you click Reconnect.
+- Hosts that need a password, passphrase, second factor, or a new host key
+  open a **Sign in to** *host* tab once. It leaves a shared SSH connection
+  that the workstation uses without prompting until the network drops. Hosts
+  without tmux 3.2 or newer keep working as plain SSH shells, and a
+  notification says so.
+- `recovery.log` in the app's data folder records how each terminal came back
+  after a restart, and when a lost tmux connection was re-established. It
+  holds ids and errors, never terminal output.
+- Quitting a bot's agent starts a new thread: press Ctrl+C twice (or `/exit`)
+  and the conversation ends, stays saved, and a fresh one starts in the same
+  tab, like `/new`. A single Ctrl+C still clears the prompt or interrupts a
+  turn. An agent that exits with an error, or quits within a few seconds of
+  starting, leaves its shell open and posts a notification. Works for every
+  bot agent.
+
+### Changed
+
+- Workstations are now the sidebar's only way to organize terminals. Projects
+  and tab groups are gone; everything they did is covered by workstations and
+  tabs.
+- **This Mac** (**This Computer** on Linux) is your home workstation. It can be
+  renamed, recolored, pinned, and given a root folder, but never deleted. On
+  upgrade, your first local workstation becomes This Mac (it keeps a custom
+  title; a default "Workstation N" title becomes "This Mac"), or an empty This
+  Mac is added if you had none.
+- Workstations nest up to four levels deep: **New Workstation Inside…** on a
+  workstation's menu replaces **New Project…**. A nested workstation runs on
+  its parent's machine and uses its parent's root folder until you set its own
+  with **Set Root Folder…**. A collapsed workstation's card wears one status
+  border for itself and everything inside it. Deleting a workstation also removes the
+  workstations nested inside it (the confirmation says how many), and
+  disconnecting or reconnecting an SSH workstation includes them too.
+- Projects become nested workstations on upgrade, keeping their folder, title,
+  color, icon, pin, tabs, and running terminals.
+- A tab-level group is now simply a tab: **New Group** and **Add Group** are
+  removed, and its menu reads **Rename tab…**, **Delete tab…**, **New terminal
+  in this tab**, **New browser in this tab**, and **Pick tab color**. Tabs with
+  a default "Group N" title show their terminal's title again.
+- Dragging a tab onto another workstation on the same machine moves it there.
+- `hh terminal list` (and MCP `terminal_list`) adds `parent_workstation` to each
+  workstation, and a tab's `cwd` is its workstation's effective root folder.
+  CLI, MCP, and omp plugin command names are unchanged.
+- Bumped the desktop/service wire protocol from 47 to 51 for nested and home
+  workstations, the removed project and tab-group requests, pane seen state,
+  notifications, task progress, and bot agent exit reports; desktop and
+  service must be upgraded together, so the update restarts the terminal
+  service. Session snapshots move to schema 17.
+- Updating from 0.1.26 or earlier: local terminals keep running through the
+  service restart and reattach with their scrollback. SSH workstations and SSH
+  tabs opened by an earlier version are plain SSH connections, so the update
+  ends them; click Reconnect afterwards, and from then on they run in tmux on
+  the host and survive dropped connections, quits, and updates.
+- The bell counts unread notifications, magenta when one needs you (including
+  an agent asking for approval or input) and blue otherwise. The Dock icon
+  shows the same count in macOS's standard red badge.
+- Closing a tab is the only thing that ends its terminal's program, for local
+  and SSH tabs alike. Quitting, updating, disconnecting, and a dropped
+  connection leave it running. A tab closed while its host was unreachable is
+  ended when the workstation next connects.
+- The toolbar no longer shows a Permissions warning for terminals started by
+  an earlier version. **Settings → Permissions** explains that they keep their
+  earlier permissions until they restart, and still offers Restart Terminals
+  with its warning.
+
+### Fixed
+
+- A workstation created with `hh workstation new --cwd DIR` starts its first
+  terminal in `DIR` instead of the home folder.
+- Named single-terminal tabs, such as a bot's worker tabs, are compact
+  sidebar rows showing their name, like every other tab, instead of a tall box
+  holding one terminal chip. Only tabs with several panes show the pane map.
+- A finished tab's green border stays until you look at the pane: clicking it
+  or its tab, switching to its tab or workstation, clicking its notification,
+  or typing into it. Merely focusing the window no longer clears it, it is set
+  for every finish or request for attention (including omp title changes,
+  bells, and exits), and it survives restarts. Viewing a pane also marks its
+  unread notifications read, including bells and messages that change no
+  border.
+- SSH tabs whose connection drops are no longer reported as finished: they
+  keep their status and progress and post no notification.
+- Notifications no longer go blind after the terminal service restarts; the
+  app reloads the list when the service's notification history changes.
+- omp completions and every other finish or request for attention are
+  recorded as notifications, without duplicates for repeated events.
+- A restart or update never kills a running local terminal program any more.
+  If a saved terminal could not be reattached, the service used to open a
+  fresh shell over it and then close its tmux window, ending the program.
+  Recovery now finds windows by a tag as well as their saved ids, gives slow
+  scrollback reads 30 seconds instead of 5, retries on a fresh tmux
+  connection, and otherwise leaves the tab showing that its program is still
+  running, with Reattach to try again.
+- A lost connection to the local tmux server no longer marks every terminal
+  in the workstation as exited; the service reconnects and the terminals carry
+  on.
+- An SSH tab's “— Offline; reconnect required” title no longer sticks after
+  reconnecting.
+- Tests no longer write into the installed app's data folder or reach its
+  session service when run from inside a Harness Harlot terminal.
+- Inline terminal images (omp's concept board, pasted images, thumbnails) are
+  sharp. They were drawn by stretching the full-size picture on the GPU, which
+  blurs images shown larger than their pixel size and drops detail from ones
+  shown smaller, so most images looked soft or jagged even on a Retina screen.
+  Each image is now resized with a proper filter to the exact size it is shown
+  at, and its graphics memory is freed when it is replaced or no longer shown.
+
 ## [0.1.26] - 2026-09-26
 
 ### Added

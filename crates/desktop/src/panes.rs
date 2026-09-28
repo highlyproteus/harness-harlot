@@ -10,18 +10,17 @@ use hh_protocol::{
 };
 
 use crate::helpers::{
-    LiveScrollTarget, TerminalPointerAction, TerminalUrlOpenTarget, WorkspaceTabScope,
-    append_rename_text, apply_layout_control_mutation, collect_terminal_tabs,
-    constrained_sidebar_width, effective_split_ratio, find_pane, find_split_rect,
-    live_scroll_target, prepare_paste, terminal_modifiers, terminal_mouse_button,
-    terminal_point_clamped, terminal_pointer_action, terminal_url_open_target, url_at_column,
-    visible_panes, wheel_delta_lines, workspace_tab_set,
+    LiveScrollTarget, TerminalPointerAction, TerminalUrlOpenTarget, append_rename_text,
+    apply_layout_control_mutation, collect_terminal_tabs, constrained_sidebar_width,
+    effective_split_ratio, find_pane, find_split_rect, live_scroll_target, prepare_paste,
+    terminal_modifiers, terminal_mouse_button, terminal_point_clamped, terminal_pointer_action,
+    terminal_url_open_target, url_at_column, visible_panes, wheel_delta_lines,
 };
 use crate::input::browser_url_editor_is_active;
 use crate::typography::{TerminalCellMetrics, adjusted_terminal_zoom_level};
 use crate::view_models::{
-    CloseConfirmation, GroupRenameEditor, LayoutControlMutation, Modal, PixelRect, RenameEditor,
-    SearchEditor, SelectionAutoscroll, SelectionDrag, SidebarResizeMove, TabCloseConfirmation,
+    CloseConfirmation, LayoutControlMutation, Modal, PixelRect, RenameEditor, SearchEditor,
+    SelectionAutoscroll, SelectionDrag, SidebarResizeMove, TabCloseConfirmation, TabRenameEditor,
     WorkspaceCreationStep, route_workspace_creation_paste,
 };
 use crate::{
@@ -31,19 +30,12 @@ use uuid::Uuid;
 
 impl HhApp {
     pub(crate) fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let Some((workspace_id, bots, scope, empty)) = self
+        let Some((workspace_id, bots, empty)) = self
             .session
             .snapshot
             .as_ref()
             .and_then(|snapshot| self.active_workspace_in(snapshot))
-            .map(|workspace| {
-                (
-                    workspace.id,
-                    workspace.is_bot(),
-                    workspace_tab_set(workspace, self.sidebar.workspace_tab_scope).scope,
-                    workspace.tabs.is_empty(),
-                )
-            })
+            .map(|workspace| (workspace.id, workspace.is_bot(), workspace.tabs.is_empty()))
         else {
             return;
         };
@@ -54,13 +46,8 @@ impl HhApp {
         }
         if empty {
             self.open_workspace_terminal(workspace_id, cx);
-            return;
-        }
-        match scope {
-            WorkspaceTabScope::Workstation => self.new_workspace_tab(workspace_id, cx),
-            WorkspaceTabScope::Project(project_id) => {
-                self.new_project_group(workspace_id, project_id, cx);
-            }
+        } else {
+            self.new_workspace_tab(workspace_id, cx);
         }
     }
 
@@ -70,7 +57,7 @@ impl HhApp {
         pane_id: Uuid,
         cx: &mut Context<Self>,
     ) {
-        self.sidebar.expanded_workspaces.insert(workspace_id);
+        self.reveal_workspace(workspace_id);
         self.sidebar.active_workspace = Some(workspace_id);
         self.focus_pane_with_snapshot(pane_id, cx);
         cx.notify();
@@ -78,7 +65,7 @@ impl HhApp {
 
     pub(crate) fn focus_created_pane_inferred(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
         if let Some(workspace_id) = self.workspace_id_for_pane(pane_id) {
-            self.sidebar.expanded_workspaces.insert(workspace_id);
+            self.reveal_workspace(workspace_id);
             self.sidebar.active_workspace = Some(workspace_id);
         }
         self.focus_pane_with_snapshot(pane_id, cx);
@@ -116,28 +103,9 @@ impl HhApp {
         cx.notify();
     }
 
-    pub(crate) fn new_workspace_group(&mut self, workspace_id: Uuid, cx: &mut Context<Self>) {
-        self.dispatch_with(
-            ClientRequest::CreateWorkspaceGroup {
-                workspace_id,
-                parent_tab: None,
-            },
-            Box::new(move |this, cx, result| match result {
-                Ok(ServiceResponse::PaneCreated { pane_id }) => {
-                    this.focus_created_pane(workspace_id, pane_id, cx);
-                }
-                Ok(response) => this.report_unexpected(&response),
-                Err(error) => this.report(&error),
-            }),
-        );
-        self.layout.last_sizes.clear();
-        self.editor.modal = Modal::None;
-        cx.notify();
-    }
-
     pub(crate) fn new_tab_at(&mut self, target_pane: Uuid, cx: &mut Context<Self>) {
         self.dispatch_with(
-            ClientRequest::CreateGroupTerminal { target_pane },
+            ClientRequest::CreateTabTerminal { target_pane },
             Box::new(move |this, cx, result| match result {
                 Ok(ServiceResponse::PaneCreated { pane_id }) => {
                     this.focus_created_pane_inferred(pane_id, cx);
@@ -172,6 +140,7 @@ impl HhApp {
     }
 
     pub(crate) fn activate_tab(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        self.mark_pane_seen(pane_id);
         self.dispatch_with(
             ClientRequest::ActivateTab { pane_id },
             Box::new(move |this, cx, result| match result {
@@ -259,7 +228,7 @@ impl HhApp {
         })
     }
 
-    pub(crate) fn group_metadata(&self, tab_id: Uuid) -> Option<(String, Uuid)> {
+    pub(crate) fn tab_metadata(&self, tab_id: Uuid) -> Option<(String, Uuid)> {
         self.session.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .workspaces
@@ -282,8 +251,8 @@ impl HhApp {
         })
     }
 
-    pub(crate) fn new_group_terminal(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        let target_pane = self.group_metadata(tab_id).map(|(_, pane_id)| pane_id);
+    pub(crate) fn new_tab_terminal(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        let target_pane = self.tab_metadata(tab_id).map(|(_, pane_id)| pane_id);
         self.editor.modal = Modal::None;
         if let Some(target_pane) = target_pane {
             self.new_tab_at(target_pane, cx);
@@ -292,34 +261,9 @@ impl HhApp {
         }
     }
 
-    pub(crate) fn new_project_group(
-        &mut self,
-        workspace_id: Uuid,
-        tab_id: Uuid,
-        cx: &mut Context<Self>,
-    ) {
-        self.dispatch_with(
-            ClientRequest::CreateWorkspaceGroup {
-                workspace_id,
-                parent_tab: Some(tab_id),
-            },
-            Box::new(move |this, cx, result| match result {
-                Ok(ServiceResponse::PaneCreated { pane_id }) => {
-                    this.focus_created_pane(workspace_id, pane_id, cx);
-                    this.sidebar.collapsed_groups.remove(&tab_id);
-                }
-                Ok(response) => this.report_unexpected(&response),
-                Err(error) => this.report(&error),
-            }),
-        );
-        self.editor.modal = Modal::None;
-        self.layout.last_sizes.clear();
-        cx.notify();
-    }
-
-    pub(crate) fn begin_group_rename(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
-        if let Some((label, _)) = self.group_metadata(tab_id) {
-            self.editor.modal = Modal::GroupRename(GroupRenameEditor {
+    pub(crate) fn begin_tab_rename(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        if let Some((label, _)) = self.tab_metadata(tab_id) {
+            self.editor.modal = Modal::TabRename(TabRenameEditor {
                 tab_id,
                 value: label,
                 replace_on_type: true,
@@ -351,8 +295,8 @@ impl HhApp {
         cx.notify();
     }
 
-    pub(crate) fn submit_group_rename(&mut self, cx: &mut Context<Self>) {
-        let Modal::GroupRename(editor) = std::mem::take(&mut self.editor.modal) else {
+    pub(crate) fn submit_tab_rename(&mut self, cx: &mut Context<Self>) {
+        let Modal::TabRename(editor) = std::mem::take(&mut self.editor.modal) else {
             return;
         };
         self.dispatch(ClientRequest::RenameTab {
@@ -385,25 +329,14 @@ impl HhApp {
         let confirmation = self.session.snapshot.as_ref().and_then(|snapshot| {
             snapshot.workspaces.iter().find_map(|workspace| {
                 let tab = workspace.tabs.iter().find(|tab| tab.id == tab_id)?;
-                let child_count = workspace
-                    .tabs
-                    .iter()
-                    .filter(|candidate| candidate.parent_tab == Some(tab_id))
-                    .count();
                 let mut panes = Vec::new();
-                for candidate in workspace.tabs.iter().filter(|candidate| {
-                    candidate.id == tab_id || candidate.parent_tab == Some(tab_id)
-                }) {
-                    collect_terminal_tabs(&candidate.layout, &mut panes);
-                }
+                collect_terminal_tabs(&tab.layout, &mut panes);
                 Some(TabCloseConfirmation {
                     tab_id,
                     title: tab
                         .custom_title
                         .clone()
                         .unwrap_or_else(|| tab.title.clone()),
-                    is_project: tab.project_dir.is_some(),
-                    child_count,
                     terminal_count: panes.len(),
                 })
             })
@@ -464,6 +397,7 @@ impl HhApp {
         } else {
             index - 1
         };
+        self.mark_pane_seen(panes[next]);
         self.focus_pane_with_snapshot(panes[next], cx);
         if self.layout.zoomed_pane.is_some() {
             self.layout.zoomed_pane = self.layout.focused_pane;
@@ -766,7 +700,7 @@ impl HhApp {
             cx.notify();
             return;
         }
-        if let Some(editor) = self.editor.modal.group_rename_mut() {
+        if let Some(editor) = self.editor.modal.tab_rename_mut() {
             append_rename_text(&mut editor.value, &mut editor.replace_on_type, text);
             cx.notify();
             return;
@@ -799,6 +733,7 @@ impl HhApp {
         cx: &mut Context<Self>,
     ) {
         self.layout.scroll_residual.remove(&pane_id);
+        self.mark_pane_seen(pane_id);
         self.focus_pane_with_snapshot(pane_id, cx);
         self.focus_handle.focus(window);
         if matches!(self.editor.modal, Modal::TerminalImageMenu(_)) {

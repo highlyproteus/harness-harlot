@@ -159,6 +159,7 @@ fn target(panes: &[(Uuid, Option<&str>)], active: Uuid, pinned: &[&str]) -> BotT
                         BotThreadPane {
                             session: session.map(str::to_owned),
                             activated_ms: 0,
+                            launch: None,
                         },
                     )
                 })
@@ -433,15 +434,15 @@ fn thread_panes_split_side_by_side_stay_threads_but_generic_creation_is_refused(
 
     // Moving a thread back out into its own tab works too.
     registry
-        .move_pane_to_new_tab(second, first_tab, true, None)
+        .move_pane_to_new_tab(second, first_tab, true)
         .unwrap();
     assert_eq!(thread_tabs(registry, bot_id).len(), 2);
 
     let workstation = registry.snapshot().unwrap().workspaces[0].id;
     let plain = crate::layout::first_pane_id(&registry.snapshot().unwrap()).unwrap();
     assert!(registry.create_pane(first, SplitAxis::Vertical).is_err());
-    assert!(registry.create_group_terminal(first).is_err());
-    assert!(registry.create_group_browser(first, None).is_err());
+    assert!(registry.create_tab_terminal(first).is_err());
+    assert!(registry.create_tab_browser(first, None).is_err());
     assert!(registry.create_workspace_tab(bot_id).is_err());
     assert!(registry.create_browser_tab(bot_id, None).is_err());
     assert!(
@@ -458,7 +459,7 @@ fn thread_panes_split_side_by_side_stay_threads_but_generic_creation_is_refused(
     );
     assert!(
         registry
-            .move_pane_to_group(first, registry.snapshot().unwrap().workspaces[0].tabs[0].id)
+            .move_pane_into_tab(first, registry.snapshot().unwrap().workspaces[0].tabs[0].id)
             .is_err()
     );
     assert_eq!(live(registry, bot_id).0.len(), 2);
@@ -700,4 +701,169 @@ fn switching_a_bot_to_another_agent_keeps_only_its_active_thread() {
             .contains("only omp bots keep threads")
     );
     assert!(Path::new(&fixture.threads_dir(bot_id)).is_dir());
+}
+
+/// The agent launch bot pane `pane_id` runs now.
+fn launch_of(registry: &SessionRegistry, bot_id: Uuid, pane_id: Uuid) -> Option<AgentLaunch> {
+    spec(registry, bot_id).thread_panes[&pane_id].launch.clone()
+}
+
+/// Makes pane `pane_id`'s agent look like it has been running for a while.
+fn age_launch(registry: &SessionRegistry, bot_id: Uuid, pane_id: Uuid) -> AgentLaunch {
+    let mut state = registry.state.write();
+    let thread = state
+        .bot_spec_mut(bot_id)
+        .unwrap()
+        .thread_panes
+        .get_mut(&pane_id)
+        .unwrap();
+    let launch = thread.launch.as_mut().unwrap();
+    launch.started_ms = crate::now_ms() - MIN_AGENT_RUN_MS - 1;
+    launch.clone()
+}
+
+/// Messages of the notifications posted on `pane_id`.
+fn messages(registry: &SessionRegistry, pane_id: Uuid) -> Vec<String> {
+    registry
+        .notifications()
+        .unwrap()
+        .into_iter()
+        .filter(|notification| notification.pane_id == pane_id)
+        .filter_map(|notification| notification.message)
+        .collect()
+}
+
+#[test]
+fn a_clean_agent_exit_starts_a_fresh_thread_in_the_same_tab_and_keeps_the_old_one_saved() {
+    let fixture = Fixture::new();
+    let registry = &fixture.registry;
+    let (bot_id, _, first) = registry
+        .create_bot(Some("Hive3"), TerminalProfile::Omp, None, None)
+        .unwrap();
+    let (_, second) = registry.open_bot_thread(bot_id, None).unwrap();
+    let (_, worker, _) = registry
+        .create_worker(None, None, None, None, Some(first))
+        .unwrap();
+    registry.report_bot_session(first, "s-old").unwrap();
+    registry.report_bot_session(second, "s-other").unwrap();
+    fixture.save_thread(bot_id, "s-old", "Old");
+    let tabs = thread_tabs(registry, bot_id);
+    let old_terminal = registry.pane(first).unwrap();
+    let second_terminal = registry.pane(second).unwrap();
+    let old_launch = age_launch(registry, bot_id, first);
+
+    registry
+        .bot_agent_exited(first, old_launch.id, true)
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Arc::ptr_eq(&registry.pane(first).unwrap(), &old_terminal) {
+        assert!(
+            Instant::now() < deadline,
+            "the pane never got a fresh shell"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let screen = wait_for_screen(registry, first, "OMP_UP");
+    assert!(!screen.contains("--resume"), "screen:\n{screen}");
+    assert_eq!(thread_tabs(registry, bot_id), tabs, "same tabs and panes");
+    let spec = spec(registry, bot_id);
+    assert_eq!(spec.thread_panes[&first].session, None);
+    let new_launch = spec.thread_panes[&first].launch.clone().unwrap();
+    assert_ne!(new_launch.id, old_launch.id);
+    assert_eq!(
+        spec.thread_panes[&second].session.as_deref(),
+        Some("s-other")
+    );
+    assert!(
+        Arc::ptr_eq(&registry.pane(second).unwrap(), &second_terminal),
+        "other threads keep running"
+    );
+    let threads = registry.list_bot_threads(bot_id).unwrap();
+    let listed = |id: &str| threads.iter().find(|thread| thread.id == id).cloned();
+    assert_eq!(
+        listed("s-old").unwrap().pane_id,
+        None,
+        "old thread is saved"
+    );
+    assert_eq!(listed(&pane_thread_id(first)).unwrap().pane_id, Some(first));
+    assert_eq!(
+        find_tab(&registry.snapshot().unwrap(), worker).owner_thread,
+        Some(first),
+        "workers stay with the pane and report to the new conversation"
+    );
+
+    // The old launch's hook firing again cannot restart the new thread.
+    registry
+        .bot_agent_exited(first, old_launch.id, true)
+        .unwrap();
+    assert_eq!(launch_of(registry, bot_id, first), Some(new_launch));
+}
+
+#[test]
+fn failed_immediate_stale_and_closed_exits_leave_the_shell_alone() {
+    let fixture = Fixture::new();
+    let registry = &fixture.registry;
+    let (bot_id, _, pane_id) = registry
+        .create_bot(Some("Hive3"), TerminalProfile::Omp, None, None)
+        .unwrap();
+    registry.report_bot_session(pane_id, "s1").unwrap();
+    let terminal = registry.pane(pane_id).unwrap();
+    let first = launch_of(registry, bot_id, pane_id).unwrap();
+
+    registry
+        .bot_agent_exited(pane_id, Uuid::new_v4(), true)
+        .unwrap();
+    assert_eq!(
+        launch_of(registry, bot_id, pane_id),
+        Some(first.clone()),
+        "an unknown launch is ignored"
+    );
+
+    registry.bot_agent_exited(pane_id, first.id, true).unwrap();
+    assert_eq!(
+        messages(registry, pane_id),
+        ["Hive3's agent quit right after starting, so no new thread was opened."]
+    );
+    assert_eq!(launch_of(registry, bot_id, pane_id), None);
+
+    registry.restart_bot(bot_id).unwrap();
+    let restarted = age_launch(registry, bot_id, pane_id);
+    let terminal_after_restart = registry.pane(pane_id).unwrap();
+    assert!(!Arc::ptr_eq(&terminal, &terminal_after_restart));
+    registry.bot_agent_exited(pane_id, first.id, true).unwrap();
+    assert_eq!(
+        launch_of(registry, bot_id, pane_id),
+        Some(restarted.clone()),
+        "a restart retires the previous launch"
+    );
+
+    registry
+        .bot_agent_exited(pane_id, restarted.id, false)
+        .unwrap();
+    assert_eq!(
+        messages(registry, pane_id).last().map(String::as_str),
+        Some("Hive3's agent exited with an error; its shell is left open.")
+    );
+    assert_eq!(launch_of(registry, bot_id, pane_id), None);
+    assert!(Arc::ptr_eq(
+        &registry.pane(pane_id).unwrap(),
+        &terminal_after_restart
+    ));
+    assert_eq!(
+        spec(registry, bot_id).thread_panes[&pane_id]
+            .session
+            .as_deref(),
+        Some("s1"),
+        "a crashed thread keeps its conversation"
+    );
+
+    let (_, closing) = registry.open_bot_thread(bot_id, None).unwrap();
+    let closing_launch = age_launch(registry, bot_id, closing);
+    registry.close_pane(closing).unwrap();
+    registry
+        .bot_agent_exited(closing, closing_launch.id, true)
+        .unwrap();
+    assert!(registry.pane(closing).is_err());
+    assert!(!spec(registry, bot_id).thread_panes.contains_key(&closing));
 }

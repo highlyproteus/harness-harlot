@@ -22,6 +22,8 @@ pub(super) struct PaneDrag {
 #[derive(Clone, Debug)]
 pub(super) struct WorkspaceDrag {
     pub(super) workspace_id: Uuid,
+    /// Reordering stays among siblings under the same parent.
+    pub(super) parent: Option<Uuid>,
     pub(super) pinned: bool,
     pub(super) title: String,
     pub(super) position: Point<Pixels>,
@@ -32,7 +34,7 @@ pub(super) struct TabDrag {
     pub(super) workspace_id: Uuid,
     pub(super) tab_id: Uuid,
     pub(super) pane_id: Option<Uuid>,
-    pub(super) from_group: bool,
+    pub(super) from_pane_map: bool,
     pub(super) title: String,
     pub(super) position: Point<Pixels>,
 }
@@ -41,7 +43,7 @@ pub(super) struct TabDrag {
 pub(super) struct TabDropPreview {
     pub(super) target_tab_id: Uuid,
     pub(super) after: bool,
-    pub(super) into_group: bool,
+    pub(super) into_tab: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,25 +179,23 @@ pub(super) enum SidebarMode {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct GroupMenu {
+pub(super) struct TabRowMenu {
     pub(super) tab_id: Uuid,
     pub(super) position: Point<Pixels>,
     pub(super) icon_picker_open: bool,
 }
 
-/// The tab strip's ＋ menu: what to add to a workstation, after `target_tab`.
+/// The tab strip's ＋ menu: what to add to a workstation.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CreateMenu {
     pub(super) position: Point<Pixels>,
     pub(super) workspace_id: Uuid,
-    pub(super) target_tab: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum DirEditorTarget {
-    WorkspaceDefault(Uuid),
-    NewProject(Uuid),
-    ProjectDir(Uuid),
+    /// A remote workstation's root folder.
+    WorkspaceRoot(Uuid),
 }
 
 #[derive(Clone, Debug)]
@@ -234,7 +234,7 @@ pub(super) struct RenameEditor {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct GroupRenameEditor {
+pub(super) struct TabRenameEditor {
     pub(super) tab_id: Uuid,
     pub(super) value: String,
     pub(super) replace_on_type: bool,
@@ -244,7 +244,7 @@ pub(super) struct GroupRenameEditor {
 pub(super) enum RenameTarget {
     Pane,
     Workspace,
-    Group,
+    Tab,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -289,8 +289,6 @@ pub(super) enum CloseConfirmationKind {
 pub(super) struct TabCloseConfirmation {
     pub(super) tab_id: Uuid,
     pub(super) title: String,
-    pub(super) is_project: bool,
-    pub(super) child_count: usize,
     pub(super) terminal_count: usize,
 }
 
@@ -308,6 +306,8 @@ pub(super) struct WorkspaceDeleteConfirmation {
     pub(super) workspace_id: Uuid,
     pub(super) title: String,
     pub(super) active_terminal_count: u32,
+    /// Workstations nested anywhere below this one; deleted with it.
+    pub(super) nested_count: usize,
     /// Deletes a bot rather than a workstation; only the dialog copy differs.
     pub(super) bot: bool,
 }
@@ -706,9 +706,21 @@ impl DialogTextEditor {
     }
 }
 
+/// The workstation a new workstation is created inside.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CreationParent {
+    pub(super) workspace_id: Uuid,
+    pub(super) title: String,
+    /// The parent runs over SSH: the child inherits its machine, and only a
+    /// name is asked for.
+    pub(super) remote: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WorkspaceCreationDialog {
     pub(super) kind: WorkspaceCreationKind,
+    /// Set when creating a nested workstation; `None` creates a top-level one.
+    pub(super) parent: Option<CreationParent>,
     pub(super) name: DialogTextEditor,
     pub(super) destination: DialogTextEditor,
     pub(super) working_dir: DialogTextEditor,
@@ -724,6 +736,7 @@ impl WorkspaceCreationDialog {
     pub(super) fn new() -> Self {
         Self {
             kind: WorkspaceCreationKind::Local,
+            parent: None,
             name: DialogTextEditor::default(),
             destination: DialogTextEditor::default(),
             working_dir: DialogTextEditor::default(),
@@ -733,6 +746,20 @@ impl WorkspaceCreationDialog {
             step: WorkspaceCreationStep::Details,
             error: None,
         }
+    }
+
+    pub(super) fn nested(parent: CreationParent) -> Self {
+        Self {
+            parent: Some(parent),
+            ..Self::new()
+        }
+    }
+
+    /// Whether the dialog asks for a local root folder: top-level local
+    /// workstations and those nested in a local one.
+    pub(super) fn asks_local_root(&self) -> bool {
+        self.kind == WorkspaceCreationKind::Local
+            && !self.parent.as_ref().is_some_and(|parent| parent.remote)
     }
 
     pub(super) fn new_bot(agent: Option<TerminalProfile>) -> Self {
@@ -814,7 +841,14 @@ impl WorkspaceCreationDialog {
         let title = (!self.name.text.trim().is_empty()).then(|| self.name.text.trim().to_owned());
         match self.kind {
             WorkspaceCreationKind::Local if self.step == WorkspaceCreationStep::Details => {
-                Some(ClientRequest::CreateWorkspace { title })
+                let working_dir = (self.asks_local_root()
+                    && !self.working_dir.text.trim().is_empty())
+                .then(|| expand_home(self.working_dir.text.trim()));
+                Some(ClientRequest::CreateWorkspace {
+                    title,
+                    parent_workstation: self.parent.as_ref().map(|parent| parent.workspace_id),
+                    working_dir,
+                })
             }
             WorkspaceCreationKind::Bot if self.step == WorkspaceCreationStep::Details => {
                 let working_dir = (!self.working_dir.text.trim().is_empty())
@@ -829,7 +863,8 @@ impl WorkspaceCreationDialog {
                 })
             }
             WorkspaceCreationKind::SystemSsh
-                if self.step == WorkspaceCreationStep::ConfirmSsh
+                if self.parent.is_none()
+                    && self.step == WorkspaceCreationStep::ConfirmSsh
                     && validate_ssh_host(&self.destination.text).is_ok() =>
             {
                 Some(ClientRequest::CreateSshWorkspace {
@@ -1004,7 +1039,7 @@ pub(super) enum Modal {
     WorkspaceRename(WorkspaceRenameEditor),
     DirEditor(DirEditor),
     PaneRename(RenameEditor),
-    GroupRename(GroupRenameEditor),
+    TabRename(TabRenameEditor),
     Search(SearchEditor),
     WorkspaceDelete(WorkspaceDeleteConfirmation),
     UpdateRestart(UpdateRestartConfirmation),
@@ -1015,7 +1050,7 @@ pub(super) enum Modal {
     TabMenu(TabMenu),
     WorkspaceMenu(WorkspaceMenu),
     CreateMenu(CreateMenu),
-    GroupMenu(GroupMenu),
+    TabRowMenu(TabRowMenu),
     BotMenu(BotMenu),
     BotThreadMenu(BotThreadMenu),
     TerminalImageMenu(TerminalImageMenu),
@@ -1128,15 +1163,15 @@ impl Modal {
         Some(editor)
     }
 
-    pub(super) fn group_rename_mut(&mut self) -> Option<&mut GroupRenameEditor> {
-        let Self::GroupRename(editor) = self else {
+    pub(super) fn tab_rename_mut(&mut self) -> Option<&mut TabRenameEditor> {
+        let Self::TabRename(editor) = self else {
             return None;
         };
         Some(editor)
     }
 
-    pub(super) fn group_rename(&self) -> Option<&GroupRenameEditor> {
-        let Self::GroupRename(editor) = self else {
+    pub(super) fn tab_rename(&self) -> Option<&TabRenameEditor> {
+        let Self::TabRename(editor) = self else {
             return None;
         };
         Some(editor)

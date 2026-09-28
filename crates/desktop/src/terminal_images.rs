@@ -4,18 +4,24 @@
 //! lists it in `TerminalScreen::images`. Placeholder cells in the grid name
 //! the image (foreground color) and their row/column within it (diacritics);
 //! each horizontal stretch of such cells becomes one clipped image draw.
+//!
+//! The GPU samples textures bilinearly without mipmaps, which skips source
+//! pixels when shrinking and smears them when enlarging. So each image is
+//! resampled on the CPU to the exact device-pixel size it is drawn at and
+//! drawn pixel-aligned; the full-size decode is drawn until that is ready.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use gpui::{Bounds, Pixels, RenderImage, Size, point, px, size};
+use gpui::{Bounds, DevicePixels, ImageId, Pixels, RenderImage, Size, point, px, size};
 use hh_protocol::{
     KITTY_PLACEHOLDER, PlaceholderCell, TerminalColor, TerminalImage, TerminalLine,
     placeholder_cells, placeholder_image_id,
 };
-use image::Frame;
+use image::imageops::FilterType;
+use image::{Frame, ImageBuffer, Rgba};
 
 use crate::typography::TerminalCellMetrics;
 
@@ -122,6 +128,35 @@ pub(crate) fn segment_draw_bounds(
     Some((image, clip))
 }
 
+/// Snaps an image's logical draw bounds to whole device pixels, returning
+/// them with their size in device pixels. GPUI floors a sprite's device
+/// origin and ceils its device size; the quarter-pixel nudges keep float
+/// error from moving either by a pixel, so a texture resampled to that size
+/// maps each texel onto one pixel. `None` when the image covers no pixel.
+pub(crate) fn pixel_aligned_bounds(
+    bounds: Bounds<Pixels>,
+    scale_factor: f32,
+) -> Option<(Bounds<Pixels>, Size<DevicePixels>)> {
+    let x = (f32::from(bounds.origin.x) * scale_factor).round();
+    let y = (f32::from(bounds.origin.y) * scale_factor).round();
+    let width = (f32::from(bounds.size.width) * scale_factor).round();
+    let height = (f32::from(bounds.size.height) * scale_factor).round();
+    if !(width >= 1.0 && height >= 1.0 && width <= 65_536.0 && height <= 65_536.0) {
+        return None;
+    }
+    let snapped = Bounds::new(
+        point(px((x + 0.25) / scale_factor), px((y + 0.25) / scale_factor)),
+        size(
+            px((width - 0.25) / scale_factor),
+            px((height - 0.25) / scale_factor),
+        ),
+    );
+    // Checked above: whole numbers in 1..=65536.
+    #[allow(clippy::cast_possible_truncation)]
+    let device = size(DevicePixels(width as i32), DevicePixels(height as i32));
+    Some((snapped, device))
+}
+
 /// The placed image painted under one screen cell. Uses the same row segments,
 /// placement lookup, and decode state as the painter, so a cell maps to an
 /// image exactly when that image is drawn there.
@@ -144,14 +179,43 @@ pub(crate) fn painted_image_at<'a>(
 
 pub(crate) enum ImageLoad {
     Loading,
-    Ready(Arc<RenderImage>),
+    Ready(DecodedImage),
     Failed,
+}
+
+/// A full-size decode and its copy resampled for the size it is drawn at.
+pub(crate) struct DecodedImage {
+    source: Arc<RenderImage>,
+    resampled: Option<(Size<DevicePixels>, Arc<RenderImage>)>,
+    /// Size of the resample in flight. One runs at a time, so resizing a
+    /// window does not queue a resample for every intermediate size.
+    pending: Option<Size<DevicePixels>>,
+}
+
+/// What to paint for one image this frame.
+pub(crate) struct ImageDraw {
+    pub(crate) image: Arc<RenderImage>,
+    /// A resample of this source to the drawn size, for the caller to start
+    /// and hand to [`TerminalImageCache::finish_resample`].
+    pub(crate) resample: Option<Arc<RenderImage>>,
+}
+
+impl DecodedImage {
+    /// Pixel size of the full-size decode.
+    pub(crate) fn size(&self) -> Size<DevicePixels> {
+        self.source.size(0)
+    }
 }
 
 /// Decoded images keyed by file path (which names pane, id, and generation).
 #[derive(Default)]
 pub(crate) struct TerminalImageCache {
     entries: HashMap<String, ImageLoad>,
+    /// Images handed out for painting since their texture was last released:
+    /// GPUI's sprite atlas holds a texture for each of them.
+    painted: HashSet<ImageId>,
+    /// Images whose atlas texture is released at the next prepaint.
+    released: Vec<Arc<RenderImage>>,
 }
 
 impl TerminalImageCache {
@@ -169,8 +233,83 @@ impl TerminalImageCache {
     }
 
     pub(crate) fn finish_load(&mut self, path: String, image: Option<Arc<RenderImage>>) {
-        self.entries
-            .insert(path, image.map_or(ImageLoad::Failed, ImageLoad::Ready));
+        let load = image.map_or(ImageLoad::Failed, |source| {
+            ImageLoad::Ready(DecodedImage {
+                source,
+                resampled: None,
+                pending: None,
+            })
+        });
+        if let Some(previous) = self.entries.insert(path, load) {
+            self.release_load(previous);
+        }
+    }
+
+    /// The image to paint for `path` at `drawn` device pixels: its resample
+    /// for that size once ready, the full-size decode until then (and when
+    /// they already match). `None` until the image has decoded.
+    pub(crate) fn draw(&mut self, path: &str, drawn: Size<DevicePixels>) -> Option<ImageDraw> {
+        let Some(ImageLoad::Ready(decoded)) = self.entries.get_mut(path) else {
+            return None;
+        };
+        let draw = match &decoded.resampled {
+            Some((resampled_size, image)) if *resampled_size == drawn => ImageDraw {
+                image: Arc::clone(image),
+                resample: None,
+            },
+            _ if decoded.source.size(0) == drawn => ImageDraw {
+                image: Arc::clone(&decoded.source),
+                resample: None,
+            },
+            _ => {
+                let start = decoded.pending.is_none();
+                if start {
+                    decoded.pending = Some(drawn);
+                }
+                ImageDraw {
+                    image: Arc::clone(&decoded.source),
+                    resample: start.then(|| Arc::clone(&decoded.source)),
+                }
+            }
+        };
+        self.painted.insert(draw.image.id);
+        Some(draw)
+    }
+
+    /// Stores a finished resample, releasing the textures it replaces; if the
+    /// image is drawn at another size by now, the next [`Self::draw`] starts
+    /// a resample for that. A failed resample leaves the full-size decode
+    /// drawn at that size.
+    pub(crate) fn finish_resample(
+        &mut self,
+        path: &str,
+        drawn: Size<DevicePixels>,
+        image: Option<Arc<RenderImage>>,
+    ) {
+        let Some(ImageLoad::Ready(decoded)) = self.entries.get_mut(path) else {
+            return;
+        };
+        if decoded.pending != Some(drawn) {
+            return;
+        }
+        decoded.pending = None;
+        let image = image.unwrap_or_else(|| Arc::clone(&decoded.source));
+        let mut replaced = vec![Arc::clone(&decoded.source)];
+        replaced.extend(
+            decoded
+                .resampled
+                .replace((drawn, image))
+                .map(|(_, previous)| previous),
+        );
+        for image in replaced {
+            self.release(image);
+        }
+    }
+
+    /// Images whose atlas texture should be dropped now, each at most once
+    /// per time it was painted.
+    pub(crate) fn take_released(&mut self) -> Vec<Arc<RenderImage>> {
+        std::mem::take(&mut self.released)
     }
 
     /// Drops decoded images no current screen lists, once enough accumulate.
@@ -179,8 +318,34 @@ impl TerminalImageCache {
             return;
         }
         let referenced = referenced.collect::<HashSet<_>>();
-        self.entries
-            .retain(|path, _| referenced.contains(path.as_str()));
+        let stale = self
+            .entries
+            .keys()
+            .filter(|path| !referenced.contains(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in stale {
+            if let Some(load) = self.entries.remove(&path) {
+                self.release_load(load);
+            }
+        }
+    }
+
+    fn release_load(&mut self, load: ImageLoad) {
+        if let ImageLoad::Ready(decoded) = load {
+            self.release(decoded.source);
+            if let Some((_, image)) = decoded.resampled {
+                self.release(image);
+            }
+        }
+    }
+
+    /// Queues `image`'s atlas texture for release if it was painted. GPUI's
+    /// atlas counts releases, so an unpainted image must not be released.
+    fn release(&mut self, image: Arc<RenderImage>) {
+        if self.painted.remove(&image.id) {
+            self.released.push(image);
+        }
     }
 }
 
@@ -194,6 +359,29 @@ pub(crate) fn decode_terminal_image(path: &Path) -> Result<Arc<RenderImage>> {
         pixel.swap(0, 2);
     }
     Ok(Arc::new(RenderImage::new(vec![Frame::new(rgba)])))
+}
+
+/// Resamples a decoded image to `drawn` device pixels with a Catmull-Rom
+/// filter, which weighs every covered source pixel when shrinking and stays
+/// sharper than bilinear when enlarging. The filter treats channels alike,
+/// so the BGRA order passes through unchanged.
+pub(crate) fn resample_terminal_image(
+    source: &RenderImage,
+    drawn: Size<DevicePixels>,
+) -> Option<Arc<RenderImage>> {
+    let from = source.size(0);
+    let view = ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(
+        u32::try_from(from.width.0).ok()?,
+        u32::try_from(from.height.0).ok()?,
+        source.as_bytes(0)?,
+    )?;
+    let resampled = image::imageops::resize(
+        &view,
+        u32::try_from(drawn.width.0).ok()?,
+        u32::try_from(drawn.height.0).ok()?,
+        FilterType::CatmullRom,
+    );
+    Some(Arc::new(RenderImage::new(vec![Frame::new(resampled)])))
 }
 
 #[cfg(test)]
@@ -412,5 +600,129 @@ mod tests {
         assert!(painted_image_at(&lines, &images, &cache, 0, 2).is_some());
         // Placeholder cells for an id the screen no longer lists.
         assert!(painted_image_at(&lines, &images[1..], &cache, 0, 2).is_none());
+    }
+
+    fn device(width: i32, height: i32) -> Size<DevicePixels> {
+        size(DevicePixels(width), DevicePixels(height))
+    }
+
+    fn image_of(pixels: image::RgbaImage) -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(vec![Frame::new(pixels)]))
+    }
+
+    fn ids(images: &[Arc<RenderImage>]) -> Vec<ImageId> {
+        images.iter().map(|image| image.id).collect()
+    }
+
+    #[test]
+    // Every compared value is a whole number of pixels, so exact equality is the point.
+    #[allow(clippy::float_cmp)]
+    fn aligned_bounds_cover_whole_device_pixels_after_gpui_rounds_them() {
+        let bounds = Bounds::new(point(px(100.3), px(50.7)), size(px(200.45), px(99.9)));
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let (snapped, drawn) = pixel_aligned_bounds(bounds, scale).unwrap();
+            // What GPUI's paint_image does: scale, floor the origin, ceil the size.
+            let origin_x = (f32::from(snapped.origin.x) * scale).floor();
+            let origin_y = (f32::from(snapped.origin.y) * scale).floor();
+            let width = (f32::from(snapped.size.width) * scale).ceil();
+            let height = (f32::from(snapped.size.height) * scale).ceil();
+            assert_eq!(origin_x, (100.3 * scale).round());
+            assert_eq!(origin_y, (50.7 * scale).round());
+            #[allow(clippy::cast_precision_loss)]
+            let expected = (drawn.width.0 as f32, drawn.height.0 as f32);
+            assert_eq!((width, height), expected);
+            assert_eq!(expected, ((200.45 * scale).round(), (99.9 * scale).round()));
+        }
+        let empty = Bounds::new(point(px(0.0), px(0.0)), size(px(0.2), px(40.0)));
+        assert!(pixel_aligned_bounds(empty, 2.0).is_none());
+    }
+
+    #[test]
+    fn the_resample_for_the_drawn_size_replaces_the_full_size_decode() {
+        let mut cache = TerminalImageCache::default();
+        let source = image_of(image::RgbaImage::new(8, 8));
+        cache.finish_load("/a.png".to_owned(), Some(Arc::clone(&source)));
+
+        // Already the drawn size: drawn as is, nothing to resample.
+        let draw = cache.draw("/a.png", device(8, 8)).unwrap();
+        assert_eq!((draw.image.id, draw.resample.is_none()), (source.id, true));
+
+        // Another size: the decode is drawn while one resample runs, and
+        // sizes seen meanwhile (a window being resized) start no more.
+        let draw = cache.draw("/a.png", device(4, 4)).unwrap();
+        assert_eq!(draw.image.id, source.id);
+        assert_eq!(draw.resample.map(|image| image.id), Some(source.id));
+        let resample_started = |cache: &mut TerminalImageCache, width, height| {
+            cache
+                .draw("/a.png", device(width, height))
+                .unwrap()
+                .resample
+                .is_some()
+        };
+        assert!(!resample_started(&mut cache, 4, 4));
+        assert!(!resample_started(&mut cache, 5, 5));
+
+        let small = image_of(image::RgbaImage::new(4, 4));
+        cache.finish_resample("/a.png", device(4, 4), Some(Arc::clone(&small)));
+        let draw = cache.draw("/a.png", device(4, 4)).unwrap();
+        assert_eq!((draw.image.id, draw.resample.is_none()), (small.id, true));
+
+        // Once it finishes, a different drawn size gets its own resample; a
+        // result for a size no longer drawn is not shown.
+        assert!(resample_started(&mut cache, 6, 6));
+        let six = image_of(image::RgbaImage::new(6, 6));
+        cache.finish_resample("/a.png", device(6, 6), Some(six));
+        let draw = cache.draw("/a.png", device(7, 7)).unwrap();
+        assert_eq!(draw.image.id, source.id);
+        assert!(draw.resample.is_some());
+    }
+
+    #[test]
+    fn replaced_and_pruned_textures_are_released_once_and_only_if_painted() {
+        let mut cache = TerminalImageCache::default();
+        let source = image_of(image::RgbaImage::new(8, 8));
+        cache.finish_load("/a.png".to_owned(), Some(Arc::clone(&source)));
+        cache.draw("/a.png", device(4, 4));
+        let small = image_of(image::RgbaImage::new(4, 4));
+        cache.finish_resample("/a.png", device(4, 4), Some(Arc::clone(&small)));
+        // The decode was painted while the resample ran; it is not painted any more.
+        assert_eq!(ids(&cache.take_released()), vec![source.id]);
+        assert!(cache.take_released().is_empty());
+
+        cache.draw("/a.png", device(4, 4));
+        cache.draw("/a.png", device(6, 6));
+        let medium = image_of(image::RgbaImage::new(6, 6));
+        cache.finish_resample("/a.png", device(6, 6), Some(Arc::clone(&medium)));
+        let mut released = ids(&cache.take_released());
+        released.sort();
+        let mut expected = vec![source.id, small.id];
+        expected.sort();
+        assert_eq!(released, expected);
+
+        // Decoded but never painted: pruning it releases nothing.
+        for index in 0..=MAX_UNREFERENCED_IMAGES {
+            ready(&mut cache, &format!("/unpainted-{index}.png"));
+        }
+        cache.draw("/a.png", device(6, 6));
+        cache.prune(std::iter::empty());
+        assert_eq!(ids(&cache.take_released()), vec![medium.id]);
+    }
+
+    #[test]
+    fn shrinking_averages_every_source_pixel_instead_of_skipping_them() {
+        // One-pixel black and white stripes shrunk 3x must come out an even
+        // gray; a sampler that skips pixels turns them into solid bars.
+        let stripes = image::RgbaImage::from_fn(90, 12, |x, _| {
+            let value = if x % 2 == 0 { 0 } else { 255 };
+            image::Rgba([value, value, value, 255])
+        });
+        let resampled = resample_terminal_image(&image_of(stripes), device(30, 4)).unwrap();
+        assert_eq!(resampled.size(0), device(30, 4));
+        let pixels = resampled.as_bytes(0).unwrap();
+        // Away from the edges, where the filter sees stripes on both sides.
+        for column in 2..28 {
+            let value = i32::from(pixels[(30 + column) * 4]);
+            assert!((value - 127).abs() < 24, "column {column} is {value}");
+        }
     }
 }

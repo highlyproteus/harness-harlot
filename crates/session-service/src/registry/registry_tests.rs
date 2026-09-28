@@ -65,7 +65,7 @@ fn service_shutdown_requires_zero_live_terminals() {
     assert!(registry.shutdown_requested());
 }
 
-fn status_state(profile: TerminalProfile) -> (RegistryState, Uuid) {
+pub(super) fn status_state(profile: TerminalProfile) -> (RegistryState, Uuid) {
     let mut snapshot = SessionSnapshot::seeded();
     let pane_id = first_pane_id(&snapshot).unwrap();
     let pane = find_pane_mut_in_snapshot(&mut snapshot, pane_id).unwrap();
@@ -77,10 +77,14 @@ fn status_state(profile: TerminalProfile) -> (RegistryState, Uuid) {
             tmux: None,
             tmux_clients: HashMap::new(),
             tmux_sinks: HashMap::new(),
+            remote_clients: HashMap::new(),
+            tmux_socket_name: "hh-test".to_owned(),
+            state_dir: None,
             notifications: VecDeque::new(),
             next_notification_id: 1,
+            notifications_dirty: false,
+            notifications_epoch: Uuid::new_v4(),
             next_terminal_number: 2,
-            next_group_number: 1,
             last_identity_refresh: None,
         },
         pane_id,
@@ -109,7 +113,7 @@ fn contract_event_is_swallowed_and_synthesizes_attention() {
     assert_eq!(state.notifications[0].kind, NotificationKind::Attention);
     assert_eq!(
         state.notifications[0].message.as_deref(),
-        Some("needs approval")
+        Some("Needs approval")
     );
 }
 
@@ -132,7 +136,7 @@ fn heuristic_event_sets_status_and_preserves_message() {
         PaneStatus::NeedsApproval
     );
     assert_eq!(state.notifications.len(), 1);
-    assert_eq!(state.notifications[0].kind, NotificationKind::Message);
+    assert_eq!(state.notifications[0].kind, NotificationKind::Attention);
     assert_eq!(
         state.notifications[0].message.as_deref(),
         Some("Approval requested: edit src/lib.rs")
@@ -212,10 +216,11 @@ fn local_runtime_replacement_inside_ssh_workstation_projects_local_transport() {
     let pane_id = first_pane_id(&registry.snapshot().unwrap()).unwrap();
     {
         let mut state = registry.state.write();
-        state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
-            destination: "developer@build-node".to_owned(),
-            status: WorkspaceConnectionStatus::Connected,
-        };
+        crate::registry::make_first_workstation_remote(
+            &mut state,
+            "developer@build-node",
+            WorkspaceConnectionStatus::Connected,
+        );
     }
 
     registry

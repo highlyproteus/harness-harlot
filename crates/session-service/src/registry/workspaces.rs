@@ -1,19 +1,23 @@
 //! Workstation lifecycle: creation, SSH intents, pins, order, and appearance defaults.
 use super::{
-    RuntimePane, RuntimePaneBackend, RuntimePaneKind, SessionRegistry, SshWorkspaceIds,
-    TerminalRuntimePane, encode_desired_state, ssh_pane_title,
+    InitialTerminalSpawn, ProcessScan, RuntimePane, RuntimePaneBackend, RuntimePaneKind,
+    SessionRegistry, SshWorkspaceIds, TerminalRuntimePane, encode_desired_state, ssh_pane_title,
 };
 use crate::layout::{find_pane_mut, pane_ids_for_workspace};
-use crate::persistence::{MAX_RECENT_COLORS, MAX_WORKSPACES, validate_title};
-use crate::process::fallback_cwd;
+use crate::persistence::{MAX_RECENT_COLORS, MAX_TITLE_CHARS, MAX_WORKSPACES, validate_title};
+use crate::process::{fallback_cwd, local_spawn_dir};
 use crate::pty::PtySession;
 use crate::registry::bots::{forget_bots, workstation_count};
-use crate::registry::identity::set_pane_runtime_label;
+use crate::registry::identity::{
+    PANE_DISCONNECTED, refresh_workspace_activity, set_pane_runtime_label,
+};
+use crate::registry::panes::Reattached;
 use anyhow::{Context, Result, bail};
 use hh_protocol::{
-    AppearanceColor, MAX_PANES, Pane, PaneLayout, SessionSnapshot, Tab, TerminalIdentity,
-    Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspaceKind, WorkspacePinMove,
-    validate_ssh_host, validate_workspace_dir,
+    AppearanceColor, MAX_PANES, MAX_WORKSTATION_DEPTH, Pane, PaneLayout, SessionSnapshot, Tab,
+    TerminalIdentity, Workspace, WorkspaceConnection, WorkspaceConnectionStatus, WorkspaceKind,
+    WorkspacePinMove, effective_working_dir, validate_ssh_host, validate_workspace_dir,
+    workstation_depth, workstation_descendants,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -40,29 +44,6 @@ struct ReconnectionPlan {
     pane_ids: Vec<Uuid>,
 }
 
-/// Spawns every SSH session a reconnect needs, terminating any already
-/// spawned session when one fails.
-fn spawn_reconnect_sessions(
-    workspace_id: Uuid,
-    destination: &str,
-    working_dir: Option<&str>,
-    pane_ids: &[Uuid],
-) -> Result<Vec<(Uuid, Arc<PtySession>)>> {
-    let mut sessions = Vec::with_capacity(pane_ids.len());
-    for pane_id in pane_ids {
-        match PtySession::spawn_ssh(*pane_id, workspace_id, destination, working_dir) {
-            Ok(session) => sessions.push((*pane_id, session)),
-            Err(error) => {
-                for (_, session) in sessions {
-                    let _ = session.terminate_and_wait();
-                }
-                return Err(error);
-            }
-        }
-    }
-    Ok(sessions)
-}
-
 pub(crate) fn normalize_workspace_title(title: Option<&str>) -> Result<Option<String>> {
     let Some(title) = title else {
         return Ok(None);
@@ -73,6 +54,47 @@ pub(crate) fn normalize_workspace_title(title: Option<&str>) -> Result<Option<St
     }
     validate_title(title, "workstation")?;
     Ok(Some(title.to_owned()))
+}
+
+/// Whether two workstations run on the same machine: both local, or both
+/// reached over SSH at the same destination.
+pub(crate) fn same_machine(first: &WorkspaceConnection, second: &WorkspaceConnection) -> bool {
+    match (first, second) {
+        (WorkspaceConnection::Local, WorkspaceConnection::Local) => true,
+        (
+            WorkspaceConnection::SystemSsh {
+                destination: first, ..
+            },
+            WorkspaceConnection::SystemSsh {
+                destination: second,
+                ..
+            },
+        ) => first == second,
+        _ => false,
+    }
+}
+
+/// The connection of a new workstation nested in `parent`: the parent's
+/// machine. Fails when `parent` cannot hold another nesting level.
+fn nested_connection(workspaces: &[Workspace], parent: Uuid) -> Result<WorkspaceConnection> {
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.id == parent)
+        .with_context(|| format!("workstation {parent} does not exist"))?;
+    if workspace.is_bot() {
+        bail!("a bot cannot hold nested workstations");
+    }
+    if workstation_depth(workspaces, parent).is_none_or(|depth| depth >= MAX_WORKSTATION_DEPTH) {
+        bail!("workstations nest at most {MAX_WORKSTATION_DEPTH} levels deep");
+    }
+    Ok(workspace.connection.clone())
+}
+
+/// Default title of a workstation rooted at `dir`: the folder's name.
+fn directory_title(dir: &str) -> Option<String> {
+    dir.rsplit('/')
+        .find(|component| !component.is_empty())
+        .map(|name| name.chars().take(MAX_TITLE_CHARS).collect())
 }
 
 pub(crate) fn next_workspace_order(workspaces: &[Workspace], pinned: bool) -> u32 {
@@ -233,9 +255,21 @@ impl SessionRegistry {
         Ok(())
     }
 
-    pub fn create_workspace(&self, title: Option<&str>) -> Result<(Uuid, Uuid)> {
+    /// Creates a workstation and opens its first terminal in the effective
+    /// root folder. With `parent` it is nested there and runs on the parent's
+    /// machine (for a remote parent, over SSH to the same destination);
+    /// otherwise it is a top-level local workstation.
+    pub fn create_workspace(
+        &self,
+        title: Option<&str>,
+        parent: Option<Uuid>,
+        working_dir: Option<String>,
+    ) -> Result<(Uuid, Uuid)> {
         let title = normalize_workspace_title(title)?;
-        {
+        if let Some(dir) = working_dir.as_deref() {
+            validate_workspace_dir(dir).map_err(anyhow::Error::from)?;
+        }
+        let (connection, root) = {
             let state = self.state.read();
             if workstation_count(&state.snapshot) >= MAX_WORKSPACES {
                 bail!("workstation limit of {MAX_WORKSPACES} reached");
@@ -243,12 +277,35 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
-        }
+            let connection = match parent {
+                Some(parent) => nested_connection(&state.snapshot.workspaces, parent)?,
+                None => WorkspaceConnection::Local,
+            };
+            let root = working_dir.clone().or_else(|| {
+                parent.and_then(|parent| {
+                    effective_working_dir(&state.snapshot.workspaces, parent).map(str::to_owned)
+                })
+            });
+            (connection, root)
+        };
         let workspace_id = Uuid::new_v4();
-        let tab_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
-        let cwd = fallback_cwd()?;
-        let session = self.spawn_local_transport(pane_id, workspace_id, None, &cwd)?;
+        let cwd = match connection {
+            WorkspaceConnection::Local => local_spawn_dir(root.as_deref())?,
+            WorkspaceConnection::SystemSsh { .. } => fallback_cwd()?,
+        };
+        let InitialTerminalSpawn {
+            session,
+            kind,
+            tab_title,
+            ..
+        } = self.spawn_initial_workspace_terminal(
+            pane_id,
+            workspace_id,
+            &connection,
+            root.as_deref(),
+            &cwd,
+        )?;
         let result = (|| {
             let mut state = self.state.write();
             if workstation_count(&state.snapshot) >= MAX_WORKSPACES {
@@ -257,33 +314,47 @@ impl SessionRegistry {
             if state.panes.len() >= MAX_PANES {
                 bail!("pane limit of {MAX_PANES} reached");
             }
+            if let Some(parent) = parent {
+                nested_connection(&state.snapshot.workspaces, parent)?;
+            }
             let number = workstation_count(&state.snapshot) + 1;
             let order = next_workspace_order(&state.snapshot.workspaces, false);
-            let pane = state.new_pane(pane_id, Some(cwd.as_path()));
+            let pane = state.new_runtime_pane(pane_id, &cwd, &kind);
+            let connection = match connection {
+                WorkspaceConnection::Local => WorkspaceConnection::Local,
+                WorkspaceConnection::SystemSsh { destination, .. } => {
+                    WorkspaceConnection::SystemSsh {
+                        destination,
+                        status: WorkspaceConnectionStatus::Connected,
+                    }
+                }
+            };
             state.snapshot.workspaces.push(Workspace {
                 id: workspace_id,
-                title: title.unwrap_or_else(|| format!("Workstation {number}")),
+                title: title
+                    .or_else(|| working_dir.as_deref().and_then(directory_title))
+                    .unwrap_or_else(|| format!("Workstation {number}")),
                 color: None,
                 pinned: false,
                 pin_order: 0,
                 order,
                 active_terminal_count: 1,
-                connection: WorkspaceConnection::Local,
-                working_dir: None,
+                connection,
+                working_dir,
                 kind: WorkspaceKind::Workstation,
+                parent_workstation: parent,
+                home: false,
                 instructions: None,
                 owner_bot: None,
                 custom_icon: None,
                 bot: None,
                 tabs: vec![Tab {
                     owner_thread: None,
-                    id: tab_id,
-                    title: "Terminals".to_owned(),
+                    id: Uuid::new_v4(),
+                    title: tab_title,
                     custom_title: None,
-                    project_dir: None,
                     color: None,
                     custom_icon: None,
-                    parent_tab: None,
                     pinned: false,
                     owner_bot: None,
                     layout: PaneLayout::Leaf { pane },
@@ -295,11 +366,12 @@ impl SessionRegistry {
                     backend: RuntimePaneBackend::Terminal(TerminalRuntimePane {
                         session: Arc::clone(&session),
                         last_valid_cwd: cwd,
-                        kind: RuntimePaneKind::Local,
+                        kind,
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: false,
                     }),
                 },
             );
@@ -329,7 +401,7 @@ impl SessionRegistry {
         };
         let cwd = fallback_cwd()?;
         self.persist_ssh_workspace_intent(title, destination, ids)?;
-        let session = PtySession::spawn_ssh(ids.pane, ids.workspace, destination, None)?;
+        let session = self.spawn_ssh_transport(ids.pane, ids.workspace, destination, None)?;
         let result = self.attach_ssh_workspace(destination, ids, cwd, Arc::clone(&session));
         if result.is_err() {
             let _ = session.terminate_and_wait();
@@ -350,7 +422,6 @@ impl SessionRegistry {
         if state.panes.len() >= MAX_PANES {
             bail!("pane limit of {MAX_PANES} reached");
         }
-        let number = workstation_count(&state.snapshot) + 1;
         let order = next_workspace_order(&state.snapshot.workspaces, false);
         let pane = Pane {
             id: ids.pane,
@@ -364,10 +435,12 @@ impl SessionRegistry {
             custom_title: None,
             profile_override: None,
             custom_icon: None,
+            unseen: false,
+            progress: None,
         };
         state.snapshot.workspaces.push(Workspace {
             id: ids.workspace,
-            title: title.unwrap_or_else(|| format!("SSH Workstation {number}")),
+            title: title.unwrap_or_else(|| destination.to_owned()),
             color: None,
             pinned: false,
             pin_order: 0,
@@ -379,6 +452,8 @@ impl SessionRegistry {
             },
             working_dir: None,
             kind: WorkspaceKind::Workstation,
+            parent_workstation: None,
+            home: false,
             instructions: None,
             owner_bot: None,
             custom_icon: None,
@@ -388,10 +463,8 @@ impl SessionRegistry {
                 id: ids.tab,
                 title: "Remote".to_owned(),
                 custom_title: None,
-                project_dir: None,
                 color: None,
                 custom_icon: None,
-                parent_tab: None,
                 pinned: false,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
@@ -438,8 +511,9 @@ impl SessionRegistry {
                     },
                     recovered: false,
                     exit_status: None,
-                    detected_command_profile: None,
+                    process_scan: ProcessScan::Unknown,
                     omp_title_status: None,
+                    title_baseline_pending: false,
                 }),
             },
         );
@@ -533,11 +607,18 @@ impl SessionRegistry {
     ) -> Result<()> {
         let mut state = self.state.write();
         normalize_workspace_orders(&mut state.snapshot.workspaces);
+        let parent = state
+            .snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.parent_workstation)
+            .with_context(|| format!("workstation {workspace_id} does not exist"))?;
         let mut pinned = state
             .snapshot
             .workspaces
             .iter()
-            .filter(|workspace| workspace.pinned)
+            .filter(|workspace| workspace.pinned && workspace.parent_workstation == parent)
             .map(|workspace| (workspace.id, workspace.pin_order))
             .collect::<Vec<_>>();
         pinned.sort_by_key(|(_, order)| *order);
@@ -577,28 +658,46 @@ impl SessionRegistry {
         after: bool,
     ) -> Result<()> {
         let mut state = self.state.write();
-        let (source_pinned, source_kind) = state
+        let source = state
             .snapshot
             .workspaces
             .iter()
             .find(|workspace| workspace.id == workspace_id)
-            .map(|workspace| (workspace.pinned, workspace.kind))
+            .map(|workspace| {
+                (
+                    workspace.pinned,
+                    workspace.kind,
+                    workspace.parent_workstation,
+                )
+            })
             .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-        let (target_pinned, target_kind) = state
+        let target = state
             .snapshot
             .workspaces
             .iter()
             .find(|workspace| workspace.id == target_workspace_id)
-            .map(|workspace| (workspace.pinned, workspace.kind))
+            .map(|workspace| {
+                (
+                    workspace.pinned,
+                    workspace.kind,
+                    workspace.parent_workstation,
+                )
+            })
             .with_context(|| format!("workstation {target_workspace_id} does not exist"))?;
-        if source_pinned != target_pinned || source_kind != target_kind {
-            bail!("workstations can only be reordered within the same group");
+        if source != target {
+            bail!("workstations can only be reordered among their siblings");
         }
         let mut ordered = state
             .snapshot
             .workspaces
             .iter()
-            .filter(|workspace| workspace.pinned == source_pinned && workspace.kind == source_kind)
+            .filter(|workspace| {
+                (
+                    workspace.pinned,
+                    workspace.kind,
+                    workspace.parent_workstation,
+                ) == source
+            })
             .map(|workspace| (workspace.id, workspace.order))
             .collect::<Vec<_>>();
         ordered.sort_by_key(|(_, order)| *order);
@@ -631,9 +730,11 @@ impl SessionRegistry {
         }
     }
 
+    /// Disconnects a remote workstation and every workstation nested in it:
+    /// their SSH sessions end and their saved tabs stay as offline panes.
     pub fn disconnect_workspace(&self, workspace_id: Uuid) -> Result<()> {
-        let sessions = {
-            let state = self.state.read();
+        let targets = {
+            let mut state = self.state.write();
             let workspace = state
                 .snapshot
                 .workspaces
@@ -643,46 +744,75 @@ impl SessionRegistry {
             if !matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. }) {
                 bail!("only a system-SSH workstation can be disconnected");
             }
-            pane_ids_for_workspace(workspace)
-                .into_iter()
-                .filter_map(|pane_id| {
-                    let terminal = state.panes.get(&pane_id)?.terminal()?;
-                    matches!(terminal.kind, RuntimePaneKind::SystemSsh { .. })
-                        .then(|| (pane_id, Arc::clone(&terminal.session)))
+            let targets = std::iter::once(workspace_id)
+                .chain(workstation_descendants(
+                    &state.snapshot.workspaces,
+                    workspace_id,
+                ))
+                .filter_map(|id| {
+                    let workspace = state
+                        .snapshot
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.id == id)?;
+                    if !matches!(workspace.connection, WorkspaceConnection::SystemSsh { .. }) {
+                        return None;
+                    }
+                    let sessions = pane_ids_for_workspace(workspace)
+                        .into_iter()
+                        .filter_map(|pane_id| {
+                            let terminal = state.panes.get(&pane_id)?.terminal()?;
+                            matches!(terminal.kind, RuntimePaneKind::SystemSsh { .. })
+                                .then(|| (pane_id, Arc::clone(&terminal.session)))
+                        })
+                        .collect::<Vec<_>>();
+                    Some((id, sessions))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            // Marked before their SSH clients stop, under the same lock: the
+            // runtime refresh must see a disconnect, never an exit to report.
+            for (pane_id, _) in targets.iter().flat_map(|(_, sessions)| sessions) {
+                if let Ok(runtime) = state.terminal_pane_mut(*pane_id) {
+                    runtime.exit_status = Some(PANE_DISCONNECTED.to_owned());
+                }
+                set_pane_runtime_label(
+                    &mut state.snapshot,
+                    *pane_id,
+                    false,
+                    Some(PANE_DISCONNECTED),
+                    "system OpenSSH",
+                );
+            }
+            targets
         };
-        for (_, session) in &sessions {
-            let _ = session.terminate_and_wait();
+        // The windows keep running on the host; Reconnect reattaches them.
+        for (_, session) in targets.iter().flat_map(|(_, sessions)| sessions) {
+            let _ = session.detach(PANE_DISCONNECTED);
+        }
+        for (id, _) in &targets {
+            self.close_remote_clients(*id);
         }
 
         let mut state = self.state.write();
-        let workspace = state
+        if !state
             .snapshot
             .workspaces
-            .iter_mut()
-            .find(|workspace| workspace.id == workspace_id)
-            .with_context(|| {
-                format!("workstation {workspace_id} disappeared while disconnecting")
-            })?;
-        let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection else {
-            bail!("only a system-SSH workstation can be disconnected");
-        };
-        *status = WorkspaceConnectionStatus::Offline;
-        workspace.active_terminal_count = workspace
-            .active_terminal_count
-            .saturating_sub(u32::try_from(sessions.len()).unwrap_or(u32::MAX));
-        for (pane_id, _) in sessions {
-            if let Ok(runtime) = state.terminal_pane_mut(pane_id) {
-                runtime.exit_status = Some("disconnected".to_owned());
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            bail!("workstation {workspace_id} disappeared while disconnecting");
+        }
+        refresh_workspace_activity(&mut state);
+        for (id, _) in &targets {
+            if let Some(workspace) = state
+                .snapshot
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == *id)
+                && let WorkspaceConnection::SystemSsh { status, .. } = &mut workspace.connection
+            {
+                *status = WorkspaceConnectionStatus::Offline;
             }
-            set_pane_runtime_label(
-                &mut state.snapshot,
-                pane_id,
-                false,
-                Some("disconnected"),
-                "system OpenSSH",
-            );
         }
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         {
@@ -692,15 +822,50 @@ impl SessionRegistry {
         }
     }
 
+    /// Reconnects an offline remote workstation and every offline workstation
+    /// nested in it. Saved remote panes respawn in their workstation's
+    /// effective root folder; a remote workstation without tabs gains a
+    /// fresh terminal, nested ones are only marked connected.
     pub fn reconnect_workspace(&self, workspace_id: Uuid) -> Result<Uuid> {
+        let pane_id = self
+            .reconnect_one(workspace_id, true)?
+            .context("reconnected workstation has no terminal")?;
+        let nested = {
+            let state = self.state.read();
+            workstation_descendants(&state.snapshot.workspaces, workspace_id)
+                .into_iter()
+                .filter(|id| {
+                    state.snapshot.workspaces.iter().any(|workspace| {
+                        workspace.id == *id
+                            && matches!(
+                                workspace.connection,
+                                WorkspaceConnection::SystemSsh {
+                                    status: WorkspaceConnectionStatus::Offline,
+                                    ..
+                                }
+                            )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for id in nested {
+            self.reconnect_one(id, false)
+                .with_context(|| format!("reconnect nested workstation {id}"))?;
+        }
+        Ok(pane_id)
+    }
+
+    fn reconnect_one(&self, workspace_id: Uuid, open_if_empty: bool) -> Result<Option<Uuid>> {
         let plan = self.reconnection_plan(workspace_id)?;
         validate_ssh_host(&plan.destination).map_err(anyhow::Error::from)?;
-        let created_layout = plan.pane_ids.is_empty();
+        let created_layout = open_if_empty && plan.pane_ids.is_empty();
         let mut pane_ids = plan.pane_ids;
         if created_layout {
             pane_ids.push(Uuid::new_v4());
         }
-        let sessions = spawn_reconnect_sessions(
+        // Reattaches every window still running on the host, with its
+        // scrollback; a host that needs a prompt gets a sign-in tab first.
+        let sessions = self.spawn_ssh_sessions(
             workspace_id,
             &plan.destination,
             plan.working_dir.as_deref(),
@@ -714,11 +879,11 @@ impl SessionRegistry {
             &sessions,
         );
         if result.is_err() {
-            for (_, session) in sessions {
-                let _ = session.terminate_and_wait();
+            for (_, session, _) in sessions {
+                let _ = session.detach("reconnect failed");
             }
         }
-        result
+        result.map(|()| pane_ids.first().copied())
     }
 
     /// Reads the offline SSH destination and the pane IDs a reconnect must
@@ -754,21 +919,23 @@ impl SessionRegistry {
             .collect::<Vec<_>>();
         Ok(ReconnectionPlan {
             destination: destination.clone(),
-            working_dir: workspace.working_dir.clone(),
+            working_dir: effective_working_dir(&state.snapshot.workspaces, workspace_id)
+                .map(str::to_owned),
             pane_ids,
         })
     }
 
     /// Publishes respawned SSH sessions into the desired state and marks the
-    /// workstation connected again.
+    /// workstation connected again. A pane that reattached its still-running
+    /// remote window keeps its status and progress.
     fn apply_workspace_reconnection(
         &self,
         workspace_id: Uuid,
         destination: &str,
         created_layout: bool,
         pane_ids: &[Uuid],
-        sessions: &[(Uuid, Arc<PtySession>)],
-    ) -> Result<Uuid> {
+        sessions: &[(Uuid, Arc<PtySession>, Reattached)],
+    ) -> Result<()> {
         let cwd = fallback_cwd()?;
         let mut state = self.state.write();
         let workspace = state
@@ -796,16 +963,16 @@ impl SessionRegistry {
                 custom_title: None,
                 profile_override: None,
                 custom_icon: None,
+                unseen: false,
+                progress: None,
             };
             workspace.tabs.push(Tab {
                 owner_thread: None,
                 id: Uuid::new_v4(),
                 title: "Remote".to_owned(),
                 custom_title: None,
-                project_dir: None,
                 color: None,
                 custom_icon: None,
-                parent_tab: None,
                 pinned: false,
                 owner_bot: None,
                 layout: PaneLayout::Leaf { pane },
@@ -827,7 +994,16 @@ impl SessionRegistry {
             .active_terminal_count
             .saturating_add(u32::try_from(sessions.len()).unwrap_or(u32::MAX));
 
-        for (pane_id, session) in sessions {
+        let mut replaced = Vec::new();
+        for (pane_id, session, behind) in sessions {
+            if state.terminal_pane(*pane_id).is_ok() {
+                replaced.push(state.install_reattached_session(
+                    *pane_id,
+                    Arc::clone(session),
+                    *behind,
+                )?);
+                continue;
+            }
             state.panes.insert(
                 *pane_id,
                 RuntimePane {
@@ -839,8 +1015,9 @@ impl SessionRegistry {
                         },
                         recovered: false,
                         exit_status: None,
-                        detected_command_profile: None,
+                        process_scan: ProcessScan::Unknown,
                         omp_title_status: None,
+                        title_baseline_pending: *behind == Reattached::RunningProgram,
                     }),
                 },
             );
@@ -848,12 +1025,15 @@ impl SessionRegistry {
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
         drop(state);
-        self.write_snapshot(&bytes)?;
-        Ok(pane_ids[0])
+        drop(replaced);
+        self.write_snapshot(&bytes)
     }
 
+    /// Deletes a workstation and every workstation nested in it: ends their
+    /// terminals, removes their galleries and kills their tmux sessions. The
+    /// home workstation is refused.
     pub fn delete_workspace(&self, workspace_id: Uuid) -> Result<()> {
-        let (pane_ids, sessions, tmux_client) = {
+        let (removed_ids, pane_ids, sessions, tmux_clients, remote_hosts) = {
             let state = self.state.read();
             let workspace = state
                 .snapshot
@@ -861,10 +1041,22 @@ impl SessionRegistry {
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
                 .with_context(|| format!("workstation {workspace_id} does not exist"))?;
-            if !workspace.is_bot() && workstation_count(&state.snapshot) <= 1 {
-                bail!("the last workstation cannot be deleted");
+            if workspace.home {
+                bail!("the home workstation cannot be deleted");
             }
-            let pane_ids = pane_ids_for_workspace(workspace);
+            let removed_ids = std::iter::once(workspace_id)
+                .chain(workstation_descendants(
+                    &state.snapshot.workspaces,
+                    workspace_id,
+                ))
+                .collect::<HashSet<_>>();
+            let pane_ids = state
+                .snapshot
+                .workspaces
+                .iter()
+                .filter(|workspace| removed_ids.contains(&workspace.id))
+                .flat_map(pane_ids_for_workspace)
+                .collect::<Vec<_>>();
             let sessions = pane_ids
                 .iter()
                 .filter_map(|pane_id| {
@@ -875,41 +1067,77 @@ impl SessionRegistry {
                         .map(|terminal| Arc::clone(&terminal.session))
                 })
                 .collect::<Vec<_>>();
-            let tmux_client = state.tmux_clients.get(&workspace_id).cloned();
-            (pane_ids, sessions, tmux_client)
+            let tmux_clients = removed_ids
+                .iter()
+                .filter_map(|id| state.tmux_clients.get(id).cloned())
+                .collect::<Vec<_>>();
+            // Every host each removed workstation ran tmux on: its own
+            // destination and those of its direct SSH tabs.
+            let remote_hosts = state
+                .snapshot
+                .workspaces
+                .iter()
+                .filter(|workspace| removed_ids.contains(&workspace.id))
+                .map(|workspace| {
+                    let mut hosts = pane_ids_for_workspace(workspace)
+                        .iter()
+                        .filter_map(|pane_id| state.panes.get(pane_id)?.terminal())
+                        .filter_map(|terminal| match &terminal.kind {
+                            RuntimePaneKind::SystemSsh { host } => Some(host.clone()),
+                            _ => None,
+                        })
+                        .collect::<HashSet<_>>();
+                    if let WorkspaceConnection::SystemSsh { destination, .. } =
+                        &workspace.connection
+                    {
+                        hosts.insert(destination.clone());
+                    }
+                    (workspace.id, hosts)
+                })
+                .collect::<Vec<_>>();
+            (removed_ids, pane_ids, sessions, tmux_clients, remote_hosts)
         };
         for session in &sessions {
             let _ = session.terminate_and_wait();
         }
-        let mut cleanup_errors: Vec<anyhow::Error> = Vec::new();
-        if let Some(directory) = hh_protocol::gallery_directory(workspace_id)
-            && let Err(error) = std::fs::remove_dir_all(&directory)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            cleanup_errors.push(
-                anyhow::Error::new(error)
-                    .context(format!("remove gallery directory {}", directory.display())),
-            );
+        for (id, hosts) in &remote_hosts {
+            self.kill_remote_sessions(*id, hosts);
         }
-        if let Some(client) = tmux_client {
+        let mut cleanup_errors: Vec<anyhow::Error> = Vec::new();
+        for id in &removed_ids {
+            if let Some(directory) = hh_protocol::gallery_directory(*id)
+                && let Err(error) = std::fs::remove_dir_all(&directory)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                cleanup_errors.push(
+                    anyhow::Error::new(error)
+                        .context(format!("remove gallery directory {}", directory.display())),
+                );
+            }
+        }
+        for client in tmux_clients {
             let _ = client.kill_session();
         }
         let mut state = self.state.write();
-        let index = state
+        if !state
             .snapshot
             .workspaces
             .iter()
-            .position(|workspace| workspace.id == workspace_id)
-            .with_context(|| format!("workstation {workspace_id} disappeared while deleting"))?;
-        if !state.snapshot.workspaces[index].is_bot() && workstation_count(&state.snapshot) <= 1 {
-            bail!("the last workstation cannot be deleted");
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            bail!("workstation {workspace_id} disappeared while deleting");
         }
-        let removed_workspace = state.snapshot.workspaces.remove(index);
-        let removed_bots = removed_workspace
-            .is_bot()
-            .then_some(workspace_id)
-            .into_iter()
+        let removed_bots = state
+            .snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| removed_ids.contains(&workspace.id) && workspace.is_bot())
+            .map(|workspace| workspace.id)
             .collect::<HashSet<_>>();
+        state
+            .snapshot
+            .workspaces
+            .retain(|workspace| !removed_ids.contains(&workspace.id));
         forget_bots(
             &mut state.snapshot,
             &removed_bots,
@@ -919,8 +1147,10 @@ impl SessionRegistry {
             .into_iter()
             .filter_map(|pane_id| state.panes.remove(&pane_id))
             .collect::<Vec<_>>();
-        state.tmux_clients.remove(&workspace_id);
-        state.tmux_sinks.remove(&workspace_id);
+        for id in &removed_ids {
+            state.tmux_clients.remove(id);
+            state.tmux_sinks.remove(id);
+        }
         normalize_workspace_orders(&mut state.snapshot.workspaces);
         state.snapshot.revision = state.snapshot.revision.saturating_add(1);
         let bytes = encode_desired_state(&state)?;
@@ -935,385 +1165,5 @@ impl SessionRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::layout::{find_pane_mut_in_snapshot, first_pane_id};
-    use crate::registry::{
-        SessionRegistry, create_owner_only_directory, runtime_kind_for_workspace,
-    };
-    use uuid::Uuid;
-
-    #[test]
-    fn extra_panes_in_saved_ssh_workstations_retain_the_saved_destination() {
-        let destination = "admin@build-node";
-        let ssh = WorkspaceConnection::SystemSsh {
-            destination: destination.to_owned(),
-            status: WorkspaceConnectionStatus::Connected,
-        };
-        assert_eq!(
-            runtime_kind_for_workspace(&ssh),
-            RuntimePaneKind::SystemSsh {
-                host: destination.to_owned(),
-            }
-        );
-        assert_eq!(
-            runtime_kind_for_workspace(&WorkspaceConnection::Local),
-            RuntimePaneKind::Local
-        );
-    }
-
-    #[test]
-    fn failed_custom_icon_persistence_does_not_publish_live_state() {
-        let directory =
-            std::env::temp_dir().join(format!("hh-icon-persistence-test-{}", Uuid::new_v4()));
-        create_owner_only_directory(&directory);
-        let registry = SessionRegistry::persistent(directory.join("sessions.json")).unwrap();
-        let before = registry.snapshot().unwrap();
-        let workspace_id = before.workspaces[0].id;
-        registry
-            .store
-            .as_ref()
-            .unwrap()
-            .inject_failure_before_replace(true);
-
-        assert!(
-            registry
-                .set_workspace_custom_icon(
-                    workspace_id,
-                    Some("00000000-0000-4000-8000-000000000004.png".to_owned()),
-                )
-                .is_err()
-        );
-        assert_eq!(registry.snapshot().unwrap(), before);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn stable_ssh_workstation_creation_is_delivered_to_the_rail_and_survives_restart() {
-        let directory =
-            std::env::temp_dir().join(format!("hh-ssh-workstation-test-{}", Uuid::new_v4()));
-        create_owner_only_directory(&directory);
-        let snapshot_path = directory.join("sessions.json");
-
-        let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
-        let before = registry.snapshot().unwrap();
-        let (workspace_id, _) = registry
-            .create_simulated_ssh_workspace(Some("Safe local simulation"), "test@local-host")
-            .unwrap();
-
-        let update = registry
-            .pane_updates(Some(before.revision), &[], &[], true, 0)
-            .unwrap();
-        let delivered = update
-            .snapshot
-            .expect("new workstation snapshot is delivered");
-        assert!(
-            delivered
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.id == workspace_id)
-        );
-        let created = delivered
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .unwrap();
-        assert_eq!(created.title, "Safe local simulation");
-        assert!(matches!(
-            created.connection,
-            WorkspaceConnection::SystemSsh {
-                ref destination,
-                status: WorkspaceConnectionStatus::Connected,
-            } if destination == "test@local-host"
-        ));
-
-        drop(registry);
-
-        let recovered = SessionRegistry::persistent(&snapshot_path).unwrap();
-        let snapshot = recovered.snapshot().unwrap();
-        let saved = snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .expect("saved SSH workstation remains after restart");
-        assert_eq!(saved.title, "Safe local simulation");
-        assert!(matches!(
-            saved.connection,
-            WorkspaceConnection::SystemSsh {
-                ref destination,
-                status: WorkspaceConnectionStatus::Offline,
-            } if destination == "test@local-host"
-        ));
-
-        drop(recovered);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn confirmed_ssh_workstation_is_durable_before_session_attachment() {
-        let directory =
-            std::env::temp_dir().join(format!("hh-ssh-workstation-intent-test-{}", Uuid::new_v4()));
-        create_owner_only_directory(&directory);
-        let snapshot_path = directory.join("sessions.json");
-        let ids = SshWorkspaceIds {
-            workspace: Uuid::new_v4(),
-            tab: Uuid::new_v4(),
-            pane: Uuid::new_v4(),
-        };
-
-        let registry = SessionRegistry::persistent(&snapshot_path).unwrap();
-        registry
-            .persist_ssh_workspace_intent(
-                Some("Durable before connection".to_owned()),
-                "test@local-host",
-                ids,
-            )
-            .unwrap();
-        drop(registry);
-
-        let recovered = SessionRegistry::persistent(&snapshot_path).unwrap();
-        let snapshot = recovered.snapshot().unwrap();
-        let saved = snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == ids.workspace)
-            .expect("confirmed SSH workstation remains after a restart");
-        assert_eq!(saved.title, "Durable before connection");
-        assert_eq!(saved.active_terminal_count, 0);
-        assert!(matches!(
-            saved.connection,
-            WorkspaceConnection::SystemSsh {
-                ref destination,
-                status: WorkspaceConnectionStatus::Offline,
-            } if destination == "test@local-host"
-        ));
-
-        drop(recovered);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn rejected_ssh_intent_does_not_create_or_replace_a_terminal() {
-        let registry = SessionRegistry::new().unwrap();
-        let first = first_pane_id(&registry.snapshot().unwrap()).unwrap();
-        let first_pid = registry.pane_process_id(first).unwrap();
-
-        assert!(registry.connect_ssh(first, "-A").is_err());
-
-        assert_eq!(registry.pane_process_id(first).unwrap(), first_pid);
-        assert_eq!(registry.state().unwrap().1.len(), 1);
-    }
-
-    #[test]
-    fn appearance_mutations_keep_global_defaults_and_entity_overrides_independent() {
-        let registry = SessionRegistry::new().unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let workspace_id = snapshot.workspaces[0].id;
-        let pane_id = first_pane_id(&snapshot).unwrap();
-        let terminal_default = AppearanceColor::new(0x95, 0xcc, 0x7f);
-        let workspace_default = AppearanceColor::new(0xc9, 0x90, 0xe5);
-        let terminal_override = AppearanceColor::new(0xef, 0x71, 0x7a);
-        let workspace_override = AppearanceColor::new(0xe4, 0xbd, 0x72);
-
-        registry
-            .set_default_terminal_accent(terminal_default)
-            .unwrap();
-        registry
-            .set_default_workspace_color(workspace_default)
-            .unwrap();
-        registry
-            .set_pane_color(pane_id, Some(terminal_override))
-            .unwrap();
-        registry
-            .set_workspace_color(workspace_id, Some(workspace_override))
-            .unwrap();
-
-        let snapshot = registry.snapshot().unwrap();
-        assert_eq!(
-            snapshot.appearance.default_terminal_accent,
-            terminal_default
-        );
-        assert_eq!(
-            snapshot.appearance.default_workspace_color,
-            workspace_default
-        );
-        assert_eq!(snapshot.workspaces[0].color, Some(workspace_override));
-        assert_eq!(
-            find_pane_mut_in_snapshot(&mut snapshot.clone(), pane_id).and_then(|pane| pane.color),
-            Some(terminal_override)
-        );
-        assert_eq!(snapshot.appearance.recent_colors[0], workspace_override);
-
-        registry.set_pane_color(pane_id, None).unwrap();
-        registry.set_workspace_color(workspace_id, None).unwrap();
-        let reset = registry.snapshot().unwrap();
-        assert_eq!(reset.workspaces[0].color, None);
-        assert_eq!(
-            find_pane_mut_in_snapshot(&mut reset.clone(), pane_id).and_then(|pane| pane.color),
-            None
-        );
-        assert_eq!(reset.appearance.default_terminal_accent, terminal_default);
-        assert_eq!(reset.appearance.default_workspace_color, workspace_default);
-    }
-
-    #[test]
-    fn saved_workspace_management_renames_pins_reorders_and_deletes_deterministically() {
-        let registry = SessionRegistry::new().unwrap();
-        let first = registry.snapshot().unwrap().workspaces[0].id;
-        let (second, _) = registry.create_workspace(Some("Second")).unwrap();
-        let (third, _) = registry.create_workspace(Some("Third")).unwrap();
-
-        registry.rename_workspace(second, "Build tools").unwrap();
-        registry.set_workspace_pinned(second, true).unwrap();
-        registry.set_workspace_pinned(third, true).unwrap();
-        registry
-            .move_pinned_workspace(third, WorkspacePinMove::Up)
-            .unwrap();
-
-        let snapshot = registry.snapshot().unwrap();
-        let build = snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == second)
-            .unwrap();
-        let third_workspace = snapshot
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == third)
-            .unwrap();
-        assert_eq!(build.title, "Build tools");
-        assert!(build.pinned);
-        assert!(third_workspace.pinned);
-        assert_eq!(third_workspace.pin_order, 1);
-        assert_eq!(build.pin_order, 2);
-
-        registry.delete_workspace(second).unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        assert!(
-            snapshot
-                .workspaces
-                .iter()
-                .all(|workspace| workspace.id != second)
-        );
-        assert_eq!(
-            snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == third)
-                .unwrap()
-                .pin_order,
-            1
-        );
-        assert!(registry.delete_workspace(first).is_ok());
-        assert!(registry.delete_workspace(third).is_err());
-    }
-
-    #[test]
-    fn workspace_reorder_stays_in_its_group_and_persists_explicit_order() {
-        let registry = SessionRegistry::new().unwrap();
-        let first = registry.snapshot().unwrap().workspaces[0].id;
-        let (second, _) = registry.create_workspace(Some("Second")).unwrap();
-        let (third, _) = registry.create_workspace(Some("Third")).unwrap();
-
-        registry.reorder_workspace(third, first, false).unwrap();
-        registry.set_workspace_pinned(second, true).unwrap();
-        assert!(registry.reorder_workspace(third, second, false).is_err());
-
-        let snapshot = registry.snapshot().unwrap();
-        let mut regular = snapshot
-            .workspaces
-            .iter()
-            .filter(|workspace| !workspace.pinned)
-            .map(|workspace| (workspace.title.as_str(), workspace.order))
-            .collect::<Vec<_>>();
-        regular.sort_by_key(|(_, order)| *order);
-        assert_eq!(regular, vec![("Third", 1), ("Workstation 1", 2)]);
-        assert!(
-            snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == second)
-                .is_some_and(|workspace| workspace.pinned)
-        );
-    }
-
-    #[test]
-    fn disconnect_keeps_saved_workspace_tabs_and_layout_offline() {
-        let registry = SessionRegistry::new().unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let workspace_id = snapshot.workspaces[0].id;
-        let pane_id = first_pane_id(&snapshot).unwrap();
-        let expected_panes = pane_ids_for_workspace(&snapshot.workspaces[0]);
-        {
-            let mut state = registry.state.write();
-            state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
-                destination: "build-node".to_owned(),
-                status: WorkspaceConnectionStatus::Connected,
-            };
-            state
-                .panes
-                .get_mut(&pane_id)
-                .unwrap()
-                .terminal_mut()
-                .unwrap()
-                .kind = RuntimePaneKind::SystemSsh {
-                host: "build-node".to_owned(),
-            };
-        }
-
-        registry.disconnect_workspace(workspace_id).unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let workspace = &snapshot.workspaces[0];
-
-        assert_eq!(pane_ids_for_workspace(workspace), expected_panes);
-        assert!(matches!(workspace.tabs[0].layout, PaneLayout::Leaf { .. }));
-        assert_eq!(workspace.active_terminal_count, 0);
-        assert_eq!(
-            workspace.connection,
-            WorkspaceConnection::SystemSsh {
-                destination: "build-node".to_owned(),
-                status: WorkspaceConnectionStatus::Offline,
-            }
-        );
-        assert!(registry.state.read().panes.contains_key(&pane_id));
-    }
-
-    #[test]
-    fn closing_the_last_terminal_keeps_an_ssh_workstation_connected() {
-        let registry = SessionRegistry::new().unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let pane_id = first_pane_id(&snapshot).unwrap();
-        {
-            let mut state = registry.state.write();
-            state.snapshot.workspaces[0].connection = WorkspaceConnection::SystemSsh {
-                destination: "build-node".to_owned(),
-                status: WorkspaceConnectionStatus::Connected,
-            };
-            state
-                .panes
-                .get_mut(&pane_id)
-                .unwrap()
-                .terminal_mut()
-                .unwrap()
-                .kind = RuntimePaneKind::SystemSsh {
-                host: "build-node".to_owned(),
-            };
-        }
-
-        registry.close_pane(pane_id).unwrap();
-        let snapshot = registry.snapshot().unwrap();
-        let workspace = &snapshot.workspaces[0];
-
-        // Zero terminals is an empty workstation, not a disconnect: the next
-        // terminal must open instead of demanding a reconnect.
-        assert!(workspace.tabs.is_empty());
-        assert_eq!(workspace.active_terminal_count, 0);
-        assert_eq!(
-            workspace.connection,
-            WorkspaceConnection::SystemSsh {
-                destination: "build-node".to_owned(),
-                status: WorkspaceConnectionStatus::Connected,
-            }
-        );
-    }
-}
+#[path = "workspaces_tests.rs"]
+mod tests;

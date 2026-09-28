@@ -801,6 +801,8 @@ impl HhApp {
         text: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // Pasting into a pane is looking at it.
+        self.mark_pane_seen(pane_id);
         let Some(screen) = self.session.screens.get(&pane_id) else {
             return;
         };
