@@ -30,9 +30,10 @@ pub(crate) struct BotThreadsState {
     pub(crate) lists: HashMap<Uuid, Vec<BotThread>>,
     in_flight: HashSet<Uuid>,
     polling: bool,
-    /// Each bot's live thread panes when its list was last requested; a
-    /// change (thread opened, closed, or evicted) refreshes the list.
-    listed_panes: HashMap<Uuid, Vec<Uuid>>,
+    /// Each bot's live thread panes and their sessions when its list was last
+    /// requested; a change (thread opened, closed, evicted, or started anew
+    /// in its pane) refreshes the list.
+    listed_panes: HashMap<Uuid, Vec<(Uuid, Option<String>)>>,
     /// The bot pane whose activation the service last recorded.
     pub(crate) activated: Option<Uuid>,
 }
@@ -40,6 +41,14 @@ pub(crate) struct BotThreadsState {
 /// Threads exist only for omp bots.
 pub(crate) fn has_threads(bot: &BotSpec) -> bool {
     bot.agent == TerminalProfile::Omp
+}
+
+/// A bot's live thread panes with the session each shows.
+fn listed_panes(bot: &BotSpec) -> Vec<(Uuid, Option<String>)> {
+    bot.thread_panes
+        .iter()
+        .map(|(pane_id, thread)| (*pane_id, thread.session.clone()))
+        .collect()
 }
 
 /// Saved (not live) threads: pinned first, then newest first.
@@ -117,7 +126,7 @@ impl HhApp {
         if !has_threads(bot) {
             return;
         }
-        let panes = bot.thread_panes.keys().copied().collect();
+        let panes = listed_panes(bot);
         self.bot_threads.listed_panes.insert(bot_id, panes);
         if !self.bot_threads.in_flight.insert(bot_id) {
             return;
@@ -169,7 +178,7 @@ impl HhApp {
             .filter_map(|workspace| {
                 let bot = workspace.bot.as_ref().filter(|bot| has_threads(bot))?;
                 let listed = self.bot_threads.listed_panes.get(&workspace.id)?;
-                (!listed.iter().eq(bot.thread_panes.keys())).then_some(workspace.id)
+                (*listed != listed_panes(bot)).then_some(workspace.id)
             })
             .collect::<Vec<_>>();
         for bot_id in changed {

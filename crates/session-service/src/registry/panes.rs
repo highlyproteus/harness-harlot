@@ -818,6 +818,7 @@ impl SessionRegistry {
             }
             let was_terminal = find_pane_in_snapshot(&state.snapshot, pane_id)
                 .is_some_and(|pane| matches!(pane.kind, PaneKind::Terminal));
+            state.forget_bot_launch(pane_id);
             let runtime = state.panes.get(&pane_id);
             let session = runtime
                 .and_then(RuntimePane::terminal)

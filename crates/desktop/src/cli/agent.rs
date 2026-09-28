@@ -36,7 +36,11 @@ pub(crate) fn execute(command: &AgentCommand) -> Result<Value> {
     }
 }
 
+/// Prints a command's result; a `null` result prints nothing.
 pub(crate) fn print_result(result: &Value, json_output: bool) -> Result<()> {
+    if result.is_null() {
+        return Ok(());
+    }
     if json_output {
         println!("{}", serde_json::to_string_pretty(result)?);
     } else if let Some(text) = result.as_str() {

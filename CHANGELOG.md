@@ -60,6 +60,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `recovery.log` in the app's data folder records how each terminal came back
   after a restart, and when a lost tmux connection was re-established. It
   holds ids and errors, never terminal output.
+- Quitting a bot's agent starts a new thread: press Ctrl+C twice (or `/exit`)
+  and the conversation ends, stays saved, and a fresh one starts in the same
+  tab, like `/new`. A single Ctrl+C still clears the prompt or interrupts a
+  turn. An agent that exits with an error, or quits within a few seconds of
+  starting, leaves its shell open and posts a notification. Works for every
+  bot agent.
 
 ### Changed
 

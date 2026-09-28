@@ -75,6 +75,19 @@ pub(super) fn execute_bot(context: &AgentContext, command: &BotCommand) -> Resul
             })?;
             Ok(json!({ "pane_id": pane_id, "session_id": session, "ok": true }))
         }
+        BotCommand::AgentExited { launch, failed } => {
+            let pane_id = context.pane_id.context(format!(
+                "agent-exited needs the bot pane; run inside a bot terminal or pass --pane (sets {})",
+                hh_protocol::PANE_ID_ENV
+            ))?;
+            acknowledge(&ClientRequest::BotAgentExited {
+                pane_id,
+                launch: *launch,
+                clean: !failed,
+            })?;
+            // Quiet: this runs in the user's terminal after the agent exits.
+            Ok(Value::Null)
+        }
         BotCommand::Info => {
             let session = Session::fetch(&mut client()?)?;
             let bot = session.caller_bot(context)?;

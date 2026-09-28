@@ -153,6 +153,14 @@ right-click it to pin it. Up to five threads stay open; older idle ones close
 and stay saved. Starting `/new` or `/resume` inside omp shows up as that tab's
 thread, and each thread hears only about the workers it opened.
 
+Quitting a bot's agent starts a fresh conversation in the same tab, like
+`/new`: press Ctrl+C twice, or quit it any other way, such as `/exit`. The old
+conversation ends and stays saved (omp lists it with the bot's saved threads;
+Claude Code and Codex keep it in their own history), and workers it opened
+report to the new one. A single Ctrl+C still clears the prompt or interrupts a
+turn. If the agent exits with an error, or quits within a few seconds of
+starting, its shell is left open and a notification says so.
+
 omp bots load the bundled Harness Harlot plugin automatically, which also
 reports worker status changes into the bot's conversation. Claude Code and
 Codex bots get the `hh mcp` server attached at launch. Other agents need a

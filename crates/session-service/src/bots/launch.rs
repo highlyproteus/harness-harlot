@@ -326,6 +326,18 @@ fn utf8_path(path: &Path) -> Result<String> {
         .with_context(|| format!("path is not UTF-8: {}", path.display()))
 }
 
+/// `command` followed by a hook that reports how the agent exited to
+/// Harness Harlot: `hh bot agent-exited --launch <id>` after exit status 0,
+/// with `--failed` after any other. `&&`/`||` read the same in bash, zsh
+/// and fish, so no shell's own exit-status variable is needed.
+pub(crate) fn with_exit_hook(command: &str, hh_cli: &Path, launch: Uuid) -> Result<String> {
+    let report = format!(
+        "{} bot agent-exited --launch {launch}",
+        shell_quote(&utf8_path(hh_cli)?)
+    );
+    Ok(format!("{command} && {report} || {report} --failed"))
+}
+
 /// A TOML basic string: JSON string escaping is a subset of TOML's.
 fn toml_string(value: &str) -> Result<String> {
     serde_json::to_string(value).context("encode TOML string")
@@ -458,6 +470,20 @@ mod tests {
         assert!(!threads.exists(), "deleting the bot deletes its threads");
         fs::remove_dir_all(custom).unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_exit_hook_reports_clean_and_failed_exits_of_this_launch() {
+        let launch = Uuid::from_u128(7);
+        let hh = Path::new("/Applications/Harness Harlot.app/Contents/MacOS/hh");
+        assert_eq!(
+            with_exit_hook("/opt/bin/omp -e x", hh, launch).unwrap(),
+            format!(
+                "/opt/bin/omp -e x && '{0}' bot agent-exited --launch {launch} \
+                 || '{0}' bot agent-exited --launch {launch} --failed",
+                hh.display()
+            )
+        );
     }
 
     #[test]

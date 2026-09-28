@@ -6,6 +6,7 @@ use super::{
 };
 use crate::bots::{
     BotLaunch, PreparedLaunch, bot_home, bots_directory, prepare_launch, remove_bot_files,
+    with_exit_hook,
 };
 use crate::layout::{collect_pane_ids, find_pane_in_snapshot, find_pane_mut, layout_contains};
 use crate::persistence::{
@@ -317,6 +318,7 @@ impl SessionRegistry {
                 BotThreadPane {
                     session: None,
                     activated_ms: crate::now_ms(),
+                    launch: None,
                 },
             )]),
         };
@@ -361,7 +363,7 @@ impl SessionRegistry {
             let _ = session.terminate_and_wait();
             return Err(error);
         }
-        self.start_bot_agent(bot_id, session, launch);
+        self.start_bot_agent(bot_id, pane_id, session, launch);
         Ok((bot_id, tab_id, pane_id))
     }
 
@@ -393,6 +395,7 @@ impl SessionRegistry {
                     BotThreadPane {
                         session: None,
                         activated_ms: crate::now_ms(),
+                        launch: None,
                     },
                 )
             })
@@ -637,7 +640,9 @@ impl SessionRegistry {
                     Ok::<_, anyhow::Error>((registry.pane(pane_id)?, launch))
                 })();
                 match launched {
-                    Ok((session, launch)) => registry.start_bot_agent(bot_id, session, launch),
+                    Ok((session, launch)) => {
+                        registry.start_bot_agent(bot_id, pane_id, session, launch);
+                    }
                     Err(error) => registry
                         .notify_bot(bot_id, &format!("could not start its agent: {error:#}")),
                 }
@@ -663,15 +668,28 @@ impl SessionRegistry {
         }
     }
 
-    /// Types the agent's launch command into the bot's fresh shell and tells
-    /// the user when a custom home kept its own `AGENTS.md`.
+    /// Types the agent's launch command into bot pane `pane_id`'s fresh
+    /// shell, followed by an exit hook quoting a new launch id, and tells the
+    /// user when a custom home kept its own `AGENTS.md`.
     pub(super) fn start_bot_agent(
         &self,
         bot_id: Uuid,
+        pane_id: Uuid,
         session: Arc<PtySession>,
         launch: PreparedLaunch,
     ) {
-        type_when_ready(session, launch.command);
+        let hooked = self
+            .record_bot_launch(bot_id, pane_id)
+            .and_then(|id| {
+                hh_cli_path()
+                    .map(|hh| with_exit_hook(&launch.command, &hh, id))
+                    .transpose()
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("bot pane {pane_id} starts without an exit hook: {error:#}");
+                None
+            });
+        type_when_ready(session, hooked.unwrap_or(launch.command));
         if !launch.context_written {
             self.notify_bot(
                 bot_id,
@@ -716,8 +734,15 @@ impl SessionRegistry {
     }
 
     /// Terminates one bot pane's terminal, respawns the same pane in a fresh
-    /// shell in the bot's home and types the launch command into it.
-    fn relaunch_bot(&self, bot_id: Uuid, pane_id: Uuid, launch: PreparedLaunch) -> Result<()> {
+    /// shell in the bot's home and types the launch command into it. The old
+    /// launch is forgotten first, so its exit hook cannot fire into the new one.
+    pub(super) fn relaunch_bot(
+        &self,
+        bot_id: Uuid,
+        pane_id: Uuid,
+        launch: PreparedLaunch,
+    ) -> Result<()> {
+        self.state.write().forget_bot_launch(pane_id);
         let previous = {
             let mut state = self.state.write();
             let target = state.bot_target(bot_id)?;
@@ -775,7 +800,7 @@ impl SessionRegistry {
         let bytes = encode_desired_state(&state)?;
         drop(state);
         drop(replaced);
-        self.start_bot_agent(bot_id, session, launch);
+        self.start_bot_agent(bot_id, pane_id, session, launch);
         self.write_snapshot(&bytes)
     }
 

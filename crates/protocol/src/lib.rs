@@ -19,7 +19,7 @@
 /// bump. Because the
 /// handshake is strict equality, a bump orphans every live service until
 /// the desktop relaunches them.
-pub const PROTOCOL_VERSION: u16 = 50;
+pub const PROTOCOL_VERSION: u16 = 51;
 
 /// Claude Code `PostToolUse` matcher of the task-progress hook: the task
 /// tools of current versions plus `TodoWrite` for older ones.

@@ -525,6 +525,7 @@ mod tests {
         let activated = |ms: u64| BotThreadPane {
             session: None,
             activated_ms: ms,
+            launch: None,
         };
         let mut spec = BotSpec {
             agent: TerminalProfile::Omp,

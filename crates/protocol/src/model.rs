@@ -62,6 +62,18 @@ pub struct BotThreadPane {
     /// Epoch milliseconds the pane was last activated; 0 = never.
     #[serde(default)]
     pub activated_ms: u64,
+    /// The agent launch running in the pane. Its exit hook quotes the id, so
+    /// a hook left over from an earlier launch is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<AgentLaunch>,
+}
+
+/// One launch of a bot pane's agent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentLaunch {
+    pub id: Uuid,
+    /// Epoch milliseconds the launch command was issued.
+    pub started_ms: u64,
 }
 
 /// One thread of a bot: a saved or live agent conversation.
@@ -746,6 +758,7 @@ mod bot_thread_tests {
                 BotThreadPane {
                     session: Some("0193-abc".to_owned()),
                     activated_ms: 7,
+                    launch: None,
                 },
             )]),
         };
@@ -755,6 +768,20 @@ mod bot_thread_tests {
             serde_json::json!({ pane.to_string(): {"session": "0193-abc", "activated_ms": 7} })
         );
         assert_eq!(serde_json::from_value::<BotSpec>(encoded).unwrap(), spec);
+        let mut launched = spec.clone();
+        launched.thread_panes.get_mut(&pane).unwrap().launch = Some(AgentLaunch {
+            id: pane,
+            started_ms: 9,
+        });
+        let encoded = serde_json::to_value(&launched).unwrap();
+        assert_eq!(
+            encoded["thread_panes"][pane.to_string()]["launch"],
+            serde_json::json!({"id": pane, "started_ms": 9})
+        );
+        assert_eq!(
+            serde_json::from_value::<BotSpec>(encoded).unwrap(),
+            launched
+        );
 
         let mut snapshot = SessionSnapshot::seeded();
         assert_eq!(snapshot.workspaces[0].tabs[0].owner_thread, None);
