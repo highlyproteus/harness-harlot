@@ -20,8 +20,9 @@ pub struct AppTheme {
     pub accent_soft: u32,
     pub selection: u32,
     pub danger: u32,
-    /// Caution orange (e.g. missing permissions), distinct from destructive
-    /// `danger` red. Tab states use the palette in `status_art`.
+    /// Caution orange for missing macOS permissions, distinct from
+    /// destructive `danger` red. Tab states use the palette in `status_art`.
+    #[cfg(target_os = "macos")]
     pub warning: u32,
     pub ansi: [u32; 16],
 }
@@ -46,6 +47,7 @@ impl AppTheme {
         accent_soft: 0x243b55,
         selection: 0x294766,
         danger: 0xef6b73,
+        #[cfg(target_os = "macos")]
         warning: 0xe8912d,
         ansi: [
             0x20242b, 0xef717a, 0x95cc7f, 0xe4bd72, 0x6faaf2, 0xc990e5, 0x67c8c6, 0xd2d7df,
