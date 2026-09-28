@@ -98,6 +98,15 @@ pub enum ClientRequest {
         pane_id: Uuid,
         session_id: String,
     },
+    /// Sent by a bot pane's shell after its agent exits: `clean` for exit
+    /// status 0. A clean exit starts a fresh conversation in the pane; a
+    /// failed one posts a notification and leaves the shell. `launch` must
+    /// name the pane's current agent launch, else the report is ignored.
+    BotAgentExited {
+        pane_id: Uuid,
+        launch: Uuid,
+        clean: bool,
+    },
     /// Opens a worker terminal tab in a workstation and optionally types
     /// `command` into its shell once the shell is spawned. When
     /// `requester_pane` is a bot pane, the tab records that bot as
@@ -904,6 +913,19 @@ mod tests {
                     "type": "report_bot_session",
                     "pane_id": pane_id,
                     "session_id": "0193-abc",
+                }),
+            ),
+            (
+                ClientRequest::BotAgentExited {
+                    pane_id,
+                    launch: bot_id,
+                    clean: true,
+                },
+                serde_json::json!({
+                    "type": "bot_agent_exited",
+                    "pane_id": pane_id,
+                    "launch": bot_id,
+                    "clean": true,
                 }),
             ),
         ]);

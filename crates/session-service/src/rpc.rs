@@ -209,6 +209,7 @@ pub(crate) fn handle_request(
         | ClientRequest::SetBotThreadPinned { .. }
         | ClientRequest::DeleteBotThread { .. }
         | ClientRequest::ReportBotSession { .. }
+        | ClientRequest::BotAgentExited { .. }
         | ClientRequest::GetCodingAgents => handle_bots_request(sessions, request),
     }
 }
@@ -790,6 +791,14 @@ fn handle_bots_request(
             session_id,
         } => {
             sessions.report_bot_session(pane_id, &session_id)?;
+            Ok(ServiceResponse::Ack)
+        }
+        ClientRequest::BotAgentExited {
+            pane_id,
+            launch,
+            clean,
+        } => {
+            sessions.bot_agent_exited(pane_id, launch, clean)?;
             Ok(ServiceResponse::Ack)
         }
         ClientRequest::GetCodingAgents => Ok(ServiceResponse::CodingAgents {

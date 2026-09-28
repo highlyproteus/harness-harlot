@@ -83,9 +83,14 @@ fn bot_workspaces_and_owners_round_trip() {
     let bot_id = Uuid::new_v4();
     let mut bot_pane = crate::layout::pane_fixture(Uuid::new_v4());
     bot_pane.profile_override = Some(TerminalProfile::Omp);
+    // The launch persists: a surviving tmux shell's exit hook quotes it.
     let live_thread = hh_protocol::BotThreadPane {
         session: Some("0193-live".to_owned()),
         activated_ms: 42,
+        launch: Some(hh_protocol::AgentLaunch {
+            id: Uuid::new_v4(),
+            started_ms: 41,
+        }),
     };
     let spec = BotSpec {
         pinned_threads: vec!["0193-pinned".to_owned()],

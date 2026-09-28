@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Quitting a bot's agent starts a new thread: press Ctrl+C twice (or `/exit`)
+  and the conversation ends, stays saved, and a fresh one starts in the same
+  tab, like `/new`. A single Ctrl+C still clears the prompt or interrupts a
+  turn. An agent that exits with an error, or quits within a few seconds of
+  starting, leaves its shell open and posts a notification. Works for every
+  bot agent. Protocol version 48.
+
 ## [0.1.26] - 2026-09-26
 
 ### Added

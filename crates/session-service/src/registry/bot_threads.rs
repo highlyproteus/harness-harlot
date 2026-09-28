@@ -1,16 +1,28 @@
 //! Bot threads: an omp bot's tabs hold its live thread panes, each one omp
 //! process showing one saved conversation of the bot.
+//!
+//! Every bot pane's launch command ends in an exit hook
+//! ([`crate::bots::with_exit_hook`]). When the agent quits cleanly (a double
+//! Ctrl+C, `/exit`, Ctrl+D) the pane starts a fresh conversation in place and
+//! the old one stays saved; a failed exit leaves the shell and notifies.
 use super::bots::{BotTarget, bot_for_pane, local_terminal_runtime, thread_tab};
-use super::{RegistryState, SessionRegistry};
+use super::{RegistryState, SessionRegistry, encode_desired_state};
 use crate::bots::{
     SavedThread, delete_saved_thread, saved_threads, threads_directory, valid_session_id,
 };
 use crate::layout::{activate_tab, find_pane_in_snapshot, layout_contains};
 use crate::persistence::MAX_TABS_PER_WORKSPACE;
 use anyhow::{Context, Result, bail};
-use hh_protocol::{BotThread, BotThreadPane, MAX_PANES, PaneStatus, TerminalProfile};
+use hh_protocol::{
+    AgentLaunch, BotThread, BotThreadPane, MAX_PANES, NotificationKind, PaneStatus, TerminalProfile,
+};
 use std::sync::Arc;
+use std::thread;
 use uuid::Uuid;
+
+/// A clean agent exit sooner than this after launch leaves the shell instead
+/// of starting a new thread, so an agent that quits at once cannot loop.
+const MIN_AGENT_RUN_MS: u64 = 5_000;
 
 /// Live thread panes a bot keeps before idle ones are closed.
 pub(crate) const MAX_LIVE_THREADS: usize = 5;
@@ -229,6 +241,122 @@ impl SessionRegistry {
         self.commit_or_restore(&mut state, previous, &[])
     }
 
+    /// Handles the exit hook of bot pane `pane_id`'s agent launch `launch`.
+    /// A clean exit starts a fresh conversation in the same pane off the
+    /// caller's thread (the caller runs in the shell being replaced); a
+    /// failed or immediate one only notifies. Reports from an earlier or
+    /// already reported launch, or from a closed pane, are ignored.
+    pub fn bot_agent_exited(&self, pane_id: Uuid, launch: Uuid, clean: bool) -> Result<()> {
+        let (bot_id, started_ms) = {
+            let mut state = self.state.write();
+            let Some(bot_id) = bot_for_pane(&state.snapshot, pane_id) else {
+                return Ok(());
+            };
+            let Some(thread) = state.bot_spec_mut(bot_id)?.thread_panes.get_mut(&pane_id) else {
+                return Ok(());
+            };
+            match thread.launch.take() {
+                Some(current) if current.id == launch => (bot_id, current.started_ms),
+                current => {
+                    thread.launch = current;
+                    return Ok(());
+                }
+            }
+        };
+        if !clean {
+            self.notify_bot_pane(
+                bot_id,
+                pane_id,
+                "agent exited with an error; its shell is left open.",
+            );
+        } else if crate::now_ms().saturating_sub(started_ms) < MIN_AGENT_RUN_MS {
+            self.notify_bot_pane(
+                bot_id,
+                pane_id,
+                "agent quit right after starting, so no new thread was opened.",
+            );
+        } else {
+            let registry = self.clone();
+            thread::Builder::new()
+                .name("hh-bot-new-thread".to_owned())
+                .spawn(move || {
+                    if let Err(error) = registry.renew_bot_thread(bot_id, pane_id) {
+                        registry.notify_bot_pane(
+                            bot_id,
+                            pane_id,
+                            &format!("could not start a new thread: {error:#}"),
+                        );
+                    }
+                })
+                .context("start the new thread")?;
+        }
+        Ok(())
+    }
+
+    /// Starts a fresh conversation in bot pane `pane_id`, in place: the pane
+    /// forgets its session, which stays listed as a saved thread, and its
+    /// agent is launched again without resuming. Workers the old
+    /// conversation opened stay with the pane.
+    pub(super) fn renew_bot_thread(&self, bot_id: Uuid, pane_id: Uuid) -> Result<()> {
+        let target = self.state.read().bot_target(bot_id)?;
+        if !target.panes.contains(&pane_id) {
+            bail!("pane {pane_id} is not a thread of bot {bot_id}");
+        }
+        let launch = self.prepare_bot_launch(
+            bot_id,
+            &target.name,
+            target.project_dir.as_deref(),
+            &target.spec,
+            None,
+        )?;
+        {
+            let mut state = self.state.write();
+            let previous = state.snapshot.clone();
+            if let Some(thread) = state.bot_spec_mut(bot_id)?.thread_panes.get_mut(&pane_id) {
+                thread.session = None;
+            }
+            self.commit_or_restore(&mut state, previous, &[])?;
+        }
+        self.relaunch_bot(bot_id, pane_id, launch)
+    }
+
+    /// Records a new agent launch in bot pane `pane_id` and returns its id.
+    pub(super) fn record_bot_launch(&self, bot_id: Uuid, pane_id: Uuid) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        let mut state = self.state.write();
+        if !state.bot_target(bot_id)?.panes.contains(&pane_id) {
+            bail!("pane {pane_id} is not a thread of bot {bot_id}");
+        }
+        state
+            .bot_spec_mut(bot_id)?
+            .thread_panes
+            .entry(pane_id)
+            .or_default()
+            .launch = Some(AgentLaunch {
+            id,
+            started_ms: crate::now_ms(),
+        });
+        state.snapshot.revision = state.snapshot.revision.saturating_add(1);
+        let bytes = encode_desired_state(&state)?;
+        drop(state);
+        self.write_snapshot(&bytes)?;
+        Ok(id)
+    }
+
+    /// Posts a message notification on bot pane `pane_id`, prefixed with the
+    /// bot's name.
+    fn notify_bot_pane(&self, bot_id: Uuid, pane_id: Uuid, message: &str) {
+        let mut state = self.state.write();
+        if let Ok(target) = state.bot_target(bot_id) {
+            state.append_notification(
+                pane_id,
+                NotificationKind::Message,
+                Some(format!("{}'s {message}", target.name)),
+                crate::now_ms(),
+            );
+        }
+    }
+
     /// Shows live thread pane `pane_id` in its tab and records when it was
     /// activated. Returns its tab.
     fn activate_bot_pane(&self, bot_id: Uuid, pane_id: Uuid) -> Result<(Uuid, Uuid)> {
@@ -286,6 +414,7 @@ impl SessionRegistry {
                     BotThreadPane {
                         session: resume.map(str::to_owned),
                         activated_ms: crate::now_ms(),
+                        launch: None,
                     },
                 );
             }
@@ -299,7 +428,7 @@ impl SessionRegistry {
             let _ = session.terminate_and_wait();
             return Err(error);
         }
-        self.start_bot_agent(bot_id, session, launch);
+        self.start_bot_agent(bot_id, pane_id, session, launch);
         let evictable = self.state.read().evictable_bot_panes(bot_id)?;
         for pane_id in evictable {
             if let Err(error) = self.close_pane(pane_id) {
@@ -345,6 +474,17 @@ pub(crate) fn select_evictions(threads: &[LiveThread], active: Option<Uuid>) -> 
 }
 
 impl RegistryState {
+    /// Forgets bot pane `pane_id`'s agent launch so its exit hook is ignored;
+    /// called before the pane's terminal is closed or replaced.
+    pub(crate) fn forget_bot_launch(&mut self, pane_id: Uuid) {
+        if let Some(bot_id) = bot_for_pane(&self.snapshot, pane_id)
+            && let Ok(spec) = self.bot_spec_mut(bot_id)
+            && let Some(thread) = spec.thread_panes.get_mut(&pane_id)
+        {
+            thread.launch = None;
+        }
+    }
+
     /// Live panes of bot `bot_id` to close; see [`select_evictions`].
     pub(crate) fn evictable_bot_panes(&self, bot_id: Uuid) -> Result<Vec<Uuid>> {
         let target = self.bot_target(bot_id)?;

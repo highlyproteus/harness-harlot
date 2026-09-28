@@ -7,6 +7,7 @@ mod threads;
 pub(crate) use discovery::discover_coding_agents;
 pub(crate) use launch::{
     BotLaunch, PreparedLaunch, bot_home, bots_directory, prepare_launch, remove_bot_files,
+    with_exit_hook,
 };
 pub(crate) use threads::{
     SavedThread, delete_saved_thread, saved_threads, threads_directory, valid_session_id,

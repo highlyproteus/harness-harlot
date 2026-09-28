@@ -33,6 +33,9 @@ pub(crate) enum AgentAction {
 pub(crate) enum BotCommand {
     /// Records the agent session the calling bot pane now shows.
     ReportSession { session: String },
+    /// Typed after a bot pane's agent command: reports that launch `launch`
+    /// exited, cleanly unless `failed`.
+    AgentExited { launch: Uuid, failed: bool },
     /// The calling bot pane, its bot (workspace) and the bot's live and active thread panes.
     Info,
 }
@@ -304,6 +307,17 @@ fn parse_bot(arguments: &[String]) -> Result<BotCommand> {
                     .single("--session")?
                     .context("bot report-session requires --session ID")?
                     .to_owned(),
+            })
+        }
+        "agent-exited" => {
+            let options = Options::scan(arguments, &["--launch"], &["--failed"])?;
+            options.positionals::<0>("hh bot agent-exited --launch ID [--failed] [--pane ID]")?;
+            let launch = options
+                .single("--launch")?
+                .context("bot agent-exited requires --launch ID")?;
+            Ok(BotCommand::AgentExited {
+                launch: parse_uuid_flag("--launch", launch)?,
+                failed: options.switch("--failed")?,
             })
         }
         "info" => no_arguments(arguments, BotCommand::Info),
@@ -794,6 +808,23 @@ mod tests {
             })
         );
         assert!(parse(&["bot", "report-session"]).is_err());
+        let launch = Uuid::from_u128(9);
+        assert_eq!(
+            parse(&[
+                "bot",
+                "agent-exited",
+                "--launch",
+                &launch.to_string(),
+                "--failed"
+            ])
+            .unwrap(),
+            AgentAction::Bot(BotCommand::AgentExited {
+                launch,
+                failed: true,
+            })
+        );
+        assert!(parse(&["bot", "agent-exited"]).is_err());
+        assert!(parse(&["bot", "agent-exited", "--launch", "nope"]).is_err());
         assert_eq!(
             parse(&["bot", "info"]).unwrap(),
             AgentAction::Bot(BotCommand::Info)
