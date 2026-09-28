@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Inline terminal images (omp's concept board, pasted images, thumbnails) are
+  sharp. They were drawn by stretching the full-size picture on the GPU, which
+  blurs images shown larger than their pixel size and drops detail from ones
+  shown smaller, so most images looked soft or jagged even on a Retina screen.
+  Each image is now resized with a proper filter to the exact size it is shown
+  at, and its graphics memory is freed when it is replaced or no longer shown.
+
 ## [0.1.26] - 2026-09-26
 
 ### Added
