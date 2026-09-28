@@ -94,11 +94,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `hh terminal list` (and MCP `terminal_list`) adds `parent_workstation` to each
   workstation, and a tab's `cwd` is its workstation's effective root folder.
   CLI, MCP, and omp plugin command names are unchanged.
-- Bumped the desktop/service wire protocol from 47 to 50 for nested and home
-  workstations, the removed project and tab-group requests, and pane seen
-  state, notifications, and task progress; desktop and service must be
-  upgraded together, so the update restarts the terminal service. Session
-  snapshots move to schema 17.
+- Bumped the desktop/service wire protocol from 47 to 51 for nested and home
+  workstations, the removed project and tab-group requests, pane seen state,
+  notifications, task progress, and bot agent exit reports; desktop and
+  service must be upgraded together, so the update restarts the terminal
+  service. Session snapshots move to schema 17.
+- Updating from 0.1.26 or earlier: local terminals keep running through the
+  service restart and reattach with their scrollback. SSH workstations and SSH
+  tabs opened by an earlier version are plain SSH connections, so the update
+  ends them; click Reconnect afterwards, and from then on they run in tmux on
+  the host and survive dropped connections, quits, and updates.
 - The bell counts unread notifications, magenta when one needs you (including
   an agent asking for approval or input) and blue otherwise. The Dock icon
   shows the same count in macOS's standard red badge.
