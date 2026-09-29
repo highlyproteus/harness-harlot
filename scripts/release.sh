@@ -199,7 +199,7 @@ cmd_prepare() {
       *) [ -z "$version" ] || usage; version=$1; shift ;;
     esac
   done
-  [ -n "$version" ] && [ -n "$title" ] || usage
+  { [ -n "$version" ] && [ -n "$title" ]; } || usage
   [ "$skip_preflight" -eq 0 ] || [ "$dry_run" -eq 1 ] || die "--skip-preflight is only allowed with --dry-run"
   check_version "$version"
   init_gh
