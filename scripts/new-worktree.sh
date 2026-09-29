@@ -34,7 +34,7 @@ source_target="$main_checkout/target"
 if [ -d "$source_target" ]; then
   mkdir -p "$destination/target"
   case "$(uname -s)" in
-    Darwin) clone='cp -cR' ;;
+    Darwin) clone='/bin/cp -cR' ;; # APFS clonefile; GNU cp in PATH lacks -c
     *) clone='cp -R --reflink=auto' ;;
   esac
   for entry in "$source_target"/* "$source_target"/.[!.]*; do

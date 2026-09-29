@@ -99,9 +99,9 @@ build_in_worktree() {
   worktrees="$worktrees $tree"
   if [ -d "$repository_root/target/release" ]; then
     mkdir -p "$tree/target"
-    cp -cR "$repository_root/target/release" "$tree/target/release"
+    /bin/cp -cR "$repository_root/target/release" "$tree/target/release"
     [ -d "$repository_root/target/fixture-updater" ] &&
-      cp -cR "$repository_root/target/fixture-updater" "$tree/target/fixture-updater"
+      /bin/cp -cR "$repository_root/target/fixture-updater" "$tree/target/fixture-updater"
   fi
   (
     cd "$tree"
