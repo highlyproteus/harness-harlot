@@ -139,6 +139,24 @@ Releases are cut with `scripts/release.sh` (see `docs/macos-release.md`,
 "Fast release path"); the tag reuses the green CI run of the identical tree, so
 Linux tests are not re-run on the tag. `release.sh` publishes as soon as CI is
 green, so when a release changes rendering, CEF, or Linux-specific desktop code,
-smoke-test a local build (`scripts/package-linux-release.sh` in test mode) under
-X11 and Wayland-plus-XWayland on a real Linux GPU machine before starting the
-release; container compilation does not replace that visual/runtime check.
+smoke-test a browser-enabled local build on a real Linux GPU machine under X11
+and under Wayland-plus-XWayland before starting the release. Container
+compilation does not replace that visual/runtime check. Don't use
+`package-linux-release.sh` test mode for this: it deliberately builds `hh`
+without `browser` and ships no CEF helper or runtime. Instead, with `CEF_PATH`
+set to the unpacked pinned CEF archive for the machine's architecture, lay the
+binaries out as the package does:
+
+```sh
+cargo build --locked --release -p hh-desktop --bin hh -p hh-cef-view --bin hh-cef-helper \
+  --features hh-desktop/browser,hh-cef-view/cef
+cargo build --locked --release -p hh-session-service --bin hh-service
+smoke=$(mktemp -d)
+cp target/release/hh target/release/hh-cef-helper target/release/hh-service "$smoke/"
+find "$CEF_PATH/Release" "$CEF_PATH/Resources" -maxdepth 1 -type f -exec cp {} "$smoke/" \;
+cp -R "$CEF_PATH/Resources/locales" "$smoke/"
+HH_STATE_DIR="$smoke/state" "$smoke/hh"
+```
+
+In each session, open a browser tab, load a page, and resize and switch tabs
+next to a terminal pane.

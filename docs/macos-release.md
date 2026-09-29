@@ -216,9 +216,11 @@ publish, and nothing prompts afterwards.
    `crates/protocol`, or `crates/session-service` changed since the previous tag,
    build the fixture pair with
    `scripts/build-upgrade-fixtures.sh vPREVIOUS --next-version X.Y.Z` (the
-   previous version's fixture is cached and reused), install the old fixture,
-   upgrade to the new one, and confirm running terminals, SSH workstations, and
-   bots survive. `release.sh` refuses such a release without
+   previous version's fixture is cached and reused; the script already proves
+   the old fixture updater accepts and installs the new DMG in a scratch
+   prefix). Then install the old fixture for real, upgrade with the printed
+   command, and confirm running terminals, SSH workstations, and bots survive.
+   `release.sh` refuses such a release without
    `--upgrade-smoke-passed`. Linux rendering/CEF changes need the GPU smoke in
    `docs/linux-release.md`. Otherwise skip this step.
 3. **Ship.** `scripts/release.sh X.Y.Z --title "short summary"`.
