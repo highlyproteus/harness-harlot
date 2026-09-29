@@ -380,7 +380,7 @@ def duration(job):
     if job.get("started_at") and job.get("completed_at"):
         from datetime import datetime
         f = lambda s: datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
-        return int((f(job["completed_at"]) - f(job["started_at"])).total_seconds())
+        return max(0, int((f(job["completed_at"]) - f(job["started_at"])).total_seconds()))
     return 0
 
 
