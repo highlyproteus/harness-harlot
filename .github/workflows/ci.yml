@@ -17,6 +17,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # crates.io downloads intermittently fail with HTTP/2 framing errors on hosted
+  # runners; retry more and avoid HTTP/2 multiplexing.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
 jobs:
   already-tested:
     name: Skip main push when its pull request already tested this tree
