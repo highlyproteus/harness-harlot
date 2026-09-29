@@ -80,10 +80,20 @@ command -v curl >/dev/null 2>&1 || {
   echo "curl is required to download Harness Harlot." >&2
   exit 1
 }
-case "$(uname -m)" in
+machine=$(uname -m)
+# A Rosetta-translated shell on Apple silicon reports x86_64; install the
+# native build there.
+if [ "$machine" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+  machine=arm64
+fi
+case "$machine" in
   arm64) architecture=arm64 ;;
-  x86_64) architecture=x86_64 ;;
-  *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+  x86_64)
+    echo "Harness Harlot now requires a Mac with Apple silicon." >&2
+    echo "The last release for Intel Macs is 0.1.27: https://github.com/$REPOSITORY/releases/tag/v0.1.27" >&2
+    exit 1
+    ;;
+  *) echo "unsupported macOS architecture: $machine" >&2; exit 1 ;;
 esac
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/hh-community-install.XXXXXX")

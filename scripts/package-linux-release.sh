@@ -126,9 +126,14 @@ fi
 if [ "$test_mode" = 1 ]; then
   cargo build --locked --release -p hh-desktop --bin hh
 else
-  cargo build --locked --release -p hh-desktop --features browser --bin hh
-  cargo build --locked --release -p hh-cef-view --features cef --bin hh-cef-helper
+  # `hh` and `hh-cef-helper` share one cargo invocation: the helper's graph is
+  # already part of `hh --features browser`, so a separate build only recompiled
+  # dependencies under a different feature resolution.
+  cargo build --locked --release -p hh-desktop --bin hh -p hh-cef-view --bin hh-cef-helper \
+    --features hh-desktop/browser,hh-cef-view/cef
 fi
+# hh-service and hh-update-tool stay separate so desktop-only dependency
+# features are never unified into them.
 cargo build --locked --release -p hh-session-service --bin hh-service
 updater_features=fetch
 if [ "$test_mode" = 1 ]; then

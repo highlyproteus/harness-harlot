@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- macOS releases now require a Mac with Apple silicon. 0.1.27 is the last
+  release for Intel Macs: the installer tells Intel users so and links to it,
+  and Intel installs stop being offered updates (Settings → Updates shows
+  "Unable to check for updates"). The installer also now picks the Apple
+  silicon build when run from a Rosetta shell. Linux x86_64 and arm64 are
+  unchanged.
+
 ## [0.1.27] - 2026-09-28
 
 ### Added

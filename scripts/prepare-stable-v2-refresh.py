@@ -24,7 +24,6 @@ ALIASES = {
     "manifest-linux-arm64-v2.update.json": ("linux", "arm64", "tar.gz"),
     "manifest-linux-x86_64-v2.update.json": ("linux", "x86_64", "tar.gz"),
     "manifest-macos-community-arm64-v2.update.json": ("macos", "arm64", "dmg"),
-    "manifest-macos-community-x86_64-v2.update.json": ("macos", "x86_64", "dmg"),
 }
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_SIGNATURE_BYTES = 4 * 1024

@@ -97,10 +97,19 @@ fi
 
 [ -n "$version" ] || usage
 case "$version" in *[!0-9A-Za-z.+-]* | '' | .* | *.) echo "invalid release version" >&2; exit 2 ;; esac
-case "$(uname -m)" in
+machine=$(uname -m)
+# A Rosetta-translated shell on Apple silicon reports x86_64; install the
+# native build there.
+if [ "$machine" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+  machine=arm64
+fi
+case "$machine" in
   arm64) architecture=arm64 ;;
-  x86_64) architecture=x86_64 ;;
-  *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+  x86_64)
+    echo "Harness Harlot now requires a Mac with Apple silicon; releases after 0.1.27 do not support Intel Macs." >&2
+    exit 1
+    ;;
+  *) echo "unsupported macOS architecture: $machine" >&2; exit 1 ;;
 esac
 
 fixture=${HH_INSTALLER_TEST_MODE:-0}

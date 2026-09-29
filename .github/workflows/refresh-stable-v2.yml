@@ -50,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir "$RUNNER_TEMP/release"
-          for platform in linux-arm64 linux-x86_64 macos-community-arm64 macos-community-x86_64; do
+          for platform in linux-arm64 linux-x86_64 macos-community-arm64; do
             alias="manifest-${platform}-v2.update.json"
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release" --pattern "$alias"
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release" --pattern "$alias.sig"
@@ -59,7 +59,7 @@ jobs:
           import json, pathlib, re, subprocess, sys
           root, tag, repository = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
           aliases = sorted(root.glob("manifest-*-v2.update.json"))
-          assert len(aliases) == 4
+          assert len(aliases) == 3
           names = []
           for path in aliases:
               manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -69,10 +69,10 @@ jobs:
               assert re.fullmatch(r"Harness-Harlot-[A-Za-z0-9._-]+", name)
               assert artifact["url"] == f"https://github.com/{repository}/releases/download/{tag}/{name}"
               names.append(name)
-          assert len(set(names)) == 4
+          assert len(set(names)) == 3
           for name in names:
               subprocess.run(["gh", "release", "download", tag, "--repo", repository, "--dir", str(root), "--pattern", name], check=True)
-          assert len(list(root.iterdir())) == 12
+          assert len(list(root.iterdir())) == 9
           PY
       - name: Verify release provenance, existing signatures, artifact identity, digests, and sizes
         env:
@@ -141,7 +141,6 @@ jobs:
               "manifest-linux-arm64-v2.update.json",
               "manifest-linux-x86_64-v2.update.json",
               "manifest-macos-community-arm64-v2.update.json",
-              "manifest-macos-community-x86_64-v2.update.json",
           }
           expected_files = aliases | {"stable-v2-refresh.json"}
           by_name = {path.name: path for path in root.iterdir() if path.is_file() and not path.is_symlink()}
@@ -267,7 +266,7 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$COMMIT" --jq .commit.verification.verified)" = true
           test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$COMMIT" --jq .author.login)" = highlyproteus
           mkdir "$RUNNER_TEMP/original"
-          for platform in linux-arm64 linux-x86_64 macos-community-arm64 macos-community-x86_64; do
+          for platform in linux-arm64 linux-x86_64 macos-community-arm64; do
             alias="manifest-${platform}-v2.update.json"
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/original" --pattern "$alias" --pattern "$alias.sig"
             for file in "$RUNNER_TEMP/original/$alias" "$RUNNER_TEMP/original/$alias.sig"; do
@@ -299,7 +298,6 @@ jobs:
               "manifest-linux-arm64-v2.update.json": ("linux", "arm64", "tar.gz"),
               "manifest-linux-x86_64-v2.update.json": ("linux", "x86_64", "tar.gz"),
               "manifest-macos-community-arm64-v2.update.json": ("macos", "arm64", "dmg"),
-              "manifest-macos-community-x86_64-v2.update.json": ("macos", "x86_64", "dmg"),
           }
           expected_files = set(aliases) | {"stable-v2-refresh.json"}
           by_name = {path.name: path for path in root.iterdir() if path.is_file() and not path.is_symlink()}
@@ -401,12 +399,11 @@ jobs:
               "manifest-linux-arm64-v2.update.json",
               "manifest-linux-x86_64-v2.update.json",
               "manifest-macos-community-arm64-v2.update.json",
-              "manifest-macos-community-x86_64-v2.update.json",
           }
           expected_files = aliases | {name + ".sig" for name in aliases} | {"stable-v2-refresh.json"}
           by_name = {path.name: path for path in root.iterdir() if path.is_file() and not path.is_symlink()}
           assert set(by_name) == expected_files
-          assert len(by_name) == 9
+          assert len(by_name) == 7
           PY
       - name: Attest stable-v2 refresh payload
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
@@ -442,12 +439,11 @@ jobs:
               "manifest-linux-arm64-v2.update.json",
               "manifest-linux-x86_64-v2.update.json",
               "manifest-macos-community-arm64-v2.update.json",
-              "manifest-macos-community-x86_64-v2.update.json",
           }
           expected = aliases | {name + ".sig" for name in aliases} | {"stable-v2-refresh.json"}
           paths = list(root.iterdir())
           assert {path.name for path in paths} == expected
-          assert len(paths) == 9
+          assert len(paths) == 7
           assert all(path.is_file() and not path.is_symlink() for path in paths)
           PY
       - name: Publish rolling refresh assets after signing material is gone
@@ -473,6 +469,15 @@ jobs:
             test "$(jq -r .isDraft "$RUNNER_TEMP/existing.json")" = false
             test "$(jq -r .isPrerelease "$RUNNER_TEMP/existing.json")" = true
           fi
+          # macOS Intel builds ended with v0.1.27: remove its retired alias from the
+          # rolling release so the published set stays exactly the signed payload.
+          for retired in manifest-macos-community-x86_64-v2.update.json manifest-macos-community-x86_64-v2.update.json.sig; do
+            present=$(gh release view "$refresh_tag" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq "any(.assets[]; .name == \"$retired\")")
+            if [ "$present" = true ]; then
+              gh release delete-asset "$refresh_tag" "$retired" --repo "$GITHUB_REPOSITORY" --yes
+            fi
+          done
           gh release upload "$refresh_tag" --repo "$GITHUB_REPOSITORY" --clobber \
             "$RUNNER_TEMP"/stable-v2-refresh/*
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-after.json"
@@ -487,7 +492,7 @@ jobs:
           assert published["isDraft"] is False and published["isPrerelease"] is True
           assets = {asset["name"]: asset for asset in published["assets"]}
           files = {path.name: path for path in root.iterdir()}
-          assert set(assets) == set(files) and len(files) == 9
+          assert set(assets) == set(files) and len(files) == 7
           for name, path in files.items():
               body = path.read_bytes()
               assert assets[name]["size"] == len(body)

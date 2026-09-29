@@ -33,14 +33,50 @@ concurrency:
   group: packaging-assurance-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # crates.io downloads intermittently fail with HTTP/2 framing errors on hosted
+  # runners; retry more and avoid HTTP/2 multiplexing.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
 jobs:
+  already-tested:
+    name: Skip main push when its pull request already tested this tree
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      tested: ${{ steps.find.outputs.tested }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: find
+        name: Look for a green Packaging Assurance run on the identical tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if python3 scripts/find-green-ci-run.py --repo "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" --workflow packaging-assurance.yml --exclude-run "$GITHUB_RUN_ID" \
+            --job "macOS release and updater fixtures" --job "Linux release and updater fixtures"; then
+            echo tested=true >> "$GITHUB_OUTPUT"
+          else
+            echo tested=false >> "$GITHUB_OUTPUT"
+          fi
+
   macos-fixtures:
     name: macOS release and updater fixtures
+    needs: already-tested
+    if: ${{ !cancelled() && needs.already-tested.outputs.tested != 'true' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.96"
@@ -48,6 +84,7 @@ jobs:
         with:
           shared-key: packaging-macos-arm64
           cache-targets: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: |
           scripts/test-installer.sh
           scripts/test-release-fixture.sh
@@ -59,11 +96,14 @@ jobs:
 
   linux-fixtures:
     name: Linux release and updater fixtures
+    needs: already-tested
+    if: ${{ !cancelled() && needs.already-tested.outputs.tested != 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
@@ -79,6 +119,7 @@ jobs:
         with:
           shared-key: packaging-linux-x86_64
           cache-targets: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: |
           scripts/test-linux-update-tool.sh
           scripts/test-linux-release-fixture.sh

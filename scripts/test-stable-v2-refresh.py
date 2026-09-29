@@ -26,7 +26,6 @@ ALIASES = (
     "manifest-linux-arm64-v2.update.json",
     "manifest-linux-x86_64-v2.update.json",
     "manifest-macos-community-arm64-v2.update.json",
-    "manifest-macos-community-x86_64-v2.update.json",
 )
 
 
