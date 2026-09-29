@@ -126,10 +126,19 @@ binaries, and emits immutable versioned assets plus
 `manifest-linux-ARCH-v2.update.json` and `.sig` stable aliases under
 `target/release-dist/linux-ARCH/`.
 
-`.github/workflows/release.yml` downloads and SHA-256-verifies the CEF 151 minimal
-archive pinned to `cef = 151.6.0`, then runs the package job for x86_64 and arm64
-inside Ubuntu 22.04 containers, attests the outputs, and publishes them with the
-macOS assets. CI compiles the Linux browser feature against the same pinned
-archive. Release approval still requires real X11 and Wayland-plus-XWayland GPU
-smoke tests on both architectures; container compilation does not replace that
-visual/runtime gate.
+`.github/workflows/release.yml` downloads (with retries) and SHA-256-verifies the
+CEF 151 minimal archive pinned to `cef = 151.6.0`, then runs the package job for
+x86_64 and arm64 inside Ubuntu 22.04 containers, attests the outputs, and
+publishes them with the macOS assets. Package jobs use no build cache: they
+neither restore nor save one. `hh` and `hh-cef-helper` build in one cargo
+invocation; `hh-service` and `hh-update-tool` build separately so desktop-only
+dependency features never reach them. CI compiles the Linux browser feature
+against the same pinned archive.
+
+Releases are cut with `scripts/release.sh` (see `docs/macos-release.md`,
+"Fast release path"); the tag reuses the green CI run of the identical tree, so
+Linux tests are not re-run on the tag. `release.sh` publishes as soon as CI is
+green, so when a release changes rendering, CEF, or Linux-specific desktop code,
+smoke-test a local build (`scripts/package-linux-release.sh` in test mode) under
+X11 and Wayland-plus-XWayland on a real Linux GPU machine before starting the
+release; container compilation does not replace that visual/runtime check.

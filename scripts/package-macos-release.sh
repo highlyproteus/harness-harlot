@@ -132,25 +132,6 @@ if [ "$test_mode" != 1 ]; then
   fi
 fi
 
-if [ "$test_mode" = 1 ]; then
-  if [ "$community" -eq 1 ]; then
-    cargo build --locked --release -p hh-desktop --features community-macos --bin hh
-  else
-    cargo build --locked --release -p hh-desktop --bin hh
-  fi
-else
-  if [ "$community" -eq 1 ]; then
-    cargo build --locked --release -p hh-desktop --features browser,community-macos --bin hh
-  else
-    cargo build --locked --release -p hh-desktop --features browser --bin hh
-  fi
-fi
-cargo build --locked --release -p hh-session-service --bin hh-service
-updater_features=fetch
-if [ "$community" -eq 1 ]; then
-  updater_features="$updater_features,community-macos"
-fi
-cargo build --locked --release -p hh-updater --features "$updater_features" --bin hh-update-tool
 fixture_update_tool=
 if [ "$test_mode" = 1 ]; then
   fixture_target_directory="$repository_root/target/fixture-updater"

@@ -66,28 +66,32 @@ cargo_release=
 if [ "$profile" = release ]; then
   cargo_release=--release
 fi
+
+# `hh` and `hh-cef-helper` build in ONE cargo invocation: the helper's whole
+# dependency graph is already part of `hh --features browser`, so building them
+# separately only re-resolved features and recompiled ~60 crates.
+# hh-service and hh-update-tool stay separate invocations on purpose: building
+# them together with hh would unify desktop-only dependency features into them
+# (for example serde_json `unbounded_depth`), changing the security-relevant
+# binaries. Their standalone builds are small.
 desktop_features=
+add_desktop_feature() {
+  desktop_features="${desktop_features:+$desktop_features,}$1"
+}
+set -- -p hh-desktop --bin hh
 if [ "$browser_enabled" -eq 1 ]; then
-  desktop_features=browser
+  set -- "$@" -p hh-cef-view --bin hh-cef-helper
+  add_desktop_feature hh-desktop/browser
+  add_desktop_feature hh-cef-view/cef
 fi
 if [ "$community_build" -eq 1 ]; then
-  if [ -n "$desktop_features" ]; then
-    desktop_features="$desktop_features,community-macos"
-  else
-    desktop_features=community-macos
-  fi
+  add_desktop_feature hh-desktop/community-macos
 fi
 if [ -n "$desktop_features" ]; then
-  # shellcheck disable=SC2086
-  cargo build --locked $cargo_release -p hh-desktop --bin hh --features "$desktop_features"
-else
-  # shellcheck disable=SC2086
-  cargo build --locked $cargo_release -p hh-desktop --bin hh
+  set -- "$@" --features "$desktop_features"
 fi
-if [ "$browser_enabled" -eq 1 ]; then
-  # shellcheck disable=SC2086
-  cargo build --locked $cargo_release -p hh-cef-view --bin hh-cef-helper --features cef
-fi
+# shellcheck disable=SC2086
+cargo build --locked $cargo_release "$@"
 # shellcheck disable=SC2086
 cargo build --locked $cargo_release -p hh-session-service --bin hh-service
 updater_features=fetch

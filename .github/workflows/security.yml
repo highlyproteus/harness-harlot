@@ -16,20 +16,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  already-tested:
+    name: Skip main push when its pull request already tested this tree
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      tested: ${{ steps.find.outputs.tested }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: find
+        name: Look for a green Security run on the identical tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if python3 scripts/find-green-ci-run.py --repo "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" --workflow security.yml --exclude-run "$GITHUB_RUN_ID" \
+            --job dependency-policy; then
+            echo tested=true >> "$GITHUB_OUTPUT"
+          else
+            echo tested=false >> "$GITHUB_OUTPUT"
+          fi
+
   dependency-policy:
+    needs: already-tested
+    if: ${{ !cancelled() && needs.already-tested.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.96"
+      - name: Restore security tools
+        id: security-tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-about
+          key: security-tools-${{ runner.os }}-${{ runner.arch }}-rust-1.96-audit-0.22.2-deny-0.20.2-about-0.9.1
       - name: Install security tools
+        if: steps.security-tools.outputs.cache-hit != 'true'
         run: |
           cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2
           cargo install --locked cargo-about@0.9.1 --features cli
+      - name: Save security tools from main
+        if: github.ref == 'refs/heads/main' && steps.security-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-about
+          key: security-tools-${{ runner.os }}-${{ runner.arch }}-rust-1.96-audit-0.22.2-deny-0.20.2-about-0.9.1
       - run: cargo audit
       - run: cargo deny check
       - name: Verify generated dependency notices

@@ -58,6 +58,29 @@ for package_name in ("package", "package-linux"):
         assert token not in block, f"{package_name} receives release authority: {token}"
     assert "HH_RELEASE_UNSIGNED: 1" in block, f"{package_name} is not explicitly unsigned"
 
+# Release builds never restore or write build caches; only the security tools
+# built on main may be restored (read-only) by the tag's security job.
+assert "Swatinem/rust-cache" not in RELEASE, "release builds must not use build caches"
+assert "actions/cache@" not in RELEASE and "actions/cache/save@" not in RELEASE, (
+    "release runs must never write caches"
+)
+assert RELEASE.count("actions/cache/restore@") == 1, "only the security tools may be restored"
+assert "actions/cache/restore@" in job(RELEASE, "verify-release-security")
+
+# The tag reuses CI only for the identical tree, and signing waits for the tag's
+# own security verification.
+verify_ci = job(RELEASE, "verify-release-ci")
+assert "scripts/find-green-ci-run.py" in verify_ci
+assert '--job "Fast quality gate"' in verify_ci and '--job "macOS quality gate"' in verify_ci
+for token in ("SIGNING_SEED", "SIGNING_KEY_FILE", "contents: write", "id-token: write"):
+    assert token not in verify_ci, f"verify-release-ci holds release authority: {token}"
+assert "verify-release-security" in job(RELEASE, "sign-stable-v2")
+assert "macos-15-intel" not in RELEASE, "macOS Intel packages ended with v0.1.27"
+assert "name: macOS quality gate" in CI and "name: Fast quality gate" in CI
+assert CI.count("github.event.pull_request.head.sha || github.sha") == 2, (
+    "CI must test the pull request head tree that find-green-ci-run.py compares"
+)
+
 linux_package = job(RELEASE, "package-linux")
 checkout_trust_match = re.search(
     r"^      - name: Install checkout trust dependencies\n"
@@ -165,7 +188,6 @@ for package_name, source in (("macOS", MAC_PACKAGE), ("Linux", LINUX_PACKAGE)):
 
 expected_sha256 = {
     "70c8b97c4dead81b67a8fb29b80da12681e008d4ae9a9778f59e5a2f2adc4e08",
-    "7ab55b3e45d7a89088d498a5fb6b231c3d3bd17fc1a3eb2aee6c8875f7bd842d",
     "554c2c107a4ca8d555273c0c0d0c1efdfbbb5a2d9ba3a2387dbdf3b622bdb24c",
     "c3acf4f408759cf39c274fc80dc4dee8054e1f4de46bfe15e71b4ada1aa4c664",
 }

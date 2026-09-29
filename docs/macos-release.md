@@ -112,7 +112,7 @@ Apple credentials:
      target/release-dist/Harness-Harlot-0.1.0-b1-macos-arm64/manifest-macos-arm64-v2.update.json.sig
    ```
 
-4. On clean Apple Silicon and Intel test accounts, install the notarized DMG,
+4. On a clean Apple silicon test account, install the notarized DMG,
    run it, confirm the nested service starts, and check
    `codesign --verify --deep --strict`, `spctl --assess --type execute`, and
    `stapler validate`.
@@ -122,8 +122,8 @@ The protected `release` environment always needs variable
 `HH_UPDATE_KEY_ID=hh-stable-2026` and secrets
 `RELEASE_TAG_GPG_PUBLIC_KEY`, `HH_UPDATE_SIGNING_SEED`, and
 `HH_UPDATE_PUBLIC_KEY`. That is sufficient for community macOS and both Linux
-architectures. The workflow verifies the tag, packages community builds on
-Apple Silicon and Intel runners, attests every release file plus the bootstrap
+architectures. The workflow verifies the tag, packages the community build on
+an Apple silicon runner, attests every release file plus the bootstrap
 installer, generates an attested CycloneDX SBOM, and publishes one immutable
 GitHub release.
 
@@ -132,6 +132,20 @@ Developer ID matrix entries are disabled unless repository variable
 `HH_CODESIGN_IDENTITY` and `HH_EXPECTED_TEAM_ID`, plus secrets
 `MACOS_CERTIFICATE_P12`, `MACOS_CERTIFICATE_PASSWORD`, `APPLE_API_KEY_P8`,
 `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER_ID`.
+
+### Intel Macs
+
+macOS releases after 0.1.27 are Apple silicon only; the `macos-15-intel`
+package job is gone. Intel installs are never offered an arm64 build: the
+client's manifest name is fixed at compile time
+(`manifest-macos-community-x86_64-v2.update.json`) and the signed artifact
+architecture must match. The daily stable-v2 refresh no longer publishes that
+Intel alias, so Intel apps keep working but report "Unable to check for
+updates". `install-community-macos.sh` refuses Intel Macs with a pointer to
+the v0.1.27 release, and treats a Rosetta shell on Apple silicon as arm64.
+The frozen v0.1.16 legacy bridge (including its Intel pair) is unchanged.
+The website sync (`harness-harlot-landing`) must accept the three-alias
+refresh before this change reaches `main`.
 
 ## Install, update, and rollback behavior
 
@@ -189,30 +203,66 @@ flow instead of a DMG. The unprivileged installer stages the application at
 names, integration-link paths, trust checks, rollback, and command-line update
 instructions.
 
-## Release checklist
+## Fast release path
 
-- [ ] Bump the workspace semantic version and choose a never-reused positive
-  build number.
-- [ ] Create and push a signed annotated release tag at the exact commit being
-  packaged; set `HH_RELEASE_TAG` to that tag.
-- [ ] Run `cargo fmt --all --check`, `cargo clippy --locked --workspace
-  --all-targets --all-features -- -D warnings`, and `cargo test --locked
-  --workspace --all-targets --all-features`.
-- [ ] Build and inspect the app bundle. Confirm `Contents/MacOS` contains
-  exactly `hh`, `hh-service`, and `hh-update-tool`; confirm
-  `Contents/Frameworks` contains the pinned Chromium Embedded Framework and
-  five signed helper app bundles, and `Contents/Resources` contains
-  `Harness-Harlot.icns`.
-- [ ] For community artifacts, verify ad-hoc signatures, all GitHub
-  attestations, the distinct community manifest name, manual first launch, and
-  notify-only update behavior on both architectures.
-- [ ] If `HH_ENABLE_APPLE_SIGNING=true`, sign, notarize, staple, verify the
-  pinned Team ID, and exercise automatic update/rollback on both architectures.
-- [ ] Publish versioned artifacts and regenerate
-  `manifest-macos-community-ARCH-v2.update.json` in every release. When Developer
-  ID packaging is enabled, regenerate `manifest-macos-ARCH-v2.update.json` in the
-  same release. Publish each matching `.sig`, perform a fresh-host attestation
-  and install check, and never publish a mutable unversioned DMG.
+From "branches finished" to "users are offered the update" in about 45
+minutes, with one approval: starting `scripts/release.sh` is the approval to
+publish, and nothing prompts afterwards.
+
+1. **Assemble.** Merge the finished branches into `release/vX.Y.Z` (cut from
+   `main`), resolve conflicts, and describe the changes under
+   `## [Unreleased]` in `CHANGELOG.md`.
+2. **Smoke only what can break upgrades.** If anything under `crates/updater`,
+   `crates/protocol`, or `crates/session-service` changed since the previous tag,
+   build the fixture pair with
+   `scripts/build-upgrade-fixtures.sh vPREVIOUS --next-version X.Y.Z` (the
+   previous version's fixture is cached and reused), install the old fixture,
+   upgrade to the new one, and confirm running terminals, SSH workstations, and
+   bots survive. `release.sh` refuses such a release without
+   `--upgrade-smoke-passed`. Linux rendering/CEF changes need the GPU smoke in
+   `docs/linux-release.md`. Otherwise skip this step.
+3. **Ship.** `scripts/release.sh X.Y.Z --title "short summary"`.
+
+| Stage (`release.sh` subcommand) | What happens | Target |
+|---|---|---|
+| `prepare` | Version bump (Cargo.toml, Cargo.lock, notices), dated changelog heading, `scripts/preflight.sh` (the exact CI gate), commit, push, PR | 2–5 min warm |
+| `watch-pr` | CI (Linux gate + full macOS gate), Security, Packaging Assurance; exits at the first failed job | 10–12 min |
+| `publish` | Squash-merge, signed tag at the merge commit, push tag to GitHub and GitLab, push `main` to GitLab | 1 min |
+| `watch-release` | Tag workflow: CI binding, security, packages (macOS arm64, Linux x86_64/arm64), SBOM, isolated signing, publish; exits at the first failed job | ~20 min |
+| `land` | Dispatches the stable-v2 refresh and the website sync, waits until harnessharlot.com serves the version | ~10 min |
+
+Each subcommand resumes a failed run (`release.sh watch-pr N`,
+`publish X.Y.Z`, `watch-release vX.Y.Z`, `land vX.Y.Z`). A failed Release job
+can be re-run with `gh run rerun ID --failed` only after the whole run
+finishes; network steps retry on their own first.
+
+What the automation already proves, so it is not repeated by hand:
+
+- **Code quality:** `preflight.sh` locally, then CI on the PR head tree. The
+  tag does not re-run tests: `Verify CI passed for the tagged tree` requires a
+  green `Fast quality gate` and `macOS quality gate` for a commit with exactly
+  the tagged tree (`scripts/find-green-ci-run.py`). This tree-equality binding
+  is newer than the same-SHA binding `edge.yml` uses: it trusts a green run
+  from a same-repository pull request whose head tree equals the merge commit's
+  tree. Pull request CI checks out the PR head, so that is the tree it tested.
+  If `main` moved and the trees differ, the main-push CI runs and the tag waits
+  for it (up to 45 minutes).
+- **Dependencies and secrets:** `cargo audit`, `cargo deny`, notices,
+  shellcheck, and gitleaks run again on the tag; signing waits for them.
+- **Tag and artifact trust:** protected signed tag, verified commit author,
+  runner architecture, pinned CEF SHA-256, `verify-macos-release.sh` bundle
+  and signature checks, provenance attestations, isolated manifest signing,
+  and the exact-file publication check.
+
+CI speed rules: build caches are written only from `main` (nightly CI and
+main pushes) and pull requests restore them; tag runs never restore or save
+build caches. A push to `main` skips CI, Security, and Packaging Assurance when
+the same workflow already passed on the pull request with the identical tree;
+the nightly runs keep full coverage of `main`.
+
+For Developer ID builds (`HH_ENABLE_APPLE_SIGNING=true`), additionally sign,
+notarize, staple, verify the pinned Team ID, and exercise automatic
+update/rollback before announcing the release.
 
 ## Release handoff runbook
 
@@ -242,10 +292,12 @@ Ordered owner steps from a staged repository to a real no-cost release:
 6. **Store the required GitHub variable**:
    `HH_UPDATE_KEY_ID=hh-stable-2026`. Leave
    `HH_ENABLE_APPLE_SIGNING` unset or `false`.
-7. **Cut a community release.** Bump the workspace version, create a
-   GPG-signed annotated tag `vX.Y.Z`, and push it to GitLab. The push mirror
-   transfers the tag to GitHub, where the workflow packages, attests, and
-   publishes community macOS plus Linux artifacts without an Apple account.
+7. **Cut a community release.** Follow "Fast release path" above:
+   `scripts/release.sh X.Y.Z --title "..."` squash-merges the release PR on
+   GitHub, creates the signed annotated tag `vX.Y.Z` at the merge commit, and
+   pushes the tag to GitHub and GitLab (plus `main` to GitLab). The tag workflow
+   packages, attests, and publishes community macOS (Apple silicon) plus Linux
+   artifacts without an Apple account.
 8. **Verify from a clean Mac.** Run the website bootstrap with `--verify-only`
    from a saved copy, exercise first launch and Open Anyway if macOS asks, then
    confirm a newer fixture is notification only.
