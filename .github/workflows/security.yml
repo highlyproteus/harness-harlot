@@ -67,6 +67,10 @@ jobs:
           key: security-tools-${{ runner.os }}-${{ runner.arch }}-rust-1.96-audit-0.22.2-deny-0.20.2-about-0.9.1
       - name: Install security tools
         if: steps.security-tools.outputs.cache-hit != 'true'
+        env:
+          # crates.io downloads have failed with HTTP/2 framing errors here.
+          CARGO_HTTP_MULTIPLEXING: "false"
+          CARGO_NET_RETRY: "10"
         run: |
           cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2
           cargo install --locked cargo-about@0.9.1 --features cli
